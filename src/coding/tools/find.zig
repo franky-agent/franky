@@ -10,8 +10,9 @@
 //!   - `[abc]` character class
 //! Results are file paths, one per line.
 //!
-//! `respectGitignore` is accepted but currently a no-op (deferred until
-//! we ship a .gitignore parser).
+//! `respectGitignore` (default `true`): uses `coding/gitignore.zig` to
+//! drop any result whose path is ignored by a `.gitignore` inside
+//! `cwd`. Pass `false` to search the full tree.
 
 const std = @import("std");
 const ai = struct {
@@ -19,6 +20,7 @@ const ai = struct {
     pub const stream = @import("../../ai/stream.zig");
 };
 const at = @import("../../agent/types.zig");
+const gitignore = @import("../gitignore.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -28,7 +30,7 @@ pub const parameters_json: []const u8 =
     \\    "pattern": {"type": "string", "description": "Glob pattern. Supports *, **, ?, [abc]."},
     \\    "cwd": {"type": "string", "description": "Root to search (default '.')."},
     \\    "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of results (default 1000)."},
-    \\    "respectGitignore": {"type": "boolean"}
+    \\    "respectGitignore": {"type": "boolean", "description": "Respect .gitignore rules under cwd. Default true."}
     \\  },
     \\  "additionalProperties": false
     \\}
@@ -79,8 +81,12 @@ fn execute(
         if (v == .integer and v.integer >= 1) break :blk @intCast(v.integer);
         break :blk default_limit;
     } else default_limit;
+    const respect_gitignore: bool = if (root.object.get("respectGitignore")) |v|
+        (v != .bool or v.bool)
+    else
+        true;
 
-    return try findMatches(allocator, io, cwd, pattern, limit, cancel);
+    return try findMatches(allocator, io, cwd, pattern, limit, respect_gitignore, cancel);
 }
 
 pub fn findMatches(
@@ -89,6 +95,7 @@ pub fn findMatches(
     cwd: []const u8,
     pattern: []const u8,
     limit: usize,
+    respect_gitignore: bool,
     cancel: *ai.stream.Cancel,
 ) !at.ToolResult {
     const root_dir = std.Io.Dir.cwd().openDir(io, cwd, .{ .iterate = true }) catch |err| switch (err) {
@@ -106,6 +113,12 @@ pub fn findMatches(
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
+    var ignore_stack: ?gitignore.Stack = null;
+    defer if (ignore_stack) |*s| s.deinit();
+    if (respect_gitignore) {
+        ignore_stack = gitignore.loadFromTree(allocator, io, cwd) catch null;
+    }
+
     var found: usize = 0;
     var visited: usize = 0;
     while (walker.next(io) catch |e| return toolError(allocator, "walk_failed", @errorName(e))) |entry| {
@@ -117,6 +130,9 @@ pub fn findMatches(
         }
         // find matches only files (spec §C.6 default behavior; dirs are not "finds").
         if (entry.kind != .file) continue;
+        if (ignore_stack) |*s| {
+            if (s.isIgnored(entry.path, false)) continue;
+        }
         if (globMatch(pattern, entry.path)) {
             try out.appendSlice(allocator, entry.path);
             try out.append(allocator, '\n');
@@ -295,10 +311,52 @@ test "find tool: returns matching files" {
     }
 
     var cancel: ai.stream.Cancel = .{};
-    var res = try findMatches(gpa, io, base, "**/*.zig", 100, &cancel);
+    var res = try findMatches(gpa, io, base, "**/*.zig", 100, false, &cancel);
     defer res.deinit(gpa);
     const text = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, "alpha.zig") != null);
     try testing.expect(std.mem.indexOf(u8, text, "beta.zig") != null);
     try testing.expect(std.mem.indexOf(u8, text, "beta.c") == null);
+}
+
+test "find tool: respectGitignore drops ignored matches" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_find_gi_test";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/build");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.gitignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "build/\n*.tmp\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/src.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/scratch.tmp", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/build/cache.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    var res = try findMatches(gpa, io, base, "**/*", 100, true, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "src.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "scratch.tmp") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "cache.zig") == null);
+    try testing.expect(std.mem.indexOf(u8, text, ".gitignore") != null);
 }

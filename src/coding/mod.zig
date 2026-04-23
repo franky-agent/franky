@@ -16,6 +16,8 @@ pub const modes = struct {
 
 pub const session = @import("session.zig");
 pub const cli = @import("cli.zig");
+pub const regex = @import("regex.zig");
+pub const gitignore = @import("gitignore.zig");
 
 test {
     _ = tools.read;
@@ -28,4 +30,6 @@ test {
     _ = modes.print;
     _ = session;
     _ = cli;
+    _ = regex;
+    _ = gitignore;
 }

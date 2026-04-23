@@ -12,7 +12,7 @@ pub const ai = @import("ai/mod.zig");
 pub const agent = @import("agent/mod.zig");
 pub const coding = @import("coding/mod.zig");
 
-pub const version = "0.0.1";
+pub const version = "0.3.1";
 
 test {
     _ = ai;

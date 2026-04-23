@@ -1,12 +1,16 @@
 //! grep tool — §C.7 of the spec.
 //!
-//! Schema: `{pattern, path?, filesGlob?, caseSensitive?, contextBefore?,
-//!           contextAfter?, maxMatches?}`.
+//! Schema: `{pattern, path?, filesGlob?, regex?, caseSensitive?,
+//!           contextBefore?, contextAfter?, maxMatches?}`.
 //!
-//! MVP: literal substring search (regex engine deferred). If the caller
-//! provides a regex, we still do literal matching — so it behaves like
-//! `grep -F`. This covers the common coding-agent use case ("find all
-//! callers of `foo_bar`").
+//! Two matching modes:
+//!   - `regex=true` (default): `pattern` is compiled by `coding/regex.zig`
+//!     (ECMAScript-subset: `. * + ? | [...] ^ $ \w \d \s` + negations +
+//!     non-capturing groups). A bad pattern returns a structured
+//!     `grep_bad_regex` error with the parser position so the model can
+//!     fix it on the next turn.
+//!   - `regex=false`: literal substring search (`grep -F` semantics).
+//!     Useful for patterns full of metacharacters.
 //!
 //! Binary files are skipped (NUL byte in the first 8 KiB). Matches are
 //! reported as `path:line:snippet`. Context lines (before/after) are
@@ -19,15 +23,17 @@ const ai = struct {
 };
 const at = @import("../../agent/types.zig");
 const find_mod = @import("find.zig");
+const regex_mod = @import("../regex.zig");
 
 pub const parameters_json: []const u8 =
     \\{
     \\  "type": "object",
     \\  "required": ["pattern"],
     \\  "properties": {
-    \\    "pattern": {"type": "string", "description": "Literal substring to search for (regex not yet supported; treated as literal)."},
+    \\    "pattern": {"type": "string", "description": "ECMAScript-subset regex by default: . * + ? | [abc] [^abc] [a-z] ^ $ \\w \\d \\s (and \\W \\D \\S). Non-capturing groups with (...). Set regex=false for literal substring match."},
     \\    "path": {"type": "string", "description": "Root path to search. Default '.'."},
     \\    "filesGlob": {"type": "string", "description": "Only search files matching this glob (e.g. '**/*.zig')."},
+    \\    "regex": {"type": "boolean", "description": "Treat pattern as regex. Default true. Set false for `grep -F` literal search."},
     \\    "caseSensitive": {"type": "boolean", "description": "Default true."},
     \\    "contextBefore": {"type": "integer", "minimum": 0},
     \\    "contextAfter": {"type": "integer", "minimum": 0},
@@ -44,7 +50,7 @@ pub const binary_sniff_bytes: usize = 8 * 1024;
 pub fn tool() at.AgentTool {
     return .{
         .name = "grep",
-        .description = "Search for a literal substring across files. Skips binaries; supports file glob.",
+        .description = "Search files for a regex (default) or literal substring. Skips binaries; supports file glob.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .execute = execute,
@@ -100,17 +106,92 @@ fn execute(
         (if (v == .integer and v.integer >= 1) @intCast(v.integer) else default_max_matches)
     else
         default_max_matches;
+    const use_regex: bool = if (root.object.get("regex")) |v|
+        (v != .bool or v.bool)
+    else
+        true;
 
-    return try grepTree(allocator, io, path, pattern, files_glob, case_sensitive, context_before, context_after, max_matches, cancel);
+    // Compile the regex up front so a bad pattern surfaces as a clean
+    // `grep_bad_regex` tool error before we touch the filesystem.
+    var matcher: Matcher = undefined;
+    if (use_regex) {
+        var report: regex_mod.ErrorReport = .{};
+        matcher = .{ .regex = regex_mod.compileOpts(
+            allocator,
+            pattern,
+            .{ .case_insensitive = !case_sensitive },
+            &report,
+        ) catch |e| {
+            return try badRegexError(allocator, pattern, e, report.pos);
+        } };
+    } else {
+        matcher = .{ .literal = .{ .pattern = pattern, .case_sensitive = case_sensitive } };
+    }
+    defer matcher.deinit();
+
+    return try grepTree(allocator, io, path, &matcher, files_glob, context_before, context_after, max_matches, cancel);
+}
+
+/// Unified matcher abstraction so `grepFile` can stay pattern-agnostic.
+pub const Matcher = union(enum) {
+    regex: regex_mod.Regex,
+    literal: Literal,
+
+    pub const Literal = struct {
+        pattern: []const u8,
+        case_sensitive: bool,
+    };
+
+    pub fn deinit(self: *Matcher) void {
+        switch (self.*) {
+            .regex => |*r| r.deinit(),
+            .literal => {},
+        }
+    }
+
+    pub fn matches(self: *const Matcher, line: []const u8) bool {
+        return switch (self.*) {
+            .regex => |*r| r.matches(line),
+            .literal => |l| if (l.case_sensitive)
+                std.mem.indexOf(u8, line, l.pattern) != null
+            else
+                indexOfNoCase(line, l.pattern) != null,
+        };
+    }
+};
+
+fn badRegexError(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+    e: regex_mod.CompileError,
+    pos: usize,
+) !at.ToolResult {
+    const kind = switch (e) {
+        error.EmptyPattern => "empty pattern",
+        error.UnmatchedParen => "unmatched '('",
+        error.UnmatchedBracket => "unmatched '['",
+        error.DanglingQuantifier => "quantifier with no preceding atom",
+        error.InvalidEscape => "invalid escape sequence",
+        error.InvalidCharClass => "empty or invalid character class",
+        error.InvalidRange => "invalid range in character class",
+        error.TrailingGarbage => "unexpected trailing characters",
+        error.OutOfMemory => "out of memory",
+    };
+    const msg = try std.fmt.allocPrint(
+        allocator,
+        "{s} at position {d} in pattern {s}\\ (use regex=false for literal substring search)",
+        .{ kind, pos, pattern },
+    );
+    defer allocator.free(msg);
+    return toolError(allocator, "grep_bad_regex", msg);
 }
 
 pub fn grepTree(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
-    pattern: []const u8,
+    matcher: *const Matcher,
     files_glob: ?[]const u8,
-    case_sensitive: bool,
     context_before: usize,
     context_after: usize,
     max_matches: usize,
@@ -146,8 +227,7 @@ pub fn grepTree(
             io,
             &dir,
             entry.path,
-            pattern,
-            case_sensitive,
+            matcher,
             context_before,
             context_after,
             max_matches,
@@ -170,8 +250,7 @@ fn grepFile(
     io: std.Io,
     dir: *std.Io.Dir,
     rel_path: []const u8,
-    pattern: []const u8,
-    case_sensitive: bool,
+    matcher: *const Matcher,
     context_before: usize,
     context_after: usize,
     max_matches: usize,
@@ -215,11 +294,7 @@ fn grepFile(
         const end = if (l + 1 < line_starts.items.len) line_starts.items[l + 1] - 1 else bytes.len;
         const line = bytes[start..end];
 
-        const hit = if (case_sensitive)
-            std.mem.indexOf(u8, line, pattern) != null
-        else
-            indexOfNoCase(line, pattern) != null;
-        if (!hit) continue;
+        if (!matcher.matches(line)) continue;
 
         // Write "before" context.
         const ctx_start = if (l >= context_before) l - context_before else 0;
@@ -313,6 +388,20 @@ fn testIo() std.Io.Threaded {
     });
 }
 
+fn literalMatcher(pattern: []const u8, case_sensitive: bool) Matcher {
+    return .{ .literal = .{ .pattern = pattern, .case_sensitive = case_sensitive } };
+}
+
+fn regexMatcher(pattern: []const u8, case_insensitive: bool) !Matcher {
+    var report: regex_mod.ErrorReport = .{};
+    return .{ .regex = try regex_mod.compileOpts(
+        testing.allocator,
+        pattern,
+        .{ .case_insensitive = case_insensitive },
+        &report,
+    ) };
+}
+
 test "grep tool: finds literal matches with line numbers" {
     var threaded = testIo();
     defer threaded.deinit();
@@ -331,14 +420,16 @@ test "grep tool: finds literal matches with line numbers" {
     }
 
     var cancel: ai.stream.Cancel = .{};
-    var res = try grepTree(gpa, io, base, "NEEDLE", null, true, 0, 0, 100, &cancel);
+    var m = literalMatcher("NEEDLE", true);
+    defer m.deinit();
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, &cancel);
     defer res.deinit(gpa);
     const text = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, ":2:NEEDLE here") != null);
     try testing.expect(std.mem.indexOf(u8, text, "line one") == null);
 }
 
-test "grep tool: case-insensitive match" {
+test "grep tool: case-insensitive literal match" {
     var threaded = testIo();
     defer threaded.deinit();
     const io = threaded.io();
@@ -356,7 +447,9 @@ test "grep tool: case-insensitive match" {
     }
 
     var cancel: ai.stream.Cancel = .{};
-    var res = try grepTree(gpa, io, base, "world", null, false, 0, 0, 100, &cancel);
+    var m = literalMatcher("world", false);
+    defer m.deinit();
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, &cancel);
     defer res.deinit(gpa);
     try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "Hello World") != null);
 }
@@ -379,7 +472,9 @@ test "grep tool: context before/after" {
     }
 
     var cancel: ai.stream.Cancel = .{};
-    var res = try grepTree(gpa, io, base, "MATCH", null, true, 1, 1, 100, &cancel);
+    var m = literalMatcher("MATCH", true);
+    defer m.deinit();
+    var res = try grepTree(gpa, io, base, &m, null, 1, 1, 100, &cancel);
     defer res.deinit(gpa);
     const text = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, "-2-l2") != null);
@@ -405,7 +500,153 @@ test "grep tool: skips binary files" {
     }
 
     var cancel: ai.stream.Cancel = .{};
-    var res = try grepTree(gpa, io, base, "NEEDLE", null, true, 0, 0, 100, &cancel);
+    var m = literalMatcher("NEEDLE", true);
+    defer m.deinit();
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, &cancel);
     defer res.deinit(gpa);
     try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "NEEDLE") == null);
+}
+
+// ─── regex mode ───────────────────────────────────────────────────────
+
+test "grep tool: regex metacharacters across files" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_grep_re_test";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/a.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "pub fn foo() void {}\nfn bar() !void {}\nconst x = 1;\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/b.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "pub fn baz() u32 {\n    return 42;\n}\n");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    // Match function declarations: `fn <name>` (pub optional)
+    var m = try regexMatcher("(pub )?fn \\w+", false);
+    defer m.deinit();
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "pub fn foo") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "fn bar") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "pub fn baz") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "const x") == null);
+}
+
+test "grep tool: regex + filesGlob combo" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_grep_glob_re";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/a.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "TODO: ship it\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/notes.txt", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "TODO: write more\n");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    var m = try regexMatcher("^TODO:", false);
+    defer m.deinit();
+    var res = try grepTree(gpa, io, base, &m, "*.zig", 0, 0, 100, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "a.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "notes.txt") == null);
+}
+
+test "grep tool: grep_bad_regex error path" {
+    const gpa = testing.allocator;
+    const bad =
+        \\{"pattern":"foo(bar","path":"/tmp"}
+    ;
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    var cancel: ai.stream.Cancel = .{};
+    const t = tool();
+    var res = try t.execute(&t, gpa, io, "call-1", bad, &cancel, .{});
+    defer res.deinit(gpa);
+    try testing.expect(res.is_error);
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "grep_bad_regex") != null);
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "unmatched") != null);
+}
+
+test "grep tool: regex=false preserves literal behavior" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_grep_literal_opt";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/a.txt", .{});
+        defer f.close(io);
+        // `.*` as literal chars, not a regex
+        try f.writeStreamingAll(io, "hello .* world\nnothing here\n");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    const args = try std.fmt.allocPrint(gpa,
+        \\{{"pattern":".*","path":"{s}","regex":false}}
+    , .{base});
+    defer gpa.free(args);
+    const t = tool();
+    var res = try t.execute(&t, gpa, io, "call-2", args, &cancel, .{});
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, ":1:hello .* world") != null);
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "nothing here") == null);
+}
+
+test "grep tool: cancellation fires cleanly with regex compiled" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_grep_cancel";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/a.txt", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "match me\n");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    cancel.fire();
+    var m = try regexMatcher("match", false);
+    defer m.deinit();
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, &cancel);
+    defer res.deinit(gpa);
+    try testing.expect(res.is_error);
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "aborted") != null);
 }

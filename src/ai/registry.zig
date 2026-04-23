@@ -33,8 +33,35 @@ pub const StreamOptions = struct {
     cache_retention: CacheRetention = .none,
     session_id: ?[]const u8 = null,
     thinking: types.ThinkingLevel = .off,
+    /// HTTP phase deadlines — §G.4. Zero means "no timeout on this phase".
+    timeouts: Timeouts = .{},
 
     pub const Header = struct { name: []const u8, value: []const u8 };
+};
+
+/// §G.4 phase timeouts. Zero on any individual field disables that phase's
+/// cap. The three request-phase deadlines (`connect_ms`, `upload_ms`,
+/// `first_byte_ms`) compose into a single wall-clock budget around the
+/// `fetch()` call — see `fetchDeadlineMs()`. `event_gap_ms` is enforced
+/// separately inside the SSE parse loop.
+pub const Timeouts = struct {
+    /// Max time to establish the TCP (and TLS) connection.
+    connect_ms: u32 = 10_000,
+    /// Max time to write the request body.
+    upload_ms: u32 = 120_000,
+    /// Max time from request send to first response byte.
+    first_byte_ms: u32 = 30_000,
+    /// Max time between two successful SSE events while the response body
+    /// streams. Also observed between the last event callback and EOF.
+    event_gap_ms: u32 = 60_000,
+
+    /// Wall-clock budget for a complete request-to-body-ready fetch.
+    /// Under the current buffered-fetch implementation this is the only
+    /// externally observable deadline; per-phase enforcement will land
+    /// when we migrate to streaming reads (tracked in the port log).
+    pub fn fetchDeadlineMs(self: Timeouts) u64 {
+        return @as(u64, self.connect_ms) + @as(u64, self.upload_ms) + @as(u64, self.first_byte_ms);
+    }
 };
 
 pub const CacheRetention = enum { none, short, long };

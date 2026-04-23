@@ -12,6 +12,7 @@ pub const channel = @import("channel.zig");
 pub const stream = @import("stream.zig");
 pub const registry = @import("registry.zig");
 pub const http = @import("http.zig");
+pub const retry = @import("retry.zig");
 pub const log = @import("log.zig");
 pub const providers = struct {
     pub const faux = @import("providers/faux.zig");
@@ -27,6 +28,7 @@ test {
     _ = stream;
     _ = registry;
     _ = http;
+    _ = retry;
     _ = log;
     _ = providers.faux;
     _ = providers.anthropic;

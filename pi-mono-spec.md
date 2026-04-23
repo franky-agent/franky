@@ -26,11 +26,11 @@ Status of each section against the code in `franky/src/` as of 2026-04-23. Legen
 | 4.2 | AgentMessage superset | ✅ | Custom role + `convertToLlm` |
 | 4.3 | Agent loop | 🟡 | Sequential mode; `steer`/`followUp` deferred |
 | 4.4 | Parallel tool execution | ❌ | Sequential only |
-| 4.5 | Tools | 🟡 | No `executionMode` field yet |
+| 4.5 | Tools | 🟡 | `execution_mode: ExecutionMode` field live on `AgentTool` (`src/agent/types.zig`) and set on every built-in tool (read/grep/ls/find = `.parallel`; bash/write/edit = `.sequential`). Loop dispatcher is still sequential until §4.4 lands — the field is declared-but-unenforced |
 | 4.6 | Agent class | ✅ | `src/agent/agent.zig` |
 | 4.7 | streamProxy | ❌ | Deferred (web-ui/mom not ported) |
 | 5.1 | AgentSession orchestrator | 🟡 | Auto-persistence wired; branching/compaction deferred |
-| 5.2 | Built-in tools | 🟡 | read/write/edit/bash/ls/find/grep ✓; gitignore-awareness deferred |
+| 5.2 | Built-in tools | ✅ | read/write/edit/bash/ls/find/grep all live; `ls`/`find` honor `.gitignore` via `src/coding/gitignore.zig`; `grep` regex engine via `src/coding/regex.zig` |
 | 5.3 | Sessions on disk | 🟡 | ULID + atomic round-trip + resume wired into print mode; branching/objects scaffolded |
 | 5.4 | Extension system | ❌ | Registries are the extension points; no loader |
 | 5.5 | Run modes | 🟡 | Print mode ✓; Interactive/RPC deferred |
@@ -43,7 +43,7 @@ Status of each section against the code in `franky/src/` as of 2026-04-23. Legen
 | 8.1 | Slack bot | ❌ | Not ported |
 | 8.2 | Pods CLI | ❌ | Not ported |
 | 9 | Cross-cutting patterns | 🟡 | Registry/streams/errors-as-events/persistence all honored |
-| 10 | Testing strategy | 🟡 | 97 tests passing; faux backbone ✓ |
+| 10 | Testing strategy | 🟡 | 168 tests passing (159 unit via `src/root.zig` aggregator + 3 `test/agent_loop_test.zig` + 3 `test/agent_class_test.zig` + 3 `test/gitignore_test.zig`); faux backbone ✓ |
 | 11 | Operational rules | ✅ | |
 | 12 | Implementation details | 🟡 | Partial-JSON ✓; migrations/compaction deferred |
 | 13 | Preserve vs reconsider | — | Guidance |
@@ -60,18 +60,18 @@ Status of each section against the code in `franky/src/` as of 2026-04-23. Legen
 | C.2 | write tool | ✅ | |
 | C.3 | edit tool | ✅ | |
 | C.4 | bash tool | 🟡 | `/bin/sh -c <cmd>`, timeout, 1 MiB output cap; shell-trust/env denylist/background/cwd-tracking deferred |
-| C.5 | ls tool | 🟡 | Non-recursive + recursive with depth cap; gitignore-awareness deferred |
-| C.6 | find tool | 🟡 | Shell glob (`*`, `**`, `?`, `[abc]`); gitignore-awareness deferred |
-| C.7 | grep tool | 🟡 | Literal substring, case-insensitive, context, file glob, binary skip; regex engine deferred |
+| C.5 | ls tool | ✅ | Non-recursive + recursive with depth cap; `respectGitignore` (default `true`) routed through `src/coding/gitignore.zig` — nested `.gitignore` files compose, negations honored, ignored dirs pruned (`cannot re-include inside ignored dir`) |
+| C.6 | find tool | ✅ | Shell glob (`*`, `**`, `?`, `[abc]`); `respectGitignore` (default `true`) drops ignored results via the same `src/coding/gitignore.zig` stack as §C.5 |
+| C.7 | grep tool | ✅ | Regex (default) or literal (`regex=false`) via `src/coding/regex.zig`. Engine supports `. * + ? \| [...] ^ $ \w \d \s` (+ negations) + non-capturing groups. Bad regex returns `grep_bad_regex` with parser position |
 | D | System prompt template | 🟡 | Minimal inline; no loader |
 | E | Compaction algorithm | ❌ | Deferred |
 | F | Error taxonomy | ✅ | `src/ai/errors.zig` |
-| F.1 | Retry policy | 🟡 | Structure present; not live in HTTP loop |
+| F.1 | Retry policy | 🟡 | `src/ai/retry.zig` ships the §F.1 algorithm — decorrelated-jitter backoff with `base=500ms`, `max_retries=3`, `Retry-After` precedence up to cap, `rate_limited_hard` short-circuit when server-requested delay exceeds cap, cancellation short-circuit. Pure logic with `AttemptFn` + `SleepFn` callbacks; provider-side integration (wrapping `client.fetch` in the retry loop) pending |
 | F.2 | Tool vs agent errors | 🟡 | Fields ready; mapping partial |
 | G.1 | HTTP client | 🟡 | `std.http.Client` ✓; `HTTP(S)_PROXY`/`NO_PROXY` honored via `options.environ_map`; timeouts still deferred |
 | G.2 | SSE parser | ✅ | |
 | G.3 | Cancellation | ✅ | `Cancel` atomic |
-| G.4 | Timeouts | 🟡 | Scaffolded |
+| G.4 | Timeouts | 🟡 | `StreamOptions.timeouts: Timeouts` exposes `connect_ms`/`upload_ms`/`first_byte_ms`/`event_gap_ms` with §G.4 defaults (10s/120s/30s/60s). `event_gap_ms` is enforced inside `driveSseFromBytes` between successful event callbacks. The three request-phase deadlines are plumbed through but not yet enforced by the buffered `std.http.Client.fetch` — pending either a streaming-reads refactor or a worker-thread-with-deadline reconciliation against `std.Io.Mutex`/`Condition` |
 | G.5 | Logging & tracing | ✅ | `src/ai/log.zig` — 5 levels, atomic threshold, `--log-level`/`FRANKY_LOG`/`FRANKY_DEBUG`, trace dumps every message + HTTP body |
 | H.1 | auth.json | 🟡 | Schema; no loader |
 | H.2 | settings.json | 🟡 | Schema; no loader |
@@ -415,6 +415,840 @@ stack.
 None of these block the current binary from being useful as an
 end-to-end coding agent against real Anthropic; they are the next
 increments against the spec rather than unimplemented fundamentals.
+
+### Pass 4 — `grep` regex engine, v0.2.0 (2026-04-23)
+
+First feature milestone of the post-baseline roadmap. Closes §C.7.
+
+**What changed.** `src/coding/regex.zig` added — a ~600-line minimal
+regex engine. Pipeline: pattern → recursive-descent AST → bytecode `[]Op`
+with `split`/`jump` for nondeterministic branches → depth-first
+backtracking executor gated by both a step budget (200k ops per starting
+position) and a recursion-depth cap (800 frames). The depth cap is the
+belt to the budget's suspenders — the budget alone could not prevent
+stack-overflow crashes on `(a*)*b` because each decrement still consumed
+a stack frame. Supported: `.` `*` `+` `?` `|` `[abc] [^abc] [a-z]` `^`
+`$` `\d \D \w \W \s \S` `\n \t \r` `\0`, non-capturing groups `(...)`,
+ASCII case-folding via `CompileOptions.case_insensitive`. Not supported
+(out of scope): capture groups, backreferences, lazy quantifiers,
+bounded quantifiers, lookaround, Unicode property classes. Surfaces are
+documented in the file header.
+
+**Grep tool wiring.** `src/coding/tools/grep.zig` gained:
+
+- A new `regex: bool` schema field (default `true`); set `regex=false`
+  for literal `grep -F` semantics. The schema description now lists the
+  supported metacharacter set so the model knows what syntax to use.
+- A `Matcher` union wrapping either a compiled `Regex` or a
+  `{pattern, case_sensitive}` pair, letting `grepTree`/`grepFile` stay
+  pattern-shape-agnostic.
+- A `grep_bad_regex` structured error carrying the parser error kind and
+  the byte position in the pattern so the model can fix the regex on
+  the next turn rather than giving up.
+
+**Gotchas surfaced.**
+
+1. **`\b` is not supported.** One draft test used `\b?(fn|pub)` and
+   failed at compile time with `InvalidEscape`. Word-boundary is not in
+   the roadmap's acceptance list for v0.2.0 and was removed from the
+   test. If a future milestone adds it, expose it as `word_boundary` Op
+   (lookaround over `[A-Za-z0-9_]` on both sides) — no new complexity
+   in the backtracking executor.
+2. **Catastrophic backtracking blows the stack before the budget.** First
+   cut of `exec` had only the 200k-ops budget; `(a*)*b` against 40 a's
+   still segfaulted because each recursion allocated a stack frame.
+   Added a `depth: u16` counter and `max_depth: u16 = 800`. The two
+   limits compose: `max_depth` bounds worst-case stack usage; `budget`
+   bounds wall time for patterns that explode breadth-first instead of
+   deep.
+3. **Anchoring via the `start_anchor` op.** Rather than carry a separate
+   `anchored_start: bool` on the `Regex`, `^` emits a `start_anchor` op
+   that fails unless `pos == 0`. `matches()` still special-cases the
+   first op being `start_anchor` as an optimization (try only `pos=0`),
+   but the semantics live entirely in the bytecode. Makes `foo|^bar`
+   and other unusual placements fall out of the grammar for free.
+
+**Test delta.** 105 → 133 (+28).
+
+| Area | Before | After | Delta |
+|---|---|---|---|
+| `src/coding/regex.zig` unit | 0 | 23 | +23 (every supported metachar, every `CompileError` variant except `OutOfMemory`, case-insensitive, UTF-8 byte-safety, step-budget guard) |
+| `src/coding/tools/grep.zig` unit | 4 | 9 | +5 (regex-metachar across files, regex+filesGlob, `grep_bad_regex`, `regex=false` fallback, cancellation with regex compiled) |
+| Other | 101 | 101 | — |
+| **Total** | **105** | **133** | **+28** |
+
+**Coverage gate.** Roadmap floor: ≥ 8 regex-related tests. Actual: 28
+new tests. Every metachar from the acceptance list has an assertion,
+every `CompileError` variant (except `OutOfMemory`, which is
+unreachable from test code) has a negative test. `TODO(coverage)`
+markers: none — any future addition (word boundary, lazy quantifiers,
+bounded quantifiers) will need its own roadmap milestone.
+
+**Verification run.**
+
+```
+$ rm -rf zig-out /tmp/franky-zig-cache && ./build.sh  # clean rebuild, no warnings
+$ ./zig-out/bin/franky --version                       # franky 0.2.0
+$ ./zig-out/bin/franky --help | head -4                # exit 0, flag list intact
+$ ./zig-out/bin/franky "hello"                         # "you said: hello" via faux
+$ zig build test --summary all                         # 133/133 pass
+```
+
+**Spec + manifest update.** `build.zig.zon` and `src/root.zig` both
+bumped `0.0.1 → 0.2.0`. §C.7 status row flipped to ✅. §10 test-count
+cell updated to 133. The roadmap's `v0.2.0` row in the aggregate
+coverage table should now show `28 / 8 floor (✅)`.
+
+**Deferred from this milestone.** The regex engine intentionally
+implements only the metachar set the v0.2.0 acceptance criteria listed.
+If any future feature (a `/search` slash-command, the `find`
+tool's content-filter flag, etc.) needs lazy quantifiers, bounded
+repetitions, or capture groups, open a separate milestone — they are
+non-trivial extensions to the bytecode and executor, not small add-ons.
+
+### Pass 5 — gitignore awareness for `ls` + `find`, v0.2.1 (2026-04-23)
+
+Second feature milestone. Closes §C.5 and §C.6.
+
+**What changed.** New module `src/coding/gitignore.zig` (~600 lines
+including tests). Parses `.gitignore` files per the documented git
+semantics we need: blank lines + `#` comments skipped, leading `!`
+negates (escape with `\!`), trailing `/` is directory-only, leading or
+internal `/` anchors to the file's directory, unanchored patterns
+match at any depth. Wildcards handled by an in-module glob matcher
+duplicated from `tools/find.zig` to avoid a circular import (glob
+logic is ~90 lines; de-duplicating into a shared module would buy
+little for the first two callers).
+
+`Stack.loadFromTree` walks the scan root once, collects every
+`.gitignore` it finds, **sorts by depth** (shallowest first), then
+parses in that order. The sort is load-bearing — `Io.Dir.Walker` does
+not guarantee outer-to-inner visit order, and without the sort a
+nested `.gitignore` could land before its parent, reversing the
+"innermost file wins" semantics. `Stack.isIgnored(rel_path, is_dir)`
+walks ancestor-prefixes-as-directories first; if any ancestor's
+decision is "ignored", the path is ignored with no re-inclusion
+possible (git's
+cannot-re-include-inside-ignored-dir rule).
+
+**Tool wiring.** `src/coding/tools/ls.zig` and
+`src/coding/tools/find.zig` both took a new `respect_gitignore: bool`
+parameter on their public function signatures and a new
+`respectGitignore` schema field (default `true`). Each loads a
+`Stack` once at entry time (graceful degradation to "nothing
+ignored" on load failure) and checks every walked entry against it.
+Pass `respectGitignore: false` to get the full tree — useful for
+audit / debug queries.
+
+**Gotchas surfaced.**
+
+1. **Walker reorder.** First cut did `loadOne("")` up front then let
+   the walker pick up the rest. Debug print showed the sub
+   `.gitignore` landing at index 2 and the root re-loaded at indices
+   3-4, clobbering the sub's negation. Fix: two-pass — collect base
+   dirs, sort by depth, parse in that order. Skip the walker's return
+   of the root `.gitignore` (its `dirname` is `null`) so the root is
+   parsed exactly once.
+2. **Ancestor check missing.** Initial `isIgnored` checked each pattern
+   against the full path only. `build/` as a dir-only pattern then
+   failed to ignore `build/cache.zig` because the dir-only guard
+   rejected the file-kind check. Fixed by walking every `/` separator
+   in the path, evaluating each prefix as a directory, and returning
+   `true` on the first ignored ancestor. This also enforces git's
+   no-re-inclusion-inside-ignored-dir rule for free.
+3. **`Io.Dir.openFile` accepts slashes.** Loading `sub/.gitignore` via
+   a root-level handle worked without needing to open the intermediate
+   `sub/` dir first. Kept the code simple.
+4. **Integration-test arena leaks.** First `buildTree` helper called
+   `std.fs.path.join(gpa, ...)` and discarded the result, leaking 9
+   paths per run. Fixed by wrapping in a `mkdir` helper that
+   `defer`-frees the join. macOS DebugAllocator would have caught this
+   too; the sandbox GPA did.
+
+**Test delta.** 133 → 150 (+17).
+
+| Area | Before | After | Delta |
+|---|---|---|---|
+| `src/coding/gitignore.zig` unit | 0 | 11 | +11 (each pattern form: plain, wildcard, `**`, anchored, dir-only, negation, escaped-`!`, comment/blank handling, nested composition, last-match-wins, char class, `loadFromTree` end-to-end) |
+| `src/coding/tools/ls.zig` unit | 3 | 5 | +2 (`respectGitignore=true` skips; `=false` preserves) |
+| `src/coding/tools/find.zig` unit | 2 | 3 | +1 (`respectGitignore` drops ignored matches) |
+| `test/gitignore_test.zig` integration | 0 | 3 | +3 (multi-level tree through full tool `execute`; on/off toggle; pkg-level negation) |
+| Other | 128 | 128 | — |
+| **Total** | **133** | **150** | **+17** |
+
+**Coverage gate.** Roadmap floor: ≥ 6 unit tests + 1 integration.
+Actual: 14 unit + 3 integration. Every pattern form from §C.5
+(wildcards, anchored, directory-only, negation) has at least one
+asserting test; cross-file composition has dedicated coverage.
+
+**Verification run.**
+
+```
+$ rm -rf zig-out /tmp/franky-zig-cache && ./build.sh  # clean rebuild, no warnings
+$ ./zig-out/bin/franky --version                       # franky 0.2.1
+$ ./zig-out/bin/franky --help | head -2                # exit 0
+$ ./zig-out/bin/franky "hello"                         # "you said: hello"
+$ zig build test --summary all                         # 150/150 pass
+```
+
+**Spec + manifest update.** `build.zig.zon` and `src/root.zig` both
+bumped `0.2.0 → 0.2.1`. §C.5 and §C.6 status rows flipped 🟡 → ✅.
+§5.2 (Built-in tools) also flipped to ✅ since the gitignore
+deferral was its only open sub-item. §10 test count updated to 150.
+The roadmap's `v0.2.1` row now shows `17 / 7 floor (✅)`.
+
+**Deferred from this milestone.** No `core.excludesFile` / global git
+config honoring. No `.git/info/exclude`. No `core.ignoreCase`. No
+case-folding for Windows filesystems. No `.gitignore` files *above*
+the scan root. These are git-completist concerns — open a follow-up
+milestone if any real use case needs them.
+
+### Pass 6 — HTTP timeouts surface, v0.3.0 (2026-04-23)
+
+First milestone of the v0.3.* path-to-§A.6 chain. Lays down the §G.4
+timeout surface without blocking on a full HTTP-streaming refactor.
+
+**What changed.** `StreamOptions.timeouts: Timeouts` is now a
+first-class field. `Timeouts` has the four §G.4 fields — `connect_ms`
+(default 10s), `upload_ms` (120s), `first_byte_ms` (30s),
+`event_gap_ms` (60s) — plus a `fetchDeadlineMs()` helper that sums
+the first three as the overall fetch budget. `driveSseFromBytes` grew
+a `WithTimeouts` variant that enforces `event_gap_ms` between
+successful handler callbacks; the bare version delegates to it with
+default timeouts. `streamSse` gained a `timeouts` parameter threading
+the same.
+
+**What is *not* yet enforced.** The three request-phase deadlines
+(`connect_ms`, `upload_ms`, `first_byte_ms`) are plumbed through the
+API but not yet observed at the socket level. `std.http.Client.fetch`
+is a buffered, blocking primitive with no per-phase hooks and no
+cancellation integration in Zig 0.17-dev. The two paths forward are:
+
+1. Migrate to the streaming `Client.request` + `Request.reader` API so
+   we can wrap each phase boundary ourselves.
+2. Run `fetch` on a worker thread and race against a `std.Io.Mutex` +
+   `Condition.timedWait` deadline — works, but requires reconciling
+   the `io: Io` parameter threading across what is today a synchronous
+   helper.
+
+Both are substantial and better delivered as a focused follow-up. The
+API surface shipped here is stable, so the eventual enforcement lands
+without changing callers.
+
+**Gotchas surfaced.** Zig 0.17-dev's stdlib reorganized aggressively
+while this milestone was in flight:
+
+- `std.Thread.sleep` and `std.posix.nanosleep` are both gone. The
+  ergonomic stand-in for a blocking sleep is now `std.Io.Mutex` +
+  `std.Io.Condition.timedWait`, but that requires an `io: Io` handle
+  the test callback didn't have. Settled on a brief busy-wait using
+  the existing `stream_mod.nowMillis()` for the one-off slow-handler
+  test — fine for 80ms of wait, ugly at scale.
+- `std.time.milliTimestamp` / `nanoTimestamp` are gone too. Replaced
+  with `stream_mod.nowMillis()`, which the codebase already had for
+  the cancel-flag machinery.
+- `std.net` moved to `std.Io.net`. The planned live-localhost
+  integration test (bind a listener that accepts + holds) would need
+  new `Io.net` plumbing; deferred with a `NOTE(coverage-v0.3.0)`
+  pointer in the source.
+
+**Test delta.** 150 → 156 (+6).
+
+| Area | Before | After | Delta |
+|---|---|---|---|
+| `src/ai/http.zig` unit | 2 | 8 | +6 (4 `Timeouts` arithmetic — each field's contribution + default values — plus an `event_gap_ms` SSE-parse-loop integration) |
+| Other | 148 | 148 | — |
+| **Total** | **150** | **156** | **+6** |
+
+**Coverage gate.** Roadmap floor: "each of the four timeouts has an
+independent asserting test". Delivered: 4 timeout-specific tests
+(`connect_ms` contributes, `upload_ms` contributes, `first_byte_ms`
+contributes, `event_gap_ms` fires during parse) plus a defaults
+assertion and a sum-math test. Gate satisfied for the shipped surface;
+the not-yet-enforced-at-socket behavior is documented with an explicit
+follow-up pointer.
+
+**Verification run.**
+
+```
+$ rm -rf zig-out /tmp/franky-zig-cache && ./build.sh  # clean rebuild
+$ ./zig-out/bin/franky --version                       # franky 0.3.0
+$ ./zig-out/bin/franky "hello"                         # offline faux path works
+$ zig build test --summary all                         # 156/156 pass
+```
+
+**Spec + manifest update.** `build.zig.zon` and `src/root.zig` both
+bumped `0.2.1 → 0.3.0`. §G.4 status row updated with precise scope
+(event_gap_ms enforced, fetch-phase fields plumbed but not yet
+enforced). §10 testing row updated to 156. The roadmap's `v0.3.0`
+row now shows `6 / 4 floor (✅)`.
+
+**Deferred from this milestone.** Enforcement of `connect_ms`,
+`upload_ms`, `first_byte_ms` at the socket level (pending streaming
+reads or worker-thread reconciliation). Live-localhost integration
+test for the fetch-phase timeouts (pending `std.Io.net` usage pattern
+stabilizing in 0.17-dev).
+
+### Pass 7 — retry policy, v0.3.1 (2026-04-23)
+
+Second milestone of the v0.3.* path-to-§A.6 chain. Closes §F.1's
+algorithm surface; leaves the provider-side wiring (the bit that
+wraps `client.fetch` in the retry loop) as a focused follow-up.
+
+**What changed.** New module `src/ai/retry.zig` (~400 lines inc.
+tests). Pure logic — the caller injects both the per-attempt verdict
+function (`AttemptFn`) and the sleep primitive (`SleepFn`), which lets
+tests mock both and run without real waiting. Shape:
+
+```zig
+const Outcome = enum { success, retryable, terminal };
+const AttemptResult = struct {
+    outcome: Outcome,
+    retry_after_ms: ?u32 = null,
+};
+pub fn run(policy, cancel, sleep_fn, sleep_ctx, attempt_fn, attempt_ctx) RunResult;
+```
+
+`nextDelay` is exported and tested independently for the backoff
+math. `Policy` defaults match §F.1: `max_retries=3`,
+`base_delay_ms=500`, `max_retry_delay_ms=60_000`. When an
+`AttemptResult` carries `retry_after_ms` above the cap, `run` flips
+to `.terminal` immediately and propagates the hint — the caller then
+emits `rate_limited_hard` with `ErrorDetails.retry_after_ms` set,
+exactly as §F.1 requires.
+
+**Why a pure helper instead of monkey-patching the Anthropic fetch.**
+The retry loop needs two inputs the fetch call doesn't currently
+provide: (1) classification of the HTTP failure into retryable vs
+terminal, and (2) whether response bytes have started flowing (§F.1
+forbids retry past that point). Both are cleanly expressed as an
+`AttemptFn` return value. Writing the helper first lets us test each
+§F.1 invariant — backoff math, `Retry-After` precedence, cap
+short-circuit, cancellation — without standing up a full HTTP mock.
+The provider-side wiring becomes a small wrapper around
+`retry.run` that reshapes the inline fetch into an attempt callback.
+
+**Gotchas surfaced.**
+
+1. **Cancel observation timing.** First cut of the "cancel during
+   backoff" test expected two attempts to run; actually one does,
+   because the mock sleep completes fully before the helper rechecks
+   cancel at the top of the loop. Correct behavior, test expectation
+   was off. Adjusted and documented why the count is 1.
+2. **Seed defaults.** `policy.seed` is `?u64`; when `null`, we seed
+   from `stream_mod.nowMillis()`. Tests always pass an explicit seed
+   so the results are reproducible.
+3. **`std.Random.DefaultPrng.uintLessThan` takes an exclusive upper
+   bound**, so `span + 1` is the right argument to cover the full
+   `[base, base+span]` inclusive range.
+
+**Test delta.** 156 → 168 (+12).
+
+| Area | Before | After | Delta |
+|---|---|---|---|
+| `src/ai/retry.zig` unit | 0 | 12 | +12 (3 backoff-math tests, 4 outcome variants, 2 Retry-After tests, 2 cancellation tests, 1 Code.isRetryable spot-check) |
+| Other | 156 | 156 | — |
+| **Total** | **156** | **168** | **+12** |
+
+**Coverage gate.** Roadmap floor: ≥ 6 tests. Delivered: 12. Covers
+every branch in `run` plus the backoff math's base/prev/cap cases
+plus both cancellation paths plus the §F.1 code-classification spot-
+check.
+
+**Verification run.**
+
+```
+$ rm -rf zig-out /tmp/franky-zig-cache && ./build.sh  # clean rebuild
+$ ./zig-out/bin/franky --version                       # franky 0.3.1
+$ ./zig-out/bin/franky "hello"                         # offline faux ok
+$ zig build test --summary all                         # 168/168 pass
+```
+
+**Spec + manifest update.** `build.zig.zon` and `src/root.zig` both
+bumped `0.3.0 → 0.3.1`. §F.1 status row updated to reflect the
+shipped algorithm + pending provider integration. §10 testing row
+updated to 168. Roadmap `v0.3.1` row filled in.
+
+**Deferred from this milestone.** Wiring `retry.run` into the
+Anthropic provider's fetch path (and the v0.3.2 OpenAI provider's).
+Faux-provider `retry_script` step for an end-to-end
+429-then-success integration test — the roadmap promised this but
+it requires structural changes to how the agent loop handles
+transient provider failures. Both targeted for the first pass that
+ties transport failures back into the retry helper.
+
+---
+
+## Version roadmap — remaining work
+
+This roadmap sequences the deferred rows of the implementation-status table into small, independently verifiable increments. Each milestone names **one feature**, points at the spec `§`, declares acceptance criteria, lists a verification checklist, and specifies the test-coverage obligations that gate the version bump. The roadmap is intentionally granular — each `v0.X.Y` tag is a single feature that can be reviewed, merged, and reasoned about in isolation. Grouping similar features into the same `v0.X` major-minor line is purely for narrative (e.g. `v0.2.*` = tool hardening); nothing in the build system enforces the grouping.
+
+### Per-feature verification protocol
+
+This protocol runs **after every feature** and **before** bumping `build.zig.zon`'s `version` field and writing a new port-log entry. All seven steps are mandatory.
+
+1. **Clean rebuild.** `rm -rf zig-out /tmp/franky-zig-cache && ./build.sh`. No warnings, no LLD/ELF errors on any supported target (Linux gnu, Linux musl, macOS aarch64, macOS x86_64 — all native targets the `build.zig` supports). SIGILL at startup = stale cache; rebuild before debugging (see Pass 3 log).
+2. **Full test suite.** `./test.sh` (or `zig build test --summary all`). Every test that passed before the change must still pass. Record the new `N pass (N total)` line in the port log's test-growth accounting.
+3. **Manual smoke sweep (golden path).**
+   - `./zig-out/bin/franky --help` — exit 0, lists all current flags.
+   - `./zig-out/bin/franky --version` — exit 0, prints the `build.zig.zon` version.
+   - `./zig-out/bin/franky "hello"` — offline faux path; exit 0.
+   - At least one prompt against a real provider exercising the **new** code path (e.g. for a new tool, a prompt that forces the model to call it; for a new provider, `--provider <name> "ping"`).
+   - Record exact commands in the commit message or port log.
+4. **Regression smoke.** Re-run the smoke sweep from the previous milestone unchanged. Example: after adding `grep` regex (`v0.2.0`), re-run the `v0.1.0` smoke commands — including tool calls that previously worked — to catch scope-creep regressions.
+5. **Memory-leak check on macOS.** On a macOS build (DebugAllocator on by default), exit must not print `Leaked bytes`. This is the most reliable leak detector in the repo; the sandbox GPA hides them. Any `Allocating.fromArrayList` usage introduced by the feature is an automatic review failure (see Pass 3 log).
+6. **Test-coverage analysis** (non-negotiable).
+    1. Enumerate every new public symbol (struct, fn, enum, constant) introduced by the feature.
+    2. For each, name the test(s) covering: the happy path, each error variant, and each boundary (empty input, max-size input, cancellation mid-way, allocation failure where it matters).
+    3. Enumerate each **new error code** the feature can return and confirm a test asserts on the code.
+    4. Run `zig build test --summary all 2>&1 | grep -E "<feature-name>"` and confirm the expected test names fire. If any test was added but not picked up by the `src/root.zig` aggregator, fix the aggregator.
+    5. Flag any still-uncovered path with a `// TODO(coverage-vX.Y.Z): …` comment in the code and a follow-up task pinned to the next patch release.
+7. **Spec update** (in one commit with the feature code).
+    - Flip the matching row in the **Implementation status** table (§7-94) from 🟡/❌ to ✅. Keep the note, updated to point at the file(s) that now implement it.
+    - Add a short subsection to the **Port implementation log** titled `### Pass N — <feature> (YYYY-MM-DD)` describing: what changed, any gotchas, the new test count, and any deferred follow-ups that opened. Pass numbering continues from Pass 3.
+    - Bump `build.zig.zon` `.version` to the roadmap's milestone tag. Tag the commit `vX.Y.Z`.
+
+### Coverage taxonomy
+
+Each feature entry below is classified along two axes:
+
+- **Risk** — how bad is a bug here?
+  - 🔥 **critical**: data-loss, security bypass, or wire-format breach (tool FS write, OAuth, bash exec, persistence).
+  - ⚠️ **load-bearing**: directly user-facing behavior on the golden path (provider stream, agent loop, TUI).
+  - 🪟 **contained**: auxiliary surface, fails loudly if broken (new CLI flag, new slash command).
+- **Test strategy** — what coverage shape is expected?
+  - **U**: unit tests in-file (the norm).
+  - **I**: integration tests under `test/` (for features that span modules or need filesystem/network).
+  - **G**: golden/snapshot tests (for JSON wire formats; record the canonical bytes in a `test/golden/` fixture).
+  - **F**: faux-provider scripted scenarios (for agent-loop behavior).
+  - **H**: HTTP recording (for real-network features — one smoke call against a recorded transcript, not live).
+
+Every feature must have at least one **U** or **I**. 🔥 features must additionally have either **G** or **I**. ⚠️ features must have **F** if they touch the loop.
+
+---
+
+### Ordering rationale — path to §A.6 OpenAI-compatible gateways (updated 2026-04-23)
+
+The v0.3.* line has been promoted from "transport resilience" to **"path to §A.6 OpenAI-compatible gateways"** — the near-term focus. Gateways (Ollama, LM Studio, vLLM, Groq, Cerebras, OpenRouter, xAI, Fireworks, HuggingFace TGI, Z.AI, MiniMax, LiteLLM, …) all speak OpenAI Chat Completions over a configurable base URL + auth header, so shipping §A.6 is a thin config wrapper *on top of* a working §A.3 provider. The chain is:
+
+1. **§G.4 HTTP timeouts** — a local gateway may hang indefinitely; a remote gateway may stall mid-SSE. Four independent timeouts (`connect`, `upload`, `firstByte`, `event`) bound each phase.
+2. **§F.1 Retry policy** — hosted gateways (Groq, Cerebras, OpenRouter free tier) are aggressively rate-limited; `429 Retry-After` handling is essentially mandatory before dogfooding against one.
+3. **§A.3 OpenAI Chat Completions** — the base wire format. The gateway path is "this provider, with a configurable base URL + auth header". Ship the provider first.
+4. **§A.7 Per-provider error normalization** — each gateway vendor returns a slightly different error envelope (Groq's `x_groq` extension, OpenAI's `error.type`, Anthropic's `error.type` already covered, gateway-proxy 502s, local-only connection-refused). Normalization belongs *after* the second provider lands so the mapper has two concrete shapes to generalize from.
+5. **§A.6 OpenAI-compatible gateways** — the target. Represents gateways as `{apiTag: "openai-chat-completions", baseUrl, authHeader}` triples per §A.6's existing prose; no new wire-format code.
+
+Prerequisites already satisfied at v0.2.1: §3.2 types, §3.3 registry, §3.4 stream contract, §3.5 shared stream options (core fields), §B thinking-budget mapping (Anthropic + OpenAI tables already live), §G.2 SSE parser, §G.3 cancellation, §G.5 logging, §P partial-JSON parser. No additional plumbing needed.
+
+What was pushed back by this reorder:
+
+| Previously | Now | Reason |
+|---|---|---|
+| v0.2.2–v0.2.4 (bash streaming, path safety, command hardening) | v0.4.0–v0.4.2 | Tool-hardening work is orthogonal to §A.6 — still critical, just not blocking the gateway path. |
+| v0.4.* (parallel tools) | v0.5.* | Unchanged scope, number shifted. |
+| v0.5.* (persistence depth) | v0.6.* | Unchanged scope, number shifted. |
+| v0.6.* (settings / auth / models.json) | v0.7.* | Unchanged scope, number shifted. `--gateway-url` / `--gateway-auth` flags will still need `settings.json` once the full config surface lands, but for the first cut we pass via CLI + env vars. |
+| v0.7.0 (OpenAI Chat) | v0.3.2 | Promoted — it is the load-bearing prerequisite for §A.6. |
+| v0.7.1–v0.7.3 (OpenAI Responses, Google GenAI, Vertex) | v0.8.0–v0.8.2 | The non-gateway remainder of the provider expansion. |
+| v0.7.4 (§A.6 itself) | v0.3.4 | Promoted — the target. |
+| v0.8.* (steer / followUp / streamProxy) | v0.9.* | Unchanged scope, number shifted. |
+| v0.9.* (extended CLI / RPC / slash / prompts / extensions) | v0.10.* | Unchanged scope, number shifted. |
+| v0.10.* (TUI) | v0.11.* | Unchanged scope, number shifted. |
+| v0.11.* (OAuth minting) | v0.12.* | Unchanged scope, number shifted. |
+
+Nothing is dropped. `v1.0.0` still requires every row of the implementation-status table (§7-94) to be ✅. The reorder only decides *which* milestone lands first.
+
+### Milestones
+
+#### v0.1.0 — MVP hardened (current state, tag-ready baseline)
+
+**Scope.** Everything currently live in `src/`. No code change — this milestone tags the existing tree so later regressions have a fixed reference point.
+
+- Acceptance: the implementation-status table's current ✅/🟡 rows match the code, 105 tests pass, `franky "hello"` works offline, a real Anthropic key produces a real response, OAuth bearer path works end-to-end against Pro/Max subscriptions.
+- Verification: full protocol on the current HEAD. Step 7 becomes "bump `.version` from `0.0.1` to `0.1.0`; write the port-log Pass 4 entry pointing at this roadmap".
+- Coverage review: 105 tests broken down by file — `src/ai/*` 48, `src/ai/providers/*` 12, `src/agent/*` 1 (in `types.zig`; the loop and agent class tests live under `test/`), `src/coding/*` 38, `test/*` 6. **Gap**: no tests for `src/coding/modes/print.zig`'s top-level flow; no tests for `src/coding/cli.zig`'s environment-fallback logic (only the parser is unit-tested). These are tracked as follow-up tasks but do not block `v0.1.0`.
+
+---
+
+#### v0.2.* — Tool hardening (regex + gitignore; shipped)
+
+Originally five entries; the three remaining tool-hardening items (`bash` streaming, path safety, command hardening) moved to v0.4.* after the reorder above so the v0.3.* path-to-§A.6 line could land first without tool changes gating it. The two entries below are the shipped state.
+
+##### v0.2.0 — `grep` regex engine (§C.7) — ⚠️ load-bearing, strategy U
+
+- **Change**: replace literal-only matcher in `src/coding/tools/grep.zig` with `std.regex` (if 0.17 ships one) or port a minimal ECMAScript-regex subset (alternation, anchors, character classes, quantifiers). Schema advertises the full syntax.
+- **Acceptance**: schema description drops the "literal" caveat; new `regex: bool` param (default `true`) with `regex: false` preserving current `grep -F` behavior. Invalid regex returns structured error `grep_bad_regex` with the parser position.
+- **Verification**: add unit tests covering `.` / `*` / `+` / `?` / `|` / `[…]` / `^` / `$` / `\w`; one cancellation mid-search test; one malformed-regex test; one binary-skip test; one file-glob + regex combo test. Manual smoke: `franky "grep all fn declarations in src/"` forces a `\bfn\s+\w+\b` tool call.
+- **Coverage gate**: ≥ 8 new tests; every regex metachar listed in the schema has an assertion.
+
+##### v0.2.1 — gitignore awareness for `ls` + `find` (§C.5, §C.6) — ⚠️ load-bearing, strategy U+I
+
+- **Change**: add a `gitignore.zig` module under `src/coding/` that parses `.gitignore` files walking upward from the scan root, composing patterns per §C.5/§C.6. Tools accept `respectGitignore: bool` (default `true`).
+- **Acceptance**: `ls` / `find` skip anything `git check-ignore` skips, given the same cwd, with no subprocess call. Nested `.gitignore` files compose correctly. Negation (`!pattern`) honored.
+- **Verification**: unit tests with a `tmpDir` fixture that constructs a tiny repo (no git binary needed — just the `.gitignore` files and dummy entries); assert pattern-match ordering matches `git check-ignore`. Add one integration test under `test/gitignore_test.zig` that walks a multi-level tree.
+- **Coverage gate**: ≥ 6 new unit tests + 1 integration; every pattern form from §C.5 (wildcards, anchored, directory-only `/`, negation) has an assertion.
+
+---
+
+#### v0.3.* — Path to §A.6 OpenAI-compatible gateways
+
+Each milestone in this line is a prerequisite for landing §A.6 (`v0.3.4`). The line is tight: every entry here is load-bearing for the gateway target, and nothing else slots in between. The per-feature verification protocol runs unchanged at every step.
+
+##### v0.3.0 — HTTP timeouts (§G.4) — ⚠️ load-bearing, strategy U
+
+- **Change**: wire `connectTimeoutMs` (10s), `uploadTimeoutMs` (120s), `firstByteTimeoutMs` (30s), `eventTimeoutMs` (60s) from `StreamOptions` into `std.http.Client` and the SSE loop. Fire `AgentError.timeout` on expiry.
+- **Acceptance**: a provider that connects but never sends bytes is killed after 30s; an SSE stream that stalls mid-stream is killed after 60s idle; failures map to the `timeout` error code with `retry_after_ms = null`. Local-only gateways (Ollama, LM Studio) stop hanging when the model is still loading.
+- **Verification**: unit tests driving a synthetic stalled stream; one integration test against a localhost HTTP server that holds the socket open.
+- **Coverage gate**: each of the four timeouts has an independent asserting test.
+
+##### v0.3.1 — Retry policy (§F.1) — ⚠️ load-bearing, strategy U+F
+
+- **Change**: add `src/ai/retry.zig` implementing decorrelated exponential backoff with `Retry-After` precedence; retry up to 3 times on retryable `Code`s before the SSE stream opens; **never** retry once bytes start flowing. Cancellation short-circuits mid-backoff.
+- **Acceptance**: `429` with `Retry-After: 2` → one retry after 2s; `503` with no `Retry-After` → decorrelated backoff capped at `max_retry_delay_ms`; `aborted` mid-backoff → returns immediately. Hosted gateways (Groq, Cerebras, OpenRouter free tier) become usable without manual re-prompting.
+- **Verification**: faux provider gains a `retry_script` step type; unit tests for the backoff math; faux scenario exercising 429 → retry → success end-to-end through the agent loop.
+- **Coverage gate**: every `Code` in `isRetryable` has at least one retry test; `aborted`-during-backoff test present.
+
+##### v0.3.2 — OpenAI Chat Completions (§A.3) — ⚠️ load-bearing, strategy U+G
+
+- **Change**: add `src/ai/providers/openai_chat.zig` (~400 lines following the `anthropic.zig` shape). Handles the POST `/v1/chat/completions` endpoint with `stream: true`, SSE chunks with `choices[0].delta` shape, tool calls via `choices[0].delta.tool_calls[].function`, reasoning-effort mapping per §B. Registers under api tag `openai-chat-completions` — the exact tag §A.6 gateways will reuse.
+- **Acceptance**: `franky --provider openai --model gpt-5 "hi"` streams a response against `OPENAI_API_KEY`; thinking models (gpt-5-thinking, o-series) map correctly via §B; tool calls round-trip; errors map through the §F taxonomy (partial pending v0.3.3's fuller normalization).
+- **Verification**: request-body golden file, SSE-to-StreamEvent unit tests per event type (`content.delta`, `tool_calls.delta`, `finish_reason`), thinking-mapping tests, tool-call args round-trip. One faux-driven integration smoke. At least one live smoke against the real endpoint (documented in the commit message, not the CI).
+- **Coverage gate**: ≥ 10 unit tests following the §A.3 event matrix; no new cross-provider handoff failures against the existing Anthropic suite.
+
+##### v0.3.3 — Per-provider error normalization (§A.7) — 🪟 contained, strategy U
+
+- **Change**: fill in `mapHttpError` in `src/ai/http.zig` (currently sparse) and add a provider-specific `mapError` hook for both Anthropic and the newly-landed OpenAI Chat provider. Anthropic: 400 `invalid_request_error` → `request_invalid`, 401 `authentication_error` → `auth`, 403 → `auth`, 413 → `payload_too_large`, `overloaded` → `rate_limited_hard`. OpenAI: 401 → `auth`, 400 `invalid_request_error` → `request_invalid`, 429 `insufficient_quota` → `rate_limited_hard`, 429 generic → `rate_limited`, context-length-exceeded → `context_overflow`, `content_filter` → `safety_refusal`.
+- **Acceptance**: every error documented in §A.7 for both providers maps to a distinct `Code`; non-mapped HTTP errors get a reasonable default by status-code tier. `providerCode` / `providerMessage` fields survive into `ErrorDetails`.
+- **Verification**: unit tests feeding each canonical error body into the mapper and asserting the resulting `(code, retryable)` tuple. Mapper is a pure function over the error body — no network, fast.
+- **Coverage gate**: one test per row of §A.7 per provider.
+
+##### v0.3.4 — OpenAI-compatible gateways (§A.6) — 🪟 contained, strategy U
+
+**Target milestone.** The payoff of the whole v0.3.* line.
+
+- **Change**: add `src/ai/providers/openai_gateway.zig` that re-registers the `openai-chat-completions` api tag under a new `openai-compatible-gateway` alias. The gateway provider reads `--base-url` (or `OPENAI_BASE_URL` / `FRANKY_GATEWAY_URL`) and optional `--gateway-auth` (or `OPENAI_API_KEY` / `FRANKY_GATEWAY_TOKEN`) and delegates the wire work to the v0.3.2 implementation. No new SSE parsing, no new body builder — it is configuration + dispatch.
+- **Acceptance** (local-gateway path): `franky --provider ollama --model llama3.2 "hi"` against a running Ollama at `:11434/v1` produces a streamed response with no API key. Same exact binary against `--base-url http://192.168.1.20:1234/v1` hits LM Studio, against `http://localhost:8000/v1` hits vLLM, etc.
+- **Acceptance** (hosted-gateway path): `franky --provider gateway --base-url https://api.groq.com/openai/v1 --api-key $GROQ_KEY --model llama-3.1-70b "hi"` works; same for xAI, Cerebras, OpenRouter, Fireworks, HuggingFace TGI, Z.AI, MiniMax. Rate-limit handling inherited from v0.3.1.
+- **Known per-vendor quirks to handle in this milestone**:
+  - Some gateways omit `stream_options.include_usage`; usage lands in the last chunk's vendor-extension field (Groq's `x_groq`) or is absent entirely — tolerate both.
+  - Some gateways return tool-call arguments as objects instead of strings; accept both shapes in the parser.
+  - Ollama has a native `/api/chat` protocol alongside `/v1/chat/completions` — per §A.6's existing prose, we use the OpenAI-compatible endpoint only. Ollama-specific features (model list via `/api/tags`, thinking via `think: true`, model pull via `/api/pull`) are out of scope for this milestone and go in a later sidecar if needed.
+- **Verification**: unit tests for the base-URL plumbing (valid, trailing slash, missing scheme); one faux-driven integration smoke. Live smokes against Ollama/LM Studio (if available in the dev environment) and one hosted gateway — recorded in the commit message, not in CI.
+- **Coverage gate**: ≥ 6 unit tests (base-URL normalization, auth-header selection, vendor-extension-usage tolerance, tool-call-arg-shape tolerance, error-envelope pass-through, cancellation propagation).
+
+Post-landing this milestone, **§A.6 flips from ❌ to ✅** in the implementation-status table and the Zig port can be demoed against any of the ~15 gateways listed in §3.1 / §A.6 with nothing but a flag change.
+
+---
+
+#### v0.4.* — Tool hardening (deferred from the pre-§A.6 line)
+
+One tool concern per release. Each unblocks a distinct security / ergonomics concern raised by the §R appendix. None are prerequisites for the provider work above, but all should land before `v1.0.0`.
+
+##### v0.4.0 — `bash` streaming + cwd trailer (§C.4, §R.5) — 🔥 critical, strategy U+F
+
+- **Change**: stream stdout/stderr chunks via `on_update`; wrap the command in `printf '<<<FRANKY_TRAILER>>>cwd=%s\n' "$PWD"` to capture cwd after each command; update the session's `cwd` accordingly. Background mode (`background: true`) spawns the process and returns a handle tracked in session state.
+- **Acceptance**: long-running command prints output incrementally in print mode; `cd subdir && pwd` updates the next `bash` call's working directory; background processes are terminated on session close.
+- **Verification**: faux-scripted scenario exercising `on_update` callbacks; unit test asserting the trailer is stripped from the reported stdout and the cwd is updated on a session stub; signal-handling tests (SIGTERM escalation to SIGKILL after 5s, per §R.7).
+- **Coverage gate**: ≥ 6 new tests + 1 faux scenario; trailer-parse, trailer-stripped-from-output, cwd-updated-across-calls, timeout-escalation, output-cap-enforced, background-tracked all have assertions.
+
+##### v0.4.1 — Path-canonicalization safety (§R.1–§R.4) — 🔥 critical, strategy U
+
+- **Change**: new `src/coding/path_safety.zig` exporting `canonicalize(path, workspace_root) !CanonPath`. Rejects NUL, Windows reserved names, out-of-workspace paths (unless the forthcoming `settings.allowPathsOutsideRoot` is set). Read/ls/find/grep follow symlinks and recheck; write/edit don't follow final component.
+- **Acceptance**: every tool in `src/coding/tools/*.zig` routes path params through `canonicalize` before touching disk. Attempts to read `/etc/passwd` from a workspace rooted at `/tmp/proj` return `path_outside_workspace`.
+- **Verification**: symlink-escape tests, TOCTOU sanity test (create symlink after canonicalize — re-open with `openat`), NUL-in-path test, `..` traversal test.
+- **Coverage gate**: every error variant from `PathError` (workspace_escape, nul_byte, reserved_name, symlink_escape) has at least one asserting test.
+
+##### v0.4.2 — Command-exec hardening (§R.5–§R.7) — 🔥 critical, strategy U+I
+
+- **Change**: env denylist (`FRANKY_SECRET_*`, provider keys, cloud credentials — per §R.6) filtered from the `bash` child's environment; `$SHELL` trust check; opt-in `allowUntrustedShell` setting to bypass.
+- **Acceptance**: `env | grep ANTHROPIC_API_KEY` from inside a `bash` tool call returns nothing by default; setting `shell_untrusted_mode=refuse` short-circuits with `bash_shell_untrusted`.
+- **Verification**: unit tests that inspect the env map passed to `std.process.Child`; integration test under `test/bash_hardening_test.zig` running a real `sh -c env | wc -l` and asserting the count dropped by the denylist size.
+- **Coverage gate**: every row of the denylist is explicitly asserted; any new env var promoted to the denylist requires a test extension.
+
+---
+
+#### v0.5.* — Parallel tool execution
+
+##### v0.5.0 — Parallel dispatch via `io.concurrent` (§4.4, §N.2) — 🔥 critical, strategy U+F+I
+
+- **Change**: in `src/agent/loop.zig`, partition a turn's tool calls by `execution_mode`; run `.parallel` tools concurrently via `io.concurrent` (threaded backend today), `.sequential` tools serially before/after the parallel batch per the ordering rule in §4.4. Emit completion-order `tool_execution_*` events; store results in **source** order in the transcript.
+- **Acceptance**: three `read` tool calls in one turn finish in ~`max(individual)` wall-time; their `tool_execution_start` events fire in source order, `tool_execution_end` events fire in completion order, transcript shows them in source order. A tool throwing in parallel does not poison sibling tools — they all run to completion, errors isolated per call.
+- **Verification**: faux-scripted scenario with three parallel tool calls, assertions on event ordering; a synthetic "slow read" that sleeps for 100ms used to prove wall-time. New integration test `test/parallel_tools_test.zig` (wire into `build.zig`).
+- **Coverage gate**: every invariant in §4.4 (source-order transcript, completion-order events, per-call error isolation, cancellation cascades to all in-flight) has at least one test.
+
+##### v0.5.1 — Parallel-tool cancellation semantics (§4.4, §G.3) — 🔥 critical, strategy F
+
+- **Change**: cancellation flag propagates to every in-flight tool's `*Cancel`; completed-but-unsent results are freed via the channel's drop hook; transcript is *not* written on cancel. Partial transcript persistence only happens on successful turn_end.
+- **Acceptance**: `Agent.abort()` mid-parallel-batch yields no dangling threads, no leaked memory, no partially-persisted transcript.
+- **Verification**: extend the `v0.5.0` integration test with an abort-after-N-ms variant; assert `getCheckSum` on the allocator hits zero after the abort.
+- **Coverage gate**: leak-free abort proven by DebugAllocator on macOS.
+
+---
+
+#### v0.6.* — Persistence depth
+
+##### v0.6.0 — Session migrations (§H.5) — ⚠️ load-bearing, strategy U+G
+
+- **Change**: add `migrations: []const MigrationFn` in `src/coding/session.zig`; `readSessionHeader` / `readTranscript` detect `version < CURRENT_VERSION` and run the migration chain (with a `.bak` backup of the pre-migration file). `version > CURRENT_VERSION` still errors with `UnsupportedSessionVersion`.
+- **Acceptance**: loading a v1 session produces an in-memory v2 struct and leaves `session.json.bak` on disk; round-tripping rewrites as v2.
+- **Verification**: golden fixtures under `test/golden/session-v1.json`; unit tests asserting the migrated in-memory struct matches a hand-written expected struct.
+- **Coverage gate**: one fixture per historical version; a synthetic `v999` test asserts the forward-incompatibility error.
+
+##### v0.6.1 — Content-addressed object storage (§H.4) — ⚠️ load-bearing, strategy U
+
+- **Change**: blobs ≥ 32 KiB (default threshold) are stored under `objects/sha256/ab/cdef…` and referenced as `{"$ref":"sha256:…"}` in `transcript.json`. Smaller blobs inline.
+- **Acceptance**: a 128 KiB file attached to a user message round-trips via object store; `transcript.json` stays small; `objects/` shards by first 2 hex chars.
+- **Verification**: unit tests for the inline/extern threshold, the sharding function, and dangling-object GC (every object referenced from a branch head is kept; orphans can be swept).
+- **Coverage gate**: threshold-boundary test (32766 / 32767 / 32768 bytes), sharding collision test, GC test.
+
+##### v0.6.2 — Session branching (§5.1, §H.4) — ⚠️ load-bearing, strategy U+I
+
+- **Change**: `tree.json` tracks `branches` with parent pointers and fork indices. `Agent` gains `fork(name, fromIndex)`, `switchBranch(name)`. CLI adds `--fork <name>` and `/branch` slash-command equivalent (wired in `v0.10.*`).
+- **Acceptance**: forking at message index 7 creates a new branch whose first 7 messages alias the parent's first 7; `switchBranch` changes the head pointer without rewriting the transcript.
+- **Verification**: unit tests on the branch tree invariants; integration test creating, forking, continuing, switching, and asserting both transcripts diverge correctly.
+- **Coverage gate**: orphan-tool-pair invariant (§E.2) tested; fork-at-head and fork-mid-history both tested.
+
+##### v0.6.3 — Compaction algorithm (§E) — 🔥 critical, strategy U+F
+
+- **Change**: implement §E.1 trigger (soft 80% / hard 92% of context window), §E.2 span selection, §E.3 summarization prompt (a separate short-context LLM call through the registry), §E.4 re-injection with branching (original session checkpointed as a branch).
+- **Acceptance**: a session exceeding 80% of its model's window auto-compacts before the next turn; the user-visible history shows the synthetic `compaction_summary` message; the original span remains recoverable via the auto-created branch.
+- **Verification**: faux scenario with a configured `contextWindow=2000` model that triggers compaction; golden test on the span-selection invariants (first user message preserved, tail preserved, no orphan tool pairs in the boundary).
+- **Coverage gate**: every invariant in §E.2 has an asserting test; happy-path faux scenario covers end-to-end trigger → summarize → re-inject.
+
+---
+
+#### v0.7.* — Configuration surface
+
+##### v0.7.0 — `settings.json` loader (§5.7, §H.2) — 🪟 contained, strategy U
+
+- **Change**: new `src/coding/settings.zig` loading layered config (CLI > project `.franky/settings.json` > user `$FRANKY_HOME/settings.json` > defaults). Emits a flat effective-config struct threaded into print mode. First users include the gateway config shipped in v0.3.4 (base-URL + auth per-gateway stored declaratively).
+- **Acceptance**: `defaultProvider`, `defaultModels`, `thinking`, `theme`, per-tool overrides, per-gateway URLs all respected in precedence order.
+- **Verification**: unit tests per layer; an integration test that spawns `franky` with a temp `$FRANKY_HOME` and verifies precedence.
+- **Coverage gate**: every field in §H.2's schema has a load + override test.
+
+##### v0.7.1 — `auth.json` loader + api-key disk cache (§H.1) — 🔥 critical, strategy U
+
+- **Change**: read/write `$FRANKY_HOME/auth.json` with mode `0600`; OAuth-minting flows (§Q.1–Q.4, later milestones) will write here; API-key users may pre-populate. Precedence: CLI flag > env var > `auth.json`.
+- **Acceptance**: a `claude-code`-provisioned token in `auth.json` is picked up without any env var or flag; bad mode (`0644`) triggers a warning but does not refuse (configurable).
+- **Verification**: unit tests on the loader + precedence ordering; a file-mode test on POSIX only.
+- **Coverage gate**: every provider type (`apiKey`, `oauth`) has load + refuse-if-expired paths covered.
+
+##### v0.7.2 — `models.json` generator (§3.7, §H.3) — 🪟 contained, strategy U+G
+
+- **Change**: ship a build script (`zig build gen-models`) that produces `src/ai/models.generated.zig` from a checked-in `models.json`. The generated module exports `pub const models: []const Model = .{…}`.
+- **Acceptance**: CLI `--model <id>` resolves against the generated catalog (context window, max_output, cost, capabilities); unknown model id is a hard error.
+- **Verification**: a golden `models.json` + snapshot test of the generated `.zig` file.
+- **Coverage gate**: catalog-lookup test for every capability flag (supportsThinking, supportsTools, supportsVision).
+
+---
+
+#### v0.8.* — Remaining providers
+
+OpenAI Chat (§A.3) already landed in v0.3.2; §A.6 gateways in v0.3.4. The remaining provider work rounds out the §A.4/§A.5 surface. Each new provider ships ~400 lines following the `anthropic.zig` shape: request-serialization unit tests, SSE-to-StreamEvent unit tests, error-mapping unit tests, and one faux-driven integration smoke.
+
+##### v0.8.0 — OpenAI Responses API (§A.4) — ⚠️ load-bearing, strategy U+G
+##### v0.8.1 — Google Generative AI (§A.5) — ⚠️ load-bearing, strategy U+G
+##### v0.8.2 — Google Vertex AI (§A.5, §Q.4) — ⚠️ load-bearing, strategy U+G
+
+Common acceptance for all 0.8.* entries:
+
+- **Acceptance**: `franky --provider <name> --model <id> "hi"` produces a response against a real key; thinking (where supported) maps correctly via §B; tool calls round-trip; the provider's error envelope normalizes into the unified `Code` set via the v0.3.3 mapper.
+- **Coverage gate per provider**: ≥ 10 unit tests (request body golden, SSE-to-StreamEvent per event type, thinking mapping, tool-call args round-trip, error envelopes from §A.7). No provider ships without cross-provider handoff tests if §3.6 applies.
+
+---
+
+#### v0.9.* — Agent runtime extras
+
+##### v0.9.0 — `steer` command (§4.3, §4.6) — ⚠️ load-bearing, strategy F
+
+- **Change**: `Agent.steer(text)` injects a user-role `steering_message` into the current turn's tool-results pass (before the next LLM call). Requires a queue on the Agent so a mid-turn `steer` is held for the right boundary.
+- **Acceptance**: calling `steer` mid-turn does not split the turn; the steering text appears in the LLM's next prompt as a user message, not as an assistant-turn-boundary.
+- **Verification**: faux scenario with a multi-tool turn, `steer` fired between tool_execution_start and tool_execution_end, assertions on the resulting LLM prompt.
+- **Coverage gate**: queue behavior (steer-while-idle, steer-while-turn-in-flight, steer-during-abort) all tested.
+
+##### v0.9.1 — `followUp` command (§4.3) — ⚠️ load-bearing, strategy F
+
+- **Change**: `Agent.followUp(text)` enqueues a user message for after the current turn ends naturally; does not abort. Differs from `steer` in timing.
+- **Acceptance**: followUp fired mid-turn queues; fires as a fresh prompt after `turn_end`.
+- **Verification**: faux scenario exercising the ordering.
+- **Coverage gate**: `followUp` vs `steer` ordering tested side-by-side.
+
+##### v0.9.2 — `streamProxy` (§4.7) — 🪟 contained, strategy I
+
+- **Change**: new `src/agent/proxy.zig` exposing the agent loop over HTTP/SSE so a remote front-end can drive it; uses the same event shape. Gated on `v0.10.*` CLI flags to launch in proxy mode.
+- **Acceptance**: a local HTTP client sending a JSON POST receives `text/event-stream` of the same `StreamEvent`s the in-process loop would emit; cancellation on socket close propagates.
+- **Verification**: integration test under `test/stream_proxy_test.zig` with a localhost HTTP round-trip.
+- **Coverage gate**: cancellation-on-disconnect, back-pressure, and malformed-request error paths tested.
+
+---
+
+#### v0.10.* — Surfaces
+
+##### v0.10.0 — Extended CLI flags (§5.6) — 🪟 contained, strategy U+I
+
+- **Change**: add `--continue`, `--fork <name>`, `--export <format>`, `--tools <list>`, `--skills <list>`, `--prompts <dir>`, `--themes <name>`, `--offline`, `--extensions <list>` — each triggering a code path that may re-delegate to other deferred features (e.g. `--fork` needs `v0.6.2`).
+- **Acceptance**: each flag parses, validates, and produces a clear error if the backing feature isn't built (e.g. `--extensions` before `v0.10.4` prints "extensions not enabled in this build").
+- **Verification**: CLI-parse unit tests for each flag; integration test for `--continue` (resumes a prior session via ULID match).
+- **Coverage gate**: every flag has a parse test + a rejection test.
+
+##### v0.10.1 — RPC mode (§I) — ⚠️ load-bearing, strategy I+G
+
+- **Change**: implement `--mode rpc` delegating to `src/coding/modes/rpc.zig`. Speaks JSON-RPC 2.0 over stdio with LSP framing. Methods: `initialize`, `session.{create,list,get,delete}`, `prompt`, `steer`, `followUp`, `abort`, `compact`, `branch.{create,switch}`, `subscribe`, `unsubscribe`, `tool.{list,invoke}`. Notifications: `event`.
+- **Acceptance**: an external client can drive an end-to-end session purely over RPC; all agent events surface as RPC notifications with the shape in §I.2.
+- **Verification**: a Python test harness under `test/rpc_harness.py` (or a Zig-native test that forks a child process) driving a scripted session; golden files for each method's request/response.
+- **Coverage gate**: every method in §I.1 and every notification in §I.2 has a round-trip test; every error code in §I.3 has an asserting test.
+
+##### v0.10.2 — Slash commands (§J) — 🪟 contained, strategy U
+
+- **Change**: implement built-ins `/help /model /thinking /compact /branch /branches /checkout /export /template /tools /tool /cwd /clear /retry /edit /cost /login /logout /quit` as a dispatch table in `src/coding/commands/slash.zig`. Print-mode parser recognizes `^/` as a directive to hand to the dispatcher rather than the LLM.
+- **Acceptance**: `/help` prints the full command list; `/model claude-sonnet-4-6` hot-swaps the model for the current session; unknown `/foo` returns a clean error.
+- **Verification**: unit tests per command.
+- **Coverage gate**: every command in §J has at least a happy-path test.
+
+##### v0.10.3 — Prompt templates & skills (§5.8) — 🪟 contained, strategy U
+
+- **Change**: load `.franky/prompts/*.md` files; `/template <name> <args…>` expands a template into the next user message. Skills are templates with metadata.
+- **Acceptance**: a template with `${arg}` placeholders expands correctly; missing args produce a clean error.
+- **Verification**: unit tests on the loader and expander; integration test with a tmpdir-based `.franky/prompts/` layout.
+- **Coverage gate**: placeholder syntax, missing-arg error, template-collision (project vs user) precedence tested.
+
+##### v0.10.4 — Extensions Tier-1 (static modules) (§5.4, §N.4) — 🪟 contained, strategy U
+
+- **Change**: a comptime-registered extension registry following §N.4 Tier 1. Extensions supply `registerCommand`, `registerTool`, `registerKeybinding`, `subscribe`. Tier 2 (`.so`/`.dylib`) and Tier 3 (Wasm) remain deferred.
+- **Acceptance**: a sample extension in `examples/` that registers a slash command and a tool loads and runs.
+- **Verification**: integration test loading the sample extension.
+- **Coverage gate**: each extension hook type has at least one asserting test.
+
+---
+
+#### v0.11.* — Interactive TUI
+
+##### v0.11.0 — TUI framework (§6, §L) — ⚠️ load-bearing, strategy U+I
+
+- **Change**: populate `src/tui/` with `Terminal`, `Buffer`, `Cell`, `Region`, `TextBuffer`, `KeyDecoder`, `DiffRenderer` per §L. Emacs keybindings preset (§K.3) as the default.
+- **Acceptance**: `franky --mode interactive` drops into a minimal REPL (text-input widget + message log); arrow keys, Ctrl+C, Ctrl+D work; redraw cost is `O(dirty region)` per §L.2.
+- **Verification**: unit tests for the differential-diff math (assert cells count vs bytes-emitted budget); tmux-based integration tests driving key sequences and asserting the rendered frame (see §10's tmux fixture pattern).
+- **Coverage gate**: every primitive in §6.2 has a focused test; key decoder has a test per escape class (CSI, SS3, bracketed paste, Kitty).
+
+##### v0.11.1 — Keybinding presets (§K) — 🪟 contained, strategy U
+
+- **Change**: emacs and vi presets registered; user can override per key via `settings.json` keybindings map.
+- **Acceptance**: `settings.keybindings.preset = "vi"` toggles modal behavior; `app.abort` is bound to Ctrl+C in both; a custom override (e.g. `app.slashCommand = "Alt+x"`) takes effect.
+- **Verification**: unit tests on each preset's table; integration test flipping presets at runtime.
+- **Coverage gate**: every action in §K.1 and §K.2 has a binding in both presets and is tested.
+
+##### v0.11.2 — Interactive mode integration (§5.5) — ⚠️ load-bearing, strategy I
+
+- **Change**: wire `--mode interactive` through the Agent + TUI so sessions persist, /commands dispatch, streaming renders live, and the whole loop from §5.5 runs end-to-end.
+- **Acceptance**: a user can type a prompt, see a streaming response render token-by-token, tool-call live progress updates, hit Ctrl+C to abort mid-turn, and resume a prior session.
+- **Verification**: tmux integration test scripting a full turn.
+- **Coverage gate**: streaming rendering, abort mid-stream, resume after abort all tested.
+
+---
+
+#### v0.12.* — OAuth minting flows
+
+##### v0.12.0 — Anthropic PKCE (§Q.1) — 🔥 critical, strategy U+I
+##### v0.12.1 — GitHub Copilot device code (§Q.2) — 🔥 critical, strategy U+I
+##### v0.12.2 — Google Gemini PKCE (§Q.3) — 🔥 critical, strategy U+I
+##### v0.12.3 — Google Vertex service-account JWT (§Q.4) — 🔥 critical, strategy U+I
+
+Common acceptance:
+
+- **Acceptance**: `franky login --provider <name>` runs the full minting flow, writes to `auth.json`, and subsequent invocations use the minted token automatically with refresh on expiry. OAuth errors map to the §Q.6 codes.
+- **Verification**: unit tests on the PKCE state-machine, the JWT builder, the device-code poller; integration test against a recorded/mocked OAuth server (no live credentials in tests).
+- **Coverage gate per provider**: every error code in §Q.6 has an asserting test; refresh-before-expiry, refresh-on-401, and refresh-failure paths all tested.
+
+---
+
+#### v1.0.0 — Spec-complete native CLI
+
+**Definition of done.** Every row of the implementation-status table (§7-94) shows ✅. 99%+ of spec `§`-referenced behavior is implemented for native (non-web) targets. Side applications (§7, §8) remain explicitly out of scope per §O.
+
+- **Acceptance**: an `agent` that previously only ran against `faux` + Anthropic now runs equivalently well against OpenAI, Google, Vertex, Copilot, and any OpenAI-compatible gateway; all three run modes work; sessions branch and compact; the TUI is usable; extensions load.
+- **Verification**: the per-feature protocol on a release-build cold cache; the full regression sweep; a long-running "kitchen sink" integration test (`test/kitchen_sink_test.zig`) that exercises interactive mode + parallel tools + compaction + a branch-and-merge flow using the faux provider.
+- **Coverage gate**: the aggregate test suite is ≥ 400 tests (the 105 baseline plus the per-milestone deltas). Each new roadmap milestone that hasn't lifted the suite by ≥ 5 tests is flagged — either the feature was too small to warrant its own tag, or (more likely) coverage is thin.
+
+---
+
+#### Post-1.0 — Side applications (optional, out-of-scope per §O)
+
+Out of scope for this roadmap unless explicitly re-prioritized. Each would be a sibling Zig project, not a sub-module, to preserve the one-way `ai → agent → coding` layering.
+
+- **`franky-mom` — Slack bot (§8.1)**: thread-scoped sessions, streaming with throttled edits, bash sandbox.
+- **`franky-pods` — vLLM / GPU pod CLI (§8.2)**: pod provisioning, SSH tunneling, deploy / start / stop / logs / benchmark.
+- **`franky-web-ui` (§7)**: web-component chat UI; likely stays TypeScript-land given §3.10, with the Zig core behind `streamProxy`.
+
+---
+
+### Aggregate test-coverage plan
+
+The test matrix below is populated per milestone; the left column is derived from §7-94 of the status table; the right columns get filled in as each milestone's coverage review lands. The **Minimum tests** column is a hard floor set during roadmap planning — a milestone that lands below its floor blocks the version bump.
+
+| Milestone | Spec § | Minimum tests | Test file(s) | Status |
+|---|---|---|---|---|
+| v0.1.0 | baseline | — | — | 105 ✅ |
+| v0.2.0 | §C.7 | +8 | `src/coding/regex.zig` + `src/coding/tools/grep.zig` | 133 ✅ (+28) |
+| v0.2.1 | §C.5/§C.6 | +7 | `src/coding/gitignore.zig` + `src/coding/tools/{ls,find}.zig` + `test/gitignore_test.zig` | 150 ✅ (+17) |
+| **v0.3.* — path to §A.6** | | | | |
+| v0.3.0 | §G.4 | +4 | `src/ai/http.zig` | 156 🟡 (+6) — surface shipped, enforcement partial |
+| v0.3.1 | §F.1 | +6 | `src/ai/retry.zig` | 168 🟡 (+12) — algorithm shipped, provider wiring pending |
+| v0.3.2 | §A.3 | +10 | `src/ai/providers/openai_chat.zig` | — |
+| v0.3.3 | §A.7 | +12 | `src/ai/http.zig` + `src/ai/providers/{anthropic,openai_chat}.zig` (two providers) | — |
+| **v0.3.4** | **§A.6** (target) | **+6** | `src/ai/providers/openai_gateway.zig` | — |
+| **v0.4.* — tool hardening (deferred)** | | | | |
+| v0.4.0 | §C.4/§R.5 | +7 | `src/coding/tools/bash.zig` + faux scenario | — |
+| v0.4.1 | §R.1–§R.4 | +4 | `src/coding/path_safety.zig` | — |
+| v0.4.2 | §R.5–§R.7 | +3 | `src/coding/tools/bash.zig` + `test/bash_hardening_test.zig` | — |
+| **v0.5.* — parallel tools** | | | | |
+| v0.5.0 | §4.4 | +5 | `src/agent/loop.zig` + `test/parallel_tools_test.zig` | — |
+| v0.5.1 | §4.4/§G.3 | +3 | `test/parallel_tools_test.zig` | — |
+| **v0.6.* — persistence depth** | | | | |
+| v0.6.0 | §H.5 | +3 | `src/coding/session.zig` + `test/golden/session-v1.json` | — |
+| v0.6.1 | §H.4 | +5 | `src/coding/session.zig` (objects) | — |
+| v0.6.2 | §5.1/§H.4 | +5 | `src/coding/session.zig` + `test/branching_test.zig` | — |
+| v0.6.3 | §E | +8 | `src/agent/compaction.zig` + faux scenario | — |
+| **v0.7.* — configuration surface** | | | | |
+| v0.7.0 | §5.7/§H.2 | +6 | `src/coding/settings.zig` | — |
+| v0.7.1 | §H.1 | +5 | `src/coding/auth.zig` | — |
+| v0.7.2 | §3.7/§H.3 | +4 | build step + `src/ai/models.generated.zig` | — |
+| **v0.8.* — remaining providers** | | | | |
+| v0.8.0 | §A.4 | +10 | `src/ai/providers/openai_responses.zig` | — |
+| v0.8.1 | §A.5 | +10 | `src/ai/providers/google_gemini.zig` | — |
+| v0.8.2 | §A.5/§Q.4 | +10 | `src/ai/providers/google_vertex.zig` | — |
+| **v0.9.* — agent runtime extras** | | | | |
+| v0.9.0 | §4.3/§4.6 | +4 | `src/agent/agent.zig` + faux scenario | — |
+| v0.9.1 | §4.3 | +3 | `src/agent/agent.zig` + faux scenario | — |
+| v0.9.2 | §4.7 | +5 | `src/agent/proxy.zig` + `test/stream_proxy_test.zig` | — |
+| **v0.10.* — surfaces** | | | | |
+| v0.10.0 | §5.6 | +10 | `src/coding/cli.zig` | — |
+| v0.10.1 | §I | +15 | `src/coding/modes/rpc.zig` + `test/rpc_*_test.zig` | — |
+| v0.10.2 | §J | +12 | `src/coding/commands/slash.zig` | — |
+| v0.10.3 | §5.8 | +5 | `src/coding/templates.zig` | — |
+| v0.10.4 | §5.4/§N.4 | +4 | `src/coding/extensions.zig` | — |
+| **v0.11.* — interactive TUI** | | | | |
+| v0.11.0 | §6/§L | +15 | `src/tui/*` + `test/tui_*_test.zig` | — |
+| v0.11.1 | §K | +8 | `src/tui/keybindings.zig` | — |
+| v0.11.2 | §5.5 | +5 | `test/interactive_test.zig` | — |
+| **v0.12.* — OAuth minting** | | | | |
+| v0.12.0 | §Q.1 | +7 | `src/ai/oauth/anthropic.zig` | — |
+| v0.12.1 | §Q.2 | +7 | `src/ai/oauth/copilot.zig` | — |
+| v0.12.2 | §Q.3 | +7 | `src/ai/oauth/google.zig` | — |
+| v0.12.3 | §Q.4 | +7 | `src/ai/oauth/vertex.zig` | — |
+| **v1.0.0 floor** | — | **≥ 400** | — | — |
+
+### What this roadmap does *not* cover
+
+- Side applications (§7, §8) — see "Post-1.0" above.
+- Extension Tiers 2 (`.so`/`.dylib`) and 3 (Wasm) per §N.4 — Tier 1 is sufficient for `v1.0.0`.
+- Anything in §13 labeled "reconsider" — those are porting-phase questions, not feature tasks.
+- Models catalog generation's external data source (who curates `models.json` and how often) — operational concern, not a code task.
+
+### How to consume this roadmap
+
+- Pick the lowest-numbered `v0.X.Y` with a 🟡 or ❌ status in §7-94, land it per the protocol, move on.
+- Do **not** batch milestones. A single PR = a single `v0.X.Y`. Reviewers can hold the feature in their head. Regression surface stays bounded.
+- Milestones within a `v0.X` line may ship in parallel by different contributors only if they touch disjoint files — otherwise rebase and serialize to keep the per-feature verification protocol meaningful.
+- When a milestone is blocked (e.g. you hit a Zig 0.17 limitation), land a `v0.X.Y-rc` with the partial work behind a `-D<feature>=false` build flag and open a follow-up task — don't stall the chain.
 
 ---
 

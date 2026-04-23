@@ -59,6 +59,7 @@ pub fn build(b: *std.Build) void {
     const integration_files = [_][]const u8{
         "test/agent_loop_test.zig",
         "test/agent_class_test.zig",
+        "test/gitignore_test.zig",
     };
     for (integration_files) |path| {
         const mod = b.createModule(.{

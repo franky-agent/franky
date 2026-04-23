@@ -2,11 +2,15 @@
 //!
 //! Schema: `{path?, recursive?, maxDepth?, respectGitignore?}`.
 //! Output: one entry per line, indented by depth, with a `/` suffix on
-//! directories. Symlinks get a `@` suffix. `respectGitignore` is accepted
-//! but ignored in the MVP (the `.gitignore` parser is a larger task).
+//! directories. Symlinks get a `@` suffix.
 //!
 //! When `recursive=false` (default), lists one level. When `true`, uses
 //! `Io.Dir.walk` with a depth cap.
+//!
+//! `respectGitignore` (default `true`): load every `.gitignore` in the
+//! scanned subtree via `coding/gitignore.zig` and drop ignored entries.
+//! Recursive walks also prune ignored directories so we don't descend
+//! into them. Pass `respectGitignore=false` to force the full listing.
 
 const std = @import("std");
 const ai = struct {
@@ -14,6 +18,7 @@ const ai = struct {
     pub const stream = @import("../../ai/stream.zig");
 };
 const at = @import("../../agent/types.zig");
+const gitignore = @import("../gitignore.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -22,7 +27,7 @@ pub const parameters_json: []const u8 =
     \\    "path": {"type": "string", "description": "Directory to list. Defaults to the agent's cwd."},
     \\    "recursive": {"type": "boolean", "description": "Recurse into subdirectories. Default false."},
     \\    "maxDepth": {"type": "integer", "minimum": 1, "description": "Maximum depth when recursive is true. Default 8."},
-    \\    "respectGitignore": {"type": "boolean", "description": "Respect .gitignore rules. Default true (currently a no-op)."}
+    \\    "respectGitignore": {"type": "boolean", "description": "Respect .gitignore rules under the scanned path. Default true."}
     \\  },
     \\  "additionalProperties": false
     \\}
@@ -72,8 +77,12 @@ fn execute(
         if (v == .integer and v.integer >= 1) break :blk @intCast(v.integer);
         break :blk default_max_depth;
     } else default_max_depth;
+    const respect_gitignore: bool = if (root.object.get("respectGitignore")) |v|
+        (v != .bool or v.bool)
+    else
+        true;
 
-    return try listPath(allocator, io, path, recursive, max_depth, cancel);
+    return try listPath(allocator, io, path, recursive, max_depth, respect_gitignore, cancel);
 }
 
 pub fn listPath(
@@ -82,6 +91,7 @@ pub fn listPath(
     path: []const u8,
     recursive: bool,
     max_depth: usize,
+    respect_gitignore: bool,
     cancel: *ai.stream.Cancel,
 ) !at.ToolResult {
     const cwd = std.Io.Dir.cwd();
@@ -99,6 +109,15 @@ pub fn listPath(
     try out.appendSlice(allocator, path);
     try out.append(allocator, '\n');
 
+    // Load `.gitignore` stack up front so per-entry checks are cheap.
+    // On load failure (I/O error, no permission, etc.) we degrade to
+    // "nothing ignored" rather than refusing to list.
+    var ignore_stack: ?gitignore.Stack = null;
+    defer if (ignore_stack) |*s| s.deinit();
+    if (respect_gitignore) {
+        ignore_stack = gitignore.loadFromTree(allocator, io, path) catch null;
+    }
+
     var count: usize = 0;
 
     if (!recursive) {
@@ -108,6 +127,9 @@ pub fn listPath(
             if (count >= max_entries) {
                 try out.appendSlice(allocator, "(truncated: too many entries)\n");
                 break;
+            }
+            if (ignore_stack) |*s| {
+                if (s.isIgnored(entry.name, entry.kind == .directory)) continue;
             }
             try appendEntry(&out, allocator, 0, entry.name, entry.kind);
             count += 1;
@@ -122,6 +144,9 @@ pub fn listPath(
             if (count >= max_entries) {
                 try out.appendSlice(allocator, "(truncated: too many entries)\n");
                 break;
+            }
+            if (ignore_stack) |*s| {
+                if (s.isIgnored(entry.path, entry.kind == .directory)) continue;
             }
             try appendEntry(&out, allocator, depth, entry.path, entry.kind);
             count += 1;
@@ -189,7 +214,7 @@ test "ls tool: non-recursive lists entries" {
     try std.Io.Dir.cwd().createDirPath(io, base ++ "/sub");
 
     var cancel: ai.stream.Cancel = .{};
-    var res = try listPath(gpa, io, base, false, 4, &cancel);
+    var res = try listPath(gpa, io, base, false, 4, false, &cancel);
     defer res.deinit(gpa);
     try testing.expect(!res.is_error);
     const text = res.content[0].text.text;
@@ -215,7 +240,7 @@ test "ls tool: recursive walks with depth cap" {
     }
 
     var cancel: ai.stream.Cancel = .{};
-    var res = try listPath(gpa, io, base, true, 10, &cancel);
+    var res = try listPath(gpa, io, base, true, 10, false, &cancel);
     defer res.deinit(gpa);
     try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "deep.txt") != null);
 }
@@ -227,8 +252,78 @@ test "ls tool: reports file_not_found" {
     const gpa = testing.allocator;
 
     var cancel: ai.stream.Cancel = .{};
-    var res = try listPath(gpa, io, "/tmp/does-not-exist-franky-xyz", false, 4, &cancel);
+    var res = try listPath(gpa, io, "/tmp/does-not-exist-franky-xyz", false, 4, false, &cancel);
     defer res.deinit(gpa);
     try testing.expect(res.is_error);
     try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "file_not_found") != null);
+}
+
+test "ls tool: respectGitignore skips ignored entries" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_ls_gi_test";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/build");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.gitignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "*.log\nbuild/\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/foo.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/debug.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/build/out.o", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    var res = try listPath(gpa, io, base, true, 10, true, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "foo.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "debug.log") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "build/") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "out.o") == null);
+}
+
+test "ls tool: respectGitignore=false preserves full listing" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_ls_gi_off_test";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.gitignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "*.log\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/debug.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    var res = try listPath(gpa, io, base, false, 4, false, &cancel);
+    defer res.deinit(gpa);
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "debug.log") != null);
 }

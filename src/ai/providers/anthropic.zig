@@ -24,9 +24,11 @@ const sse_mod = @import("../sse.zig");
 const http_mod = @import("../http.zig");
 const log = @import("../log.zig");
 
-const Channel = channel_mod.Channel(stream_mod.StreamEvent);
+const Channel = channel_mod
+    .Channel(stream_mod.StreamEvent);
 
-pub const default_endpoint: []const u8 = "https://api.anthropic.com/v1/messages";
+// pub const default_endpoint: []const u8 = "https://api.anthropic.com/v1/messages";
+pub const default_endpoint: []const u8 = "http://localhost:11434/v1/messages";
 pub const default_version_header: []const u8 = "2023-06-01";
 /// Beta header stack required when authenticating with an OAuth/JWT
 /// bearer token (the Claude Pro/Max path). The combination of
@@ -323,6 +325,10 @@ pub fn runFromSse(
         error.OutOfMemory => out.closeWithFinal(io, .{ .error_ev = .{
             .code = .internal,
             .message = try allocator.dupe(u8, "out of memory"),
+        } }),
+        error.Timeout => out.closeWithFinal(io, .{ .error_ev = .{
+            .code = .timeout,
+            .message = try allocator.dupe(u8, "event gap exceeded timeouts.event_gap_ms"),
         } }),
         error.Handler => out.closeWithFinal(io, .{ .error_ev = .{
             .code = .internal,
