@@ -233,7 +233,7 @@ fn atomicWrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
     };
 }
 
-var tmp_counter: std.atomic.Value(u64) = .init(0);
+var tmp_counter: std.atomic.Value(u32) = .init(0);
 
 fn err(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !at.ToolResult {
     const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });

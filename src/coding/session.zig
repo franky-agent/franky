@@ -467,7 +467,7 @@ fn appendJsonNumField(
 
 // ─── filesystem ───────────────────────────────────────────────────
 
-var tmp_counter: std.atomic.Value(u64) = .init(0);
+var tmp_counter: std.atomic.Value(u32) = .init(0);
 
 fn atomicWrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
     var tmp_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;

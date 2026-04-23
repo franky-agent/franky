@@ -21,6 +21,7 @@ func main() {
 	opts.Image = ""
 	opts.Properties = map[string]*build.ListValue{
 		"goreleaser": build.NewList("true"),
+		"optimize": build.NewList("ReleaseFast"),
 	}
 	//TODO: adjust the registry to your own container registry
 	opts.Registry = "containifyci"
