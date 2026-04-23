@@ -34,6 +34,11 @@ pub const Config = struct {
     /// LLM-gateway bearer). Routed as `Authorization: Bearer` by the
     /// Anthropic provider. See src/ai/providers/AUTH.md.
     auth_token: ?[]const u8 = null,
+    /// Endpoint override for OpenAI-compatible gateways (§A.6):
+    /// Ollama, LM Studio, vLLM, Groq, Cerebras, OpenRouter, xAI,
+    /// Fireworks, HuggingFace TGI, etc. Pair with
+    /// `--provider gateway`.
+    base_url: ?[]const u8 = null,
     system_prompt: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
     thinking: types.ThinkingLevel = .off,
@@ -147,6 +152,8 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.api_key = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--auth-token")) {
             cfg.auth_token = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--base-url")) {
+            cfg.base_url = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--system-prompt")) {
             cfg.system_prompt = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--append-system-prompt")) {
@@ -208,11 +215,14 @@ pub const usage_text: []const u8 =
     \\  franky [FLAGS] [--] PROMPT...
     \\
     \\FLAGS:
-    \\  --provider NAME              Provider (faux, anthropic) [default: faux]
+    \\  --provider NAME              Provider (faux, anthropic, openai, gateway) [default: faux]
     \\  --model ID                   Model id (provider-specific default)
     \\  --api-key KEY                API key (X-Api-Key); env: ANTHROPIC_API_KEY
     \\  --auth-token TOKEN           OAuth / JWT bearer; env: ANTHROPIC_AUTH_TOKEN,
     \\                               CLAUDE_CODE_OAUTH_TOKEN
+    \\  --base-url URL               Endpoint override for OpenAI-compatible
+    \\                               gateways (Ollama, LM Studio, vLLM, Groq, …)
+    \\                               — pair with --provider gateway
     \\  --system-prompt TEXT         Override the system prompt
     \\  --append-system-prompt TEXT  Append to the default system prompt
     \\  --thinking LEVEL             off|minimal|low|medium|high|xhigh [default: off]
@@ -276,6 +286,20 @@ test "parse: inline --name=value" {
     try testing.expectEqualStrings("faux", cfg.provider.?);
     try testing.expectEqual(types.ThinkingLevel.medium, cfg.thinking);
     try testing.expectEqualStrings("hi", cfg.prompt);
+}
+
+test "parse: --base-url + --provider gateway" {
+    var cfg = try parse(testing.allocator, &.{
+        "franky",
+        "--provider",  "gateway",
+        "--base-url",  "http://localhost:11434/v1/chat/completions",
+        "--model",     "llama3.2",
+        "hello",
+    });
+    defer cfg.deinit();
+    try testing.expectEqualStrings("gateway", cfg.provider.?);
+    try testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", cfg.base_url.?);
+    try testing.expectEqualStrings("llama3.2", cfg.model.?);
 }
 
 test "parse: no-session + resume + session-dir" {

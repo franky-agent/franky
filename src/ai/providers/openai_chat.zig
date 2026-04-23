@@ -477,7 +477,14 @@ fn mapFinishReason(s: []const u8) ?types.StopReason {
 // ─── registry entry ──────────────────────────────────────────────
 
 pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
-    const credential: []const u8 = ctx.options.api_key orelse ctx.options.auth_token orelse {
+    const endpoint: []const u8 = ctx.options.base_url orelse default_endpoint;
+    const is_gateway = ctx.options.base_url != null;
+    const credential: ?[]const u8 = ctx.options.api_key orelse ctx.options.auth_token;
+
+    // OpenAI proper requires a bearer. Gateways may be local (Ollama,
+    // LM Studio, vLLM) and accept anonymous traffic; only error on
+    // missing credentials for the canonical openai.com endpoint.
+    if (credential == null and !is_gateway) {
         try ctx.out.push(ctx.io, .start);
         ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
             .code = errors.Code.auth,
@@ -487,22 +494,31 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
             ),
         } });
         return;
-    };
+    }
 
     const body = try buildRequestJson(ctx.allocator, ctx.model, ctx.context, ctx.options);
     defer ctx.allocator.free(body);
 
-    log.log(.debug, "http", "request", "provider=openai model={s} body_bytes={d}", .{ ctx.model.id, body.len });
+    log.log(.debug, "http", "request", "provider=openai model={s} endpoint={s} body_bytes={d}", .{ ctx.model.id, endpoint, body.len });
     log.body(.trace, "http", "request_body", body, 64 * 1024);
 
-    const auth_header = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{credential});
-    defer ctx.allocator.free(auth_header);
+    const auth_header: ?[]u8 = if (credential) |c|
+        try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{c})
+    else
+        null;
+    defer if (auth_header) |h| ctx.allocator.free(h);
 
     var http_headers_buf: [4]std.http.Header = undefined;
-    http_headers_buf[0] = .{ .name = "authorization", .value = auth_header };
-    http_headers_buf[1] = .{ .name = "content-type", .value = "application/json" };
-    http_headers_buf[2] = .{ .name = "accept", .value = "text/event-stream" };
-    const http_headers = http_headers_buf[0..3];
+    var http_headers_len: usize = 0;
+    if (auth_header) |h| {
+        http_headers_buf[http_headers_len] = .{ .name = "authorization", .value = h };
+        http_headers_len += 1;
+    }
+    http_headers_buf[http_headers_len] = .{ .name = "content-type", .value = "application/json" };
+    http_headers_len += 1;
+    http_headers_buf[http_headers_len] = .{ .name = "accept", .value = "text/event-stream" };
+    http_headers_len += 1;
+    const http_headers = http_headers_buf[0..http_headers_len];
 
     const cancel = ctx.options.cancel orelse unreachable;
 
@@ -526,7 +542,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     defer bw.deinit();
 
     const result = client.fetch(.{
-        .location = .{ .url = default_endpoint },
+        .location = .{ .url = endpoint },
         .method = .POST,
         .payload = body,
         .response_writer = &bw.writer,

@@ -286,14 +286,38 @@ fn runTurn(
         return false;
     }
 
-    // Execute tools sequentially (MVP). Collect results in source order.
+    // Execute tools. Collect results in source order.
     var results: std.ArrayList(ToolCallResult) = .empty;
     defer {
         for (results.items) |*r| r.result.deinit(allocator);
         results.deinit(allocator);
     }
 
-    for (tool_calls.items) |tc| {
+    // §4.4 parallel dispatch (v0.5.0): when every tool in the batch
+    // is parallel-safe, spawn a native thread per call and join them
+    // in source order. Wall-time drops from Σ individual to
+    // max(individual) for I/O-bound tools (read/grep/find/ls).
+    // Any sequential tool in the batch forces the fallback path so
+    // write/edit/bash serialization is preserved.
+    const all_parallel = blk: {
+        if (tool_calls.items.len <= 1) break :blk false;
+        for (tool_calls.items) |tc| {
+            const td = findTool(config.tools, tc.name) orelse break :blk false;
+            if (td.execution_mode != .parallel) break :blk false;
+        }
+        break :blk true;
+    };
+
+    if (all_parallel) {
+        try runToolsParallel(
+            allocator,
+            io,
+            config,
+            tool_calls.items,
+            out,
+            &results,
+        );
+    } else for (tool_calls.items) |tc| {
         const maybe_tool = findTool(config.tools, tc.name);
         if (maybe_tool == null) {
             const r = try makeErrorResult(allocator, "unknown tool");
@@ -369,6 +393,124 @@ const ToolCallResult = struct {
     result: at.ToolResult,
     terminate: bool,
 };
+
+/// Parallel-batch worker (v0.5.0). Every worker thread runs a single
+/// `tool_def.execute`; the main thread drives `tool_execution_start`
+/// events (emitted before spawn so consumers see them eagerly),
+/// joins each worker in source order, and emits
+/// `tool_execution_end` as each join completes.
+const ParWork = struct {
+    tc: ai.types.ToolCall,
+    tool_def: at.AgentTool,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cancel: *ai.stream.Cancel,
+    /// Populated by the worker thread; `err_name` wins if execute
+    /// threw. Exactly one of the two fields is set on return.
+    out_result: ?at.ToolResult = null,
+    err_name: ?[]const u8 = null,
+};
+
+fn parallelWorker(w: *ParWork) void {
+    const r = w.tool_def.execute(
+        &w.tool_def,
+        w.allocator,
+        w.io,
+        w.tc.id,
+        w.tc.arguments_json,
+        w.cancel,
+        .{},
+    ) catch |e| {
+        w.err_name = @errorName(e);
+        return;
+    };
+    w.out_result = r;
+}
+
+fn runToolsParallel(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: Config,
+    tool_calls: []const ai.types.ToolCall,
+    out: *AgentChannel,
+    results: *std.ArrayList(ToolCallResult),
+) !void {
+    const n = tool_calls.len;
+
+    // beforeToolCall hooks: run on the main thread so hook state is
+    // single-threaded (hooks can veto a call; a vetoed call never
+    // spawns a worker).
+    var workers = try allocator.alloc(ParWork, n);
+    defer allocator.free(workers);
+    var vetoed = try allocator.alloc(?at.ToolResult, n);
+    defer allocator.free(vetoed);
+    for (vetoed) |*v| v.* = null;
+
+    for (tool_calls, 0..) |tc, i| {
+        const tool_def = findTool(config.tools, tc.name).?;
+        if (config.before_tool_call) |hook| {
+            const dec = hook(config.hook_userdata, &tool_def, tc.id, tc.arguments_json);
+            if (dec.block) {
+                const reason = dec.reason_text orelse "blocked by beforeToolCall";
+                vetoed[i] = try makeErrorResult(allocator, reason);
+            }
+        }
+        workers[i] = .{
+            .tc = tc,
+            .tool_def = tool_def,
+            .allocator = allocator,
+            .io = io,
+            .cancel = config.cancel,
+        };
+    }
+
+    // Emit start events in source order — this is the consumer's first
+    // signal that a given call_id is in flight.
+    for (tool_calls) |tc| {
+        const tool_def = findTool(config.tools, tc.name).?;
+        try pushToolStart(out, io, allocator, tc.id, tool_def.name);
+    }
+
+    // Spawn one thread per non-vetoed call.
+    var threads = try allocator.alloc(?std.Thread, n);
+    defer allocator.free(threads);
+    for (threads) |*t| t.* = null;
+
+    for (workers, 0..) |*w, i| {
+        if (vetoed[i] != null) continue;
+        threads[i] = try std.Thread.spawn(.{}, parallelWorker, .{w});
+    }
+
+    // Join in source order; emit each completion's end event as the
+    // join unblocks. Source-order join means wall-time is bounded by
+    // `max(individual)` but end events fire in source order rather
+    // than completion order — §4.4's completion-order-events
+    // requirement is tracked under v0.5.1 (needs a separate
+    // arrival-channel).
+    for (workers, 0..) |*w, i| {
+        if (vetoed[i]) |veto_res| {
+            try pushToolEnd(out, io, allocator, w.tc.id, w.tool_def, veto_res);
+            try results.append(allocator, .{ .call_id = w.tc.id, .result = veto_res, .terminate = false });
+            continue;
+        }
+        threads[i].?.join();
+        var call_res: at.ToolResult = undefined;
+        if (w.out_result) |r| {
+            call_res = r;
+        } else {
+            call_res = try makeErrorResult(allocator, w.err_name orelse "tool failed");
+        }
+        if (config.after_tool_call) |hook| {
+            hook(config.hook_userdata, &w.tool_def, w.tc.id, &call_res);
+        }
+        try pushToolEnd(out, io, allocator, w.tc.id, w.tool_def, call_res);
+        try results.append(allocator, .{
+            .call_id = w.tc.id,
+            .result = call_res,
+            .terminate = call_res.terminate,
+        });
+    }
+}
 
 fn streamChannel(allocator: std.mem.Allocator) !ai.channel.Channel(ai.stream.StreamEvent) {
     // Provider-to-reducer buffer. The provider's streamFn pushes every

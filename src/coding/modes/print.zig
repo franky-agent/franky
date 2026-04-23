@@ -136,6 +136,11 @@ fn runPrint(
         .provider = "openai",
         .stream_fn = ai.providers.openai_chat.streamFn,
     });
+    try reg.register(.{
+        .api = "openai-compatible-gateway",
+        .provider = "gateway",
+        .stream_fn = ai.providers.openai_gateway.streamFn,
+    });
 
     // If we're running the faux provider, seed a scripted response so the
     // demo stays self-contained without an API key. The allocations below
@@ -231,6 +236,7 @@ fn runPrint(
             .stream_options = .{
                 .api_key = provider_info.api_key,
                 .auth_token = provider_info.auth_token,
+                .base_url = provider_info.base_url,
                 .environ_map = environ_map,
                 .thinking = cfg.thinking,
             },
@@ -355,6 +361,9 @@ const ProviderInfo = struct {
     model_id: []const u8,
     api_key: ?[]const u8,
     auth_token: ?[]const u8,
+    /// OpenAI-compatible gateway endpoint override (§A.6). Null for
+    /// every provider except `gateway`.
+    base_url: ?[]const u8,
     context_window: u32,
     max_output: u32,
 };
@@ -409,6 +418,7 @@ fn resolveProvider(
             .model_id = model,
             .api_key = null,
             .auth_token = null,
+            .base_url = null,
             .context_window = default_context_window,
             .max_output = default_max_output,
         };
@@ -427,6 +437,7 @@ fn resolveProvider(
             .model_id = model,
             .api_key = api_key,
             .auth_token = auth_token,
+            .base_url = null,
             .context_window = default_context_window,
             .max_output = default_max_output,
         };
@@ -445,12 +456,44 @@ fn resolveProvider(
             .model_id = model,
             .api_key = effective_key,
             .auth_token = null,
+            .base_url = null,
             .context_window = default_context_window,
             .max_output = default_max_output,
         };
     }
 
-    const msg = try std.fmt.allocPrint(allocator, "unknown --provider '{s}'; use faux, anthropic, or openai\n", .{chosen});
+    if (std.mem.eql(u8, chosen, "gateway")) {
+        const base_url_str: []const u8 = cfg.base_url orelse blk: {
+            if (environ.getPosix("FRANKY_GATEWAY_URL")) |u| break :blk try a.dupe(u8, u);
+            if (environ.getPosix("OPENAI_BASE_URL")) |u| break :blk try a.dupe(u8, u);
+            const msg = "gateway provider requires --base-url (or FRANKY_GATEWAY_URL / OPENAI_BASE_URL env)\n";
+            return exitWithMessageErr(allocator, msg, 2);
+        };
+        // Credential optional — local gateways (Ollama, LM Studio)
+        // accept anonymous traffic. Remote gateways (Groq, Cerebras,
+        // OpenRouter, …) want --api-key.
+        const effective_key: ?[]const u8 = cfg.api_key orelse openai_api_key orelse blk: {
+            if (environ.getPosix("FRANKY_GATEWAY_TOKEN")) |t| break :blk try a.dupe(u8, t);
+            break :blk null;
+        };
+        if (cfg.model == null) {
+            const msg = "gateway provider requires --model <id> (e.g. llama3.2 for Ollama, llama-3.1-70b for Groq)\n";
+            return exitWithMessageErr(allocator, msg, 2);
+        }
+        const model = cfg.model.?;
+        return .{
+            .provider_name = "gateway",
+            .api_tag = "openai-compatible-gateway",
+            .model_id = model,
+            .api_key = effective_key,
+            .auth_token = null,
+            .base_url = base_url_str,
+            .context_window = default_context_window,
+            .max_output = default_max_output,
+        };
+    }
+
+    const msg = try std.fmt.allocPrint(allocator, "unknown --provider '{s}'; use faux, anthropic, openai, or gateway\n", .{chosen});
     defer allocator.free(msg);
     return exitWithMessageErr(allocator, msg, 2);
 }

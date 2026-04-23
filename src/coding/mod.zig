@@ -18,6 +18,8 @@ pub const session = @import("session.zig");
 pub const cli = @import("cli.zig");
 pub const regex = @import("regex.zig");
 pub const gitignore = @import("gitignore.zig");
+pub const path_safety = @import("path_safety.zig");
+pub const env_denylist = @import("env_denylist.zig");
 
 test {
     _ = tools.read;
@@ -32,4 +34,6 @@ test {
     _ = cli;
     _ = regex;
     _ = gitignore;
+    _ = path_safety;
+    _ = env_denylist;
 }

@@ -35,6 +35,12 @@ pub const StreamOptions = struct {
     thinking: types.ThinkingLevel = .off,
     /// HTTP phase deadlines — §G.4. Zero means "no timeout on this phase".
     timeouts: Timeouts = .{},
+    /// Override the provider's default endpoint. Used by §A.6
+    /// OpenAI-compatible gateways (Ollama, LM Studio, vLLM, Groq,
+    /// Cerebras, OpenRouter, …) to retarget `openai_chat.streamFn`'s
+    /// body builder + SSE translator at a different host. Null means
+    /// "use the provider's hard-coded default".
+    base_url: ?[]const u8 = null,
 
     pub const Header = struct { name: []const u8, value: []const u8 };
 };

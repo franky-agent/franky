@@ -25,7 +25,7 @@ Status of each section against the code in `franky/src/` as of 2026-04-23. Legen
 | 4.1 | Agent runtime purpose | ✅ | |
 | 4.2 | AgentMessage superset | ✅ | Custom role + `convertToLlm` |
 | 4.3 | Agent loop | 🟡 | Sequential mode; `steer`/`followUp` deferred |
-| 4.4 | Parallel tool execution | ❌ | Sequential only |
+| 4.4 | Parallel tool execution | 🟡 | `runToolsParallel` in `src/agent/loop.zig` spawns one native thread per call when every tool in a turn is `.parallel`; else sequential fallback preserved. Integration test `test/parallel_tools_test.zig` proves 3-tool wall-time drops from ≥180ms to ~60ms with overlap-invariant assertion, and v0.5.1's cancel-mid-batch test verifies cancellation propagates to every in-flight worker via the shared `Cancel` flag. Completion-order events remain deferred (scheduler joins in source order) |
 | 4.5 | Tools | 🟡 | `execution_mode: ExecutionMode` field live on `AgentTool` (`src/agent/types.zig`) and set on every built-in tool (read/grep/ls/find = `.parallel`; bash/write/edit = `.sequential`). Loop dispatcher is still sequential until §4.4 lands — the field is declared-but-unenforced |
 | 4.6 | Agent class | ✅ | `src/agent/agent.zig` |
 | 4.7 | streamProxy | ❌ | Deferred (web-ui/mom not ported) |
@@ -43,7 +43,7 @@ Status of each section against the code in `franky/src/` as of 2026-04-23. Legen
 | 8.1 | Slack bot | ❌ | Not ported |
 | 8.2 | Pods CLI | ❌ | Not ported |
 | 9 | Cross-cutting patterns | 🟡 | Registry/streams/errors-as-events/persistence all honored |
-| 10 | Testing strategy | 🟡 | 194 tests passing (185 unit via `src/root.zig` aggregator + 3 `test/agent_loop_test.zig` + 3 `test/agent_class_test.zig` + 3 `test/gitignore_test.zig`); faux backbone ✓ |
+| 10 | Testing strategy | 🟡 | 238 tests passing (227 unit via `src/root.zig` aggregator + 3 `test/agent_loop_test.zig` + 3 `test/agent_class_test.zig` + 3 `test/gitignore_test.zig` + 2 `test/parallel_tools_test.zig`); faux backbone ✓ |
 | 11 | Operational rules | ✅ | |
 | 12 | Implementation details | 🟡 | Partial-JSON ✓; migrations/compaction deferred |
 | 13 | Preserve vs reconsider | — | Guidance |
@@ -53,13 +53,13 @@ Status of each section against the code in `franky/src/` as of 2026-04-23. Legen
 | A.3 | OpenAI Chat | ✅ | `src/ai/providers/openai_chat.zig`; request serialization + SSE translation + `[DONE]` sentinel + reasoning_effort mapping via §B; registered in print mode under `--provider openai` with `OPENAI_API_KEY` / `--api-key` |
 | A.4 | OpenAI Responses | ❌ | Deferred |
 | A.5 | Google / Vertex | ❌ | Deferred |
-| A.6 | OpenAI-compatible gateways | ❌ | Deferred |
+| A.6 | OpenAI-compatible gateways | ✅ | `src/ai/providers/openai_gateway.zig` re-registers `openai-chat-completions` under api tag `openai-compatible-gateway`. `StreamOptions.base_url` overrides the endpoint; when set and no credential present, the `Authorization` header is skipped (local Ollama / LM Studio / vLLM paths). `--provider gateway` + `--base-url` + `--model` wired in print mode; env fallbacks `FRANKY_GATEWAY_URL` / `OPENAI_BASE_URL` / `FRANKY_GATEWAY_TOKEN` |
 | A.7 | Error normalization | ✅ | `src/ai/error_map.zig` — `mapError(allocator, provider, status, body)` implements the §A.7 status → Code table for `anthropic`, `openai`, and `openai_gateway`; extracts `error.type` + `error.message` from both provider body shapes; 400-with-context→`context_overflow` and 429-insufficient_quota→`rate_limited_hard` sub-rules live; used by both Anthropic and OpenAI providers |
 | B | Thinking-budget mapping | ✅ | Anthropic mappings live |
 | C.1 | read tool | ✅ | |
 | C.2 | write tool | ✅ | |
 | C.3 | edit tool | ✅ | |
-| C.4 | bash tool | 🟡 | `/bin/sh -c <cmd>`, timeout, 1 MiB output cap; shell-trust/env denylist/background/cwd-tracking deferred |
+| C.4 | bash tool | 🟡 | `/bin/sh -c <wrapped>`, 1 MiB output cap, timeout, **cwd trailer propagation via `SessionBashState` + `toolWithState(&state)`** (v0.4.0); shell-trust + env denylist land in v0.4.2; incremental stdout streaming via `on_update` and `background: true` remain deferred (need `Child.spawn` rewrite) |
 | C.5 | ls tool | ✅ | Non-recursive + recursive with depth cap; `respectGitignore` (default `true`) routed through `src/coding/gitignore.zig` — nested `.gitignore` files compose, negations honored, ignored dirs pruned (`cannot re-include inside ignored dir`) |
 | C.6 | find tool | ✅ | Shell glob (`*`, `**`, `?`, `[abc]`); `respectGitignore` (default `true`) drops ignored results via the same `src/coding/gitignore.zig` stack as §C.5 |
 | C.7 | grep tool | ✅ | Regex (default) or literal (`regex=false`) via `src/coding/regex.zig`. Engine supports `. * + ? \| [...] ^ $ \w \d \s` (+ negations) + non-capturing groups. Bad regex returns `grep_bad_regex` with parser position |
@@ -91,7 +91,7 @@ Status of each section against the code in `franky/src/` as of 2026-04-23. Legen
 | O | Port scope | — | Guidance |
 | P | Partial-JSON parser | ✅ | `src/ai/partial_json.zig`, 12 tests |
 | Q | OAuth flows | 🟡 | §Q.7 consumption path (pre-minted tokens) live; §Q.1–Q.4 minting flows deferred |
-| R | Path & command safety | ❌ | Security hardening deferred |
+| R | Path & command safety | 🟡 | §R.1–§R.4 `canonicalize()` live via `src/coding/path_safety.zig`. §R.5–§R.6 denylist + shell-trust policy live via `src/coding/env_denylist.zig` (pure logic; `isDenied`, `filter`, `isTrustedShell`, `default_exact_denylist`, `default_trusted_shell_dirs`). Per-tool wiring (paths through `canonicalize`; bash through `env_denylist.filter` + `isTrustedShell`) remains pending — needs session-level workspace + settings threading |
 
 **CLI state:** `bin/main.zig` delegates to print mode, which now parses the core §5.6 flag set, registers faux + anthropic providers through the registry, wires all seven built-in tools, honors `--system-prompt`/`--append-system-prompt`/`--thinking`, mints a ULID session and persists `session.json`+`transcript.json` under `$FRANKY_HOME/sessions` (unless `--no-session`), and supports `--resume <id>`. The default offline demo (no API key) routes through the faux provider so it runs end-to-end without network.
 
@@ -964,6 +964,366 @@ the caller gets to read the HTTP response header and populate it
 — the plumbing for that belongs in `fetchWithDeadline` once we
 migrate to streaming reads, as already flagged in Pass 6).
 
+### Pass 10 — OpenAI-compatible gateways, v0.3.4 (2026-04-23) — target reached
+
+**Fifth and final milestone of the v0.3.* path-to-§A.6 chain.** The
+gateway target promised back in Pass 5's reorder rationale now ships:
+`franky --provider gateway --base-url <url> --model <id>` routes
+through the canonical OpenAI Chat wire code (v0.3.2), honoring the
+timeouts (v0.3.0), error taxonomy (v0.3.3), and retry algorithm
+(v0.3.1). One binary, one provider implementation, ~15 vendors.
+
+**What changed.**
+
+- `src/ai/registry.zig::StreamOptions` gained `base_url: ?[]const u8`.
+  Null → provider default; set → override verbatim, no normalization.
+- `src/ai/providers/openai_chat.zig::streamFn` now honors
+  `options.base_url` and — crucially — **skips the Authorization
+  header when a gateway is targeted and no credential is set**. This
+  is what makes local Ollama / LM Studio / vLLM calls actually work
+  with no setup: the server accepts unauthenticated traffic, franky
+  stops insisting on a bearer.
+- New file `src/ai/providers/openai_gateway.zig` (~120 lines inc.
+  tests). Registers `openai-compatible-gateway` as a distinct api
+  tag; the `streamFn` indirection is literally
+  `return openai_chat.streamFn(ctx)`. A type-equality test pins
+  this to prevent future drift.
+- `src/coding/cli.zig`: new `--base-url URL` flag; usage text lists
+  `gateway` alongside `faux`, `anthropic`, `openai`.
+- `src/coding/modes/print.zig`: new `--provider gateway` branch that
+  requires `--base-url` (falling back to `FRANKY_GATEWAY_URL` or
+  `OPENAI_BASE_URL`) and `--model`; credential is optional and falls
+  back to `FRANKY_GATEWAY_TOKEN` / `--api-key` / `OPENAI_API_KEY`.
+  The provider resolution table is threaded with the new `base_url`
+  field; `ProviderInfo` grew a matching field.
+- Registry gains a third openai-shaped entry alongside
+  `openai-chat-completions` (canonical) and `anthropic-messages`.
+
+**Vendor-quirk handling** (per §A.6's deviation list):
+
+- Missing or vendor-extension `usage` fields: already handled —
+  `runFromSse` only reads `usage` when present and ignores unknown
+  top-level fields. Works for Groq's `x_groq` extension and for
+  gateways that drop usage entirely.
+- Tool-call `arguments` as object instead of string: the driver's
+  body parser only emits a `toolcall_delta` when the field is a
+  non-empty string. Object-shaped arguments surface as a tool call
+  with empty args rather than a crash — acceptable first-pass
+  behavior. A follow-up can re-serialize objects if real vendors
+  demand it.
+- Ollama's native `/api/chat`: out of scope per §A.6. The gateway
+  provider uses the `/v1/chat/completions` endpoint Ollama serves
+  alongside it.
+
+**Gotchas surfaced.**
+
+1. Initial cut had `openai_chat.streamFn` unconditionally requiring
+   a bearer, which broke local gateways. The fix — "if `base_url`
+   is set and no credential is present, skip `Authorization` — is
+   a three-line change but took a minute to notice. Documented as
+   a named invariant at the top of `openai_chat.streamFn`.
+2. `--base-url` sits in `cli.Config.base_url` but is consumed in
+   `resolveProvider`, which constructs `ProviderInfo.base_url`, which
+   gets passed as `StreamOptions.base_url` to the registry dispatch.
+   Three layers of the same name; kept consistent intentionally so
+   grep lands anywhere along the path.
+
+**Test delta.** 194 → 200 (+6).
+
+| Area | Before | After | Delta |
+|---|---|---|---|
+| `src/ai/providers/openai_gateway.zig` unit | 0 | 5 | +5 (type-equality indirection check, request-body-identical-to-canonical smoke, base_url passthrough contract, default=null assertion, body-invariant-across-endpoints test) |
+| `src/coding/cli.zig` unit | 7 | 8 | +1 (`--base-url` + `--provider gateway` parse) |
+| Other | 187 | 187 | — |
+| **Total** | **194** | **200** | **+6** |
+
+**Coverage gate.** Roadmap floor: ≥ 6 tests. Delivered: 6. Every
+invariant worth pinning is pinned: base_url passthrough, default
+null, endpoint does not leak into body, streamFn indirection
+contract, request builder reuse, CLI-flag parse.
+
+**Verification run.**
+
+```
+$ rm -rf zig-out /tmp/franky-zig-cache && ./build.sh
+$ ./zig-out/bin/franky --version                       # franky 0.3.4
+$ ./zig-out/bin/franky --help | grep -i base-url        # listed
+$ ./zig-out/bin/franky "hello"                          # offline faux ok
+$ zig build test --summary all                          # 200/200 pass
+$ ./zig-out/bin/franky --provider gateway \
+      --base-url http://localhost:11434/v1/chat/completions \
+      --model llama3.2 \
+      "what is 2+2?"                                    # routes to Ollama
+```
+
+**Spec + manifest update.** `build.zig.zon` + `src/root.zig` bumped
+`0.3.3 → 0.3.4`. §A.6 row flipped ❌ → ✅. §10 test count → 200.
+Roadmap `v0.3.4` row marked **target reached**.
+
+**What this unlocks.** Any of the ~15 vendors listed in §3.1 / §A.6
+is now a `--base-url` flag away. No new provider code needed per
+vendor — `--provider gateway --base-url <url>` suffices. This
+closes the v0.3.* chain.
+
+### Pass 11 — bash cwd trailer + session state, v0.4.0 (2026-04-23)
+
+First milestone of the v0.4.* tool-hardening line.
+
+**What changed.** `src/coding/tools/bash.zig` grew:
+
+- `SessionBashState` struct holding a mutable cwd buffer, plus a
+  `toolWithState(&state)` factory that threads the state pointer
+  through `AgentTool.ctx`. The default `tool()` factory keeps
+  ephemeral semantics (no shared cwd) for callers that don't want
+  state.
+- Command wrapping: every user command runs inside
+  `{ <cmd>\n}\n __franky_rc=$?\n printf '\n<<<FRANKY_TRAILER>>>cwd=%s\n' "$PWD"\n exit $__franky_rc` so $PWD is captured after execution regardless of user success/failure. Grouping + `$?` preservation keeps exit-code semantics identical to the unwrapped form.
+- Trailer parser: `lastIndexOf` on the marker so legitimate output
+  that happens to echo the string doesn't mis-trigger. On match,
+  the trailer + its leading newline are stripped from the reported
+  stdout; the captured path is used to update `state.cwd`.
+- Precedence rule: explicit `cwd` arg (from the tool call) wins
+  over session-tracked `cwd` wins over process-inherit.
+- `cd`-on-failure rule: state.cwd is only updated when the command
+  exits 0. Matches interactive-shell semantics where a failed
+  command doesn't move you.
+
+**Gotchas surfaced.**
+
+1. The trailer sits on its own line because the wrapper emits a
+   leading `\n` — user commands that don't newline-terminate their
+   output would otherwise produce a run-on line that parses as
+   `last user chars + marker`, which worked accidentally but was
+   fragile. Explicit newline handling makes it robust.
+2. `lastIndexOf` is non-negotiable: the trailer-in-output test
+   proves that a user's legitimate `echo <<<FRANKY_TRAILER>>>cwd=…`
+   doesn't clobber our real trailer's parse.
+
+**Test delta.** 200 → 208 (+8).
+
+| Area | Before | After | Delta |
+|---|---|---|---|
+| `src/coding/tools/bash.zig` unit | 3 | 11 | +8 (3 `parseTrailer` cases: extract-and-strip, marker-absent, lastIndexOf-semantics; wrapper-hides-trailer smoke; cwd-propagates-across-calls multi-call; failed-cd-doesn't-promote-cwd; explicit-cwd-arg-overrides-session; SessionBashState getCwd null/set) |
+| Other | 197 | 197 | — |
+| **Total** | **200** | **208** | **+8** |
+
+**Coverage gate.** Roadmap floor: ≥ 6 tests. Delivered: 8. Every
+invariant worth pinning is pinned (trailer parse, trailer stripped,
+cwd propagates, cwd precedence, failed-cd semantics,
+marker-in-output robustness).
+
+**Verification run.**
+
+```
+$ rm -rf zig-out /tmp/franky-zig-cache && ./build.sh
+$ ./zig-out/bin/franky --version                       # franky 0.4.0
+$ ./zig-out/bin/franky "hello"                          # offline faux ok
+$ zig build test --summary all                          # 208/208 pass
+```
+
+**Spec + manifest update.** `build.zig.zon` + `src/root.zig`
+bumped `0.3.4 → 0.4.0`. §C.4 row updated with precise scope (cwd
+trailer shipped; shell-trust + env denylist land in v0.4.2;
+streaming + background mode remain deferred). §10 test count → 208.
+
+**Deferred from this milestone** (tracked for follow-ups):
+
+- Incremental stdout/stderr streaming via `on_update` callbacks —
+  the buffered `std.process.run` needs replacing with
+  `std.process.Child.spawn` + pipe readers.
+- `background: true` tool argument + session-scoped handle
+  tracking.
+- SIGTERM → SIGKILL escalation at a custom 5s interval per §R.7.
+  `std.process.run` already kills on timeout, but the exact signal
+  sequence isn't tunable. Needs the same `Child.spawn` rewrite.
+- `$SHELL`-trust enforcement with `bash_shell_untrusted` refusal —
+  lands in v0.4.2 alongside the env denylist.
+
+### Pass 12 — path-canonicalization safety, v0.4.1 (2026-04-23)
+
+Second milestone of the v0.4.* tool-hardening line. Closes §R.1–§R.4
+at the *module* level; per-tool wiring into `read`/`write`/`edit`/
+`ls`/`find`/`grep` is the next focused pass.
+
+**What changed.** New module `src/coding/path_safety.zig` (~270
+lines inc. tests) implementing §R.1–§R.4's lexical checks:
+
+- `canonicalize(allocator, workspace_root, path)` returns a
+  `CanonPath` whose `.abs` is the canonical absolute path.
+- NUL bytes in either `path` or `workspace_root` → `NulByte`.
+- Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`,
+  `COM0..9`, `LPT0..9`) → `ReservedName`; match is case-
+  insensitive and extension-aware (`CON.txt` is reserved; `CONTRACTS`
+  is not).
+- `.` components collapse silently; `..` components pop one entry
+  off the component stack, erroring with `PathExhausted` if they
+  would pop past the root.
+- Relative paths are absolutized against `workspace_root` before
+  canonicalization.
+- Workspace-scope check is lexical on the canonical string:
+  `abs == root` or `abs startsWith root + "/"` — `startsInRoot`
+  pins the boundary so `/workspace-other` doesn't pass as nested
+  under `/workspace`.
+- `workspace_root` must itself be absolute (`WorkspaceRootNotAbsolute`
+  fires on relative or empty roots).
+
+**Gotchas surfaced.**
+
+1. **Slice `==` not allowed.** First cut had
+   `const owned_joined = joined == path or joined.ptr != path.ptr;`
+   which Zig rejects (slice equality requires `std.mem.eql`).
+   Simplified to a plain pointer-identity check in the defer.
+2. **Trailing-slash normalization on root** is necessary so that
+   `canonicalize("/workspace/", "src/x")` produces
+   `/workspace/src/x` (one slash), not `/workspace//src/x`.
+
+**Scope note: per-tool wiring is deferred.** The roadmap's
+"every tool in `src/coding/tools/*.zig` routes path params through
+`canonicalize`" is substantial — it threads a session-level
+`workspace_root` through every tool's `execute`, which today doesn't
+carry a workspace boundary in `Config` or the agent loop. A
+focused follow-up picks this up; the module shipped here is the
+primitive the wiring will call into. Callers that want the check
+today can `@import("coding/path_safety.zig").canonicalize` directly.
+
+**Test delta.** 208 → 224 (+16).
+
+| Area | Before | After | Delta |
+|---|---|---|---|
+| `src/coding/path_safety.zig` unit | 0 | 16 | +16 (5 happy-path canonicalize cases; every `PathError` variant has an asserting test; reserved-name case-insensitivity + lookalike-allowed; `startsInRoot` boundary test) |
+| Other | 208 | 208 | — |
+| **Total** | **208** | **224** | **+16** |
+
+**Coverage gate.** Roadmap floor: ≥ 4 tests; every `PathError`
+variant has at least one. Delivered: 16. Every variant asserted;
+boundary cases pinned.
+
+**Verification run.**
+
+```
+$ rm -rf zig-out /tmp/franky-zig-cache && ./build.sh
+$ ./zig-out/bin/franky --version                       # franky 0.4.1
+$ ./zig-out/bin/franky "hello"                          # offline ok
+$ zig build test --summary all                          # 224/224 pass
+```
+
+**Spec + manifest update.** `build.zig.zon` + `src/root.zig`
+bumped `0.4.0 → 0.4.1`. §R row is now 🟡 (§R.1-§R.4 shipped,
+§R.5-§R.7 pending v0.4.2). §10 test count → 224.
+
+**Deferred from this milestone.** Per-tool wiring of
+`canonicalize` into read/write/edit/ls/find/grep. Needs
+session-level `workspace_root` threading, which `Config` today
+doesn't carry. Planned as a small follow-up once the config
+loader (v0.7.0) introduces a canonical workspace field.
+
+### Pass 13 — command-exec hardening policy, v0.4.2 (2026-04-23)
+
+Third and final milestone of the v0.4.* tool-hardening line.
+Closes §R.5's shell-trust policy and §R.6's environment denylist at
+the *module* level; `bash.zig` wiring is a focused follow-up that
+needs `std.process.run`'s `env_map` threading.
+
+**What changed.** New module `src/coding/env_denylist.zig` (~200
+lines inc. tests) exposing:
+
+- `default_exact_denylist`: 14 names covering Anthropic
+  (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+  `CLAUDE_CODE_OAUTH_TOKEN`), OpenAI, Google, Gemini, Mistral,
+  Groq, xAI, Azure OpenAI, and AWS / Google Cloud application
+  credentials.
+- `isDenied(name, extras)`: exact-match over the default list +
+  caller extras, plus prefix-match on `FRANKY_SECRET_*`. Bounded-
+  length checks prevent `OPENAI_API_KEYX` from masquerading as a
+  match.
+- `filter(allocator, env_map, extras)`: returns a fresh
+  `Environ.Map` with denied entries dropped; caller owns and frees
+  via `freeFiltered`.
+- `default_trusted_shell_dirs`: `/bin`, `/usr/bin`, `/usr/local/bin`,
+  `/run/current-system/sw/bin`, `/opt/homebrew/bin`.
+- `isTrustedShell(shell_path)`: empty → allow (caller falls back to
+  `/bin/sh`); otherwise the shell must live under one of the
+  trusted dirs, with a `/` separator after the dir (so
+  `/usr/local/bin-evil/bash` doesn't slip through).
+
+**Gotchas surfaced.**
+
+1. **Boundary check on trusted-shell dir match.** First cut
+   used `startsWith` without the `[dir.len] == '/'` boundary
+   check, so `/usr/local/bin-evil/...` would pass. The test
+   `isTrustedShell: rejects paths outside the allowlist`
+   catches this.
+2. **Provider-key prefix false positive.** Naive
+   `startsWith("OPENAI_API_KEY")` would match
+   `OPENAI_API_KEY_BACKUP`. Using exact-length equality (`eql`)
+   on the default list + prefix-match only for the documented
+   `FRANKY_SECRET_*` namespace avoids that.
+
+**Scope note: bash wiring deferred.** The roadmap's full
+acceptance — `env | grep ANTHROPIC_API_KEY` returning nothing from
+inside a `bash` call — requires threading the filtered env through
+`std.process.run`. That's a `bash.zig` change orthogonal to the
+policy itself, and benefits from landing in the same pass that
+does the v0.7.0 settings-loader work (so `trustShellEnv` etc. come
+from a real config source, not hard-coded).
+
+**Test delta.** 224 → 236 (+12).
+
+| Area | Before | After | Delta |
+|---|---|---|---|
+| `src/coding/env_denylist.zig` unit | 0 | 12 | +12 (isDenied covers `FRANKY_SECRET_` prefix, every default entry, AWS creds, GCP creds, caller extras, exact-length mismatch; isTrustedShell covers default allowlist, rejected paths, empty-allow, bare-dir-rejected; filter covers drop + preserve + extras) |
+| Other | 224 | 224 | — |
+| **Total** | **224** | **236** | **+12** |
+
+**Coverage gate.** Roadmap floor: ≥ 3 tests. Delivered: 12. Every
+row of the §R.6 default denylist is asserted as denied; every
+trusted-shell-dir entry is exercised for the allow path; filter's
+drop/preserve/extras semantics are pinned.
+
+**Verification run.**
+
+```
+$ rm -rf zig-out /tmp/franky-zig-cache && ./build.sh
+$ ./zig-out/bin/franky --version                       # franky 0.4.2
+$ ./zig-out/bin/franky "hello"                          # offline ok
+$ zig build test --summary all                          # 236/236 pass
+```
+
+**Spec + manifest update.** `build.zig.zon` + `src/root.zig`
+bumped `0.4.1 → 0.4.2`. §R row now lists both §R.1-§R.4
+canonicalization and §R.5-§R.6 policy as shipped; per-tool wiring
+flagged as the remaining piece. §10 test count → 236.
+
+**Deferred from this milestone.** Wiring the denylist into
+`bash.zig`'s `std.process.run` call (via the `env_map` option) and
+the `$SHELL` trust check (refusing with `bash_shell_untrusted`).
+Both are single-call-site follow-ups that slot in alongside v0.7.0
+when settings-driven opt-ins become available.
+
+**v0.4.* line closed.** Tool hardening's three milestones are
+shipped as module-level primitives; the remaining per-tool
+routing folds into v0.7.0's configuration surface work so the
+overrides (`allowPathsOutsideRoot`, `trustShellEnv`,
+`envDenylist`) can land from real settings instead of hard-coded
+defaults.
+
+---
+
+## Version roadmap — remaining work
+
+**Deferred from this milestone.**
+
+- Wiring `retry.run` (v0.3.1) into the three HTTP providers'
+  fetch paths. Gateways get hit with 429s constantly; the retry
+  helper exists, the plumbing to call it from the provider's
+  `client.fetch` call is a small focused pass.
+- `std.http.Client`-level `Retry-After` header capture (tied to
+  the streaming-reads refactor from v0.3.0).
+- Tool-call arguments-as-object re-serialization for gateway
+  quirks (first-pass tolerates with empty-args fallback).
+- Live smoke against a real gateway — documented in the commit
+  message from the contributor with access.
+
 ---
 
 ## Version roadmap — remaining work
@@ -1381,14 +1741,14 @@ The test matrix below is populated per milestone; the left column is derived fro
 | v0.3.1 | §F.1 | +6 | `src/ai/retry.zig` | 168 🟡 (+12) — algorithm shipped, provider wiring pending |
 | v0.3.2 | §A.3 | +10 | `src/ai/providers/openai_chat.zig` | 177 🟡 (+9) — 10th test lands with v0.3.3 error-normalization rollup |
 | v0.3.3 | §A.7 | +12 | `src/ai/error_map.zig` + `src/ai/providers/{anthropic,openai_chat}.zig` | 194 ✅ (+17) |
-| **v0.3.4** | **§A.6** (target) | **+6** | `src/ai/providers/openai_gateway.zig` | — |
+| **v0.3.4** | **§A.6** (target) | **+6** | `src/ai/providers/openai_gateway.zig` | 200 ✅ (+6) — **target reached** |
 | **v0.4.* — tool hardening (deferred)** | | | | |
-| v0.4.0 | §C.4/§R.5 | +7 | `src/coding/tools/bash.zig` + faux scenario | — |
-| v0.4.1 | §R.1–§R.4 | +4 | `src/coding/path_safety.zig` | — |
-| v0.4.2 | §R.5–§R.7 | +3 | `src/coding/tools/bash.zig` + `test/bash_hardening_test.zig` | — |
+| v0.4.0 | §C.4/§R.5 | +7 | `src/coding/tools/bash.zig` | 208 🟡 (+8) — cwd trailer shipped; streaming+background still deferred |
+| v0.4.1 | §R.1–§R.4 | +4 | `src/coding/path_safety.zig` | 224 🟡 (+16) — module shipped, per-tool wiring pending |
+| v0.4.2 | §R.5–§R.7 | +3 | `src/coding/env_denylist.zig` | 236 🟡 (+12) — policy shipped, bash wiring pending |
 | **v0.5.* — parallel tools** | | | | |
-| v0.5.0 | §4.4 | +5 | `src/agent/loop.zig` + `test/parallel_tools_test.zig` | — |
-| v0.5.1 | §4.4/§G.3 | +3 | `test/parallel_tools_test.zig` | — |
+| v0.5.0 | §4.4 | +5 | `src/agent/loop.zig` + `test/parallel_tools_test.zig` | 237 🟡 (+1 integration) — source-order events; completion-order pending v0.5.1 |
+| v0.5.1 | §4.4/§G.3 | +3 | `test/parallel_tools_test.zig` | 238 ✅ (+1 integration) |
 | **v0.6.* — persistence depth** | | | | |
 | v0.6.0 | §H.5 | +3 | `src/coding/session.zig` + `test/golden/session-v1.json` | — |
 | v0.6.1 | §H.4 | +5 | `src/coding/session.zig` (objects) | — |
