@@ -13,6 +13,7 @@ pub const stream = @import("stream.zig");
 pub const registry = @import("registry.zig");
 pub const http = @import("http.zig");
 pub const retry = @import("retry.zig");
+pub const error_map = @import("error_map.zig");
 pub const log = @import("log.zig");
 pub const providers = struct {
     pub const faux = @import("providers/faux.zig");
@@ -35,6 +36,7 @@ test {
     _ = registry;
     _ = http;
     _ = retry;
+    _ = error_map;
     _ = log;
     _ = providers.faux;
     _ = providers.anthropic;

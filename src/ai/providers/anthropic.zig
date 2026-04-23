@@ -638,21 +638,13 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 
     if (@intFromEnum(result.status) >= 400) {
         try ctx.out.push(ctx.io, .start);
-        const code: errors.Code = switch (@intFromEnum(result.status)) {
-            400 => .request_invalid,
-            401, 403 => .auth,
-            404 => .model_unavailable,
-            408, 504 => .timeout,
-            413 => .payload_too_large,
-            429 => .rate_limited,
-            500, 502, 503 => .transient,
-            else => .internal,
-        };
-        ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
-            .code = code,
-            .message = try ctx.allocator.dupe(u8, response_body),
-            .http_status = @intFromEnum(result.status),
-        } });
+        const details = try @import("../error_map.zig").mapError(
+            ctx.allocator,
+            .anthropic,
+            @intFromEnum(result.status),
+            response_body,
+        );
+        ctx.out.closeWithFinal(ctx.io, .{ .error_ev = details });
         return;
     }
 
