@@ -1,0 +1,162 @@
+//! Error taxonomy — §F of the spec.
+//!
+//! A single discriminated error type for every production of an error:
+//! stream events, tool results, CLI exits. Names are canonical and stable.
+//!
+//! Rich context lives in `ErrorDetails`, not in the Zig error itself;
+//! streams carry ErrorDetails in their terminal error event.
+
+const std = @import("std");
+
+/// Canonical error codes. Retryability shown in §F.
+pub const Code = enum {
+    // client
+    auth,
+    request_invalid,
+    model_unavailable,
+    context_overflow,
+    payload_too_large,
+    // server (retryable)
+    rate_limited,
+    rate_limited_hard,
+    transient,
+    timeout,
+    // network
+    transport,
+    // model
+    safety_refusal,
+    // caller
+    aborted,
+    // tool
+    tool_arg_validation,
+    tool_runtime,
+    tool_blocked,
+    // internal
+    protocol_violation,
+    internal,
+
+    pub fn isRetryable(self: Code) bool {
+        return switch (self) {
+            .rate_limited, .transient, .timeout, .transport => true,
+            else => false,
+        };
+    }
+
+    pub fn toString(self: Code) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// Zig error set — one global set for the whole library.
+///
+/// Matches §N.3: individual codes live in `Code`; the zig errors here are
+/// compact tags plus `OutOfMemory`.
+pub const AgentError = error{
+    Auth,
+    RequestInvalid,
+    ModelUnavailable,
+    ContextOverflow,
+    PayloadTooLarge,
+    RateLimited,
+    RateLimitedHard,
+    Transient,
+    Timeout,
+    Transport,
+    SafetyRefusal,
+    Aborted,
+    ToolArgValidation,
+    ToolRuntime,
+    ToolBlocked,
+    ProtocolViolation,
+    Internal,
+    OutOfMemory,
+};
+
+/// Rich error context attached to events/results/results, not to zig errors.
+///
+/// `message` and the optional string fields are caller-arena-owned: the
+/// channel/stream that carries the ErrorDetails is responsible for the
+/// backing memory.
+pub const ErrorDetails = struct {
+    code: Code,
+    message: []const u8,
+    /// Sub-code: e.g., `edit_no_match`, `path_escape_workspace`.
+    tool_code: ?[]const u8 = null,
+    provider_code: ?[]const u8 = null,
+    provider_message: ?[]const u8 = null,
+    http_status: ?u16 = null,
+    retry_after_ms: ?u64 = null,
+
+    pub fn toError(self: ErrorDetails) AgentError {
+        return switch (self.code) {
+            .auth => error.Auth,
+            .request_invalid => error.RequestInvalid,
+            .model_unavailable => error.ModelUnavailable,
+            .context_overflow => error.ContextOverflow,
+            .payload_too_large => error.PayloadTooLarge,
+            .rate_limited => error.RateLimited,
+            .rate_limited_hard => error.RateLimitedHard,
+            .transient => error.Transient,
+            .timeout => error.Timeout,
+            .transport => error.Transport,
+            .safety_refusal => error.SafetyRefusal,
+            .aborted => error.Aborted,
+            .tool_arg_validation => error.ToolArgValidation,
+            .tool_runtime => error.ToolRuntime,
+            .tool_blocked => error.ToolBlocked,
+            .protocol_violation => error.ProtocolViolation,
+            .internal => error.Internal,
+        };
+    }
+
+    /// Deep-copy the details struct (and owned strings) into `allocator`.
+    /// Returned ErrorDetails owns its strings from that allocator.
+    pub fn dupe(self: ErrorDetails, allocator: std.mem.Allocator) !ErrorDetails {
+        return .{
+            .code = self.code,
+            .message = try allocator.dupe(u8, self.message),
+            .tool_code = try dupeOpt(allocator, self.tool_code),
+            .provider_code = try dupeOpt(allocator, self.provider_code),
+            .provider_message = try dupeOpt(allocator, self.provider_message),
+            .http_status = self.http_status,
+            .retry_after_ms = self.retry_after_ms,
+        };
+    }
+
+    fn dupeOpt(allocator: std.mem.Allocator, s: ?[]const u8) !?[]const u8 {
+        if (s) |v| return try allocator.dupe(u8, v);
+        return null;
+    }
+};
+
+test "Code.isRetryable" {
+    try std.testing.expect(Code.rate_limited.isRetryable());
+    try std.testing.expect(Code.transient.isRetryable());
+    try std.testing.expect(!Code.auth.isRetryable());
+    try std.testing.expect(!Code.aborted.isRetryable());
+    try std.testing.expect(!Code.rate_limited_hard.isRetryable());
+}
+
+test "ErrorDetails.toError maps codes" {
+    const d: ErrorDetails = .{ .code = .auth, .message = "bad key" };
+    try std.testing.expectError(error.Auth, @as(AgentError!void, d.toError()));
+}
+
+test "ErrorDetails.dupe owns memory" {
+    const gpa = std.testing.allocator;
+    const src: ErrorDetails = .{
+        .code = .rate_limited,
+        .message = "slow down",
+        .provider_code = "rate_limit_exceeded",
+        .http_status = 429,
+        .retry_after_ms = 2000,
+    };
+    const dst = try src.dupe(gpa);
+    defer {
+        gpa.free(dst.message);
+        if (dst.provider_code) |v| gpa.free(v);
+    }
+    try std.testing.expectEqualStrings("slow down", dst.message);
+    try std.testing.expectEqualStrings("rate_limit_exceeded", dst.provider_code.?);
+    try std.testing.expectEqual(@as(?u16, 429), dst.http_status);
+}

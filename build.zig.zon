@@ -1,0 +1,13 @@
+.{
+    .name = .franky,
+    .fingerprint = 0x827ef3f35d829231,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0-dev",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "test",
+    },
+}
