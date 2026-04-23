@@ -43,14 +43,14 @@ Status of each section against the code in `franky/src/` as of 2026-04-23. Legen
 | 8.1 | Slack bot | ❌ | Not ported |
 | 8.2 | Pods CLI | ❌ | Not ported |
 | 9 | Cross-cutting patterns | 🟡 | Registry/streams/errors-as-events/persistence all honored |
-| 10 | Testing strategy | 🟡 | 168 tests passing (159 unit via `src/root.zig` aggregator + 3 `test/agent_loop_test.zig` + 3 `test/agent_class_test.zig` + 3 `test/gitignore_test.zig`); faux backbone ✓ |
+| 10 | Testing strategy | 🟡 | 177 tests passing (168 unit via `src/root.zig` aggregator + 3 `test/agent_loop_test.zig` + 3 `test/agent_class_test.zig` + 3 `test/gitignore_test.zig`); faux backbone ✓ |
 | 11 | Operational rules | ✅ | |
 | 12 | Implementation details | 🟡 | Partial-JSON ✓; migrations/compaction deferred |
 | 13 | Preserve vs reconsider | — | Guidance |
 | 14 | Glossary | — | Reference |
 | A.1 | SSE framing | ✅ | `src/ai/sse.zig`, 16 tests |
 | A.2 | Anthropic Messages | ✅ | `src/ai/providers/anthropic.zig`; API-key + OAuth-bearer paths (fingerprinted system prefix + headers — see §A.2.1) |
-| A.3 | OpenAI Chat | ❌ | Deferred |
+| A.3 | OpenAI Chat | ✅ | `src/ai/providers/openai_chat.zig`; request serialization + SSE translation + `[DONE]` sentinel + reasoning_effort mapping via §B; registered in print mode under `--provider openai` with `OPENAI_API_KEY` / `--api-key` |
 | A.4 | OpenAI Responses | ❌ | Deferred |
 | A.5 | Google / Vertex | ❌ | Deferred |
 | A.6 | OpenAI-compatible gateways | ❌ | Deferred |

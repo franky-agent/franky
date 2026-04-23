@@ -467,7 +467,7 @@ const Driver = struct {
 
 fn mapFinishReason(s: []const u8) ?types.StopReason {
     if (std.mem.eql(u8, s, "stop")) return .stop;
-    if (std.mem.eql(u8, s, "length")) return .max_tokens;
+    if (std.mem.eql(u8, s, "length")) return .length;
     if (std.mem.eql(u8, s, "tool_calls")) return .tool_use;
     if (std.mem.eql(u8, s, "function_call")) return .tool_use;
     if (std.mem.eql(u8, s, "content_filter")) return .refusal;
@@ -576,12 +576,11 @@ fn testIo() std.Io.Threaded {
 
 test "buildRequestJson: system prompt + user text + model + stream flag" {
     const gpa = testing.allocator;
+    var user_content = [_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }};
+    var msgs = [_]types.Message{.{ .role = .user, .content = &user_content, .timestamp = 0 }};
     const ctx: types.Context = .{
         .system_prompt = "You are a helpful assistant.",
-        .messages = &.{.{
-            .role = .user,
-            .content = &.{.{ .text = .{ .text = "Hello" } }},
-        }},
+        .messages = &msgs,
         .tools = &.{},
     };
     const model: types.Model = .{ .id = "gpt-5", .provider = "openai", .api = "openai-chat-completions" };
@@ -599,9 +598,11 @@ test "buildRequestJson: system prompt + user text + model + stream flag" {
 
 test "buildRequestJson: reasoning_effort mapped via §B" {
     const gpa = testing.allocator;
+    var uc = [_]types.ContentBlock{.{ .text = .{ .text = "hi" } }};
+    var msgs = [_]types.Message{.{ .role = .user, .content = &uc, .timestamp = 0 }};
     const ctx: types.Context = .{
         .system_prompt = "",
-        .messages = &.{.{ .role = .user, .content = &.{.{ .text = .{ .text = "hi" } }} }},
+        .messages = &msgs,
         .tools = &.{},
     };
     const model: types.Model = .{ .id = "gpt-5-thinking", .provider = "openai", .api = "openai-chat-completions" };
@@ -627,10 +628,13 @@ test "buildRequestJson: tool schema under function wrapper" {
         .description = "look up the weather",
         .parameters_json = "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}",
     };
+    var uc2 = [_]types.ContentBlock{.{ .text = .{ .text = "?" } }};
+    var msgs2 = [_]types.Message{.{ .role = .user, .content = &uc2, .timestamp = 0 }};
+    var tools_arr = [_]types.Tool{tool};
     const ctx: types.Context = .{
         .system_prompt = "",
-        .messages = &.{.{ .role = .user, .content = &.{.{ .text = .{ .text = "?" } }} }},
-        .tools = &.{tool},
+        .messages = &msgs2,
+        .tools = &tools_arr,
     };
     const model: types.Model = .{ .id = "gpt-5", .provider = "openai", .api = "openai-chat-completions" };
     const body = try buildRequestJson(gpa, model, ctx, .{});
@@ -643,24 +647,17 @@ test "buildRequestJson: tool schema under function wrapper" {
 
 test "buildRequestJson: assistant-with-tool_calls serializes tool_calls array" {
     const gpa = testing.allocator;
-    const msgs = [_]types.Message{
-        .{
-            .role = .user,
-            .content = &.{.{ .text = .{ .text = "weather in SF?" } }},
-        },
-        .{
-            .role = .assistant,
-            .content = &.{.{ .tool_call = .{
-                .id = "call_1",
-                .name = "get_weather",
-                .arguments_json = "{\"city\":\"SF\"}",
-            } }},
-        },
-        .{
-            .role = .tool_result,
-            .tool_call_id = "call_1",
-            .content = &.{.{ .text = .{ .text = "72F and sunny" } }},
-        },
+    var user_c = [_]types.ContentBlock{.{ .text = .{ .text = "weather in SF?" } }};
+    var asst_c = [_]types.ContentBlock{.{ .tool_call = .{
+        .id = "call_1",
+        .name = "get_weather",
+        .arguments_json = "{\"city\":\"SF\"}",
+    } }};
+    var tr_c = [_]types.ContentBlock{.{ .text = .{ .text = "72F and sunny" } }};
+    var msgs = [_]types.Message{
+        .{ .role = .user, .content = &user_c, .timestamp = 0 },
+        .{ .role = .assistant, .content = &asst_c, .timestamp = 0 },
+        .{ .role = .tool_result, .tool_call_id = "call_1", .content = &tr_c, .timestamp = 0 },
     };
     const ctx: types.Context = .{ .system_prompt = "", .messages = &msgs, .tools = &.{} };
     const model: types.Model = .{ .id = "gpt-5", .provider = "openai", .api = "openai-chat-completions" };
@@ -799,7 +796,7 @@ test "runFromSse: content_filter → refusal stop_reason" {
 
 test "mapFinishReason covers all documented variants" {
     try testing.expectEqual(@as(?types.StopReason, .stop), mapFinishReason("stop"));
-    try testing.expectEqual(@as(?types.StopReason, .max_tokens), mapFinishReason("length"));
+    try testing.expectEqual(@as(?types.StopReason, .length), mapFinishReason("length"));
     try testing.expectEqual(@as(?types.StopReason, .tool_use), mapFinishReason("tool_calls"));
     try testing.expectEqual(@as(?types.StopReason, .tool_use), mapFinishReason("function_call"));
     try testing.expectEqual(@as(?types.StopReason, .refusal), mapFinishReason("content_filter"));

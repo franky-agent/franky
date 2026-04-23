@@ -17,6 +17,12 @@ pub const log = @import("log.zig");
 pub const providers = struct {
     pub const faux = @import("providers/faux.zig");
     pub const anthropic = @import("providers/anthropic.zig");
+    pub const openai_chat = @import("providers/openai_chat.zig");
+    // TODO(gemini): src/ai/providers/gemini.zig is WIP (uses undeclared
+    // `appendJsonStr`, has unused params). Re-enable this import once the
+    // file compiles; the roadmap's v0.8.1 Google GenAI milestone will pick
+    // it up. Leaving it in the struct today blocks all tests.
+    // pub const gemini = @import("providers/gemini.zig");
 };
 
 test {
@@ -32,4 +38,7 @@ test {
     _ = log;
     _ = providers.faux;
     _ = providers.anthropic;
+    // Direct import avoids forcing the `providers` aggregator to
+    // analyze WIP siblings (gemini.zig) while this file tests.
+    _ = @import("providers/openai_chat.zig");
 }

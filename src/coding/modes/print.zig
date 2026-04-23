@@ -131,6 +131,11 @@ fn runPrint(
         .provider = "anthropic",
         .stream_fn = ai.providers.anthropic.streamFn,
     });
+    try reg.register(.{
+        .api = "openai-chat-completions",
+        .provider = "openai",
+        .stream_fn = ai.providers.openai_chat.streamFn,
+    });
 
     // If we're running the faux provider, seed a scripted response so the
     // demo stays self-contained without an API key. The allocations below
@@ -376,12 +381,23 @@ fn resolveProvider(
         if (environ.getPosix("CLAUDE_CODE_OAUTH_TOKEN")) |t| break :blk try a.dupe(u8, t);
         break :blk null;
     };
+    // OpenAI credential is tracked separately — `--api-key` double-binds
+    // to the Anthropic lookup first for back-compat, so the OpenAI env
+    // var is the primary path; users can still pass `--api-key` with
+    // `--provider openai` and it routes through here when the Anthropic
+    // branch doesn't claim it.
+    const openai_api_key: ?[]const u8 = blk: {
+        if (environ.getPosix("OPENAI_API_KEY")) |k| break :blk try a.dupe(u8, k);
+        break :blk null;
+    };
 
     const has_anthropic_credential = api_key != null or auth_token != null;
+    const has_openai_credential = openai_api_key != null or (cfg.api_key != null and !has_anthropic_credential);
 
     const chosen: []const u8 = blk: {
         if (cfg.provider) |p| break :blk p;
         if (has_anthropic_credential) break :blk "anthropic";
+        if (has_openai_credential) break :blk "openai";
         break :blk "faux";
     };
 
@@ -416,7 +432,25 @@ fn resolveProvider(
         };
     }
 
-    const msg = try std.fmt.allocPrint(allocator, "unknown --provider '{s}'; use faux or anthropic\n", .{chosen});
+    if (std.mem.eql(u8, chosen, "openai")) {
+        const effective_key: ?[]const u8 = openai_api_key orelse cfg.api_key;
+        if (effective_key == null) {
+            const msg = "openai provider requires --api-key or OPENAI_API_KEY\n";
+            return exitWithMessageErr(allocator, msg, 2);
+        }
+        const model = cfg.model orelse try a.dupe(u8, "gpt-5");
+        return .{
+            .provider_name = "openai",
+            .api_tag = "openai-chat-completions",
+            .model_id = model,
+            .api_key = effective_key,
+            .auth_token = null,
+            .context_window = default_context_window,
+            .max_output = default_max_output,
+        };
+    }
+
+    const msg = try std.fmt.allocPrint(allocator, "unknown --provider '{s}'; use faux, anthropic, or openai\n", .{chosen});
     defer allocator.free(msg);
     return exitWithMessageErr(allocator, msg, 2);
 }
