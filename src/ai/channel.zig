@@ -179,6 +179,31 @@ pub fn Channel(comptime T: type) type {
                 self.not_empty.waitUncancelable(io, &self.mutex);
             }
         }
+
+        /// Non-blocking take — for consumers that need to interleave
+        /// channel drain with other inputs (e.g. keyboard polling in
+        /// interactive mode).
+        ///
+        /// Returns:
+        ///   * `.event` — a real event was dequeued.
+        ///   * `.empty` — no event is currently available but the channel
+        ///               is still open; the caller should poll again later.
+        ///   * `.closed` — the channel is closed AND empty; no further
+        ///                 events will arrive.
+        pub const TryResult = union(enum) { event: T, empty, closed };
+
+        pub fn tryNext(self: *Self, io: std.Io) TryResult {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.len > 0) {
+                const ev = self.ring[self.head];
+                self.head = (self.head + 1) % self.capacity;
+                self.len -= 1;
+                self.not_full.signal(io);
+                return .{ .event = ev };
+            }
+            return if (self.closed) .closed else .empty;
+        }
     };
 }
 
@@ -236,6 +261,27 @@ test "push after close errors" {
     ch.close(io);
     try std.testing.expectError(error.Closed, ch.push(io, 1));
     try std.testing.expectEqual(@as(?u32, null), ch.next(io));
+}
+
+test "tryNext reports empty / event / closed without blocking" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = std.testing.allocator;
+    var ch = try Channel(u32).init(gpa, 2);
+    defer ch.deinit();
+
+    // Empty open channel → .empty.
+    try std.testing.expect(ch.tryNext(io) == .empty);
+
+    try ch.push(io, 7);
+    const r = ch.tryNext(io);
+    try std.testing.expect(r == .event and r.event == 7);
+    try std.testing.expect(ch.tryNext(io) == .empty);
+
+    ch.close(io);
+    try std.testing.expect(ch.tryNext(io) == .closed);
 }
 
 test "closeWithFinal is idempotent" {

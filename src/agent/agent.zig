@@ -60,6 +60,18 @@ pub const Agent = struct {
     // ── error channel ─────────────────────────────────────────────
     last_error: ?ai.errors.ErrorDetails = null,
 
+    // ── steer / followUp queues (§4.3) ────────────────────────────
+    // `pending_steer` holds user-role messages that should be
+    // injected *before* the next LLM call inside the in-flight
+    // turn. `pending_followup` holds user-role messages that run as
+    // a *fresh* prompt once the current turn ends naturally — does
+    // not abort. Both queues are drained by the loop at their
+    // respective boundaries (wiring pending; §4.3 full integration
+    // folds into the loop's next major pass).
+    pending_steer: std.ArrayList([]u8) = .empty,
+    pending_followup: std.ArrayList([]u8) = .empty,
+    queue_mutex: std.Io.Mutex = .init,
+
     pub const Config = struct {
         model: ai.types.Model,
         system_prompt: []const u8 = "",
@@ -90,6 +102,10 @@ pub const Agent = struct {
         self.allocator.free(self.system_prompt);
         self.allocator.free(self.tools);
         self.subs.deinit(self.allocator);
+        for (self.pending_steer.items) |m| self.allocator.free(m);
+        self.pending_steer.deinit(self.allocator);
+        for (self.pending_followup.items) |m| self.allocator.free(m);
+        self.pending_followup.deinit(self.allocator);
         if (self.last_error) |d| {
             self.allocator.free(d.message);
             if (d.tool_code) |v| self.allocator.free(v);
@@ -195,6 +211,69 @@ pub const Agent = struct {
 
     pub fn setThinking(self: *Agent, level: ai.types.ThinkingLevel) void {
         self.thinking_level = level;
+    }
+
+    // ── v0.9.0 steer / v0.9.1 followUp ────────────────────────────
+
+    /// Queue a steering message. §4.3 semantics: the loop drains the
+    /// queue at the next tool-results boundary *inside the current
+    /// turn*, prepending every queued entry as a user-role message
+    /// before the next LLM call. Callable while streaming; returns
+    /// immediately.
+    pub fn steer(self: *Agent, text: []const u8) !void {
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        const owned = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned);
+        try self.pending_steer.append(self.allocator, owned);
+    }
+
+    /// Queue a follow-up message. §4.3 semantics: the loop drains
+    /// the queue *after* the current turn ends naturally (not
+    /// aborted) and fires each entry as a fresh `prompt`. Callable
+    /// while streaming.
+    pub fn followUp(self: *Agent, text: []const u8) !void {
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        const owned = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned);
+        try self.pending_followup.append(self.allocator, owned);
+    }
+
+    /// Drain the steer queue into an owned slice. Caller frees
+    /// each entry + the slice. Used by the loop integration.
+    pub fn drainSteerQueue(self: *Agent) ![][]u8 {
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        const items = try self.allocator.alloc([]u8, self.pending_steer.items.len);
+        for (self.pending_steer.items, 0..) |m, i| items[i] = m;
+        self.pending_steer.clearRetainingCapacity();
+        return items;
+    }
+
+    /// Drain the followUp queue into an owned slice. Same contract
+    /// as `drainSteerQueue`.
+    pub fn drainFollowUpQueue(self: *Agent) ![][]u8 {
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        const items = try self.allocator.alloc([]u8, self.pending_followup.items.len);
+        for (self.pending_followup.items, 0..) |m, i| items[i] = m;
+        self.pending_followup.clearRetainingCapacity();
+        return items;
+    }
+
+    /// Convenience accessors for tests + UIs that want to peek
+    /// without draining.
+    pub fn pendingSteerCount(self: *Agent) usize {
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        return self.pending_steer.items.len;
+    }
+
+    pub fn pendingFollowUpCount(self: *Agent) usize {
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        return self.pending_followup.items.len;
     }
 
     // ── worker ────────────────────────────────────────────────────

@@ -20,11 +20,8 @@ pub const providers = struct {
     pub const anthropic = @import("providers/anthropic.zig");
     pub const openai_chat = @import("providers/openai_chat.zig");
     pub const openai_gateway = @import("providers/openai_gateway.zig");
-    // TODO(gemini): src/ai/providers/gemini.zig is WIP (uses undeclared
-    // `appendJsonStr`, has unused params). Re-enable this import once the
-    // file compiles; the roadmap's v0.8.1 Google GenAI milestone will pick
-    // it up. Leaving it in the struct today blocks all tests.
-    // pub const gemini = @import("providers/gemini.zig");
+    pub const openai_responses = @import("providers/openai_responses.zig");
+    pub const google_gemini = @import("providers/google_gemini.zig");
 };
 
 test {
@@ -45,4 +42,7 @@ test {
     // analyze WIP siblings (gemini.zig) while this file tests.
     _ = @import("providers/openai_chat.zig");
     _ = @import("providers/openai_gateway.zig");
+    _ = @import("providers/openai_responses.zig");
+    _ = @import("providers/google_gemini.zig");
+    _ = @import("providers/google_vertex.zig");
 }

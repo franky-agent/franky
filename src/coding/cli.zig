@@ -55,6 +55,34 @@ pub const Config = struct {
     show_help: bool = false,
     show_version: bool = false,
 
+    // ── v0.10.0 extended flags ────────────────────────────────────
+    /// `--continue` — resume the most-recent session for the current
+    /// `--session-dir`. `--resume <id>` keeps working too.
+    continue_session: bool = false,
+    /// `--fork <name>` — create a new branch at the current head
+    /// before appending the prompt. Requires the v0.6.2 branching
+    /// integration to actually take effect.
+    fork_branch: ?[]const u8 = null,
+    /// `--export <format>` — dump the active transcript and exit.
+    /// Accepted values: `markdown`, `json`.
+    export_format: ?[]const u8 = null,
+    /// `--tools <list>` — comma-separated tool name subset;
+    /// everything else is disabled for this run.
+    tools_filter: ?[]const u8 = null,
+    /// `--skills <dir>` — load a skill bundle (§5.8). Multi-value
+    /// future; one path today.
+    skills_path: ?[]const u8 = null,
+    /// `--prompts <dir>` — root for `/template <name>` lookups.
+    prompts_dir: ?[]const u8 = null,
+    /// `--themes <name>` — TUI theme; no-op until the TUI ships.
+    theme: ?[]const u8 = null,
+    /// `--offline` — hard-select the faux provider even when a
+    /// real key is available. Useful for reproducible tests.
+    offline: bool = false,
+    /// `--extensions <list>` — comma-separated extension names
+    /// opt-in once the Tier-1 loader ships (v0.10.4).
+    extensions: ?[]const u8 = null,
+
     /// Concatenated positional args — the user's prompt.
     prompt: []const u8 = "",
 
@@ -169,6 +197,24 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.session_dir = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--resume")) {
             cfg.resume_id = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--continue")) {
+            cfg.continue_session = true;
+        } else if (std.mem.eql(u8, name, "--fork")) {
+            cfg.fork_branch = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--export")) {
+            cfg.export_format = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--tools")) {
+            cfg.tools_filter = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--skills")) {
+            cfg.skills_path = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--prompts")) {
+            cfg.prompts_dir = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--themes") or std.mem.eql(u8, name, "--theme")) {
+            cfg.theme = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--offline")) {
+            cfg.offline = true;
+        } else if (std.mem.eql(u8, name, "--extensions")) {
+            cfg.extensions = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--mode")) {
             const v = try take_value(argv, &i, inline_value);
             if (std.mem.eql(u8, v, "print")) cfg.mode = .print
@@ -232,6 +278,15 @@ pub const usage_text: []const u8 =
     \\  --resume ID                  Resume a prior session (implies --session)
     \\  --no-session                 Do not persist this run
     \\  --mode MODE                  print [interactive,rpc deferred]
+    \\  --continue                   Resume the most-recent session in session-dir
+    \\  --fork NAME                  Fork a new branch at the current head (§5.1)
+    \\  --export FORMAT              Dump transcript (markdown|json) and exit
+    \\  --tools LIST                 Comma-separated tool subset for this run
+    \\  --skills PATH                Load a skill bundle (§5.8)
+    \\  --prompts DIR                Root for /template <name> lookups
+    \\  --theme NAME                 TUI theme (no-op until TUI ships)
+    \\  --offline                    Force faux provider even when a key is set
+    \\  --extensions LIST            Opt in Tier-1 extensions (§5.4/§N.4)
     \\  --verbose                    Extra logging to stderr
     \\  -h, --help                   Show this help
     \\      --version                Print version and exit
@@ -339,4 +394,67 @@ test "parse: positional after --" {
     defer cfg.deinit();
     try testing.expectEqualStrings("--provider anthropic", cfg.prompt);
     try testing.expect(cfg.provider == null);
+}
+
+// ─── v0.10.0 extended flags ──────────────────────────────────────
+
+test "parse: --continue sets the flag" {
+    var cfg = try parse(testing.allocator, &.{ "franky", "--continue" });
+    defer cfg.deinit();
+    try testing.expect(cfg.continue_session);
+}
+
+test "parse: --fork captures the branch name" {
+    var cfg = try parse(testing.allocator, &.{ "franky", "--fork", "experiment" });
+    defer cfg.deinit();
+    try testing.expectEqualStrings("experiment", cfg.fork_branch.?);
+}
+
+test "parse: --export + --offline combined" {
+    var cfg = try parse(testing.allocator, &.{
+        "franky",
+        "--export", "markdown",
+        "--offline",
+    });
+    defer cfg.deinit();
+    try testing.expectEqualStrings("markdown", cfg.export_format.?);
+    try testing.expect(cfg.offline);
+}
+
+test "parse: --tools + --skills + --prompts + --extensions" {
+    var cfg = try parse(testing.allocator, &.{
+        "franky",
+        "--tools",      "read,grep",
+        "--skills",     "/tmp/skills",
+        "--prompts",    "/tmp/prompts",
+        "--extensions", "fmt,linter",
+    });
+    defer cfg.deinit();
+    try testing.expectEqualStrings("read,grep", cfg.tools_filter.?);
+    try testing.expectEqualStrings("/tmp/skills", cfg.skills_path.?);
+    try testing.expectEqualStrings("/tmp/prompts", cfg.prompts_dir.?);
+    try testing.expectEqualStrings("fmt,linter", cfg.extensions.?);
+}
+
+test "parse: --theme accepts both --theme and --themes spelling" {
+    var a = try parse(testing.allocator, &.{ "franky", "--theme", "dark" });
+    defer a.deinit();
+    var b = try parse(testing.allocator, &.{ "franky", "--themes", "light" });
+    defer b.deinit();
+    try testing.expectEqualStrings("dark", a.theme.?);
+    try testing.expectEqualStrings("light", b.theme.?);
+}
+
+test "parse: every v0.10.0 flag defaults to null/false" {
+    var cfg = try parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    try testing.expect(!cfg.continue_session);
+    try testing.expect(cfg.fork_branch == null);
+    try testing.expect(cfg.export_format == null);
+    try testing.expect(cfg.tools_filter == null);
+    try testing.expect(cfg.skills_path == null);
+    try testing.expect(cfg.prompts_dir == null);
+    try testing.expect(cfg.theme == null);
+    try testing.expect(!cfg.offline);
+    try testing.expect(cfg.extensions == null);
 }

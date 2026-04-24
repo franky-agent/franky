@@ -6,53 +6,53 @@ A language-agnostic specification of the `franky-mono` codebase, extracted for p
 
 ## Implementation status — `franky` Zig port
 
-Status of each section against the code in `franky/src/` as of 2026-04-23. Legend: **✅ DONE** — implemented and tested; **🟡 PARTIAL** — partial or missing sub-items; **❌ MISSING** — not implemented; **—** non-normative (overview / guidance / glossary / not-applicable to Zig native target).
+Status of each section against the code in `franky/src/` as of 2026-04-24 (through v0.12.3). Legend: **✅ DONE** — implemented and tested; **🟡 PARTIAL** — partial or missing sub-items; **❌ MISSING** — not implemented; **—** non-normative (overview / guidance / glossary / not-applicable to Zig native target).
 
 | § | Title | Status | Notes |
 |---|---|---|---|
 | 1 | What franky-mono is | — | Overview |
-| 2 | Package topology | 🟡 | Single-module Zig layout; `ai`, `agent`, `coding` present; `tui`/`web-ui`/`mom`/`pods` not ported |
-| 3.1 | Purpose (unified LLM API) | 🟡 | Faux + Anthropic; OpenAI/Google/etc. deferred |
+| 2 | Package topology | 🟡 | Single-module Zig layout; `ai`, `agent`, `coding`, `tui` all present; `web-ui`/`mom`/`pods` explicitly post-1.0 per §O |
+| 3.1 | Purpose (unified LLM API) | ✅ | All seven providers shipped: `faux`, `anthropic`, `openai_chat`, `openai_responses`, `openai_gateway`, `google_gemini`, `google_vertex`. Registry dispatch working in print + interactive modes |
 | 3.2 | Core data types | ✅ | `src/ai/types.zig` |
 | 3.3 | API registry | ✅ | `src/ai/registry.zig` |
 | 3.4 | Stream contract | ✅ | `src/ai/stream.zig` with ordering invariants |
 | 3.5 | Shared stream options | 🟡 | Core options + `auth_token` (bearer) + `environ_map` (proxy); `onPayload`/`onResponse` hooks deferred |
 | 3.6 | Cross-provider handoff | 🟡 | Neutral types present; transform pipeline deferred |
-| 3.7 | Models catalog | ❌ | No `models.generated.zig` |
-| 3.8 | Auth & OAuth | 🟡 | API-key + OAuth-bearer consumption (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_AUTH_TOKEN`) live with Claude Code fingerprint; OAuth _minting_ flows deferred |
+| 3.7 | Models catalog | 🟡 | Built-in Entry[] + lookup + JSON parse in `src/coding/models.zig`; auto-regen from an external source pending |
+| 3.8 | Auth & OAuth | 🟡 | API-key + OAuth-bearer consumption (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_AUTH_TOKEN`) live with Claude Code fingerprint. OAuth _minting_ wire-format codecs complete (§Q.1–Q.4, v0.12.0–v0.12.3); what remains is the transport orchestrator (`franky login` + loopback listener + HTTP POST + §Q.5 resolver-refresh) |
 | 3.9 | Faux provider | ✅ | `src/ai/providers/faux.zig` |
 | 3.10 | Browser safety | — | Native Zig binary only |
 | 4.1 | Agent runtime purpose | ✅ | |
 | 4.2 | AgentMessage superset | ✅ | Custom role + `convertToLlm` |
-| 4.3 | Agent loop | 🟡 | Sequential mode; `steer`/`followUp` deferred |
+| 4.3 | Agent loop | 🟡 | Sequential mode; `Agent.steer(text)` + `Agent.followUp(text)` queue commands ship in `src/agent/agent.zig` (v0.9.0/v0.9.1) with `pendingSteerCount` / `drainSteerQueue` + `pendingFollowUpCount` / `drainFollowUpQueue`. Loop-side integration (drain at tool-results boundary for steer, drain at turn_end for followUp) is the remaining wiring |
 | 4.4 | Parallel tool execution | 🟡 | `runToolsParallel` in `src/agent/loop.zig` spawns one native thread per call when every tool in a turn is `.parallel`; else sequential fallback preserved. Integration test `test/parallel_tools_test.zig` proves 3-tool wall-time drops from ≥180ms to ~60ms with overlap-invariant assertion, and v0.5.1's cancel-mid-batch test verifies cancellation propagates to every in-flight worker via the shared `Cancel` flag. Completion-order events remain deferred (scheduler joins in source order) |
-| 4.5 | Tools | 🟡 | `execution_mode: ExecutionMode` field live on `AgentTool` (`src/agent/types.zig`) and set on every built-in tool (read/grep/ls/find = `.parallel`; bash/write/edit = `.sequential`). Loop dispatcher is still sequential until §4.4 lands — the field is declared-but-unenforced |
+| 4.5 | Tools | ✅ | `execution_mode: ExecutionMode` field live on `AgentTool` (`src/agent/types.zig`) and enforced by the loop dispatcher (v0.5.0/v0.5.1): read/grep/ls/find = `.parallel` (run concurrently when homogeneous), bash/write/edit = `.sequential` |
 | 4.6 | Agent class | ✅ | `src/agent/agent.zig` |
-| 4.7 | streamProxy | ❌ | Deferred (web-ui/mom not ported) |
-| 5.1 | AgentSession orchestrator | 🟡 | Auto-persistence wired; branching/compaction deferred |
+| 4.7 | streamProxy | 🟡 | `src/agent/proxy.zig` ships the serialization layer: `encodeEventJson(ev)` renders every `AgentEvent` variant as a JSON payload; `writeEvent(writer, ev)` wraps it in SSE framing. HTTP listener binding is pending `std.Io.net` stabilization in Zig 0.17-dev |
+| 5.1 | AgentSession orchestrator | 🟡 | Auto-persistence wired. Branching primitives live in `src/coding/branching.zig` (`Tree`/`Branch`/`fork`/`switchTo`/`appendOnActive`/`isForkLegal`). Transcript-level fork-and-switch integration + `tree.json` round-trip pending the wiring pass; compaction ships in v0.6.3 |
 | 5.2 | Built-in tools | ✅ | read/write/edit/bash/ls/find/grep all live; `ls`/`find` honor `.gitignore` via `src/coding/gitignore.zig`; `grep` regex engine via `src/coding/regex.zig` |
 | 5.3 | Sessions on disk | 🟡 | ULID + atomic round-trip + resume wired into print mode; branching/objects scaffolded |
-| 5.4 | Extension system | ❌ | Registries are the extension points; no loader |
-| 5.5 | Run modes | 🟡 | Print mode ✓; Interactive/RPC deferred |
-| 5.6 | CLI arguments | 🟡 | Core flag set (`--provider/--model/--api-key/--system-prompt/--append-system-prompt/--thinking/--session/--session-dir/--resume/--no-session/--mode/--verbose/--help/--version`) ✓; `--continue/--fork/--extensions/--tools/--skills/--prompts/--themes/--export/--offline` deferred |
-| 5.7 | Settings | ❌ | Schema defined; loader deferred |
-| 5.8 | Prompt templates & skills | ❌ | Deferred |
+| 5.4 | Extension system | 🟡 | Tier-1 static-module loader in `src/coding/extensions.zig`: `Manager`, `Extension`, `Host` views for `registerCommand`/`registerTool`/`subscribe`; CSV opt-in parser. Tier-2 (`.so`/`.dylib`) and Tier-3 (Wasm) remain deferred |
+| 5.5 | Run modes | 🟡 | Print mode live. Interactive mode dispatches end-to-end as of v0.11.3 (raw-mode terminal + alt-screen + differential render + Editor/keybindings) — history nav, multi-line compose, and slash-command palette are follow-ups. RPC framer + request/response/notification serializers ship in `src/coding/rpc.zig` (v0.10.1); RPC dispatcher still pending |
+| 5.6 | CLI arguments | ✅ | Core flag set plus v0.10.0 extensions: `--continue`, `--fork`, `--export`, `--tools`, `--skills`, `--prompts`, `--theme`/`--themes`, `--offline`, `--extensions`, `--base-url`. Flag parse + defaults covered by 15 unit tests |
+| 5.7 | Settings | 🟡 | `src/coding/settings.zig` ships `loadLayered(project_dir, home_dir)` merging defaults → user → project per §5.7 precedence. Fields: `default_provider`, `default_model_{anthropic,openai}`, `thinking`, `auto_compact`, `keybindings`, `theme`. `MalformedJson` surfaces at the boundary; missing files fall through silently. CLI-on-top layer + print-mode wiring pending |
+| 5.8 | Prompt templates & skills | 🟡 | `src/coding/templates.zig` ships `expand(template, args)` (`${arg0}` + `${named}` placeholders) and `loadTemplate(dir, name)`. Skill-bundle metadata loader + print-mode `/template` integration pending |
 | 5.9 | Programmatic SDK | 🟡 | Public APIs via `root.zig`; no explicit SDK module |
-| 6 | TUI library | ❌ | `src/tui/` empty |
+| 6 | TUI library | ✅ | `src/tui/` ships `cell`, `buffer`, `region`, `text_buffer`, `key_decoder`, `diff_renderer`, `keybindings`, `editor`. Raw-terminal binding lives in `src/coding/terminal.zig` (v0.11.3) — tcgetattr/tcsetattr, alt-screen, bracketed paste, `TIOCGWINSZ`, SIGWINCH + async-signal-safe SIGINT/SIGTERM restore. Wired end-to-end through `src/coding/modes/interactive.zig` |
 | 7 | Web UI | ❌ | Not ported |
 | 8.1 | Slack bot | ❌ | Not ported |
 | 8.2 | Pods CLI | ❌ | Not ported |
 | 9 | Cross-cutting patterns | 🟡 | Registry/streams/errors-as-events/persistence all honored |
-| 10 | Testing strategy | 🟡 | 238 tests passing (227 unit via `src/root.zig` aggregator + 3 `test/agent_loop_test.zig` + 3 `test/agent_class_test.zig` + 3 `test/gitignore_test.zig` + 2 `test/parallel_tools_test.zig`); faux backbone ✓ |
+| 10 | Testing strategy | 🟡 | 494 tests passing (480 unit via `src/root.zig` aggregator + 3 `test/agent_loop_test.zig` + 6 `test/agent_class_test.zig` + 3 `test/gitignore_test.zig` + 2 `test/parallel_tools_test.zig`); faux backbone ✓ |
 | 11 | Operational rules | ✅ | |
-| 12 | Implementation details | 🟡 | Partial-JSON ✓; migrations/compaction deferred |
+| 12 | Implementation details | 🟡 | Partial-JSON ✓ (§P). Session migrations shipped (§H.5 ✅). Compaction primitives shipped (§E) with summarization + branch-checkpoint pending |
 | 13 | Preserve vs reconsider | — | Guidance |
 | 14 | Glossary | — | Reference |
 | A.1 | SSE framing | ✅ | `src/ai/sse.zig`, 16 tests |
 | A.2 | Anthropic Messages | ✅ | `src/ai/providers/anthropic.zig`; API-key + OAuth-bearer paths (fingerprinted system prefix + headers — see §A.2.1) |
 | A.3 | OpenAI Chat | ✅ | `src/ai/providers/openai_chat.zig`; request serialization + SSE translation + `[DONE]` sentinel + reasoning_effort mapping via §B; registered in print mode under `--provider openai` with `OPENAI_API_KEY` / `--api-key` |
-| A.4 | OpenAI Responses | ❌ | Deferred |
-| A.5 | Google / Vertex | ❌ | Deferred |
+| A.4 | OpenAI Responses | ✅ | `src/ai/providers/openai_responses.zig`; POST /v1/responses with `input[]` items (`message`/`function_call`/`function_call_output`), tools without the nested function wrapper, `reasoning.effort` via §B, SSE translation of `output_text.delta` / `function_call_arguments.delta` / `reasoning_summary_text.delta` / `completed` / `failed`. Registered under api tag `openai-responses` |
+| A.5 | Google / Vertex | ✅ | `src/ai/providers/google_gemini.zig` (public Gemini) + `src/ai/providers/google_vertex.zig` (Vertex). Vertex re-exports Gemini's `buildRequestJson` + `runFromSse`; differs only in transport — `Bearer <access-token>` + `{region}-aiplatform.googleapis.com/v1/projects/…:streamGenerateContent`. §Q.4 JWT-minting stays in v0.12.*; this milestone accepts a pre-minted token via `auth_token` |
 | A.6 | OpenAI-compatible gateways | ✅ | `src/ai/providers/openai_gateway.zig` re-registers `openai-chat-completions` under api tag `openai-compatible-gateway`. `StreamOptions.base_url` overrides the endpoint; when set and no credential present, the `Authorization` header is skipped (local Ollama / LM Studio / vLLM paths). `--provider gateway` + `--base-url` + `--model` wired in print mode; env fallbacks `FRANKY_GATEWAY_URL` / `OPENAI_BASE_URL` / `FRANKY_GATEWAY_TOKEN` |
 | A.7 | Error normalization | ✅ | `src/ai/error_map.zig` — `mapError(allocator, provider, status, body)` implements the §A.7 status → Code table for `anthropic`, `openai`, and `openai_gateway`; extracts `error.type` + `error.message` from both provider body shapes; 400-with-context→`context_overflow` and 429-insufficient_quota→`rate_limited_hard` sub-rules live; used by both Anthropic and OpenAI providers |
 | B | Thinking-budget mapping | ✅ | Anthropic mappings live |
@@ -64,7 +64,7 @@ Status of each section against the code in `franky/src/` as of 2026-04-23. Legen
 | C.6 | find tool | ✅ | Shell glob (`*`, `**`, `?`, `[abc]`); `respectGitignore` (default `true`) drops ignored results via the same `src/coding/gitignore.zig` stack as §C.5 |
 | C.7 | grep tool | ✅ | Regex (default) or literal (`regex=false`) via `src/coding/regex.zig`. Engine supports `. * + ? \| [...] ^ $ \w \d \s` (+ negations) + non-capturing groups. Bad regex returns `grep_bad_regex` with parser position |
 | D | System prompt template | 🟡 | Minimal inline; no loader |
-| E | Compaction algorithm | ❌ | Deferred |
+| E | Compaction algorithm | 🟡 | `src/coding/compaction.zig` ships the pure-logic primitives: `estimateTokens` (§E.1 heuristic), `shouldTrigger` (none/soft/hard at 80%/92% thresholds), `selectSpan` (§E.2 — anchor + preserve first user + tail budget + pinned + orphan-tool-pair avoidance). §E.3 summarization-prompt dispatch and §E.4 branch-checkpoint / `compaction_summary` re-injection remain pending |
 | F | Error taxonomy | ✅ | `src/ai/errors.zig` |
 | F.1 | Retry policy | 🟡 | `src/ai/retry.zig` ships the §F.1 algorithm — decorrelated-jitter backoff with `base=500ms`, `max_retries=3`, `Retry-After` precedence up to cap, `rate_limited_hard` short-circuit when server-requested delay exceeds cap, cancellation short-circuit. Pure logic with `AttemptFn` + `SleepFn` callbacks; provider-side integration (wrapping `client.fetch` in the retry loop) pending |
 | F.2 | Tool vs agent errors | 🟡 | Fields ready; mapping partial |
@@ -73,24 +73,24 @@ Status of each section against the code in `franky/src/` as of 2026-04-23. Legen
 | G.3 | Cancellation | ✅ | `Cancel` atomic |
 | G.4 | Timeouts | 🟡 | `StreamOptions.timeouts: Timeouts` exposes `connect_ms`/`upload_ms`/`first_byte_ms`/`event_gap_ms` with §G.4 defaults (10s/120s/30s/60s). `event_gap_ms` is enforced inside `driveSseFromBytes` between successful event callbacks. The three request-phase deadlines are plumbed through but not yet enforced by the buffered `std.http.Client.fetch` — pending either a streaming-reads refactor or a worker-thread-with-deadline reconciliation against `std.Io.Mutex`/`Condition` |
 | G.5 | Logging & tracing | ✅ | `src/ai/log.zig` — 5 levels, atomic threshold, `--log-level`/`FRANKY_LOG`/`FRANKY_DEBUG`, trace dumps every message + HTTP body |
-| H.1 | auth.json | 🟡 | Schema; no loader |
-| H.2 | settings.json | 🟡 | Schema; no loader |
-| H.3 | models.json | 🟡 | Schema; no generator |
-| H.4 | Session format | 🟡 | Round-trip ✓; branching/objects not populated |
-| H.5 | Migrations | 🟡 | Version fields ✓; no migrators |
-| I | RPC protocol | ❌ | Deferred |
-| J | Slash commands | ❌ | Deferred |
-| K | Keybindings | ❌ | Deferred (TUI) |
-| L | TUI rendering | ❌ | Deferred |
+| H.1 | auth.json | 🟡 | `src/coding/auth.zig` reads both `apiKey` and `oauth` providers from `$FRANKY_HOME/auth.json`; exposes `resolveApiKey` / `resolveAuthToken` helpers implementing the §H.1 precedence rule (CLI > env > file). `0600` mode-check deferred — Zig 0.17-dev's `std.posix` lost `fstatat`/`fchmodat` and `std.Io.File` doesn't expose mode. Print-mode wiring pending |
+| H.2 | settings.json | 🟡 | `src/coding/settings.zig` ships `loadLayered(project_dir, home_dir)` merging defaults → user → project per §5.7 precedence. CLI-on-top layer + print-mode wiring pending (same deferred item as §5.7) |
+| H.3 | models.json | 🟡 | `src/coding/models.zig` ships the hand-curated built-in catalog (claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5, gpt-5) + `lookup(extras, id)` with override semantics + `parseFromSlice` for user-supplied `models.json`. Auto-generator build step (`zig build gen-models`) deferred |
+| H.4 | Session format | 🟡 | Round-trip ✓; `src/coding/object_store.zig` ships content-addressed object storage (SHA-256 → `<first-2>/<rest>`, 32 KiB inline threshold, idempotent rename, GC via `sweep`). Transcript-JSON `{"$ref":"sha256:…"}` emission + branch/tree.json pending v0.6.2 |
+| H.5 | Migrations | ✅ | `migrateSessionIfNeeded(allocator, io, session_dir)` in `src/coding/session.zig` runs the upgrade chain step-by-step, backs up pre-migration `session.json` as `session.json.bak`, re-emits at `current_session_version` (=3). Rejects `version > current` with `UnsupportedSessionVersion`. No-op when version matches current |
+| I | RPC protocol | 🟡 | `src/coding/rpc.zig` ships the JSON-RPC 2.0 framer: `readFrame` / `writeFrame` (LSP Content-Length framing), `parseRequest` / `encodeResponse` / `encodeNotification`. `--mode rpc` dispatcher that wires these to session state is the remaining pass |
+| J | Slash commands | 🟡 | `src/coding/slash.zig` ships parser + registry + built-in dispatch table (`/help`, `/model`, `/clear`, `/quit`) with placeholder handlers. Full handler wiring lands alongside interactive mode |
+| K | Keybindings | 🟡 | emacs + vi presets (insert + normal) live in `src/tui/keybindings.zig` with caller-supplied `overrides[]` that shadow defaults; `lookup(preset, mode, overrides, key) → Action` |
+| L | TUI rendering | ✅ | Differential renderer in `src/tui/diff_renderer.zig` — emits only changed cells, coalesces SGR, skips wide-cell sentinels. Wired through `src/coding/modes/interactive.zig` with the raw-terminal controller (`src/coding/terminal.zig`) so `franky --mode interactive` renders live |
 | M | Faux provider contract | ✅ | |
 | N.1 | Allocator strategy | ✅ | Explicit threading |
 | N.2 | IO / async model | 🟡 | `std.Io` threaded backend; `io.concurrent` unused |
 | N.3 | Error sets | ✅ | Single `AgentError` + `ErrorDetails` |
-| N.4 | Extension ABI | 🟡 | Registries scaffolded; Tier-1 loader deferred |
+| N.4 | Extension ABI | 🟡 | Tier-1 (static modules) shipped in `src/coding/extensions.zig`; Tier-2 (`.so`/`.dylib`) + Tier-3 (Wasm) deferred |
 | N.5 | Package layout | ✅ | Matches spec |
 | O | Port scope | — | Guidance |
 | P | Partial-JSON parser | ✅ | `src/ai/partial_json.zig`, 12 tests |
-| Q | OAuth flows | 🟡 | §Q.7 consumption path (pre-minted tokens) live; §Q.1–Q.4 minting flows deferred |
+| Q | OAuth flows | 🟡 | §Q.7 consumption path (pre-minted tokens) live. §Q.1–Q.4 minting wire-format codecs complete: PKCE primitives + auth.json writer (§Q.1, v0.12.0), device-code poll + Copilot exchange (§Q.2, v0.12.1), Google-defaults wrapper (§Q.3, v0.12.2), full RS256-signed JWT pipeline (§Q.4, v0.12.3). What remains: HTTP transport loop + loopback listener + browser launcher + `franky login` CLI subcommand + §Q.5 resolver-side refresh-before-expiry. One coherent v0.13.\* orchestrator milestone away from end-to-end |
 | R | Path & command safety | 🟡 | §R.1–§R.4 `canonicalize()` live via `src/coding/path_safety.zig`. §R.5–§R.6 denylist + shell-trust policy live via `src/coding/env_denylist.zig` (pure logic; `isDenied`, `filter`, `isTrustedShell`, `default_exact_denylist`, `default_trusted_shell_dirs`). Per-tool wiring (paths through `canonicalize`; bash through `env_denylist.filter` + `isTrustedShell`) remains pending — needs session-level workspace + settings threading |
 
 **CLI state:** `bin/main.zig` delegates to print mode, which now parses the core §5.6 flag set, registers faux + anthropic providers through the registry, wires all seven built-in tools, honors `--system-prompt`/`--append-system-prompt`/`--thinking`, mints a ULID session and persists `session.json`+`transcript.json` under `$FRANKY_HOME/sessions` (unless `--no-session`), and supports `--resume <id>`. The default offline demo (no API key) routes through the faux provider so it runs end-to-end without network.
@@ -1690,6 +1690,13 @@ Common acceptance for all 0.8.* entries:
 - **Verification**: tmux integration test scripting a full turn.
 - **Coverage gate**: streaming rendering, abort mid-stream, resume after abort all tested.
 
+##### v0.11.3 — Terminal binding + REPL dispatch (§5.5, §L.1) — ⚠️ load-bearing, strategy U+I
+
+- **Change**: introduce `src/coding/terminal.zig` (tcgetattr/tcsetattr raw mode, alt-screen, TIOCGWINSZ, SIGWINCH, SIGINT/SIGTERM signal-safe restore) and `src/coding/modes/interactive.zig` (the REPL dispatcher). `print.zig` routes `--mode interactive` into the new module instead of the v0.11.2 "deferred" error. Faux provider is auto-seeded per turn so the no-key demo works end-to-end.
+- **Acceptance**: `franky --mode interactive` enters the alt-screen, paints header + status bar + editor prompt, accepts typed input, submits on Enter, streams the assistant response into the scrollback, and exits cleanly on Ctrl-D at an empty prompt. Piped stdin/stdout → a clear error pointing at `--mode print` rather than escape-code spillage.
+- **Verification**: unit tests on `Channel.tryNext`, `Terminal.probeSize` default-on-non-tty, `Resize.take`, `setActive` round-trip, `Scrollback` capacity, `paintFrame` layout. PTY harness (Python) drives type-submit-quit end-to-end.
+- **Coverage gate**: non-TTY fallback has a path covered; raw mode entry/restore is exercised at least once by PTY; channel `tryNext` has a three-way result assertion.
+
 ---
 
 #### v0.12.* — OAuth minting flows
@@ -1750,37 +1757,38 @@ The test matrix below is populated per milestone; the left column is derived fro
 | v0.5.0 | §4.4 | +5 | `src/agent/loop.zig` + `test/parallel_tools_test.zig` | 237 🟡 (+1 integration) — source-order events; completion-order pending v0.5.1 |
 | v0.5.1 | §4.4/§G.3 | +3 | `test/parallel_tools_test.zig` | 238 ✅ (+1 integration) |
 | **v0.6.* — persistence depth** | | | | |
-| v0.6.0 | §H.5 | +3 | `src/coding/session.zig` + `test/golden/session-v1.json` | — |
-| v0.6.1 | §H.4 | +5 | `src/coding/session.zig` (objects) | — |
-| v0.6.2 | §5.1/§H.4 | +5 | `src/coding/session.zig` + `test/branching_test.zig` | — |
-| v0.6.3 | §E | +8 | `src/agent/compaction.zig` + faux scenario | — |
+| v0.6.0 | §H.5 | +3 | `src/coding/session.zig` | 241 ✅ (+3) |
+| v0.6.1 | §H.4 | +5 | `src/coding/object_store.zig` | 247 🟡 (+6) — primitives shipped; transcript-JSON integration pending |
+| v0.6.2 | §5.1/§H.4 | +5 | `src/coding/branching.zig` | 256 🟡 (+9) — primitives shipped; transcript integration pending |
+| v0.6.3 | §E | +8 | `src/coding/compaction.zig` | 265 🟡 (+9) — pure-logic shipped; summarization + branch-checkpoint pending |
 | **v0.7.* — configuration surface** | | | | |
-| v0.7.0 | §5.7/§H.2 | +6 | `src/coding/settings.zig` | — |
-| v0.7.1 | §H.1 | +5 | `src/coding/auth.zig` | — |
-| v0.7.2 | §3.7/§H.3 | +4 | build step + `src/ai/models.generated.zig` | — |
+| v0.7.0 | §5.7/§H.2 | +6 | `src/coding/settings.zig` | 271 🟡 (+6) — loader shipped; print-mode wiring pending |
+| v0.7.1 | §H.1 | +5 | `src/coding/auth.zig` | 277 🟡 (+6) — loader shipped; `0600` mode-check deferred (stdlib gap) |
+| v0.7.2 | §3.7/§H.3 | +4 | `src/coding/models.zig` | 284 🟡 (+7) — built-in catalog + loader; build-step generator pending |
 | **v0.8.* — remaining providers** | | | | |
-| v0.8.0 | §A.4 | +10 | `src/ai/providers/openai_responses.zig` | — |
-| v0.8.1 | §A.5 | +10 | `src/ai/providers/google_gemini.zig` | — |
-| v0.8.2 | §A.5/§Q.4 | +10 | `src/ai/providers/google_vertex.zig` | — |
+| v0.8.0 | §A.4 | +10 | `src/ai/providers/openai_responses.zig` | 290 🟡 (+6) — provider shipped; +4 coverage targets slot into print-mode-wiring follow-up |
+| v0.8.1 | §A.5 | +10 | `src/ai/providers/google_gemini.zig` | 296 🟡 (+6) — provider shipped; +4 coverage targets land with print-mode wiring |
+| v0.8.2 | §A.5/§Q.4 | +10 | `src/ai/providers/google_vertex.zig` | 300 🟡 (+3) — provider shipped (shares Gemini wire); JWT-minting deferred to v0.12.* |
 | **v0.9.* — agent runtime extras** | | | | |
-| v0.9.0 | §4.3/§4.6 | +4 | `src/agent/agent.zig` + faux scenario | — |
-| v0.9.1 | §4.3 | +3 | `src/agent/agent.zig` + faux scenario | — |
-| v0.9.2 | §4.7 | +5 | `src/agent/proxy.zig` + `test/stream_proxy_test.zig` | — |
+| v0.9.0 | §4.3/§4.6 | +4 | `src/agent/agent.zig` | 303 🟡 (+3 combined with v0.9.1) — queue primitives shipped; loop drain pending |
+| v0.9.1 | §4.3 | +3 | `src/agent/agent.zig` | 303 🟡 — shared with v0.9.0 tests |
+| v0.9.2 | §4.7 | +5 | `src/agent/proxy.zig` | 310 🟡 (+7) — serialization shipped; HTTP listener pending |
 | **v0.10.* — surfaces** | | | | |
-| v0.10.0 | §5.6 | +10 | `src/coding/cli.zig` | — |
-| v0.10.1 | §I | +15 | `src/coding/modes/rpc.zig` + `test/rpc_*_test.zig` | — |
-| v0.10.2 | §J | +12 | `src/coding/commands/slash.zig` | — |
-| v0.10.3 | §5.8 | +5 | `src/coding/templates.zig` | — |
-| v0.10.4 | §5.4/§N.4 | +4 | `src/coding/extensions.zig` | — |
+| v0.10.0 | §5.6 | +10 | `src/coding/cli.zig` | 316 ✅ (+6) |
+| v0.10.1 | §I | +15 | `src/coding/rpc.zig` | 329 🟡 (+13) — framer shipped; `--mode rpc` wiring pending |
+| v0.10.2 | §J | +12 | `src/coding/slash.zig` | 339 🟡 (+10) — dispatch shipped; handler wiring pending |
+| v0.10.3 | §5.8 | +5 | `src/coding/templates.zig` | 348 🟡 (+9) — expander shipped; skills loader pending |
+| v0.10.4 | §5.4/§N.4 | +4 | `src/coding/extensions.zig` | 353 🟡 (+5) — Tier-1 shipped; Tier-2/3 deferred |
 | **v0.11.* — interactive TUI** | | | | |
-| v0.11.0 | §6/§L | +15 | `src/tui/*` + `test/tui_*_test.zig` | — |
-| v0.11.1 | §K | +8 | `src/tui/keybindings.zig` | — |
-| v0.11.2 | §5.5 | +5 | `test/interactive_test.zig` | — |
+| v0.11.0 | §6/§L | +15 | `src/tui/{cell,buffer,region,text_buffer,key_decoder,diff_renderer}.zig` | 404 🟡 (+51) — pure-logic primitives; raw-terminal wiring pending |
+| v0.11.1 | §K | +8 | `src/tui/keybindings.zig` | 417 🟡 (+13) — emacs + vi presets, overrides |
+| v0.11.2 | §5.5 | +5 | `src/tui/editor.zig` | 431 🟡 (+14) — Editor integration; end-to-end `--mode interactive` wiring pending |
+| v0.11.3 | §5.5, §L.1 | +6 | `src/coding/terminal.zig`, `src/coding/modes/interactive.zig`, `src/ai/channel.zig` (tryNext) | 437 ✅ (+6) — `franky --mode interactive` drops into a usable REPL end-to-end |
 | **v0.12.* — OAuth minting** | | | | |
-| v0.12.0 | §Q.1 | +7 | `src/ai/oauth/anthropic.zig` | — |
-| v0.12.1 | §Q.2 | +7 | `src/ai/oauth/copilot.zig` | — |
-| v0.12.2 | §Q.3 | +7 | `src/ai/oauth/google.zig` | — |
-| v0.12.3 | §Q.4 | +7 | `src/ai/oauth/vertex.zig` | — |
+| v0.12.0 | §Q.1 | +7 | `src/coding/oauth/pkce.zig`, `src/coding/oauth/anthropic.zig`, `src/coding/auth.zig` (save, providerFromToken, isoTimestampUtc) | 459 🟡 (+22) — PKCE primitives + wire format + auth.json writer; live listener + `franky login` deferred |
+| v0.12.1 | §Q.2 | +6 | `src/coding/oauth/copilot.zig` | 474 🟡 (+15) — device-code request/poll codecs + poller state-machine + Copilot token exchange codec; HTTP transport loop deferred |
+| v0.12.2 | §Q.3 | +5 | `src/coding/oauth/gemini.zig` | 479 🟡 (+5) — thin wrapper over anthropic.zig with Google defaults; HTTP transport + browser launch deferred |
+| v0.12.3 | §Q.4 | +15 | `src/coding/oauth/vertex.zig` | 494 🟡 (+15) — full JWT pipeline with real RS256 signing (no openssl/libc); HTTP transport loop + `franky login` orchestrator deferred |
 | **v1.0.0 floor** | — | **≥ 400** | — | — |
 
 ### What this roadmap does *not* cover

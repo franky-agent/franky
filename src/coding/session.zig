@@ -16,8 +16,8 @@ const ai = struct {
 };
 const agent_mod = @import("../agent/mod.zig");
 
-pub const current_session_version: u32 = 2;
-pub const current_transcript_version: u32 = 2;
+pub const current_session_version: u32 = 3;
+pub const current_transcript_version: u32 = 3;
 
 /// 26-char Crockford base32 identifier, prefix sortable by creation time.
 pub const Ulid = struct {
@@ -499,6 +499,92 @@ fn readWholeFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]
     return buf[0..n];
 }
 
+// ─── session migrations — §H.5 ────────────────────────────────────
+//
+// Each pre-existing on-disk session declares a `version`. When the
+// session was written at a version lower than
+// `current_session_version`, `migrateSessionIfNeeded` runs the
+// migration chain step-by-step, writes the pre-migration file to
+// `<path>.bak`, and rewrites the file at the current version.
+// `version > current` always fails with `UnsupportedSessionVersion`
+// — newer files stay unreadable until the binary is upgraded.
+//
+// Today every `version <= 2 → 3` step is a no-op on the observable
+// fields (v2 already had every field we need; `readSessionHeader`
+// supplied defaults for missing ones). This module ships the
+// framework — adding a real schema change only needs a new
+// MigrationFn entry in `session_migrations` and a matching
+// `current_session_version` bump.
+
+pub const SessionMigrationError = error{
+    UnsupportedSessionVersion,
+    FileNotFound,
+} || std.mem.Allocator.Error;
+
+pub const MigratedSession = struct {
+    original_version: u32,
+    current_version: u32,
+    migrated: bool,
+};
+
+/// Probe `<session_dir>/session.json` and, if it's older than the
+/// current version, back it up and re-emit at the current version.
+/// Returns metadata describing the migration outcome. A missing
+/// session file surfaces as the caller's `FileNotFound` error; this
+/// helper is only ever called by an explicit resume path.
+pub fn migrateSessionIfNeeded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_dir: []const u8,
+) anyerror!MigratedSession {
+    const path = try std.fs.path.join(allocator, &.{ session_dir, "session.json" });
+    defer allocator.free(path);
+
+    const bytes = try readWholeFile(allocator, io, path);
+    defer allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+
+    const version: u32 = blk: {
+        const obj = parsed.value.object;
+        if (obj.get("version")) |v| {
+            if (v == .integer and v.integer >= 0) break :blk @intCast(v.integer);
+        }
+        break :blk 1; // absent version → oldest shape
+    };
+
+    if (version == current_session_version) {
+        return .{
+            .original_version = version,
+            .current_version = current_session_version,
+            .migrated = false,
+        };
+    }
+    if (version > current_session_version) {
+        return SessionMigrationError.UnsupportedSessionVersion;
+    }
+
+    // Back up the pre-migration file.
+    const bak_path = try std.fmt.allocPrint(allocator, "{s}.bak", .{path});
+    defer allocator.free(bak_path);
+    try atomicWrite(io, bak_path, bytes);
+
+    // Load into `SessionHeader` — existing defaults cover every
+    // v1/v2-era missing field, so the shared path is the migration.
+    const header = try readSessionHeader(allocator, io, session_dir);
+    defer freeSessionHeader(allocator, header);
+
+    // Re-emit at `current_session_version`.
+    try writeSessionHeader(allocator, io, session_dir, header);
+
+    return .{
+        .original_version = version,
+        .current_version = current_session_version,
+        .migrated = true,
+    };
+}
+
 // ─── convenience: top-level save/load ─────────────────────────────
 
 pub const Session = struct {
@@ -646,6 +732,112 @@ test "session round-trips through disk" {
     try testing.expectEqualStrings("let me help", m1.content[0].text.text);
     try testing.expectEqualStrings("echo", m1.content[1].tool_call.name);
     try testing.expectEqual(ai.types.StopReason.tool_use, m1.stop_reason.?);
+}
+
+test "migrateSessionIfNeeded: v1 → current backs up + rewrites" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_mig_v1";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    // Write a synthetic v1 session.json — a minimal shape lacking
+    // `activeBranch` and `systemPromptHash`. `readSessionHeader`'s
+    // existing `orelse` defaults cover them, so this tests the
+    // version-bump + backup logic.
+    const v1_json =
+        \\{"version":1,"id":"01J000","createdAtMs":100,"updatedAtMs":100,"title":"t","provider":"faux","model":"faux-1","api":"faux","thinkingLevel":"off"}
+    ;
+    const path = try std.fs.path.join(gpa, &.{ base, "session.json" });
+    defer gpa.free(path);
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, v1_json);
+    }
+
+    const r = try migrateSessionIfNeeded(gpa, io, base);
+    try testing.expectEqual(@as(u32, 1), r.original_version);
+    try testing.expectEqual(current_session_version, r.current_version);
+    try testing.expect(r.migrated);
+
+    // `.bak` contains the original bytes verbatim.
+    const bak_path = try std.fmt.allocPrint(gpa, "{s}.bak", .{path});
+    defer gpa.free(bak_path);
+    const bak_bytes = try readWholeFile(gpa, io, bak_path);
+    defer gpa.free(bak_bytes);
+    try testing.expectEqualStrings(v1_json, bak_bytes);
+
+    // Rewritten file is at the current version.
+    const new_bytes = try readWholeFile(gpa, io, path);
+    defer gpa.free(new_bytes);
+    const expected_version = try std.fmt.allocPrint(gpa, "\"version\": {d}", .{current_session_version});
+    defer gpa.free(expected_version);
+    try testing.expect(std.mem.indexOf(u8, new_bytes, expected_version) != null);
+}
+
+test "migrateSessionIfNeeded: same-version session is a no-op" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_mig_current";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    const header: SessionHeader = .{
+        .id = "01J001",
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .title = "t",
+        .provider = "faux",
+        .model = "faux-1",
+        .api = "faux",
+        .thinking_level = "off",
+    };
+    try writeSessionHeader(gpa, io, base, header);
+
+    const r = try migrateSessionIfNeeded(gpa, io, base);
+    try testing.expectEqual(current_session_version, r.original_version);
+    try testing.expect(!r.migrated);
+
+    // No `.bak` was written.
+    const bak_path = try std.fs.path.join(gpa, &.{ base, "session.json.bak" });
+    defer gpa.free(bak_path);
+    const err = std.Io.Dir.cwd().openFile(io, bak_path, .{});
+    try testing.expectError(error.FileNotFound, err);
+}
+
+test "migrateSessionIfNeeded: future version rejected" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_mig_future";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    const future_json =
+        \\{"version":999,"id":"01J999","createdAtMs":0,"updatedAtMs":0,"title":"t","provider":"faux","model":"faux-1","api":"faux","thinkingLevel":"off"}
+    ;
+    const path = try std.fs.path.join(gpa, &.{ base, "session.json" });
+    defer gpa.free(path);
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, future_json);
+    }
+
+    const err = migrateSessionIfNeeded(gpa, io, base);
+    try testing.expectError(SessionMigrationError.UnsupportedSessionVersion, err);
 }
 
 test "sha256Hex produces 64-char lowercase hex" {

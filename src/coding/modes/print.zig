@@ -69,8 +69,14 @@ pub fn run(
         defer allocator.free(msg);
         return writeOut(io, msg);
     }
-    if (cfg.mode != .print) {
-        return exitWithMessage(io, "interactive and rpc modes are deferred; use --mode print\n", 2);
+    if (cfg.mode == .rpc) {
+        return exitWithMessage(io, "rpc mode is not yet implemented; use --mode print or --mode interactive\n", 2);
+    }
+    if (cfg.mode == .interactive) {
+        // Interactive mode doesn't require a prompt — the REPL
+        // collects input from the terminal.
+        const interactive = @import("interactive.zig");
+        return interactive.run(allocator, io, environ, environ_map, &cfg);
     }
     if (cfg.prompt.len == 0 and cfg.resume_id == null) {
         return exitWithMessage(io, "no prompt given; try: franky \"hello\"\n", 2);
@@ -355,7 +361,7 @@ fn resolveLogLevel(cfg: *const cli_mod.Config, environ: std.process.Environ) ai.
 
 // ─── provider selection ──────────────────────────────────────────
 
-const ProviderInfo = struct {
+pub const ProviderInfo = struct {
     provider_name: []const u8,
     api_tag: []const u8,
     model_id: []const u8,
@@ -368,7 +374,7 @@ const ProviderInfo = struct {
     max_output: u32,
 };
 
-fn resolveProvider(
+pub fn resolveProvider(
     allocator: std.mem.Allocator,
     environ: std.process.Environ,
     cfg: *cli_mod.Config,
@@ -632,7 +638,7 @@ pub const default_system_prompt: []const u8 =
     \\gather it. Do not guess file contents.
 ;
 
-fn buildSystemPrompt(allocator: std.mem.Allocator, cfg: *const cli_mod.Config) ![]u8 {
+pub fn buildSystemPrompt(allocator: std.mem.Allocator, cfg: *const cli_mod.Config) ![]u8 {
     if (cfg.system_prompt) |s| return try allocator.dupe(u8, s);
     if (cfg.append_system_prompt) |extra| {
         return try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ default_system_prompt, extra });

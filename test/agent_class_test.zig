@@ -153,3 +153,100 @@ test "Agent.reset clears transcript" {
     agent.reset();
     try testing.expectEqual(@as(usize, 0), agent.transcript.messages.items.len);
 }
+
+test "Agent.steer: queue + drain round-trip" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var faux = ai.providers.faux.FauxProvider.init(gpa);
+    defer faux.deinit();
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{ .api = "faux", .provider = "faux", .stream_fn = fauxShim, .userdata = @ptrCast(&faux) });
+
+    var agent = try agent_mod.Agent.init(gpa, io, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .registry = &reg,
+    });
+    defer agent.deinit();
+
+    try testing.expectEqual(@as(usize, 0), agent.pendingSteerCount());
+    try agent.steer("be concise");
+    try agent.steer("prefer diffs");
+    try testing.expectEqual(@as(usize, 2), agent.pendingSteerCount());
+
+    const drained = try agent.drainSteerQueue();
+    defer {
+        for (drained) |m| gpa.free(m);
+        gpa.free(drained);
+    }
+    try testing.expectEqual(@as(usize, 2), drained.len);
+    try testing.expectEqualStrings("be concise", drained[0]);
+    try testing.expectEqualStrings("prefer diffs", drained[1]);
+    try testing.expectEqual(@as(usize, 0), agent.pendingSteerCount());
+}
+
+test "Agent.followUp: separate queue from steer" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var faux = ai.providers.faux.FauxProvider.init(gpa);
+    defer faux.deinit();
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{ .api = "faux", .provider = "faux", .stream_fn = fauxShim, .userdata = @ptrCast(&faux) });
+
+    var agent = try agent_mod.Agent.init(gpa, io, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .registry = &reg,
+    });
+    defer agent.deinit();
+
+    try agent.steer("S");
+    try agent.followUp("F1");
+    try agent.followUp("F2");
+    try testing.expectEqual(@as(usize, 1), agent.pendingSteerCount());
+    try testing.expectEqual(@as(usize, 2), agent.pendingFollowUpCount());
+
+    const s = try agent.drainSteerQueue();
+    defer {
+        for (s) |m| gpa.free(m);
+        gpa.free(s);
+    }
+    try testing.expectEqual(@as(usize, 0), agent.pendingSteerCount());
+    try testing.expectEqual(@as(usize, 2), agent.pendingFollowUpCount());
+
+    const f = try agent.drainFollowUpQueue();
+    defer {
+        for (f) |m| gpa.free(m);
+        gpa.free(f);
+    }
+    try testing.expectEqualStrings("F1", f[0]);
+    try testing.expectEqualStrings("F2", f[1]);
+}
+
+test "Agent: deinit frees queued-but-not-drained messages" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var faux = ai.providers.faux.FauxProvider.init(gpa);
+    defer faux.deinit();
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{ .api = "faux", .provider = "faux", .stream_fn = fauxShim, .userdata = @ptrCast(&faux) });
+
+    var agent = try agent_mod.Agent.init(gpa, io, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .registry = &reg,
+    });
+    // Leave both queues populated — testing.allocator flags any leak.
+    try agent.steer("leak-check-a");
+    try agent.followUp("leak-check-b");
+    agent.deinit();
+}
