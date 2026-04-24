@@ -1,20 +1,27 @@
 //! Session persistence — §H of the spec.
 //!
-//! For milestone 2 we implement the minimum subset:
+//! Implemented subset:
 //!   - ULID session ids.
 //!   - `session.json` + `transcript.json` round-trip.
 //!   - Atomic writes (tempfile + rename).
-//!   - Schema version field (migrations stubbed in).
-//!
-//! Branches, content-addressed object storage (§H.4 `objects/`, inlining
-//! threshold), and `tree.json` are deferred; the disk layout is
-//! forward-compatible with those additions.
+//!   - Schema version field with forward migrations.
+//!   - **v1.5.0**: content-addressed blob extraction — any content
+//!     block whose canonical JSON is ≥ `object_store.inline_threshold_bytes`
+//!     (32 KiB) is spilled into `<session_dir>/objects/<first2>/<rest62>`
+//!     and replaced in `transcript.json` with a `{"type":"ref",
+//!     "hash":"sha256:<hex>"}` pointer per §H.4.
+//!   - **v1.7.0**: per-branch transcript snapshots at
+//!     `<session_dir>/transcripts/<branch>.json`. `transcript.json`
+//!     stays the "active branch" view for quick-read compatibility;
+//!     the snapshot directory lets `--checkout <branch>` resume a
+//!     different branch's history.
 
 const std = @import("std");
 const ai = struct {
     pub const types = @import("../ai/types.zig");
 };
 const agent_mod = @import("../agent/mod.zig");
+const object_store = @import("object_store.zig");
 
 pub const current_session_version: u32 = 3;
 pub const current_transcript_version: u32 = 3;
@@ -138,7 +145,11 @@ pub fn freeSessionHeader(allocator: std.mem.Allocator, h: SessionHeader) void {
     allocator.free(h.system_prompt_hash);
 }
 
-/// Serialize the transcript to `session_dir/transcript.json`.
+/// Serialize the transcript to `session_dir/transcript.json`. Content
+/// blocks whose canonical JSON is ≥ `object_store.inline_threshold_bytes`
+/// are spilled to `<session_dir>/objects/<first2>/<rest62>` and
+/// replaced in the transcript with a `{"type":"ref","hash":"sha256:<hex>"}`
+/// pointer per §H.4.
 pub fn writeTranscript(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -149,6 +160,9 @@ pub fn writeTranscript(
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
+    const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
+    defer allocator.free(store_dir);
+
     try buf.appendSlice(allocator, "{\n");
     try writeJsonField(&buf, allocator, "version", current_transcript_version, false);
     try writeJsonStrField(&buf, allocator, "branch", branch, false);
@@ -157,7 +171,7 @@ pub fn writeTranscript(
     for (transcript.messages.items, 0..) |m, i| {
         if (i > 0) try buf.appendSlice(allocator, ",\n");
         try buf.appendSlice(allocator, "    ");
-        try appendMessageJson(&buf, allocator, m);
+        try appendMessageJson(&buf, allocator, io, store_dir, m);
     }
     try buf.appendSlice(allocator, "\n  ]\n}\n");
 
@@ -167,6 +181,8 @@ pub fn writeTranscript(
 }
 
 /// Load `transcript.json` into an owned `Transcript`. Caller deinits it.
+/// Content blocks stored as `{"type":"ref","hash":"sha256:<hex>"}` are
+/// resolved from `<session_dir>/objects/…` transparently.
 pub fn readTranscript(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -185,6 +201,9 @@ pub fn readTranscript(
     const version = if (root.get("version")) |v| v.integer else 0;
     if (version > current_transcript_version) return error.UnsupportedTranscriptVersion;
 
+    const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
+    defer allocator.free(store_dir);
+
     var transcript = agent_mod.loop.Transcript.init(allocator);
     errdefer transcript.deinit();
 
@@ -193,10 +212,93 @@ pub fn readTranscript(
 
     for (messages_val.array.items) |mv| {
         if (mv != .object) continue;
-        const msg = try parseMessage(allocator, mv.object);
+        const msg = try parseMessage(allocator, io, store_dir, mv.object);
         try transcript.append(msg);
     }
 
+    return transcript;
+}
+
+/// v1.7.0 — write a branch-scoped snapshot at
+/// `<session_dir>/transcripts/<branch>.json`. Same serialization
+/// rules as `writeTranscript`: oversize blocks still externalize
+/// into the shared `objects/` store (`--checkout` round-trips them
+/// transparently via `readBranchTranscript`).
+pub fn writeBranchTranscript(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_dir: []const u8,
+    transcript: *const agent_mod.loop.Transcript,
+    branch: []const u8,
+) !void {
+    const snap_dir = try std.fs.path.join(allocator, &.{ session_dir, "transcripts" });
+    defer allocator.free(snap_dir);
+    std.Io.Dir.cwd().createDirPath(io, snap_dir) catch |e| switch (e) {
+        error.PathAlreadyExists => {},
+        else => return e,
+    };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
+    defer allocator.free(store_dir);
+
+    try buf.appendSlice(allocator, "{\n");
+    try writeJsonField(&buf, allocator, "version", current_transcript_version, false);
+    try writeJsonStrField(&buf, allocator, "branch", branch, false);
+    try buf.appendSlice(allocator, "  \"messages\": [\n");
+    for (transcript.messages.items, 0..) |m, i| {
+        if (i > 0) try buf.appendSlice(allocator, ",\n");
+        try buf.appendSlice(allocator, "    ");
+        try appendMessageJson(&buf, allocator, io, store_dir, m);
+    }
+    try buf.appendSlice(allocator, "\n  ]\n}\n");
+
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{branch});
+    defer allocator.free(file_name);
+    const path = try std.fs.path.join(allocator, &.{ snap_dir, file_name });
+    defer allocator.free(path);
+    try atomicWrite(io, path, buf.items);
+}
+
+/// v1.7.0 — load a branch-scoped snapshot. Returns
+/// `error.FileNotFound` when the snapshot doesn't exist (caller
+/// decides whether to surface it or fall back to `transcript.json`).
+pub fn readBranchTranscript(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_dir: []const u8,
+    branch: []const u8,
+) !agent_mod.loop.Transcript {
+    const file_name = try std.fmt.allocPrint(allocator, "transcripts/{s}.json", .{branch});
+    defer allocator.free(file_name);
+    const path = try std.fs.path.join(allocator, &.{ session_dir, file_name });
+    defer allocator.free(path);
+
+    const bytes = try readWholeFile(allocator, io, path);
+    defer allocator.free(bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const version = if (root.get("version")) |v| v.integer else 0;
+    if (version > current_transcript_version) return error.UnsupportedTranscriptVersion;
+
+    const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
+    defer allocator.free(store_dir);
+
+    var transcript = agent_mod.loop.Transcript.init(allocator);
+    errdefer transcript.deinit();
+
+    const messages_val = root.get("messages") orelse return transcript;
+    if (messages_val != .array) return transcript;
+    for (messages_val.array.items) |mv| {
+        if (mv != .object) continue;
+        const msg = try parseMessage(allocator, io, store_dir, mv.object);
+        try transcript.append(msg);
+    }
     return transcript;
 }
 
@@ -224,6 +326,8 @@ fn strOpt(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 fn appendMessageJson(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
+    io: std.Io,
+    store_dir: []const u8,
     m: ai.types.Message,
 ) !void {
     try buf.appendSlice(allocator, "{");
@@ -246,7 +350,7 @@ fn appendMessageJson(
     try buf.appendSlice(allocator, ",\"content\":[");
     for (m.content, 0..) |cb, i| {
         if (i > 0) try buf.appendSlice(allocator, ",");
-        try appendContentBlockJson(buf, allocator, cb);
+        try appendContentBlockJsonMaybeExtern(buf, allocator, io, store_dir, cb);
     }
     try buf.appendSlice(allocator, "]");
 
@@ -269,7 +373,8 @@ fn appendMessageJson(
     try buf.appendSlice(allocator, "}");
 }
 
-fn appendContentBlockJson(
+/// Render a content block's canonical JSON inline. Pure — no IO.
+pub fn appendContentBlockJson(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     cb: ai.types.ContentBlock,
@@ -322,7 +427,41 @@ fn appendContentBlockJson(
     try buf.appendSlice(allocator, "}");
 }
 
-fn parseMessage(allocator: std.mem.Allocator, o: std.json.ObjectMap) !ai.types.Message {
+/// Render a content block, possibly extracting its canonical JSON to
+/// `<store_dir>/<first2>/<rest62>` and emitting a `{"type":"ref",…}`
+/// pointer instead when the rendered size crosses
+/// `object_store.inline_threshold_bytes` (§H.4). Caller owns `store_dir`.
+fn appendContentBlockJsonMaybeExtern(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_dir: []const u8,
+    cb: ai.types.ContentBlock,
+) !void {
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(allocator);
+    try appendContentBlockJson(&tmp, allocator, cb);
+
+    if (tmp.items.len < object_store.inline_threshold_bytes) {
+        try buf.appendSlice(allocator, tmp.items);
+        return;
+    }
+
+    const hex = try sha256Hex(allocator, tmp.items);
+    defer allocator.free(hex);
+    try object_store.writeObject(allocator, io, store_dir, hex, tmp.items);
+
+    try buf.appendSlice(allocator, "{\"type\":\"ref\",\"hash\":\"sha256:");
+    try buf.appendSlice(allocator, hex);
+    try buf.appendSlice(allocator, "\"}");
+}
+
+fn parseMessage(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_dir: []const u8,
+    o: std.json.ObjectMap,
+) !ai.types.Message {
     const role_str = strOpt(o, "role") orelse "user";
     const role: ai.types.Role = if (std.mem.eql(u8, role_str, "user"))
         .user
@@ -342,7 +481,7 @@ fn parseMessage(allocator: std.mem.Allocator, o: std.json.ObjectMap) !ai.types.M
     if (o.get("content")) |cv| if (cv == .array) {
         for (cv.array.items) |v| {
             if (v != .object) continue;
-            const cb = try parseContentBlock(allocator, v.object);
+            const cb = try parseContentBlockMaybeDeref(allocator, io, store_dir, v.object);
             try content.append(allocator, cb);
         }
     };
@@ -359,6 +498,38 @@ fn parseMessage(allocator: std.mem.Allocator, o: std.json.ObjectMap) !ai.types.M
         .api = if (o.get("api")) |v| try allocator.dupe(u8, v.string) else null,
         .custom_role = if (role == .custom) try allocator.dupe(u8, role_str) else null,
     };
+}
+
+/// Parse a content block, transparently resolving `{"type":"ref",
+/// "hash":"sha256:<hex>"}` pointers via `object_store` (§H.4).
+fn parseContentBlockMaybeDeref(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_dir: []const u8,
+    o: std.json.ObjectMap,
+) !ai.types.ContentBlock {
+    const type_str = strOpt(o, "type") orelse "text";
+    if (std.mem.eql(u8, type_str, "ref")) {
+        const hash_str = strOpt(o, "hash") orelse return error.MalformedRef;
+        const prefix = "sha256:";
+        if (!std.mem.startsWith(u8, hash_str, prefix)) return error.MalformedRef;
+        const hex = hash_str[prefix.len..];
+        if (hex.len != 64) return error.MalformedRef;
+
+        const bytes = try object_store.readObject(allocator, io, store_dir, hex);
+        defer allocator.free(bytes);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.MalformedRef;
+        // Resolved objects must not themselves be refs — guard against
+        // loops even though the hash is content-addressed (defence in
+        // depth; a cycle would require a SHA-256 collision).
+        const inner_type = strOpt(parsed.value.object, "type") orelse "text";
+        if (std.mem.eql(u8, inner_type, "ref")) return error.MalformedRef;
+        return try parseContentBlock(allocator, parsed.value.object);
+    }
+    return try parseContentBlock(allocator, o);
 }
 
 fn parseContentBlock(allocator: std.mem.Allocator, o: std.json.ObjectMap) !ai.types.ContentBlock {
@@ -846,4 +1017,282 @@ test "sha256Hex produces 64-char lowercase hex" {
     defer gpa.free(h);
     try testing.expectEqual(@as(usize, 64), h.len);
     for (h) |c| try testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+}
+
+// ─── v1.5.0 — $ref round-trip via object_store ────────────────────
+
+test "transcript: small block stays inline; objects/ dir stays empty" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_refsmall";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    var transcript = agent_mod.loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    const content = try gpa.alloc(ai.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "hi") } };
+    try transcript.append(.{ .role = .user, .content = content, .timestamp = 1 });
+
+    const header = SessionHeader{
+        .id = "01JXSMALL",
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .title = "s",
+        .provider = "faux",
+        .model = "faux-1",
+        .api = "faux",
+        .thinking_level = "off",
+    };
+    try save(gpa, io, base, header, &transcript);
+
+    // transcript.json should contain the literal "hi" inline.
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXSMALL/transcript.json", .{base});
+    defer gpa.free(t_path);
+    const t_bytes = try readWholeFile(gpa, io, t_path);
+    defer gpa.free(t_bytes);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"text\":\"hi\"") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"type\":\"ref\"") == null);
+
+    // objects/ either absent or empty (we only create shard dirs on write).
+    const obj_path = try std.fmt.allocPrint(gpa, "{s}/01JXSMALL/objects", .{base});
+    defer gpa.free(obj_path);
+    if (std.Io.Dir.cwd().openDir(io, obj_path, .{ .iterate = true })) |*d_const| {
+        var d = d_const.*;
+        defer d.close(io);
+        var it = d.iterate();
+        const entry = try it.next(io);
+        try testing.expect(entry == null);
+    } else |_| {}
+}
+
+test "transcript: 32 KiB block externalized and round-trips through $ref" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_reflarge";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    // Big enough that the block's rendered JSON crosses the threshold.
+    const big = try gpa.alloc(u8, object_store.inline_threshold_bytes + 100);
+    defer gpa.free(big);
+    @memset(big, 'z');
+
+    var transcript = agent_mod.loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    const content = try gpa.alloc(ai.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, big) } };
+    try transcript.append(.{ .role = .assistant, .content = content, .timestamp = 1 });
+
+    const header = SessionHeader{
+        .id = "01JXLARGE",
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .title = "s",
+        .provider = "faux",
+        .model = "faux-1",
+        .api = "faux",
+        .thinking_level = "off",
+    };
+    try save(gpa, io, base, header, &transcript);
+
+    // transcript.json contains a ref (not the raw block).
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXLARGE/transcript.json", .{base});
+    defer gpa.free(t_path);
+    const t_bytes = try readWholeFile(gpa, io, t_path);
+    defer gpa.free(t_bytes);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"type\":\"ref\"") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"hash\":\"sha256:") != null);
+    // The raw payload should NOT be inlined.
+    try testing.expect(t_bytes.len < big.len);
+
+    // Load round-trips the block back to its original content.
+    var loaded = try load(gpa, io, base, "01JXLARGE");
+    defer loaded.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), loaded.transcript.messages.items.len);
+    const m = loaded.transcript.messages.items[0];
+    try testing.expectEqual(@as(usize, 1), m.content.len);
+    try testing.expectEqualSlices(u8, big, m.content[0].text.text);
+}
+
+test "transcript: missing blob during load surfaces a structured error" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_refmissing";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    // Write a session first so the header is valid.
+    var transcript = agent_mod.loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    const content = try gpa.alloc(ai.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "x") } };
+    try transcript.append(.{ .role = .user, .content = content, .timestamp = 1 });
+    const header = SessionHeader{
+        .id = "01JXMISS",
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .title = "s",
+        .provider = "faux",
+        .model = "faux-1",
+        .api = "faux",
+        .thinking_level = "off",
+    };
+    try save(gpa, io, base, header, &transcript);
+
+    // Hand-craft a transcript.json containing a ref to a nonexistent blob.
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXMISS/transcript.json", .{base});
+    defer gpa.free(t_path);
+    const bogus =
+        \\{"version":3,"branch":"main","messages":[{"role":"user","timestamp":1,"content":[{"type":"ref","hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}]}]}
+    ;
+    try atomicWrite(io, t_path, bogus);
+
+    const err = load(gpa, io, base, "01JXMISS");
+    try testing.expectError(error.FileNotFound, err);
+}
+
+test "writeBranchTranscript + readBranchTranscript: round-trip preserves messages" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_branch_tx_rt";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    var transcript = agent_mod.loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    const content = try gpa.alloc(ai.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "on experiment") } };
+    try transcript.append(.{ .role = .user, .content = content, .timestamp = 10 });
+
+    try writeBranchTranscript(gpa, io, base, &transcript, "experiment");
+
+    var loaded = try readBranchTranscript(gpa, io, base, "experiment");
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 1), loaded.messages.items.len);
+    try testing.expectEqualStrings("on experiment", loaded.messages.items[0].content[0].text.text);
+}
+
+test "readBranchTranscript: missing snapshot yields FileNotFound" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_branch_tx_missing";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    const err = readBranchTranscript(gpa, io, base, "nonexistent");
+    try testing.expectError(error.FileNotFound, err);
+}
+
+test "writeBranchTranscript: large blocks still spill to shared objects/" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_branch_tx_big";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    const big = try gpa.alloc(u8, object_store.inline_threshold_bytes + 200);
+    defer gpa.free(big);
+    @memset(big, 'r');
+
+    var transcript = agent_mod.loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    const content = try gpa.alloc(ai.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, big) } };
+    try transcript.append(.{ .role = .assistant, .content = content, .timestamp = 1 });
+
+    try writeBranchTranscript(gpa, io, base, &transcript, "heavy");
+
+    // Snapshot contains a ref, not the inline blob.
+    const snap_path = try std.fmt.allocPrint(gpa, "{s}/transcripts/heavy.json", .{base});
+    defer gpa.free(snap_path);
+    const bytes = try readWholeFile(gpa, io, snap_path);
+    defer gpa.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"type\":\"ref\"") != null);
+
+    // Round-trip recovers the original payload via the shared store.
+    var loaded = try readBranchTranscript(gpa, io, base, "heavy");
+    defer loaded.deinit();
+    try testing.expectEqualSlices(u8, big, loaded.messages.items[0].content[0].text.text);
+}
+
+test "transcript: threshold edge — just below stays inline, at threshold spills" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_refedge";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    // A text block renders as `{"type":"text","text":"<N ascii-chars>"}` —
+    // scaffolding is 25 bytes. Choose payloads that clearly bracket the
+    // 32 KiB threshold of the full rendered block so the test isn't
+    // fragile to scaffolding changes.
+    const below_payload_len = object_store.inline_threshold_bytes - 100;
+    const at_payload_len = object_store.inline_threshold_bytes;
+
+    const below = try gpa.alloc(u8, below_payload_len);
+    defer gpa.free(below);
+    @memset(below, 'a');
+    const at = try gpa.alloc(u8, at_payload_len);
+    defer gpa.free(at);
+    @memset(at, 'b');
+
+    var transcript = agent_mod.loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    const content = try gpa.alloc(ai.types.ContentBlock, 2);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, below) } };
+    content[1] = .{ .text = .{ .text = try gpa.dupe(u8, at) } };
+    try transcript.append(.{ .role = .user, .content = content, .timestamp = 1 });
+
+    const header = SessionHeader{
+        .id = "01JXEDGE",
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .title = "s",
+        .provider = "faux",
+        .model = "faux-1",
+        .api = "faux",
+        .thinking_level = "off",
+    };
+    try save(gpa, io, base, header, &transcript);
+
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXEDGE/transcript.json", .{base});
+    defer gpa.free(t_path);
+    const t_bytes = try readWholeFile(gpa, io, t_path);
+    defer gpa.free(t_bytes);
+
+    // Exactly one ref should have been emitted (for the `at` block).
+    const first_ref = std.mem.indexOf(u8, t_bytes, "\"type\":\"ref\"") orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expect(std.mem.indexOfPos(u8, t_bytes, first_ref + 1, "\"type\":\"ref\"") == null);
 }

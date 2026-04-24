@@ -11,6 +11,7 @@ const ai = struct {
     pub const stream = @import("../../ai/stream.zig");
 };
 const at = @import("../../agent/types.zig");
+const workspace_mod = @import("workspace.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -39,6 +40,20 @@ pub fn tool() at.AgentTool {
     };
 }
 
+/// Variant that enforces §R.1-§R.4 workspace-scope checks: every
+/// path is canonicalized via `path_safety` before the file is
+/// opened.
+pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
+    return .{
+        .name = "read",
+        .description = "Read a file from the workspace (path-safety enforced).",
+        .parameters_json = parameters_json,
+        .execution_mode = .parallel,
+        .ctx = @constCast(@ptrCast(ws)),
+        .execute = execute,
+    };
+}
+
 fn execute(
     self: *const at.AgentTool,
     allocator: std.mem.Allocator,
@@ -48,7 +63,6 @@ fn execute(
     cancel: *ai.stream.Cancel,
     on_update: at.OnUpdate,
 ) anyerror!at.ToolResult {
-    _ = self;
     _ = call_id;
     _ = cancel;
     _ = on_update;
@@ -61,7 +75,7 @@ fn execute(
     const path_val = root.object.get("path") orelse
         return toolError(allocator, "invalid_args", "missing path");
     if (path_val != .string) return toolError(allocator, "invalid_args", "path must be a string");
-    const path = path_val.string;
+    const user_path = path_val.string;
 
     const offset: usize = if (root.object.get("offset")) |v| blk: {
         if (v == .integer and v.integer >= 1) break :blk @intCast(v.integer);
@@ -72,7 +86,23 @@ fn execute(
         break :blk null;
     } else null;
 
-    return try readFile(allocator, io, path, offset, limit);
+    // Apply §R workspace scope check when a Workspace ctx is
+    // attached.  Canonicalized path is freed after `readFile`.
+    var canon_path: ?[]u8 = null;
+    defer if (canon_path) |p| allocator.free(p);
+    const effective_path: []const u8 = if (self.ctx) |raw| blk: {
+        const ws: *const workspace_mod.Workspace = @ptrCast(@alignCast(raw));
+        const r = try workspace_mod.canonicalizeOrError(allocator, ws, user_path);
+        switch (r) {
+            .ok => |c| {
+                canon_path = c.abs;
+                break :blk c.abs;
+            },
+            .err => |e| return toolError(allocator, e.code, e.message),
+        }
+    } else user_path;
+
+    return try readFile(allocator, io, effective_path, offset, limit);
 }
 
 pub fn readFile(
@@ -146,7 +176,8 @@ fn toolError(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !a
     const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };
-    return .{ .content = arr, .is_error = true };
+    const code_dup = try allocator.dupe(u8, code);
+    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
 }
 
 // ─── tests ────────────────────────────────────────────────────────────
@@ -231,4 +262,43 @@ test "read tool honors offset and limit" {
     try testing.expect(std.mem.indexOf(u8, text, "     3\tline3") != null);
     try testing.expect(std.mem.indexOf(u8, text, "     4\tline4") != null);
     try testing.expect(std.mem.indexOf(u8, text, "line5") == null);
+}
+
+test "read tool with workspace: rejects workspace escape" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    // Stage a file inside /tmp so we have something legal to read.
+    const legal_path = "/tmp/franky_ws_legal.txt";
+    std.Io.Dir.cwd().deleteFile(io, legal_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, legal_path) catch {};
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, legal_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "inside workspace\n");
+    }
+
+    var ws: workspace_mod.Workspace = .{ .root = "/tmp" };
+    const t = toolWithWorkspace(&ws);
+    var cancel = ai.stream.Cancel{};
+
+    // Legal path → succeeds.
+    {
+        const args = try std.fmt.allocPrint(gpa, "{{\"path\":\"franky_ws_legal.txt\"}}", .{});
+        defer gpa.free(args);
+        var res = try t.execute(&t, gpa, io, "id1", args, &cancel, .{});
+        defer res.deinit(gpa);
+        try testing.expect(!res.is_error);
+        try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "inside workspace") != null);
+    }
+
+    // Escape attempt → path_escape_workspace error.
+    {
+        var res = try t.execute(&t, gpa, io, "id2", "{\"path\":\"/etc/passwd\"}", &cancel, .{});
+        defer res.deinit(gpa);
+        try testing.expect(res.is_error);
+        try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "path_escape_workspace") != null);
+    }
 }

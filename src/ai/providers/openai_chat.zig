@@ -541,13 +541,12 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     var bw = std.Io.Writer.Allocating.init(ctx.allocator);
     defer bw.deinit();
 
-    const result = client.fetch(.{
+    const result = http_mod.fetchWithRetryAndTimeouts(&client, .{
         .location = .{ .url = endpoint },
         .method = .POST,
         .payload = body,
-        .response_writer = &bw.writer,
         .extra_headers = http_headers,
-    }) catch |e| {
+    }, &bw, cancel, .{}, ctx.options.timeouts) catch |e| {
         try ctx.out.push(ctx.io, .start);
         ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
             .code = errors.Code.transport,

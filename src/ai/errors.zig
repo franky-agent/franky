@@ -5,6 +5,19 @@
 //!
 //! Rich context lives in `ErrorDetails`, not in the Zig error itself;
 //! streams carry ErrorDetails in their terminal error event.
+//!
+//! §F.2 sub-codes (v1.7.1): tool-specific sub-codes like
+//! `edit_no_match`, `path_escape_workspace`, `bash_timeout` live in
+//! `ErrorDetails.tool_code`; OAuth sub-codes from §Q.6 live in
+//! `ErrorDetails.provider_code`. At the agent-error level they all
+//! surface as:
+//!   - `.tool_runtime` for tool failures
+//!   - `.auth` for OAuth/credential failures
+//!   - the matching transport code for network failures
+//!
+//! Tools populate `ToolResult.tool_code` on failure; callers that
+//! escalate a tool result to an `agent_error` copy it into
+//! `ErrorDetails.tool_code` via `fromToolResult` below.
 
 const std = @import("std");
 
@@ -128,6 +141,38 @@ pub const ErrorDetails = struct {
         return null;
     }
 };
+
+/// v1.7.1 — §F.2 helper. Escalate a failed tool result into an
+/// `ErrorDetails` suitable for an `agent_error` stream event.
+/// Copies the tool's sub-code into `tool_code`; the top-level
+/// code stays `.tool_runtime`. The `message` slice is borrowed
+/// from `fallback_message` when the caller doesn't want to read
+/// the ToolResult's text block. Caller owns the returned struct's
+/// strings when they pass an allocator via `.dupe()` on the
+/// result. Pure.
+pub fn fromToolResult(
+    fallback_message: []const u8,
+    tool_code: ?[]const u8,
+) ErrorDetails {
+    return .{
+        .code = .tool_runtime,
+        .message = fallback_message,
+        .tool_code = tool_code,
+    };
+}
+
+test "fromToolResult: carries tool_code sub-code under code=tool_runtime" {
+    const d = fromToolResult("edit failed", "edit_no_match");
+    try std.testing.expectEqual(Code.tool_runtime, d.code);
+    try std.testing.expectEqualStrings("edit_no_match", d.tool_code.?);
+    try std.testing.expectEqualStrings("edit failed", d.message);
+}
+
+test "fromToolResult: null sub-code still yields a usable details" {
+    const d = fromToolResult("something broke", null);
+    try std.testing.expectEqual(Code.tool_runtime, d.code);
+    try std.testing.expect(d.tool_code == null);
+}
 
 test "Code.isRetryable" {
     try std.testing.expect(Code.rate_limited.isRetryable());

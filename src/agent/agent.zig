@@ -313,6 +313,8 @@ pub const Agent = struct {
             .registry = self.registry,
             .cancel = &self.cancel,
             .stream_options = stream_opts,
+            .hook_userdata = @ptrCast(self),
+            .between_turns = betweenTurnsHook,
         }, &ch);
 
         // Drain events, broadcast, capture any agent_error.
@@ -328,5 +330,57 @@ pub const Agent = struct {
             self.broadcast(ev);
             ev.deinit(self.allocator);
         }
+    }
+
+    /// §4.3 between-turns hook: drain both queues into the
+    /// transcript and request another turn whenever anything was
+    /// appended. Invoked by `loop_mod.agentLoop` after a natural
+    /// `keep_going=false` return and before closing.
+    fn betweenTurnsHook(userdata: ?*anyopaque, transcript: *loop_mod.Transcript) bool {
+        const self: *Agent = @ptrCast(@alignCast(userdata.?));
+        var any_appended = false;
+
+        // Drain the followUp queue — fresh user prompts.
+        const follow_ups = self.drainFollowUpQueue() catch return false;
+        defer self.allocator.free(follow_ups);
+        for (follow_ups) |txt| {
+            defer self.allocator.free(txt);
+            if (appendUserText(self.allocator, transcript, txt)) any_appended = true;
+        }
+
+        // Drain the steer queue — mid-conversation steering
+        // messages. Semantically same shape as followUp at this
+        // boundary (§4.3 distinguishes them by WHEN they drain;
+        // between-turns is the same code path for both).
+        const steers = self.drainSteerQueue() catch return false;
+        defer self.allocator.free(steers);
+        for (steers) |txt| {
+            defer self.allocator.free(txt);
+            if (appendUserText(self.allocator, transcript, txt)) any_appended = true;
+        }
+
+        return any_appended;
+    }
+
+    fn appendUserText(
+        allocator: std.mem.Allocator,
+        transcript: *loop_mod.Transcript,
+        text: []const u8,
+    ) bool {
+        const content = allocator.alloc(ai.types.ContentBlock, 1) catch return false;
+        content[0] = .{ .text = .{ .text = allocator.dupe(u8, text) catch {
+            allocator.free(content);
+            return false;
+        } } };
+        transcript.append(.{
+            .role = .user,
+            .content = content,
+            .timestamp = ai.stream.nowMillis(),
+        }) catch {
+            allocator.free(content[0].text.text);
+            allocator.free(content);
+            return false;
+        };
+        return true;
     }
 };

@@ -8,11 +8,14 @@ pub const tools = struct {
     pub const ls = @import("tools/ls.zig");
     pub const find = @import("tools/find.zig");
     pub const grep = @import("tools/grep.zig");
+    pub const workspace = @import("tools/workspace.zig");
 };
 
 pub const modes = struct {
     pub const print = @import("modes/print.zig");
     pub const interactive = @import("modes/interactive.zig");
+    pub const login = @import("modes/login.zig");
+    pub const rpc = @import("modes/rpc.zig");
 };
 
 pub const terminal = @import("terminal.zig");
@@ -34,6 +37,10 @@ pub const rpc = @import("rpc.zig");
 pub const slash = @import("slash.zig");
 pub const templates = @import("templates.zig");
 pub const extensions = @import("extensions.zig");
+pub const extensions_builtin = struct {
+    pub const catalog = @import("extensions_builtin/catalog.zig");
+    pub const echo = @import("extensions_builtin/echo.zig");
+};
 
 test {
     _ = tools.read;
@@ -43,8 +50,11 @@ test {
     _ = tools.ls;
     _ = tools.find;
     _ = tools.grep;
+    _ = tools.workspace;
     _ = modes.print;
     _ = modes.interactive;
+    _ = modes.login;
+    _ = modes.rpc;
     _ = terminal;
     _ = session;
     _ = cli;
@@ -63,4 +73,6 @@ test {
     _ = slash;
     _ = templates;
     _ = extensions;
+    _ = extensions_builtin.catalog;
+    _ = extensions_builtin.echo;
 }

@@ -412,13 +412,12 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     defer bw.deinit();
 
     const endpoint: []const u8 = ctx.options.base_url orelse url;
-    const result = client.fetch(.{
+    const result = http_mod.fetchWithRetryAndTimeouts(&client, .{
         .location = .{ .url = endpoint },
         .method = .POST,
         .payload = body,
-        .response_writer = &bw.writer,
         .extra_headers = http_headers,
-    }) catch |e| {
+    }, &bw, cancel, .{}, ctx.options.timeouts) catch |e| {
         try ctx.out.push(ctx.io, .start);
         ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
             .code = errors.Code.transport,

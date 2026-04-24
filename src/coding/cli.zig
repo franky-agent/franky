@@ -42,6 +42,10 @@ pub const Config = struct {
     system_prompt: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
     thinking: types.ThinkingLevel = .off,
+    /// True when the CLI parser saw `--thinking <level>`. Lets the
+    /// provider resolver know whether `thinking == .off` is a user
+    /// choice or a default that settings.json may override.
+    thinking_explicit: bool = false,
     /// Explicit --log-level from the CLI, if provided. When null the
     /// driver falls back to env vars (FRANKY_LOG, FRANKY_DEBUG) and
     /// --verbose as its resolution chain.
@@ -63,6 +67,11 @@ pub const Config = struct {
     /// before appending the prompt. Requires the v0.6.2 branching
     /// integration to actually take effect.
     fork_branch: ?[]const u8 = null,
+    /// `--checkout <name>` — resume a specific branch instead of
+    /// the session's saved active branch (v1.7.0). Loads
+    /// `<session_dir>/transcripts/<name>.json` on top of the tree
+    /// metadata; pairs naturally with `--resume <id>`.
+    checkout_branch: ?[]const u8 = null,
     /// `--export <format>` — dump the active transcript and exit.
     /// Accepted values: `markdown`, `json`.
     export_format: ?[]const u8 = null,
@@ -189,6 +198,7 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
         } else if (std.mem.eql(u8, name, "--thinking")) {
             const v = try take_value(argv, &i, inline_value);
             cfg.thinking = types.ThinkingLevel.fromString(v) orelse return error.UnknownThinkingLevel;
+            cfg.thinking_explicit = true;
         } else if (std.mem.eql(u8, name, "--log-level")) {
             cfg.log_level = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--session")) {
@@ -201,6 +211,8 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.continue_session = true;
         } else if (std.mem.eql(u8, name, "--fork")) {
             cfg.fork_branch = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--checkout")) {
+            cfg.checkout_branch = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--export")) {
             cfg.export_format = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--tools")) {
@@ -255,7 +267,7 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
 }
 
 pub const usage_text: []const u8 =
-    \\franky — a Zig LLM agent (see pi-mono-spec.md §5.6)
+    \\franky — a Zig LLM agent (see franky-spec-v1.md §5.6)
     \\
     \\USAGE:
     \\  franky [FLAGS] [--] PROMPT...
@@ -280,6 +292,7 @@ pub const usage_text: []const u8 =
     \\  --mode MODE                  print [interactive,rpc deferred]
     \\  --continue                   Resume the most-recent session in session-dir
     \\  --fork NAME                  Fork a new branch at the current head (§5.1)
+    \\  --checkout NAME              Resume the named branch (v1.7.0); pairs with --resume
     \\  --export FORMAT              Dump transcript (markdown|json) and exit
     \\  --tools LIST                 Comma-separated tool subset for this run
     \\  --skills PATH                Load a skill bundle (§5.8)

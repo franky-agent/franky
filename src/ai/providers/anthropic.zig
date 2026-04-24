@@ -617,13 +617,16 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         };
     }
 
-    const result = client.fetch(.{
+    // §F.1 retry wrap: 5xx + 429 + transient transport errors
+    // retried up to 3 times with decorrelated-jitter backoff.
+    // `fetchWithRetry` resets `bw` between attempts so a failed
+    // attempt doesn't leak body bytes into the next.
+    const result = http_mod.fetchWithRetryAndTimeouts(&client, .{
         .location = .{ .url = default_endpoint },
         .method = .POST,
         .payload = body,
-        .response_writer = &bw.writer,
         .extra_headers = http_headers,
-    }) catch |e| {
+    }, &bw, cancel, .{}, ctx.options.timeouts) catch |e| {
         try ctx.out.push(ctx.io, .start);
         ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
             .code = errors.Code.transport,

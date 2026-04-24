@@ -369,3 +369,50 @@ test "sweep: GC removes unreferenced objects" {
     const err = readObject(gpa, io, base, hex_b);
     try testing.expectError(error.FileNotFound, err);
 }
+
+// ─── v1.6.1 — coverage gap fills ─────────────────────────────────
+
+test "readObject: non-64 hex → InvalidHash" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const err = readObject(testing.allocator, io, "/tmp/franky_objstore_ignored", "abc");
+    try testing.expectError(error.InvalidHash, err);
+}
+
+test "writeObject: non-64 hex → InvalidHash" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const err = writeObject(testing.allocator, io, "/tmp/franky_objstore_ignored", "abc", "x");
+    try testing.expectError(error.InvalidHash, err);
+}
+
+test "sweep: missing store dir is a no-op (0 deletions)" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "/tmp/franky_objstore_missing";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    const deleted = try sweep(testing.allocator, io, base, &.{});
+    try testing.expectEqual(@as(usize, 0), deleted);
+}
+
+test "store: zero-length input stays inline" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "/tmp/franky_objstore_zero";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    const ref = try store(testing.allocator, io, base, "");
+    switch (ref) {
+        .inline_bytes => |b| try testing.expectEqual(@as(usize, 0), b.len),
+        .external => try testing.expect(false),
+    }
+}

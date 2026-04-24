@@ -23,6 +23,10 @@ const at = agent.types;
 const tools_mod = franky.coding.tools;
 const session_mod = franky.coding.session;
 const cli_mod = franky.coding.cli;
+const auth_mod = franky.coding.auth;
+const settings_mod = franky.coding.settings;
+const models_mod = franky.coding.models;
+const branching_mod = franky.coding.branching;
 
 /// Default model when the user didn't pass `--model`. Sonnet 4.6 is
 /// the current cost/latency sweet spot; Opus 4.6 is reachable via
@@ -70,7 +74,8 @@ pub fn run(
         return writeOut(io, msg);
     }
     if (cfg.mode == .rpc) {
-        return exitWithMessage(io, "rpc mode is not yet implemented; use --mode print or --mode interactive\n", 2);
+        const rpc_mode = @import("rpc.zig");
+        return rpc_mode.run(allocator, io, environ, environ_map, &cfg);
     }
     if (cfg.mode == .interactive) {
         // Interactive mode doesn't require a prompt — the REPL
@@ -103,7 +108,9 @@ fn runPrint(
     defer ai.log.deinit();
 
     // ── Provider selection ────────────────────────────────────────
-    const provider_info = try resolveProvider(allocator, environ, cfg);
+    // Use the io-aware resolver so `auth.json` + `settings.json`
+    // layers actually participate in the decision.
+    const provider_info = try resolveProviderIo(allocator, io, environ, cfg);
 
     {
         const auth_scheme: []const u8 = if (provider_info.auth_token != null)
@@ -164,12 +171,44 @@ fn runPrint(
         try faux.push(.{ .events = faux_events[0..] });
     }
 
+    // ── Workspace + env policy ─────────────────────────────────────
+    // Path-taking tools get canonicalized against `workspace_root`;
+    // bash filters subprocess env through the `env_denylist`. When
+    // `PWD` is absent (piped invocations, etc.) we skip the §R
+    // wiring and fall back to the v0.4.* behavior so we don't
+    // silently block every path with a `workspace_root_invalid`
+    // error.
+    const workspace_root: ?[]const u8 = environ.getPosix("PWD");
+    var workspace_state: ?tools_mod.workspace.Workspace = if (workspace_root) |root|
+        tools_mod.workspace.Workspace{ .root = root, .host_env = environ_map }
+    else
+        null;
+
+    var bash_state = tools_mod.bash.SessionBashState.init(allocator);
+    defer bash_state.deinit();
+    var bash_ctx = tools_mod.bash.BashCtx{
+        .state = &bash_state,
+        .workspace = if (workspace_state) |*ws| ws else null,
+    };
+
     // ── Tool registration ──────────────────────────────────────────
-    const all_tools = [_]at.AgentTool{
+    // When a workspace root is known, each path-taking tool routes
+    // user-supplied paths through `path_safety.canonicalize`; bash
+    // gets the combined state+workspace ctx. Otherwise we keep the
+    // v0.4.* plain factories.
+    const all_tools = if (workspace_state) |*ws| [_]at.AgentTool{
+        tools_mod.read.toolWithWorkspace(ws),
+        tools_mod.write.toolWithWorkspace(ws),
+        tools_mod.edit.toolWithWorkspace(ws),
+        tools_mod.bash.toolWithStateAndWorkspace(&bash_ctx),
+        tools_mod.ls.toolWithWorkspace(ws),
+        tools_mod.find.toolWithWorkspace(ws),
+        tools_mod.grep.toolWithWorkspace(ws),
+    } else [_]at.AgentTool{
         tools_mod.read.tool(),
         tools_mod.write.tool(),
         tools_mod.edit.tool(),
-        tools_mod.bash.tool(),
+        tools_mod.bash.toolWithState(&bash_state),
         tools_mod.ls.tool(),
         tools_mod.find.tool(),
         tools_mod.grep.tool(),
@@ -199,7 +238,7 @@ fn runPrint(
     }
 
     // ── Agent loop ─────────────────────────────────────────────────
-    const system_prompt = try buildSystemPrompt(allocator, cfg);
+    const system_prompt = try buildSystemPromptIo(allocator, io, environ, cfg);
     defer allocator.free(system_prompt);
 
     const model: ai.types.Model = .{
@@ -208,7 +247,10 @@ fn runPrint(
         .api = provider_info.api_tag,
         .context_window = provider_info.context_window,
         .max_output = provider_info.max_output,
-        .capabilities = .{ .vision = false, .tool_use = true, .reasoning = cfg.thinking != .off },
+        // capabilities come from the models-catalog entry (via
+        // `finalize` in `resolveProviderIo`); force `reasoning`
+        // when the user passed `--thinking <level>` explicitly.
+        .capabilities = provider_info.capabilities,
     };
 
     var cancel = ai.stream.Cancel{};
@@ -372,6 +414,11 @@ pub const ProviderInfo = struct {
     base_url: ?[]const u8,
     context_window: u32,
     max_output: u32,
+    /// Derived from the models-catalog entry for `model_id`, with
+    /// `reasoning` force-enabled when the user set `--thinking`.
+    /// Falls back to `{ tool_use = true }` when the catalog has no
+    /// matching entry (e.g. unknown custom model id).
+    capabilities: ai.types.Capabilities = .{ .tool_use = true },
 };
 
 pub fn resolveProvider(
@@ -379,21 +426,100 @@ pub fn resolveProvider(
     environ: std.process.Environ,
     cfg: *cli_mod.Config,
 ) !ProviderInfo {
+    return resolveProviderIo(allocator, null, environ, cfg);
+}
+
+/// Variant that consults `$FRANKY_HOME/auth.json` via `io`. The
+/// `resolveProvider` wrapper above preserves the older call-free
+/// signature that tests use; callers from the CLI dispatcher pass
+/// their real `io` so the auth-file layer actually runs.
+pub fn resolveProviderIo(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    environ: std.process.Environ,
+    cfg: *cli_mod.Config,
+) !ProviderInfo {
     const a = cfg.arena.allocator();
 
+    // ── Layered settings ─────────────────────────────────────────
+    // Defaults → $HOME/.franky/agent/settings.json → cwd/.franky/settings.json.
+    // Missing files fall through silently; CLI flags take precedence
+    // over everything below.
+    var settings = blk: {
+        if (io) |ioref| {
+            const home = environ.getPosix("FRANKY_HOME") orelse environ.getPosix("HOME");
+            // Use `$PWD` rather than a getcwd syscall — it's what
+            // shells export and it avoids `std.posix.getcwd` (gone
+            // in 0.17-dev). The resolver treats a missing project
+            // dir as "no project layer", which is the correct
+            // behavior for non-interactive invocations anyway.
+            const pwd = environ.getPosix("PWD");
+            break :blk settings_mod.loadLayered(allocator, ioref, pwd, home) catch try settings_mod.defaults(allocator);
+        }
+        break :blk try settings_mod.defaults(allocator);
+    };
+    defer settings.deinit();
+
+    // Settings.thinking overrides the default `cfg.thinking` only
+    // when the CLI didn't set it explicitly. `cfg.thinking` starts
+    // at `.off`, which could be either "user chose off" or "user
+    // didn't say"; the `thinking_explicit` flag disambiguates.
+    if (!cfg.thinking_explicit) {
+        if (ai.types.ThinkingLevel.fromString(settings.thinking)) |lvl| {
+            cfg.thinking = lvl;
+        }
+    }
+
+    // ── auth.json as a third credential tier ─────────────────────
+    // Precedence: CLI flag > env var > auth.json > (nothing).
+    // We load auth.json once and feed its contents into each
+    // provider branch below via `resolveApiKey`/`resolveAuthToken`.
+    var auth_state: ?auth_mod.Auth = null;
+    defer if (auth_state) |*a_state| a_state.deinit();
+    if (io) |ioref| {
+        const auth_path = try authJsonPath(a, environ);
+        if (auth_path) |p| {
+            auth_state = auth_mod.load(allocator, ioref, p) catch null;
+        }
+    }
+
+    // ── $FRANKY_HOME/models.json disk overlay ────────────────────
+    // Parsed entries override the built-in catalog on id collision
+    // (§H.3). Entries owned by `cfg.arena` so freed with the config.
+    const models_extras: []const models_mod.Entry = blk: {
+        if (io) |ioref| {
+            const franky_home: ?[]const u8 = environ.getPosix("FRANKY_HOME");
+            const home: ?[]const u8 = environ.getPosix("HOME");
+            const models_path = try modelsJsonPathFrom(a, franky_home, home);
+            if (models_path) |p| {
+                const bytes = readWholeFileOpt(allocator, ioref, p) orelse break :blk &.{};
+                defer allocator.free(bytes);
+                const entries = models_mod.parseFromSlice(a, bytes) catch break :blk &.{};
+                break :blk entries;
+            }
+        }
+        break :blk &.{};
+    };
+
     // Credential resolution, matching the Claude Code precedence list
-    // (see src/ai/providers/AUTH.md). CLI flags beat env vars; bearer
-    // tokens and API keys are tracked separately so the Anthropic
-    // provider can pick the right header scheme.
+    // (see src/ai/providers/AUTH.md). CLI flags beat env vars beat
+    // auth.json; bearer tokens and API keys are tracked separately
+    // so the Anthropic provider can pick the right header scheme.
+    const anthropic_file = if (auth_state) |as| as.get("anthropic") else null;
+    const openai_file = if (auth_state) |as| as.get("openai") else null;
+    const gateway_file = if (auth_state) |as| as.get("gateway") else null;
+
     const api_key: ?[]const u8 = blk: {
         if (cfg.api_key) |k| break :blk k;
         if (environ.getPosix("ANTHROPIC_API_KEY")) |k| break :blk try a.dupe(u8, k);
+        if (anthropic_file) |rec| if (rec.api_key) |k| break :blk try a.dupe(u8, k);
         break :blk null;
     };
     const auth_token: ?[]const u8 = blk: {
         if (cfg.auth_token) |t| break :blk t;
         if (environ.getPosix("ANTHROPIC_AUTH_TOKEN")) |t| break :blk try a.dupe(u8, t);
         if (environ.getPosix("CLAUDE_CODE_OAUTH_TOKEN")) |t| break :blk try a.dupe(u8, t);
+        if (anthropic_file) |rec| if (rec.access_token) |t| break :blk try a.dupe(u8, t);
         break :blk null;
     };
     // OpenAI credential is tracked separately — `--api-key` double-binds
@@ -403,22 +529,30 @@ pub fn resolveProvider(
     // branch doesn't claim it.
     const openai_api_key: ?[]const u8 = blk: {
         if (environ.getPosix("OPENAI_API_KEY")) |k| break :blk try a.dupe(u8, k);
+        if (openai_file) |rec| if (rec.api_key) |k| break :blk try a.dupe(u8, k);
         break :blk null;
     };
 
     const has_anthropic_credential = api_key != null or auth_token != null;
     const has_openai_credential = openai_api_key != null or (cfg.api_key != null and !has_anthropic_credential);
 
+    // Settings supplies the default provider when the user didn't
+    // pass `--provider` and no credentials tell us what to pick.
+    // `--offline` forces faux regardless.
     const chosen: []const u8 = blk: {
+        if (cfg.offline) break :blk "faux";
         if (cfg.provider) |p| break :blk p;
         if (has_anthropic_credential) break :blk "anthropic";
         if (has_openai_credential) break :blk "openai";
+        // Respect settings.default_provider if it points at one we
+        // can actually satisfy with available credentials; else faux.
+        if (std.mem.eql(u8, settings.default_provider, "faux")) break :blk "faux";
         break :blk "faux";
     };
 
     if (std.mem.eql(u8, chosen, "faux")) {
         const model = cfg.model orelse try a.dupe(u8, "faux-1");
-        return .{
+        return finalize(a, .{
             .provider_name = "faux",
             .api_tag = "faux",
             .model_id = model,
@@ -427,17 +561,18 @@ pub fn resolveProvider(
             .base_url = null,
             .context_window = default_context_window,
             .max_output = default_max_output,
-        };
+        }, cfg, models_extras);
     }
 
     if (std.mem.eql(u8, chosen, "anthropic")) {
         if (!has_anthropic_credential) {
-            const msg = "anthropic provider requires one of: --api-key, --auth-token, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN\n";
+            const msg = "anthropic provider requires one of: --api-key, --auth-token, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, or an `anthropic` entry in auth.json\n";
             return exitWithMessageErr(allocator, msg, 2);
         }
-        const model_input = cfg.model orelse default_anthropic_model;
+        // Model precedence: --model > settings.default_model_anthropic > default_anthropic_model.
+        const model_input = cfg.model orelse settings.default_model_anthropic;
         const model = try a.dupe(u8, resolveAnthropicAlias(model_input));
-        return .{
+        return finalize(a, .{
             .provider_name = "anthropic",
             .api_tag = "anthropic-messages",
             .model_id = model,
@@ -446,17 +581,17 @@ pub fn resolveProvider(
             .base_url = null,
             .context_window = default_context_window,
             .max_output = default_max_output,
-        };
+        }, cfg, models_extras);
     }
 
     if (std.mem.eql(u8, chosen, "openai")) {
         const effective_key: ?[]const u8 = openai_api_key orelse cfg.api_key;
         if (effective_key == null) {
-            const msg = "openai provider requires --api-key or OPENAI_API_KEY\n";
+            const msg = "openai provider requires --api-key or OPENAI_API_KEY, or an `openai` entry in auth.json\n";
             return exitWithMessageErr(allocator, msg, 2);
         }
-        const model = cfg.model orelse try a.dupe(u8, "gpt-5");
-        return .{
+        const model = cfg.model orelse try a.dupe(u8, settings.default_model_openai);
+        return finalize(a, .{
             .provider_name = "openai",
             .api_tag = "openai-chat-completions",
             .model_id = model,
@@ -465,13 +600,18 @@ pub fn resolveProvider(
             .base_url = null,
             .context_window = default_context_window,
             .max_output = default_max_output,
-        };
+        }, cfg, models_extras);
     }
 
     if (std.mem.eql(u8, chosen, "gateway")) {
         const base_url_str: []const u8 = cfg.base_url orelse blk: {
             if (environ.getPosix("FRANKY_GATEWAY_URL")) |u| break :blk try a.dupe(u8, u);
             if (environ.getPosix("OPENAI_BASE_URL")) |u| break :blk try a.dupe(u8, u);
+            if (gateway_file) |rec| if (rec.api_key) |_| {
+                // If the user put a gateway cred in auth.json, they
+                // also need to have set a base_url — otherwise we
+                // can't reach the server.
+            };
             const msg = "gateway provider requires --base-url (or FRANKY_GATEWAY_URL / OPENAI_BASE_URL env)\n";
             return exitWithMessageErr(allocator, msg, 2);
         };
@@ -480,6 +620,7 @@ pub fn resolveProvider(
         // OpenRouter, …) want --api-key.
         const effective_key: ?[]const u8 = cfg.api_key orelse openai_api_key orelse blk: {
             if (environ.getPosix("FRANKY_GATEWAY_TOKEN")) |t| break :blk try a.dupe(u8, t);
+            if (gateway_file) |rec| if (rec.api_key) |k| break :blk try a.dupe(u8, k);
             break :blk null;
         };
         if (cfg.model == null) {
@@ -487,7 +628,7 @@ pub fn resolveProvider(
             return exitWithMessageErr(allocator, msg, 2);
         }
         const model = cfg.model.?;
-        return .{
+        return finalize(a, .{
             .provider_name = "gateway",
             .api_tag = "openai-compatible-gateway",
             .model_id = model,
@@ -496,12 +637,111 @@ pub fn resolveProvider(
             .base_url = base_url_str,
             .context_window = default_context_window,
             .max_output = default_max_output,
-        };
+        }, cfg, models_extras);
     }
 
     const msg = try std.fmt.allocPrint(allocator, "unknown --provider '{s}'; use faux, anthropic, openai, or gateway\n", .{chosen});
     defer allocator.free(msg);
     return exitWithMessageErr(allocator, msg, 2);
+}
+
+/// Post-process a `ProviderInfo`: consult the models catalog for
+/// the chosen model id, and if a match exists, upgrade the
+/// context_window/max_output/capabilities from the Entry. Callers
+/// can still override by passing `--context-window` (TODO) etc.
+fn finalize(
+    arena_alloc: std.mem.Allocator,
+    info_in: ProviderInfo,
+    cfg: *const cli_mod.Config,
+    extras: []const models_mod.Entry,
+) !ProviderInfo {
+    _ = arena_alloc;
+    var info = info_in;
+    if (models_mod.lookup(extras, info.model_id)) |entry| {
+        info.context_window = entry.context_window;
+        info.max_output = entry.max_output;
+        info.capabilities = .{
+            .vision = entry.capabilities.vision,
+            .tool_use = entry.capabilities.tool_use,
+            // Thinking stays user-controlled: if the user passed
+            // `--thinking <level>` explicitly, light it up even if
+            // the catalog says the model doesn't support reasoning
+            // (the provider layer will reject gracefully).
+            .reasoning = if (cfg.thinking != .off) true else entry.capabilities.reasoning,
+            .cache = entry.capabilities.cache,
+            .streaming = entry.capabilities.streaming,
+        };
+    } else {
+        // Unknown model id — keep the hardcoded defaults but still
+        // honor `--thinking`.
+        info.capabilities = .{
+            .tool_use = true,
+            .reasoning = cfg.thinking != .off,
+        };
+    }
+    return info;
+}
+
+/// Compute the path to `auth.json` from `FRANKY_HOME` or `HOME`.
+/// Returns a slice allocated on `arena_alloc` or null if neither
+/// env var is set.
+fn authJsonPath(
+    arena_alloc: std.mem.Allocator,
+    environ: std.process.Environ,
+) !?[]const u8 {
+    const franky_home: ?[]const u8 = environ.getPosix("FRANKY_HOME");
+    const home: ?[]const u8 = environ.getPosix("HOME");
+    return authJsonPathFrom(arena_alloc, franky_home, home);
+}
+
+/// Pure-logic variant testable without a real `Environ`. Precedence:
+/// `FRANKY_HOME/auth.json` > `HOME/.franky/auth.json` > null.
+pub fn authJsonPathFrom(
+    arena_alloc: std.mem.Allocator,
+    franky_home: ?[]const u8,
+    home: ?[]const u8,
+) !?[]const u8 {
+    if (franky_home) |h| {
+        return try std.fs.path.join(arena_alloc, &.{ h, "auth.json" });
+    }
+    if (home) |h| {
+        return try std.fs.path.join(arena_alloc, &.{ h, ".franky", "auth.json" });
+    }
+    return null;
+}
+
+/// Pure-logic variant for `models.json`. Same precedence as
+/// `authJsonPathFrom`: `$FRANKY_HOME/models.json` >
+/// `$HOME/.franky/models.json` > null (§H.3, v1.5.2).
+pub fn modelsJsonPathFrom(
+    arena_alloc: std.mem.Allocator,
+    franky_home: ?[]const u8,
+    home: ?[]const u8,
+) !?[]const u8 {
+    if (franky_home) |h| {
+        return try std.fs.path.join(arena_alloc, &.{ h, "models.json" });
+    }
+    if (home) |h| {
+        return try std.fs.path.join(arena_alloc, &.{ h, ".franky", "models.json" });
+    }
+    return null;
+}
+
+/// Pure-logic variant for `system.md`. Same precedence as
+/// `authJsonPathFrom`: `$FRANKY_HOME/system.md` >
+/// `$HOME/.franky/system.md` > null (§D, v1.5.2).
+pub fn systemMdPathFrom(
+    arena_alloc: std.mem.Allocator,
+    franky_home: ?[]const u8,
+    home: ?[]const u8,
+) !?[]const u8 {
+    if (franky_home) |h| {
+        return try std.fs.path.join(arena_alloc, &.{ h, "system.md" });
+    }
+    if (home) |h| {
+        return try std.fs.path.join(arena_alloc, &.{ h, ".franky", "system.md" });
+    }
+    return null;
 }
 
 // ─── session state ───────────────────────────────────────────────
@@ -513,6 +753,11 @@ const SessionState = struct {
     parent_dir: ?[]const u8,
     transcript: agent.loop.Transcript,
     created_at_ms: i64,
+    /// v1.6.0 — branch tree for this session. Loaded from
+    /// `<session_dir>/tree.json` on `--resume`, minted fresh
+    /// otherwise. Saved alongside `session.json`/`transcript.json`
+    /// in `persist`.
+    tree: branching_mod.Tree,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -543,16 +788,47 @@ const SessionState = struct {
                 arena.deinit();
                 return err;
             };
-            const transcript = loaded.transcript;
+            var transcript = loaded.transcript;
             const created_ms = loaded.header.created_at_ms;
             const owned_id = try a.dupe(u8, sid);
             session_mod.freeSessionHeader(allocator, loaded.header);
+            // Tree: `loadTree` tolerates missing file → fresh tree
+            // with default `main` branch.
+            const session_dir = try std.fs.path.join(a, &.{ parent_dir.?, owned_id });
+            var tree = branching_mod.loadTree(allocator, io, session_dir) catch try branching_mod.Tree.init(allocator);
+
+            // v1.7.0 — `--checkout <name>` swaps the transcript to
+            // the branch snapshot at resume time. Falls back to the
+            // already-loaded active transcript if the snapshot is
+            // missing (e.g. pre-v1.7 sessions that never wrote one).
+            if (cfg.checkout_branch) |name| {
+                tree.switchTo(name) catch {};
+                if (session_mod.readBranchTranscript(allocator, io, session_dir, name)) |snap| {
+                    transcript.deinit();
+                    transcript = snap;
+                } else |_| {
+                    // No snapshot on disk yet; keep the active
+                    // transcript, log a warning so the user knows
+                    // the swap was a no-op on the message list.
+                    ai.log.log(.warn, "session", "checkout_snapshot_missing", "branch={s}", .{name});
+                }
+            }
+
+            if (cfg.fork_branch) |name| {
+                const msg_count: u32 = @intCast(transcript.messages.items.len);
+                tree.fork(name, tree.active, msg_count) catch {};
+                tree.switchTo(name) catch {};
+                // Snapshot the new branch immediately so subsequent
+                // `--checkout <name>` works before the first persist.
+                session_mod.writeBranchTranscript(allocator, io, session_dir, &transcript, name) catch {};
+            }
             return .{
                 .arena = arena,
                 .session_id = owned_id,
                 .parent_dir = parent_dir,
                 .transcript = transcript,
                 .created_at_ms = created_ms,
+                .tree = tree,
             };
         }
 
@@ -567,18 +843,26 @@ const SessionState = struct {
             break :blk try a.dupe(u8, u.asSlice());
         };
 
+        var tree = try branching_mod.Tree.init(allocator);
+        if (cfg.fork_branch) |name| {
+            tree.fork(name, tree.active, 0) catch {};
+            tree.switchTo(name) catch {};
+        }
+
         return .{
             .arena = arena,
             .session_id = owned_id,
             .parent_dir = parent_dir,
             .transcript = agent.loop.Transcript.init(allocator),
             .created_at_ms = ai.stream.nowMillis(),
+            .tree = tree,
         };
     }
 
     fn deinit(self: *SessionState, allocator: std.mem.Allocator) void {
         _ = allocator;
         self.transcript.deinit();
+        self.tree.deinit();
         self.arena.deinit();
     }
 
@@ -621,6 +905,33 @@ const SessionState = struct {
         };
 
         try session_mod.save(allocator, io, parent, header, &self.transcript);
+
+        // v1.6.0 — persist the branch tree alongside the header
+        // and transcript. Errors here are non-fatal: the tree is
+        // a convenience layer; losing it degrades to the pre-v1.6
+        // "main-only" behavior on next load.
+        const session_dir = try std.fs.path.join(allocator, &.{ parent, self.session_id });
+        defer allocator.free(session_dir);
+
+        // Sync message_count on the active branch to match the
+        // current transcript length before saving so resume knows
+        // how many messages the branch holds.
+        const entry_maybe = self.tree.branches.getPtr(self.tree.active);
+        if (entry_maybe) |entry| {
+            entry.message_count = @intCast(self.transcript.messages.items.len);
+        }
+        branching_mod.saveTree(allocator, io, session_dir, &self.tree) catch |err| {
+            ai.log.log(.warn, "session", "tree_save_failed", "error={s}", .{@errorName(err)});
+        };
+
+        // v1.7.0 — also snapshot the active branch into
+        // transcripts/<branch>.json so `--checkout <branch>` can
+        // rehydrate that exact state on resume. Non-fatal: if the
+        // snapshot fails, `transcript.json` is still authoritative
+        // for the active branch.
+        session_mod.writeBranchTranscript(allocator, io, session_dir, &self.transcript, self.tree.active) catch |err| {
+            ai.log.log(.warn, "session", "branch_snapshot_failed", "error={s}", .{@errorName(err)});
+        };
     }
 };
 
@@ -644,6 +955,49 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, cfg: *const cli_mod.Confi
         return try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ default_system_prompt, extra });
     }
     return try allocator.dupe(u8, default_system_prompt);
+}
+
+/// v1.5.2 — io-aware system-prompt loader. Precedence (highest →
+/// lowest): `--system-prompt` > `$FRANKY_HOME/system.md` or
+/// `$HOME/.franky/system.md` > built-in `default_system_prompt`.
+/// `--append-system-prompt` is appended to whichever base won.
+/// Missing `system.md` is a silent fallback, not an error.
+pub fn buildSystemPromptIo(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    environ: std.process.Environ,
+    cfg: *const cli_mod.Config,
+) ![]u8 {
+    if (cfg.system_prompt) |s| return try allocator.dupe(u8, s);
+
+    // Try the disk template. On any read failure, fall back silently.
+    var base: []u8 = undefined;
+    var base_owned = true;
+    var loaded_from_disk = false;
+    if (io) |ioref| {
+        const franky_home: ?[]const u8 = environ.getPosix("FRANKY_HOME");
+        const home: ?[]const u8 = environ.getPosix("HOME");
+        const path = systemMdPathFrom(allocator, franky_home, home) catch null;
+        if (path) |p| {
+            defer allocator.free(p);
+            if (readWholeFileOpt(allocator, ioref, p)) |bytes| {
+                base = bytes;
+                loaded_from_disk = true;
+            }
+        }
+    }
+    if (!loaded_from_disk) {
+        base = try allocator.dupe(u8, default_system_prompt);
+    }
+    defer if (base_owned) allocator.free(base);
+
+    if (cfg.append_system_prompt) |extra| {
+        const trimmed = std.mem.trimEnd(u8, base, &std.ascii.whitespace);
+        const out = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed, extra });
+        return out;
+    }
+    base_owned = false;
+    return base;
 }
 
 // ─── helpers ────────────────────────────────────────────────────
@@ -675,6 +1029,27 @@ fn exitWithMessageErr(allocator: std.mem.Allocator, msg: []const u8, code: u8) n
     std.process.exit(code);
 }
 
+/// Read `path` in full; returns null (not an error) if the file is
+/// missing or unreadable. Used for optional disk overlays like
+/// `models.json` and `system.md` where "file doesn't exist" is the
+/// normal fallback — not an error.
+fn readWholeFileOpt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) ?[]u8 {
+    const cwd = std.Io.Dir.cwd();
+    var f = cwd.openFile(io, path, .{}) catch return null;
+    defer f.close(io);
+    const len = f.length(io) catch return null;
+    const buf = allocator.alloc(u8, @intCast(len)) catch return null;
+    const n = f.readPositionalAll(io, buf, 0) catch {
+        allocator.free(buf);
+        return null;
+    };
+    return buf[0..n];
+}
+
 // ─── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -692,4 +1067,232 @@ test "resolveAnthropicAlias passes full ids through untouched" {
     try testing.expectEqualStrings("claude-opus-4-6", resolveAnthropicAlias("claude-opus-4-6"));
     try testing.expectEqualStrings("claude-haiku-4-5-20251001", resolveAnthropicAlias("claude-haiku-4-5-20251001"));
     try testing.expectEqualStrings("whatever-custom-id", resolveAnthropicAlias("whatever-custom-id"));
+}
+
+// ─── v1.1.0 — provider resolution tests ──────────────────────────
+
+fn makeCfg(
+    model: ?[]const u8,
+    thinking: ai.types.ThinkingLevel,
+    offline: bool,
+) !cli_mod.Config {
+    var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(testing.allocator) };
+    cfg.model = model;
+    cfg.thinking = thinking;
+    cfg.offline = offline;
+    return cfg;
+}
+
+test "finalize: known model pulls context_window + max_output from catalog" {
+    var cfg = try makeCfg("claude-sonnet-4-6", .off, false);
+    defer cfg.deinit();
+    const info_in: ProviderInfo = .{
+        .provider_name = "anthropic",
+        .api_tag = "anthropic-messages",
+        .model_id = "claude-sonnet-4-6",
+        .api_key = null,
+        .auth_token = null,
+        .base_url = null,
+        .context_window = 42,
+        .max_output = 7,
+    };
+    const info = try finalize(cfg.arena.allocator(), info_in, &cfg, &.{});
+    // Sonnet 4.6 has a 1M context window and 8192 max output.
+    try testing.expectEqual(@as(u32, 1_000_000), info.context_window);
+    try testing.expectEqual(@as(u32, 8192), info.max_output);
+    try testing.expect(info.capabilities.vision);
+    try testing.expect(info.capabilities.tool_use);
+    try testing.expect(info.capabilities.cache);
+}
+
+test "finalize: unknown model keeps defaults, still honors --thinking" {
+    var cfg = try makeCfg("no-such-model", .high, false);
+    defer cfg.deinit();
+    const info_in: ProviderInfo = .{
+        .provider_name = "anthropic",
+        .api_tag = "anthropic-messages",
+        .model_id = "no-such-model",
+        .api_key = null,
+        .auth_token = null,
+        .base_url = null,
+        .context_window = default_context_window,
+        .max_output = default_max_output,
+    };
+    const info = try finalize(cfg.arena.allocator(), info_in, &cfg, &.{});
+    try testing.expectEqual(default_context_window, info.context_window);
+    try testing.expectEqual(default_max_output, info.max_output);
+    try testing.expect(info.capabilities.tool_use);
+    try testing.expect(info.capabilities.reasoning); // --thinking high
+}
+
+test "finalize: --thinking forces reasoning on even for non-reasoning catalog entries" {
+    var cfg = try makeCfg("claude-haiku-4-5", .medium, false);
+    defer cfg.deinit();
+    const info_in: ProviderInfo = .{
+        .provider_name = "anthropic",
+        .api_tag = "anthropic-messages",
+        .model_id = "claude-haiku-4-5",
+        .api_key = null,
+        .auth_token = null,
+        .base_url = null,
+        .context_window = default_context_window,
+        .max_output = default_max_output,
+    };
+    const info = try finalize(cfg.arena.allocator(), info_in, &cfg, &.{});
+    // Haiku 4.5 has reasoning=false in the catalog; --thinking
+    // overrides.
+    try testing.expect(info.capabilities.reasoning);
+}
+
+test "finalize: --thinking off + catalog.reasoning=true keeps reasoning on" {
+    var cfg = try makeCfg("claude-opus-4-7", .off, false);
+    defer cfg.deinit();
+    const info_in: ProviderInfo = .{
+        .provider_name = "anthropic",
+        .api_tag = "anthropic-messages",
+        .model_id = "claude-opus-4-7",
+        .api_key = null,
+        .auth_token = null,
+        .base_url = null,
+        .context_window = default_context_window,
+        .max_output = default_max_output,
+    };
+    const info = try finalize(cfg.arena.allocator(), info_in, &cfg, &.{});
+    // Opus 4.7's catalog entry has reasoning=true; no --thinking
+    // flag shouldn't clear it.
+    try testing.expect(info.capabilities.reasoning);
+}
+
+test "resolveProvider (no io): with no creds and no --offline → faux with defaults" {
+    var cfg = try makeCfg(null, .off, false);
+    defer cfg.deinit();
+    const env: std.process.Environ = .empty;
+    const info = try resolveProvider(testing.allocator, env, &cfg);
+    try testing.expectEqualStrings("faux", info.provider_name);
+    try testing.expectEqualStrings("faux", info.api_tag);
+    try testing.expectEqualStrings("faux-1", info.model_id);
+}
+
+test "resolveProvider (no io): --offline forces faux even with --api-key" {
+    var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(testing.allocator) };
+    defer cfg.deinit();
+    cfg.api_key = try cfg.arena.allocator().dupe(u8, "sk-test");
+    cfg.offline = true;
+    const env: std.process.Environ = .empty;
+    const info = try resolveProvider(testing.allocator, env, &cfg);
+    try testing.expectEqualStrings("faux", info.provider_name);
+}
+
+test "authJsonPathFrom: FRANKY_HOME takes precedence over HOME" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = (try authJsonPathFrom(arena.allocator(), "/fh", "/home/user")).?;
+    try testing.expectEqualStrings("/fh/auth.json", path);
+}
+
+test "authJsonPathFrom: falls back to $HOME/.franky/auth.json" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = (try authJsonPathFrom(arena.allocator(), null, "/home/user")).?;
+    try testing.expectEqualStrings("/home/user/.franky/auth.json", path);
+}
+
+test "authJsonPathFrom: neither env set → null" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try authJsonPathFrom(arena.allocator(), null, null);
+    try testing.expect(path == null);
+}
+
+// ─── v1.5.2 — models.json + system.md disk-layer tests ─────────────
+
+test "modelsJsonPathFrom: FRANKY_HOME wins, else HOME/.franky" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("/fh/models.json", (try modelsJsonPathFrom(a, "/fh", "/home/u")).?);
+    try testing.expectEqualStrings("/home/u/.franky/models.json", (try modelsJsonPathFrom(a, null, "/home/u")).?);
+    try testing.expect((try modelsJsonPathFrom(a, null, null)) == null);
+}
+
+test "systemMdPathFrom: FRANKY_HOME wins, else HOME/.franky" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("/fh/system.md", (try systemMdPathFrom(a, "/fh", "/home/u")).?);
+    try testing.expectEqualStrings("/home/u/.franky/system.md", (try systemMdPathFrom(a, null, "/home/u")).?);
+    try testing.expect((try systemMdPathFrom(a, null, null)) == null);
+}
+
+fn testIoThreaded() std.Io.Threaded {
+    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
+}
+
+test "finalize: disk-extras shadow built-in catalog on id collision" {
+    const gpa = testing.allocator;
+    var cfg = try makeCfg("claude-sonnet-4-6", .off, false);
+    defer cfg.deinit();
+
+    // Override Sonnet 4.6's context_window to a small sentinel.
+    const extras = [_]models_mod.Entry{.{
+        .id = "claude-sonnet-4-6",
+        .provider = "anthropic",
+        .api = "anthropic-messages",
+        .display_name = "custom-sonnet",
+        .context_window = 42,
+        .max_output = 7,
+        .capabilities = .{
+            .vision = false,
+            .tool_use = true,
+            .reasoning = false,
+            .cache = false,
+            .streaming = true,
+        },
+        .cost = .{},
+        .knowledge_cutoff = "",
+    }};
+
+    const info_in: ProviderInfo = .{
+        .provider_name = "anthropic",
+        .api_tag = "anthropic-messages",
+        .model_id = "claude-sonnet-4-6",
+        .api_key = null,
+        .auth_token = null,
+        .base_url = null,
+        .context_window = default_context_window,
+        .max_output = default_max_output,
+    };
+    const info = try finalize(cfg.arena.allocator(), info_in, &cfg, &extras);
+    try testing.expectEqual(@as(u32, 42), info.context_window);
+    try testing.expectEqual(@as(u32, 7), info.max_output);
+    _ = gpa;
+}
+
+test "buildSystemPromptIo: --system-prompt flag beats disk + default" {
+    const gpa = testing.allocator;
+    var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+    defer cfg.deinit();
+    const explicit = try cfg.arena.allocator().dupe(u8, "you are a test");
+    cfg.system_prompt = explicit;
+
+    const env: std.process.Environ = .empty;
+    const out = try buildSystemPromptIo(gpa, null, env, &cfg);
+    defer gpa.free(out);
+    try testing.expectEqualStrings("you are a test", out);
+}
+
+test "buildSystemPromptIo: missing system.md falls back to default" {
+    const gpa = testing.allocator;
+    var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+    defer cfg.deinit();
+
+    var threaded = testIoThreaded();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Env with no FRANKY_HOME/HOME → no disk lookup attempted.
+    const env: std.process.Environ = .empty;
+    const out = try buildSystemPromptIo(gpa, io, env, &cfg);
+    defer gpa.free(out);
+    try testing.expectEqualStrings(default_system_prompt, out);
 }

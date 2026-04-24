@@ -18,6 +18,7 @@ const ai = struct {
     pub const stream = @import("../../ai/stream.zig");
 };
 const at = @import("../../agent/types.zig");
+const workspace_mod = @import("workspace.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -53,8 +54,19 @@ pub fn tool() at.AgentTool {
     };
 }
 
+pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
+    return .{
+        .name = "edit",
+        .description = "Apply one or more find/replace edits to a file atomically (path-safety enforced).",
+        .parameters_json = parameters_json,
+        .execution_mode = .sequential,
+        .ctx = @constCast(@ptrCast(ws)),
+        .execute = execute,
+    };
+}
+
 fn execute(
-    _: *const at.AgentTool,
+    self: *const at.AgentTool,
     allocator: std.mem.Allocator,
     io: std.Io,
     _: []const u8,
@@ -68,9 +80,23 @@ fn execute(
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), args_json, .{});
     const root = parsed.value;
 
-    const path = (root.object.get("path") orelse return err(allocator, "invalid_args", "missing path")).string;
+    const user_path = (root.object.get("path") orelse return err(allocator, "invalid_args", "missing path")).string;
     const edits_val = root.object.get("edits") orelse return err(allocator, "invalid_args", "missing edits");
     if (edits_val != .array) return err(allocator, "invalid_args", "edits must be an array");
+
+    var canon_path: ?[]u8 = null;
+    defer if (canon_path) |p| allocator.free(p);
+    const path: []const u8 = if (self.ctx) |raw| blk: {
+        const ws: *const workspace_mod.Workspace = @ptrCast(@alignCast(raw));
+        const r = try workspace_mod.canonicalizeOrError(allocator, ws, user_path);
+        switch (r) {
+            .ok => |c| {
+                canon_path = c.abs;
+                break :blk c.abs;
+            },
+            .err => |e| return err(allocator, e.code, e.message),
+        }
+    } else user_path;
 
     var edits: std.ArrayList(EditOp) = .empty;
     defer edits.deinit(allocator);
@@ -239,7 +265,8 @@ fn err(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !at.Tool
     const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };
-    return .{ .content = arr, .is_error = true };
+    const code_dup = try allocator.dupe(u8, code);
+    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
 }
 
 // ─── tests ────────────────────────────────────────────────────────

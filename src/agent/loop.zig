@@ -38,28 +38,63 @@ pub const ConvertToLlmFn = *const fn (
     messages: []const AgentMessage,
 ) anyerror![]ai.types.Message;
 
-/// Default convertToLlm: pass-through, filtering out messages with role
-/// `.custom` (unknown to the model).
+/// Default convertToLlm: pass-through, with two custom-role rewrites:
+///   - `custom_role == "compaction_summary"` (§E.4.3) is converted to
+///     a plain `user` message whose first text block is prefixed with
+///     `"Earlier in this conversation:\n\n"`. The model sees this as
+///     ordinary context rather than a synthetic role it doesn't know.
+///   - Any other `.custom` role is filtered out (unknown to the model).
 pub fn defaultConvertToLlm(
     allocator: std.mem.Allocator,
     messages: []const AgentMessage,
 ) ![]ai.types.Message {
+    const compaction_prefix = "Earlier in this conversation:\n\n";
+
     var out: std.ArrayList(ai.types.Message) = .empty;
     errdefer {
         for (out.items) |*m| m.deinit(allocator);
         out.deinit(allocator);
     }
     for (messages) |m| {
-        if (m.role == .custom) continue;
+        const is_compaction = m.role == .custom and
+            m.custom_role != null and
+            std.mem.eql(u8, m.custom_role.?, "compaction_summary");
+        if (m.role == .custom and !is_compaction) continue;
+
         // Deep-copy so the resulting slice can be owned independently.
         var content: std.ArrayList(ai.types.ContentBlock) = .empty;
         errdefer {
             for (content.items) |cb| cb.deinit(allocator);
             content.deinit(allocator);
         }
-        for (m.content) |cb| try content.append(allocator, try cb.dupe(allocator));
+        if (is_compaction) {
+            // Prefix the first text block; copy the rest verbatim.
+            var first_text_done = false;
+            for (m.content) |cb| switch (cb) {
+                .text => |t| {
+                    if (!first_text_done) {
+                        const merged = try std.fmt.allocPrint(
+                            allocator,
+                            "{s}{s}",
+                            .{ compaction_prefix, t.text },
+                        );
+                        try content.append(allocator, .{ .text = .{
+                            .text = merged,
+                            .text_signature = if (t.text_signature) |s| try allocator.dupe(u8, s) else null,
+                        } });
+                        first_text_done = true;
+                    } else {
+                        try content.append(allocator, try cb.dupe(allocator));
+                    }
+                },
+                else => try content.append(allocator, try cb.dupe(allocator)),
+            };
+        } else {
+            for (m.content) |cb| try content.append(allocator, try cb.dupe(allocator));
+        }
+
         try out.append(allocator, .{
-            .role = m.role,
+            .role = if (is_compaction) .user else m.role,
             .content = try content.toOwnedSlice(allocator),
             .timestamp = m.timestamp,
             .stop_reason = m.stop_reason,
@@ -94,6 +129,16 @@ pub const AfterToolCallFn = *const fn (
     result: *at.ToolResult,
 ) void;
 
+/// §4.3 between-turn hook. Called after `runTurn` returns
+/// `keep_going=false` (the assistant stopped). Implementations
+/// drain their steer/followUp queues, append new user-role
+/// messages to `transcript`, and return `true` to request one
+/// more turn. Returning `false` ends the loop immediately.
+pub const BetweenTurnsFn = *const fn (
+    userdata: ?*anyopaque,
+    transcript: *Transcript,
+) bool;
+
 pub const Config = struct {
     model: ai.types.Model,
     system_prompt: []const u8 = "",
@@ -105,6 +150,15 @@ pub const Config = struct {
     hook_userdata: ?*anyopaque = null,
     before_tool_call: ?BeforeToolCallFn = null,
     after_tool_call: ?AfterToolCallFn = null,
+    /// §4.3 steer/followUp drain hooks. Called between turns —
+    /// after a turn naturally ends, before the next turn's LLM
+    /// call. Implementations may append messages to `transcript`
+    /// (typically one per queued steer/followUp entry) to inject
+    /// user-role messages into the conversation. Each returns
+    /// `true` to keep looping (another turn runs), `false` to
+    /// stop early. When `null`, the loop uses its default
+    /// "no tool calls → stop" rule.
+    between_turns: ?BetweenTurnsFn = null,
     stream_options: ai.registry.StreamOptions = .{},
     /// Hard cap on turn count — guards against infinite loops.
     max_turns: u32 = 50,
@@ -152,6 +206,13 @@ pub fn agentLoop(
             return;
         };
         if (!keep_going) {
+            // Natural turn_end — check the between-turns hook
+            // (§4.3 followUp drain) before closing. When the
+            // hook returns `true`, the transcript has new
+            // user-role messages appended; run another turn.
+            if (config.between_turns) |hook| {
+                if (hook(config.hook_userdata, transcript)) continue;
+            }
             out.close(io);
             return;
         }
@@ -702,4 +763,58 @@ fn dupeMessage(allocator: std.mem.Allocator, m: ai.types.Message) !ai.types.Mess
         .custom_role = if (m.custom_role) |s| try allocator.dupe(u8, s) else null,
         .meta_json = if (m.meta_json) |s| try allocator.dupe(u8, s) else null,
     };
+}
+
+// ─── tests ──────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "defaultConvertToLlm: compaction_summary rewritten to user + prefix" {
+    const gpa = testing.allocator;
+    var c_sum = [_]ai.types.ContentBlock{.{ .text = .{ .text = "the user fixed a bug" } }};
+    var c_user = [_]ai.types.ContentBlock{.{ .text = .{ .text = "next question" } }};
+    const messages = [_]AgentMessage{
+        .{
+            .role = .custom,
+            .custom_role = "compaction_summary",
+            .content = &c_sum,
+            .timestamp = 0,
+        },
+        .{ .role = .user, .content = &c_user, .timestamp = 0 },
+    };
+
+    const out = try defaultConvertToLlm(gpa, &messages);
+    defer {
+        for (out) |*m| m.deinit(gpa);
+        gpa.free(out);
+    }
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(ai.types.Role.user, out[0].role);
+    try testing.expectEqualStrings(
+        "Earlier in this conversation:\n\nthe user fixed a bug",
+        out[0].content[0].text.text,
+    );
+    try testing.expectEqualStrings("next question", out[1].content[0].text.text);
+}
+
+test "defaultConvertToLlm: unknown .custom role is filtered out" {
+    const gpa = testing.allocator;
+    var c_x = [_]ai.types.ContentBlock{.{ .text = .{ .text = "ignored" } }};
+    var c_u = [_]ai.types.ContentBlock{.{ .text = .{ .text = "kept" } }};
+    const messages = [_]AgentMessage{
+        .{
+            .role = .custom,
+            .custom_role = "something_else",
+            .content = &c_x,
+            .timestamp = 0,
+        },
+        .{ .role = .user, .content = &c_u, .timestamp = 0 },
+    };
+    const out = try defaultConvertToLlm(gpa, &messages);
+    defer {
+        for (out) |*m| m.deinit(gpa);
+        gpa.free(out);
+    }
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqualStrings("kept", out[0].content[0].text.text);
 }

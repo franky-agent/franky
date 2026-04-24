@@ -24,6 +24,7 @@ const ai = struct {
 const at = @import("../../agent/types.zig");
 const find_mod = @import("find.zig");
 const regex_mod = @import("../regex.zig");
+const workspace_mod = @import("workspace.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -57,6 +58,17 @@ pub fn tool() at.AgentTool {
     };
 }
 
+pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
+    return .{
+        .name = "grep",
+        .description = "Search files for a regex (path-safety enforced).",
+        .parameters_json = parameters_json,
+        .execution_mode = .parallel,
+        .ctx = @constCast(@ptrCast(ws)),
+        .execute = execute,
+    };
+}
+
 fn execute(
     self: *const at.AgentTool,
     allocator: std.mem.Allocator,
@@ -66,7 +78,6 @@ fn execute(
     cancel: *ai.stream.Cancel,
     on_update: at.OnUpdate,
 ) anyerror!at.ToolResult {
-    _ = self;
     _ = call_id;
     _ = on_update;
 
@@ -82,10 +93,23 @@ fn execute(
     const pattern = pattern_val.string;
     if (pattern.len == 0) return toolError(allocator, "invalid_args", "pattern cannot be empty");
 
-    const path: []const u8 = if (root.object.get("path")) |v|
+    const user_path: []const u8 = if (root.object.get("path")) |v|
         (if (v == .string) v.string else ".")
     else
         ".";
+    var canon_path: ?[]u8 = null;
+    defer if (canon_path) |p| allocator.free(p);
+    const path: []const u8 = if (self.ctx) |raw| blk: {
+        const ws: *const workspace_mod.Workspace = @ptrCast(@alignCast(raw));
+        const r = try workspace_mod.canonicalizeOrError(allocator, ws, user_path);
+        switch (r) {
+            .ok => |c| {
+                canon_path = c.abs;
+                break :blk c.abs;
+            },
+            .err => |e| return toolError(allocator, e.code, e.message),
+        }
+    } else user_path;
     const files_glob: ?[]const u8 = if (root.object.get("filesGlob")) |v|
         (if (v == .string) v.string else null)
     else
@@ -374,7 +398,8 @@ fn toolError(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !a
     const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };
-    return .{ .content = arr, .is_error = true };
+    const code_dup = try allocator.dupe(u8, code);
+    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
 }
 
 // ─── tests ────────────────────────────────────────────────────────────

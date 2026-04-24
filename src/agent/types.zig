@@ -13,6 +13,13 @@ pub const ToolResult = struct {
     /// Opaque renderer metadata (diff, table, …) — not shown to the model.
     details_json: ?[]const u8 = null,
     is_error: bool = false,
+    /// §F.2 — tool-specific sub-code (`edit_no_match`,
+    /// `path_escape_workspace`, `bash_timeout`, …) when `is_error`
+    /// is true. Callers that escalate a tool error to an
+    /// `agent_error` stream event copy this into
+    /// `ErrorDetails.tool_code` while the top-level `code` stays
+    /// `.tool_runtime`. Owned by the result's allocator.
+    tool_code: ?[]const u8 = null,
     /// Ask the loop to stop after this tool's batch completes.
     terminate: bool = false,
 
@@ -20,6 +27,7 @@ pub const ToolResult = struct {
         for (self.content) |cb| cb.deinit(allocator);
         allocator.free(self.content);
         if (self.details_json) |s| allocator.free(s);
+        if (self.tool_code) |s| allocator.free(s);
     }
 };
 

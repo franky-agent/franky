@@ -19,6 +19,7 @@ const ai = struct {
 };
 const at = @import("../../agent/types.zig");
 const gitignore = @import("../gitignore.zig");
+const workspace_mod = @import("workspace.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -46,6 +47,17 @@ pub fn tool() at.AgentTool {
     };
 }
 
+pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
+    return .{
+        .name = "ls",
+        .description = "List directory entries (path-safety enforced).",
+        .parameters_json = parameters_json,
+        .execution_mode = .parallel,
+        .ctx = @constCast(@ptrCast(ws)),
+        .execute = execute,
+    };
+}
+
 fn execute(
     self: *const at.AgentTool,
     allocator: std.mem.Allocator,
@@ -55,7 +67,6 @@ fn execute(
     cancel: *ai.stream.Cancel,
     on_update: at.OnUpdate,
 ) anyerror!at.ToolResult {
-    _ = self;
     _ = call_id;
     _ = on_update;
 
@@ -65,7 +76,7 @@ fn execute(
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), args_json, .{});
     const root = parsed.value;
 
-    const path: []const u8 = if (root.object.get("path")) |v|
+    const user_path: []const u8 = if (root.object.get("path")) |v|
         (if (v == .string) v.string else ".")
     else
         ".";
@@ -81,6 +92,20 @@ fn execute(
         (v != .bool or v.bool)
     else
         true;
+
+    var canon_path: ?[]u8 = null;
+    defer if (canon_path) |p| allocator.free(p);
+    const path: []const u8 = if (self.ctx) |raw| blk: {
+        const ws: *const workspace_mod.Workspace = @ptrCast(@alignCast(raw));
+        const r = try workspace_mod.canonicalizeOrError(allocator, ws, user_path);
+        switch (r) {
+            .ok => |c| {
+                canon_path = c.abs;
+                break :blk c.abs;
+            },
+            .err => |e| return toolError(allocator, e.code, e.message),
+        }
+    } else user_path;
 
     return try listPath(allocator, io, path, recursive, max_depth, respect_gitignore, cancel);
 }
@@ -181,7 +206,8 @@ fn toolError(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !a
     const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };
-    return .{ .content = arr, .is_error = true };
+    const code_dup = try allocator.dupe(u8, code);
+    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
 }
 
 // ─── tests ────────────────────────────────────────────────────────────
@@ -256,6 +282,9 @@ test "ls tool: reports file_not_found" {
     defer res.deinit(gpa);
     try testing.expect(res.is_error);
     try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "file_not_found") != null);
+    // v1.7.1 — §F.2: tool_code now also surfaces as a structured field.
+    try testing.expect(res.tool_code != null);
+    try testing.expectEqualStrings("file_not_found", res.tool_code.?);
 }
 
 test "ls tool: respectGitignore skips ignored entries" {

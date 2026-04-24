@@ -74,6 +74,13 @@ pub const Editor = struct {
         if (self.preset == .vi) self.mode = .insert;
     }
 
+    /// Replace the editor's buffer with `s`. Cursor lands at the
+    /// end of the new text. Used by history navigation (v1.5.5) to
+    /// swap in a prior prompt. OOM propagates.
+    pub fn setText(self: *Editor, s: []const u8) !void {
+        try self.buffer.setText(s);
+    }
+
     /// Apply one key event. Returns the externally-visible outcome.
     pub fn feedKey(self: *Editor, key: key_dec.Key) !Outcome {
         // Pasted content always writes verbatim, regardless of preset
@@ -197,37 +204,81 @@ pub const Editor = struct {
         }
     }
 
-    /// Paint the editor's current line into `region`. Cursor is
-    /// rendered as reverse-video on the cell under it.
+    /// Paint the editor's buffer into `region`, wrapping `\n`-
+    /// separated lines onto successive rows (v1.5.5 multi-line).
+    /// Cursor is rendered as reverse-video on the cell under it,
+    /// correctly positioned on the line containing the cursor.
     pub fn draw(
         self: *const Editor,
         region: region_mod.Region,
         style: cell_mod.Style,
     ) void {
         if (region.rows == 0 or region.cols == 0) return;
-        const row: u32 = 0;
-        // Write the text.
-        _ = region.writeUtf8(row, 0, style, self.buffer.text());
-        // Paint cursor cell — highlight with reverse-video.
+        const bytes = self.buffer.text();
+
+        // Paint each line into its own row.
+        var line_start: usize = 0;
+        var row: u32 = 0;
+        var i: usize = 0;
+        while (i <= bytes.len) : (i += 1) {
+            if (i == bytes.len or bytes[i] == '\n') {
+                if (row >= region.rows) break;
+                _ = region.writeUtf8(row, 0, style, bytes[line_start..i]);
+                row += 1;
+                line_start = i + 1;
+            }
+        }
+
+        // Cursor placement: figure out which line + column.
+        const cursor_row = self.cursorRow();
         const cursor_col = self.cursorColumn();
-        const clamped = @min(cursor_col, region.cols - 1);
-        const existing = region.buf.get(region.row + row, region.col + clamped);
+        if (cursor_row >= region.rows) return;
+        const clamped_col = @min(cursor_col, region.cols - 1);
+        const existing = region.buf.get(region.row + cursor_row, region.col + clamped_col);
         var cursor_style = existing.style;
         cursor_style.reverse = true;
-        region.put(row, clamped, .{
+        region.put(cursor_row, clamped_col, .{
             .codepoint = if (existing.codepoint == 0 or existing.codepoint == ' ') ' ' else existing.codepoint,
             .width = existing.width,
             .style = cursor_style,
         });
     }
 
-    /// Column position of the cursor measured in terminal cells.
-    /// Multi-byte codepoints count as 1 or 2 columns per
-    /// `cell_mod.codepointWidth`.
-    pub fn cursorColumn(self: *const Editor) u32 {
-        var col: u32 = 0;
-        var i: usize = 0;
+    /// Number of logical lines in the buffer (`\n`-separated).
+    /// Always ≥ 1 — an empty buffer still has one (empty) line.
+    pub fn lineCount(self: *const Editor) u32 {
+        var n: u32 = 1;
+        for (self.buffer.text()) |c| if (c == '\n') {
+            n += 1;
+        };
+        return n;
+    }
+
+    /// Zero-based row index of the cursor within the multi-line buffer.
+    pub fn cursorRow(self: *const Editor) u32 {
+        var r: u32 = 0;
         const bytes = self.buffer.text();
+        var i: usize = 0;
+        while (i < self.buffer.cursor_bytes and i < bytes.len) : (i += 1) {
+            if (bytes[i] == '\n') r += 1;
+        }
+        return r;
+    }
+
+    /// Column position of the cursor within its current line,
+    /// measured in terminal cells. Multi-byte codepoints count as
+    /// 1 or 2 columns per `cell_mod.codepointWidth`.
+    pub fn cursorColumn(self: *const Editor) u32 {
+        // Find the start of the line containing the cursor.
+        const bytes = self.buffer.text();
+        var line_start: usize = 0;
+        var i: usize = 0;
+        while (i < self.buffer.cursor_bytes and i < bytes.len) : (i += 1) {
+            if (bytes[i] == '\n') line_start = i + 1;
+        }
+
+        var col: u32 = 0;
+        i = line_start;
         while (i < self.buffer.cursor_bytes) {
             const cp_len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 1;
             if (i + cp_len > bytes.len) break;
@@ -389,4 +440,30 @@ test "Editor: ctrl-k deletes to line-end" {
     ed.buffer.cursorRight(); // cursor at offset 2
     _ = try ed.feedKey(.{ .char = .{ .cp = 'k', .mods = .{ .ctrl = true } } });
     try testing.expectEqualStrings("he", ed.text());
+}
+
+// ─── v1.6.1 — coverage for v1.5.5 multi-line + setText ──────────
+
+test "Editor.setText: replaces buffer atomically and places cursor at end" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    try ed.setText("one\ntwo\nthree");
+    try testing.expectEqualStrings("one\ntwo\nthree", ed.text());
+    try testing.expectEqual(@as(u32, 3), ed.lineCount());
+    try testing.expectEqual(@as(u32, 2), ed.cursorRow());
+    try testing.expectEqual(@as(u32, 5), ed.cursorColumn()); // "three"
+}
+
+test "Editor.lineCount: empty buffer is still 1 line" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    try testing.expectEqual(@as(u32, 1), ed.lineCount());
+}
+
+test "Editor.cursorRow/Column: stays on line 0 when buffer has no newlines" {
+    var ed = Editor.init(testing.allocator);
+    defer ed.deinit();
+    try ed.setText("single line text");
+    try testing.expectEqual(@as(u32, 0), ed.cursorRow());
+    try testing.expectEqual(@as(u32, 16), ed.cursorColumn());
 }

@@ -1,6 +1,6 @@
 //! Compaction algorithm — §E of the spec.
 //!
-//! Pure-logic primitives only:
+//! Pure-logic primitives:
 //!
 //!   - `estimateTokens(bytes, kind)` — §E.1 token-count heuristic.
 //!   - `shouldTrigger(estimate, model_window)` — returns `.none`,
@@ -9,17 +9,29 @@
 //!     to compact per §E.2 (anchor, preserve first user, preserve
 //!     tail-budget, preserve pinned, orphan-tool-pair avoidance).
 //!
-//! Scope note (v0.6.3): this module ships the pure-logic subset.
-//! §E.3 (summarization-prompt build + dispatch through the
-//! registry) and §E.4 (branch-checkpoint + synthetic
-//! `compaction_summary` message re-injection) are wiring steps
-//! that fold into v0.6.2's branching-integration pass when that
-//! lands. The logic here is enough to answer "should I compact
-//! now, and if so which messages?" which is the load-bearing
-//! decision.
+//! End-to-end dispatch (v1.5.1):
+//!
+//!   - `run(allocator, io, transcript, tree, config)` — the
+//!     full §E.3 + §E.4 round-trip: forks a `pre-compact-<ts>`
+//!     branch in `tree`, renders the span into a summarization
+//!     prompt, calls the registered provider, and replaces the
+//!     span in `transcript` with a synthetic `compaction_summary`
+//!     custom-role message.
+//!   - `renderSpanAsPrompt` — §E.3 user-message body builder.
+//!   - `summarizer_system_prompt` — §E.3 system-prompt constant.
+//!
+//! §E.4 bullet 3 is honored by `agent.loop.defaultConvertToLlm`:
+//! when it encounters a `custom_role = "compaction_summary"`
+//! message, it emits a `user` message prefixed with
+//! `"Earlier in this conversation:\n\n"`.
 
 const std = @import("std");
 const types = @import("../ai/types.zig");
+const registry_mod = @import("../ai/registry.zig");
+const stream_mod = @import("../ai/stream.zig");
+const channel_mod = @import("../ai/channel.zig");
+const agent_loop = @import("../agent/loop.zig");
+const branching = @import("branching.zig");
 
 pub const TokenKind = enum { english, code };
 
@@ -230,6 +242,315 @@ fn findToolResult(messages: []const types.Message, call_id: []const u8) ?u32 {
     return null;
 }
 
+// ─── §E.3 + §E.4 summarization dispatch (v1.5.1) ──────────────────
+
+pub const summarizer_system_prompt =
+    \\You are summarizing a conversation between a user and an AI assistant.
+    \\Produce a terse record of:
+    \\
+    \\1. The user's overall goal.
+    \\2. Key decisions or corrections the user gave.
+    \\3. Files touched and their current state (which were created, edited,
+    \\   or read).
+    \\4. Tool calls whose results matter for future turns (and why).
+    \\5. Open questions or blockers.
+    \\
+    \\Write at most 250 words. Use present tense. Do not restate individual
+    \\tool outputs; summarize their effect. Do not add commentary.
+;
+
+pub const CompactConfig = struct {
+    model: types.Model,
+    registry: *const registry_mod.Registry,
+    stream_options: registry_mod.StreamOptions = .{},
+    pinned: []const bool,
+    /// Wall-clock millis — used to name the checkpoint branch
+    /// (`pre-compact-<ts>`) and tagged onto the synthetic
+    /// `compaction_summary` message.
+    timestamp_ms: i64,
+    /// When set, the summarization round-trip uses this model
+    /// instead of the primary one.
+    summarizer_model: ?types.Model = null,
+    cancel: *stream_mod.Cancel,
+};
+
+pub const CompactResult = struct {
+    /// False when the span was too small or there was no anchor —
+    /// the trigger does not re-fire until another turn has elapsed.
+    proceeded: bool,
+    /// Number of messages removed and replaced by the summary.
+    replaced_count: u32,
+    /// Inclusive start / exclusive end of the removed span.
+    span_start: u32,
+    span_end: u32,
+};
+
+pub const CompactError = error{
+    /// The provider returned a terminal `.error_ev`.
+    SummarizerFailed,
+    /// The provider finished but produced no usable text.
+    EmptySummary,
+    /// The branch checkpoint could not be created (e.g., name
+    /// clash). Compaction aborts before any mutation.
+    BranchCheckpointFailed,
+};
+
+/// §E.3 + §E.4: run one compaction round. On `proceeded=true`,
+/// `transcript.messages[result.span_start]` is the new synthetic
+/// `compaction_summary` message (custom role), and the tree has a
+/// new `pre-compact-<timestamp_ms>` branch rooted at the original
+/// span start. On `proceeded=false`, nothing is mutated.
+pub fn run(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    transcript: *agent_loop.Transcript,
+    tree: *branching.Tree,
+    config: CompactConfig,
+) !CompactResult {
+    std.debug.assert(config.pinned.len == transcript.messages.items.len);
+
+    // 1. Select the span.
+    const decision = try selectSpan(
+        allocator,
+        transcript.messages.items,
+        config.model.context_window,
+        config.pinned,
+    );
+    if (!decision.proceed) return .{
+        .proceeded = false,
+        .replaced_count = 0,
+        .span_start = 0,
+        .span_end = 0,
+    };
+
+    // 2. Checkpoint the current branch before we mutate.
+    const branch_name = try std.fmt.allocPrint(
+        allocator,
+        "pre-compact-{d}",
+        .{config.timestamp_ms},
+    );
+    defer allocator.free(branch_name);
+    tree.fork(branch_name, tree.active, decision.compactable_start) catch {
+        return error.BranchCheckpointFailed;
+    };
+
+    // 3. Render the §E.3 summarization prompt body.
+    const span = transcript.messages.items[decision.compactable_start..decision.compactable_end];
+    const prompt_body = try renderSpanAsPrompt(allocator, span);
+    defer allocator.free(prompt_body);
+
+    // 4. Dispatch a one-shot summarizer call.
+    const model = config.summarizer_model orelse config.model;
+    const summary = try runSummarizer(
+        allocator,
+        io,
+        config.registry,
+        model,
+        prompt_body,
+        config.stream_options,
+        config.cancel,
+    );
+    errdefer allocator.free(summary);
+    if (summary.len == 0) {
+        allocator.free(summary);
+        return error.EmptySummary;
+    }
+
+    // 5. Splice: remove [start, end), insert the synthetic message at `start`.
+    const replaced_count = decision.compactable_end - decision.compactable_start;
+    try replaceSpanWithSummary(
+        allocator,
+        transcript,
+        decision.compactable_start,
+        decision.compactable_end,
+        summary,
+        config.timestamp_ms,
+        model,
+        replaced_count,
+    );
+
+    return .{
+        .proceeded = true,
+        .replaced_count = replaced_count,
+        .span_start = decision.compactable_start,
+        .span_end = decision.compactable_end,
+    };
+}
+
+/// §E.3 user-message body. Each message in `span` renders as:
+///   --- message {i} ({role}) ---
+///   <text blocks joined; tool calls shown as [tool: name(args-preview)];
+///    tool results as [result: first-200-chars-or-error-flag]>
+pub fn renderSpanAsPrompt(
+    allocator: std.mem.Allocator,
+    span: []const types.Message,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    for (span, 0..) |m, i| {
+        if (i > 0) try buf.append(allocator, '\n');
+        const role_name: []const u8 = switch (m.role) {
+            .user => "user",
+            .assistant => "assistant",
+            .tool_result => "toolResult",
+            .custom => m.custom_role orelse "custom",
+        };
+        var hdr_buf: [64]u8 = undefined;
+        const hdr = try std.fmt.bufPrint(&hdr_buf, "--- message {d} ({s}) ---\n", .{ i, role_name });
+        try buf.appendSlice(allocator, hdr);
+
+        for (m.content) |cb| switch (cb) {
+            .text => |t| {
+                try buf.appendSlice(allocator, t.text);
+                try buf.append(allocator, '\n');
+            },
+            .thinking => {},
+            .image => |img| {
+                try buf.appendSlice(allocator, "[image: ");
+                try buf.appendSlice(allocator, img.mime_type);
+                try buf.appendSlice(allocator, "]\n");
+            },
+            .tool_call => |tc| {
+                try buf.appendSlice(allocator, "[tool: ");
+                try buf.appendSlice(allocator, tc.name);
+                try buf.append(allocator, '(');
+                const args_preview = if (tc.arguments_json.len > 80) tc.arguments_json[0..80] else tc.arguments_json;
+                try buf.appendSlice(allocator, args_preview);
+                if (tc.arguments_json.len > 80) try buf.appendSlice(allocator, "…");
+                try buf.appendSlice(allocator, ")]\n");
+            },
+        };
+        if (m.role == .tool_result) {
+            // Tool-result content already landed in the `.text` branch above;
+            // prepend an error marker when relevant.
+            if (m.is_error) try buf.appendSlice(allocator, "[result: error flag set]\n");
+        }
+    }
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// One-shot summarizer call via the registry. Uses the provided
+/// `model.api` tag; drains the response stream into a single
+/// assistant message and returns its joined text (caller owns).
+pub fn runSummarizer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    registry: *const registry_mod.Registry,
+    model: types.Model,
+    user_text: []const u8,
+    options: registry_mod.StreamOptions,
+    cancel: *stream_mod.Cancel,
+) ![]u8 {
+    var ch = try stream_mod.Channel.init(allocator, 128);
+    defer ch.deinit();
+
+    var user_content = [_]types.ContentBlock{.{ .text = .{ .text = user_text } }};
+    var messages = [_]types.Message{.{
+        .role = .user,
+        .content = &user_content,
+        .timestamp = 0,
+    }};
+
+    var opts = options;
+    opts.cancel = cancel;
+
+    const ctx = registry_mod.StreamCtx{
+        .allocator = allocator,
+        .io = io,
+        .model = model,
+        .context = .{
+            .system_prompt = summarizer_system_prompt,
+            .messages = &messages,
+            .tools = &.{},
+        },
+        .options = opts,
+        .out = &ch,
+    };
+    // The provider drives the channel itself — most native providers
+    // run synchronously through `fetch` + SSE translation. For the
+    // faux provider this is also synchronous. If a future provider
+    // needs async dispatch, callers must switch to a worker thread
+    // (same pattern print/rpc mode use).
+    registry.stream(ctx) catch {
+        return error.SummarizerFailed;
+    };
+
+    var msg = stream_mod.drainToMessage(&ch, io, allocator, null, null, null) catch {
+        return error.SummarizerFailed;
+    };
+    defer msg.deinit(allocator);
+    if (msg.error_message != null) return error.SummarizerFailed;
+
+    // Join every text block — the reducer guarantees insertion
+    // order via its `block_order` table, so concatenation preserves
+    // the model's intended text flow.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    for (msg.content) |cb| switch (cb) {
+        .text => |t| try out.appendSlice(allocator, t.text),
+        else => {},
+    };
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Splice: remove `transcript.messages[start..end)` and insert a
+/// single `compaction_summary` custom-role message at `start`.
+fn replaceSpanWithSummary(
+    allocator: std.mem.Allocator,
+    transcript: *agent_loop.Transcript,
+    start: u32,
+    end: u32,
+    summary_text: []u8, // taken ownership of on success
+    timestamp_ms: i64,
+    summarizer_model: types.Model,
+    replaced_count: u32,
+) !void {
+    _ = summarizer_model; // reserved for future `meta` emission once
+    //   transcript messages carry a generic meta bag
+
+    // Deinit the messages we're about to drop.
+    for (transcript.messages.items[start..end]) |*m| m.deinit(allocator);
+
+    // Build the synthetic message. Content owns `summary_text`.
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = summary_text } };
+
+    const custom_role = try allocator.dupe(u8, "compaction_summary");
+
+    const summary_msg = types.Message{
+        .role = .custom,
+        .custom_role = custom_role,
+        .content = content,
+        .timestamp = timestamp_ms,
+    };
+
+    // Splice in one go: remove `end-start` items, insert one.
+    // ArrayList doesn't have a native splice, so replace [start] with
+    // `summary_msg` and then remove the rest.
+    if (end > start) {
+        transcript.messages.items[start] = summary_msg;
+        // Remove indices [start+1..end) — that's (end - start - 1) items.
+        const drop_count = end - start - 1;
+        if (drop_count > 0) {
+            // Shift-left the tail [end..len) into [start+1..].
+            const len = transcript.messages.items.len;
+            std.mem.copyForwards(
+                agent_loop.AgentMessage,
+                transcript.messages.items[start + 1 .. len - drop_count],
+                transcript.messages.items[end..len],
+            );
+            transcript.messages.items.len = len - drop_count;
+        }
+    } else {
+        // Zero-length span is a protocol violation (proceed=true
+        // implies ≥ 4 messages). Guard anyway.
+        try transcript.messages.insert(allocator, start, summary_msg);
+    }
+    _ = replaced_count;
+}
+
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -344,4 +665,244 @@ test "selectSpan: pinned messages are preserved" {
     // invariant we assert is "index 2 is outside the compactable
     // span" — either before start or after end.
     try testing.expect(d.compactable_start > 2 or d.compactable_end <= 2);
+}
+
+// ─── v1.5.1 — summarization dispatch tests ────────────────────────
+
+const faux = @import("../ai/providers/faux.zig");
+
+fn testIo() std.Io.Threaded {
+    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
+}
+
+test "renderSpanAsPrompt: text, tool-call, tool-result formatted per §E.3" {
+    const gpa = testing.allocator;
+    var c_u: [1]types.ContentBlock = .{.{ .text = .{ .text = "please list the files" } }};
+    var c_a: [1]types.ContentBlock = .{.{ .tool_call = .{
+        .id = "c-1",
+        .name = "ls",
+        .arguments_json = "{\"path\":\".\"}",
+    } }};
+    var c_r: [1]types.ContentBlock = .{.{ .text = .{ .text = "one.txt\ntwo.txt" } }};
+    const span = [_]types.Message{
+        .{ .role = .user, .content = &c_u, .timestamp = 0 },
+        .{ .role = .assistant, .content = &c_a, .timestamp = 0 },
+        .{ .role = .tool_result, .content = &c_r, .timestamp = 0, .tool_call_id = "c-1" },
+    };
+    const body = try renderSpanAsPrompt(gpa, &span);
+    defer gpa.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "--- message 0 (user) ---") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "please list the files") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "[tool: ls({\"path\":\".\"})]") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "one.txt") != null);
+}
+
+test "run: forks a pre-compact branch and splices compaction_summary in" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    // Build a 12-message transcript: enough to clear the 4-message
+    // minimum compactable span once first-user + tail-budget are
+    // preserved. Each message is ~30 bytes → ~9 tokens. Context
+    // window 100 → tail budget ~15 tokens → roughly 1-2 messages
+    // of tail preserved. Span should land in the middle.
+    var transcript = agent_loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    var i: u32 = 0;
+    while (i < 12) : (i += 1) {
+        const text = try std.fmt.allocPrint(gpa, "message number {d:>2} body text", .{i});
+        const content = try gpa.alloc(types.ContentBlock, 1);
+        content[0] = .{ .text = .{ .text = text } };
+        try transcript.append(.{
+            .role = if (i % 2 == 0) .user else .assistant,
+            .content = content,
+            .timestamp = 100 + @as(i64, i),
+        });
+    }
+
+    // Wire a faux provider that returns a known summary blob.
+    var fp = faux.FauxProvider.init(gpa);
+    defer fp.deinit();
+    try fp.push(.{ .events = &.{
+        .{ .text = .{ .text = "SUMMARY: user wants files listed; tool ls returned two.", .chunk_size = 8 } },
+    } });
+
+    var reg = registry_mod.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&fp),
+    });
+
+    var tree = try branching.Tree.init(gpa);
+    defer tree.deinit();
+    // The tree appends one Tree.appendOnActive per message in
+    // production; we simulate that here so the fork point lines
+    // up.
+    var j: u32 = 0;
+    while (j < 12) : (j += 1) try tree.appendOnActive(null);
+
+    const pinned = try gpa.alloc(bool, 12);
+    defer gpa.free(pinned);
+    @memset(pinned, false);
+
+    var cancel: stream_mod.Cancel = .{};
+    const result = try run(gpa, io, &transcript, &tree, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux", .context_window = 100 },
+        .registry = &reg,
+        .stream_options = .{ .cancel = &cancel },
+        .pinned = pinned,
+        .timestamp_ms = 1_714_000_000_000,
+        .cancel = &cancel,
+    });
+
+    try testing.expect(result.proceeded);
+    try testing.expect(result.replaced_count >= 4);
+
+    // Transcript is shorter by (replaced_count - 1).
+    try testing.expectEqual(
+        @as(usize, 12 - result.replaced_count + 1),
+        transcript.messages.items.len,
+    );
+
+    // Message at `span_start` is the compaction_summary custom-role.
+    const summary_msg = transcript.messages.items[result.span_start];
+    try testing.expectEqual(types.Role.custom, summary_msg.role);
+    try testing.expect(summary_msg.custom_role != null);
+    try testing.expectEqualStrings("compaction_summary", summary_msg.custom_role.?);
+    try testing.expectEqual(@as(usize, 1), summary_msg.content.len);
+    try testing.expect(std.mem.indexOf(u8, summary_msg.content[0].text.text, "SUMMARY") != null);
+
+    // Tree gained a `pre-compact-<ts>` branch rooted at the span start.
+    try testing.expect(tree.branches.get("pre-compact-1714000000000") != null);
+}
+
+test "run: proceed=false when the span is too short, no mutation" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    // Only 3 messages — §E.2 aborts when the compactable span is < 4.
+    var transcript = agent_loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    for (0..3) |i| {
+        const content = try gpa.alloc(types.ContentBlock, 1);
+        content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "x") } };
+        try transcript.append(.{
+            .role = if (i % 2 == 0) .user else .assistant,
+            .content = content,
+            .timestamp = @as(i64, @intCast(i)),
+        });
+    }
+    const orig_len = transcript.messages.items.len;
+
+    var reg = registry_mod.Registry.init(gpa);
+    defer reg.deinit();
+    // No provider registered — proving `run` doesn't dispatch when
+    // proceed=false.
+
+    var tree = try branching.Tree.init(gpa);
+    defer tree.deinit();
+    const pinned = [_]bool{ false, false, false };
+    var cancel: stream_mod.Cancel = .{};
+
+    const result = try run(gpa, io, &transcript, &tree, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux", .context_window = 100 },
+        .registry = &reg,
+        .stream_options = .{ .cancel = &cancel },
+        .pinned = &pinned,
+        .timestamp_ms = 1,
+        .cancel = &cancel,
+    });
+    try testing.expect(!result.proceeded);
+    try testing.expectEqual(orig_len, transcript.messages.items.len);
+}
+
+fn fauxStreamShim(ctx: registry_mod.StreamCtx) anyerror!void {
+    const fp: *faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
+    try fp.runSync(ctx.io, ctx.context, ctx.out);
+}
+
+// ─── v1.6.1 — coverage gap fills ─────────────────────────────────
+
+test "run: empty summarizer output → EmptySummary error" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var transcript = agent_loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    var i: u32 = 0;
+    while (i < 12) : (i += 1) {
+        const text = try std.fmt.allocPrint(gpa, "message number {d:>2} body text", .{i});
+        const content = try gpa.alloc(types.ContentBlock, 1);
+        content[0] = .{ .text = .{ .text = text } };
+        try transcript.append(.{
+            .role = if (i % 2 == 0) .user else .assistant,
+            .content = content,
+            .timestamp = @as(i64, @intCast(i)),
+        });
+    }
+
+    var fp = faux.FauxProvider.init(gpa);
+    defer fp.deinit();
+    // Empty text triggers EmptySummary because the reducer produces
+    // an empty string.
+    try fp.push(.{ .events = &.{.{ .text = .{ .text = "", .chunk_size = 8 } }} });
+
+    var reg = registry_mod.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&fp),
+    });
+
+    var tree = try branching.Tree.init(gpa);
+    defer tree.deinit();
+    var j: u32 = 0;
+    while (j < 12) : (j += 1) try tree.appendOnActive(null);
+    const pinned = try gpa.alloc(bool, 12);
+    defer gpa.free(pinned);
+    @memset(pinned, false);
+
+    var cancel: stream_mod.Cancel = .{};
+    const err = run(gpa, io, &transcript, &tree, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux", .context_window = 100 },
+        .registry = &reg,
+        .stream_options = .{ .cancel = &cancel },
+        .pinned = pinned,
+        .timestamp_ms = 5,
+        .cancel = &cancel,
+    });
+    try testing.expectError(error.EmptySummary, err);
+}
+
+test "messageTokens: english-rate heuristic on mixed content" {
+    const gpa = testing.allocator;
+    const c = try gpa.alloc(types.ContentBlock, 1);
+    defer gpa.free(c);
+    c[0] = .{ .text = .{ .text = "hello there" } }; // 11 bytes → ceil(11/3.5) = 4
+    const m = types.Message{ .role = .user, .content = c, .timestamp = 0 };
+    try testing.expectEqual(@as(u32, 4), messageTokens(m));
+}
+
+test "findToolResult: matches on id, ignores other roles" {
+    var cu: [1]types.ContentBlock = .{.{ .text = .{ .text = "u" } }};
+    var car: [1]types.ContentBlock = .{.{ .text = .{ .text = "r" } }};
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = &cu, .timestamp = 0 },
+        .{ .role = .tool_result, .content = &car, .timestamp = 0, .tool_call_id = "abc" },
+        .{ .role = .tool_result, .content = &car, .timestamp = 0, .tool_call_id = "xyz" },
+    };
+    try testing.expectEqual(@as(u32, 1), findToolResult(&messages, "abc").?);
+    try testing.expectEqual(@as(u32, 2), findToolResult(&messages, "xyz").?);
+    try testing.expect(findToolResult(&messages, "nope") == null);
 }

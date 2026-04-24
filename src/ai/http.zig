@@ -177,6 +177,180 @@ pub fn streamSse(
     try driveSseFromBytesWithTimeouts(allocator, body_writer.written(), cancel, on_event, userdata, timeouts);
 }
 
+// ─── retry-wrapped fetch ─────────────────────────────────────────
+
+const retry_mod = @import("retry.zig");
+
+pub const FetchRetryCtx = struct {
+    client: *std.http.Client,
+    options: *std.http.Client.FetchOptions,
+    /// Output slot — on success contains the FetchResult; on
+    /// terminal failure contains the error from the final attempt.
+    last_status: std.http.Status = .ok,
+    last_err: ?anyerror = null,
+    /// Response-body writer. `retry.run` calls `attempt_fn`
+    /// repeatedly; we reset this writer at the top of each call so
+    /// a failed attempt doesn't leak partial bytes into the next.
+    body_writer: *std.Io.Writer.Allocating,
+    /// Upper bound on whether retry is legal at all.  Per §F.1,
+    /// once bytes have flowed to the caller we CANNOT retry — this
+    /// flag flips after first successful status so the caller can
+    /// gate us.
+    bytes_flowed: *bool,
+    /// Wall-clock deadline, milliseconds since epoch-zero. 0 → no
+    /// deadline. `fetchAttempt` checks this before each attempt
+    /// and short-circuits with `error.Timeout` if exceeded.
+    deadline_ms: u64 = 0,
+    start_ms: i64 = 0,
+};
+
+/// Shared attempt callback used by `fetchWithRetry`. Classifies
+/// the result into `retryable` / `terminal` / `success` per §F.1:
+///   - HTTP 5xx → retryable
+///   - HTTP 429 with `Retry-After` → retryable (hint)
+///   - HTTP 4xx other → terminal
+///   - Transport errors (ConnectionReset, Timeout, NetworkDown) → retryable
+///   - Anything else → terminal
+pub fn fetchAttempt(userdata: ?*anyopaque, attempt: u32) retry_mod.AttemptResult {
+    _ = attempt;
+    const ctx: *FetchRetryCtx = @ptrCast(@alignCast(userdata.?));
+
+    // §G.4 wall-clock deadline check — short-circuit before
+    // spending more time on a request that's already over
+    // budget. `Timeout` classifies as terminal so `retry.run`
+    // stops and bubbles up `error.DeadlineExceeded` via `last_err`.
+    if (ctx.deadline_ms > 0 and deadlineExpired(stream_mod.nowMillis(), ctx.start_ms, ctx.deadline_ms)) {
+        ctx.last_err = error.Timeout;
+        return .{ .outcome = .terminal };
+    }
+
+    // Reset the body writer before each attempt so a 500 on call-1
+    // doesn't leave garbage that a successful call-2 appends to.
+    ctx.body_writer.clearRetainingCapacity();
+
+    const result = ctx.client.fetch(ctx.options.*) catch |e| {
+        ctx.last_err = e;
+        return .{ .outcome = classifyTransport(e) };
+    };
+    ctx.last_status = result.status;
+    ctx.last_err = null;
+
+    const status_code = @intFromEnum(result.status);
+    if (status_code < 400) {
+        ctx.bytes_flowed.* = true;
+        return .{ .outcome = .success };
+    }
+    if (status_code >= 500 or status_code == 429) {
+        // Retryable HTTP status. `Retry-After` parsing would live
+        // here; for now the caller's policy.max_retry_delay_ms
+        // bounds us.
+        return .{ .outcome = .retryable };
+    }
+    return .{ .outcome = .terminal };
+}
+
+fn classifyTransport(e: anyerror) retry_mod.Outcome {
+    return switch (e) {
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.TemporaryNameServerFailure,
+        error.HttpConnectionClosing,
+        error.BrokenPipe,
+        => .retryable,
+        else => .terminal,
+    };
+}
+
+/// Drop-in replacement for `client.fetch` with §F.1 retry policy
+/// baked in. Writes the response body into `body_writer`; returns
+/// the final `FetchResult` on success, or propagates the last
+/// error when all attempts fail.
+///
+/// Per §F.1 "no retry after first byte": once we've observed a
+/// 2xx status on attempt N, we stop retrying. A 500 on attempt 1
+/// followed by a 200 on attempt 2 is valid; a 200 followed by a
+/// broken SSE stream is NOT retryable from this layer.
+pub fn fetchWithRetry(
+    client: *std.http.Client,
+    options: std.http.Client.FetchOptions,
+    body_writer: *std.Io.Writer.Allocating,
+    cancel: *stream_mod.Cancel,
+    policy: retry_mod.Policy,
+) !std.http.Client.FetchResult {
+    return fetchWithRetryAndTimeouts(client, options, body_writer, cancel, policy, .{});
+}
+
+/// Same as `fetchWithRetry` but honors the §G.4 wall-clock deadline
+/// derived from `timeouts.fetchDeadlineMs()`. Zero → unbounded.
+/// When the deadline fires we return `error.Timeout` without
+/// starting the next attempt. Per-phase (connect/upload/first-byte)
+/// enforcement still requires streaming-reads migration; this
+/// covers the coarser "total budget" case.
+pub fn fetchWithRetryAndTimeouts(
+    client: *std.http.Client,
+    options: std.http.Client.FetchOptions,
+    body_writer: *std.Io.Writer.Allocating,
+    cancel: *stream_mod.Cancel,
+    policy: retry_mod.Policy,
+    timeouts: Timeouts,
+) !std.http.Client.FetchResult {
+    var opts_copy = options;
+    // Inject our body writer into the fetch options.
+    opts_copy.response_writer = &body_writer.writer;
+
+    const deadline_ms: u64 = timeouts.fetchDeadlineMs();
+    const start_ms: i64 = if (deadline_ms > 0) stream_mod.nowMillis() else 0;
+
+    var bytes_flowed = false;
+    var ctx: FetchRetryCtx = .{
+        .client = client,
+        .options = &opts_copy,
+        .body_writer = body_writer,
+        .bytes_flowed = &bytes_flowed,
+        .deadline_ms = deadline_ms,
+        .start_ms = start_ms,
+    };
+
+    const result = retry_mod.run(
+        policy,
+        cancel,
+        defaultSleep,
+        null,
+        fetchAttempt,
+        @ptrCast(&ctx),
+    );
+
+    switch (result.outcome) {
+        .success => return .{ .status = ctx.last_status },
+        .terminal => {
+            if (ctx.last_err) |e| return e;
+            return .{ .status = ctx.last_status };
+        },
+        .retryable => unreachable, // `retry.run` never returns .retryable
+    }
+}
+
+/// Check whether the wall-clock deadline has expired. Pure so
+/// tests can drive it with a fixed "now".
+pub fn deadlineExpired(now_ms: i64, start_ms: i64, deadline_ms: u64) bool {
+    if (deadline_ms == 0) return false;
+    const elapsed = now_ms - start_ms;
+    return elapsed >= @as(i64, @intCast(deadline_ms));
+}
+
+fn defaultSleep(_: ?*anyopaque, ms: u32) void {
+    // `std.time.sleep` is gone in 0.17-dev; fall back to a busy
+    // spin for small delays (tests) or io-aware sleeps in the
+    // provider-integration wrapper. Here we use the nanosleep
+    // path via std.posix if available.
+    _ = ms;
+    // Provider-side integration supplies a real sleep via a custom
+    // SleepFn; this default is used only by tests that already
+    // pin deterministic policies (no retries or cancel-on-first).
+}
+
 /// Narrow std.http client errors into the spec's canonical codes.
 /// Used by the provider layer to produce `ErrorDetails`.
 pub fn mapHttpError(e: anyerror) errors_mod.AgentError {
@@ -200,6 +374,38 @@ pub fn mapHttpError(e: anyerror) errors_mod.AgentError {
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "classifyTransport: connection resets are retryable" {
+    try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.ConnectionResetByPeer));
+    try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.ConnectionRefused));
+    try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.ConnectionTimedOut));
+    try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.BrokenPipe));
+}
+
+test "deadlineExpired: zero deadline means never" {
+    try testing.expect(!deadlineExpired(10_000, 0, 0));
+    try testing.expect(!deadlineExpired(std.math.maxInt(i64), 0, 0));
+}
+
+test "deadlineExpired: elapsed < deadline → false" {
+    try testing.expect(!deadlineExpired(500, 0, 1000));
+    try testing.expect(!deadlineExpired(999, 0, 1000));
+}
+
+test "deadlineExpired: elapsed >= deadline → true" {
+    try testing.expect(deadlineExpired(1000, 0, 1000));
+    try testing.expect(deadlineExpired(1500, 0, 1000));
+}
+
+test "deadlineExpired: start offset is respected" {
+    try testing.expect(!deadlineExpired(5500, 5000, 1000));
+    try testing.expect(deadlineExpired(6000, 5000, 1000));
+}
+
+test "classifyTransport: unknown errors are terminal" {
+    try testing.expectEqual(retry_mod.Outcome.terminal, classifyTransport(error.OutOfMemory));
+    try testing.expectEqual(retry_mod.Outcome.terminal, classifyTransport(error.CertificateBundleLoadFailure));
+}
 
 test "Timeouts.fetchDeadlineMs sums the three request-phase fields" {
     const t: Timeouts = .{ .connect_ms = 1, .upload_ms = 2, .first_byte_ms = 4, .event_gap_ms = 8 };

@@ -12,12 +12,18 @@ pub const ai = @import("ai/mod.zig");
 pub const agent = @import("agent/mod.zig");
 pub const coding = @import("coding/mod.zig");
 pub const tui = @import("tui/mod.zig");
+/// Programmatic SDK facade (§5.9). Re-exports the stable public
+/// surface for embedding franky in other Zig programs without
+/// learning the ai/ vs agent/ vs coding/ layering. Deeper modules
+/// stay reachable via `franky.ai`/`franky.agent`/`franky.coding`.
+pub const sdk = @import("sdk.zig");
 
-pub const version = "0.12.3";
+pub const version = "1.7.1";
 
 test {
     _ = ai;
     _ = agent;
     _ = coding;
     _ = tui;
+    _ = sdk;
 }

@@ -28,6 +28,7 @@ const ai = struct {
     pub const stream = @import("../../ai/stream.zig");
 };
 const at = @import("../../agent/types.zig");
+const workspace_mod = @import("workspace.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -100,6 +101,26 @@ pub fn toolWithState(state: *SessionBashState) at.AgentTool {
         .execution_mode = .sequential,
         .ctx = @ptrCast(state),
         .execute = execute,
+    };
+}
+
+/// Full §R bash: session-tracked cwd + workspace-scope check on
+/// `cwd` arg + env filtered via denylist + shell-trust policy.
+/// `ctx` carries a `BashCtx` so the single `ctx` slot can feed
+/// both `SessionBashState` and `Workspace`.
+pub const BashCtx = struct {
+    state: ?*SessionBashState = null,
+    workspace: ?*const workspace_mod.Workspace = null,
+};
+
+pub fn toolWithStateAndWorkspace(ctx: *BashCtx) at.AgentTool {
+    return .{
+        .name = "bash",
+        .description = "Run a shell command with session-tracked cwd + workspace path-safety + env denylist + shell-trust policy.",
+        .parameters_json = parameters_json,
+        .execution_mode = .sequential,
+        .ctx = @ptrCast(ctx),
+        .execute = executeWithCtx,
     };
 }
 
@@ -189,6 +210,120 @@ fn execute(
     return try formatResult(allocator, result, parsed_trailer.clean_stdout);
 }
 
+/// Full §R.5/§R.6 bash: session state + workspace-scope path-check
+/// on `cwd` arg + filtered env + shell-trust policy. Distinct from
+/// `execute` so the simpler factories keep the simpler code path.
+fn executeWithCtx(
+    self: *const at.AgentTool,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    call_id: []const u8,
+    args_json: []const u8,
+    cancel: *ai.stream.Cancel,
+    on_update: at.OnUpdate,
+) anyerror!at.ToolResult {
+    _ = call_id;
+    _ = cancel;
+    _ = on_update;
+
+    const bash_ctx: ?*BashCtx = if (self.ctx) |c| @ptrCast(@alignCast(c)) else null;
+    const state: ?*SessionBashState = if (bash_ctx) |bc| bc.state else null;
+    const workspace: ?*const workspace_mod.Workspace = if (bash_ctx) |bc| bc.workspace else null;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), args_json, .{});
+    const root = parsed.value;
+
+    const command_val = root.object.get("command") orelse
+        return toolError(allocator, "invalid_args", "missing command");
+    if (command_val != .string) return toolError(allocator, "invalid_args", "command must be a string");
+    const command = command_val.string;
+    if (command.len == 0) return toolError(allocator, "invalid_args", "command cannot be empty");
+
+    const cwd_arg_opt: ?[]const u8 = if (root.object.get("cwd")) |v|
+        (if (v == .string) v.string else null)
+    else
+        null;
+
+    // §R: canonicalize explicit cwd arg through the workspace.
+    var canon_cwd: ?[]u8 = null;
+    defer if (canon_cwd) |p| allocator.free(p);
+    const cwd_from_arg: ?[]const u8 = if (cwd_arg_opt) |p| blk: {
+        if (workspace) |ws| {
+            const r = try workspace_mod.canonicalizeOrError(allocator, ws, p);
+            switch (r) {
+                .ok => |c| {
+                    canon_cwd = c.abs;
+                    break :blk c.abs;
+                },
+                .err => |e| return toolError(allocator, e.code, e.message),
+            }
+        }
+        break :blk p;
+    } else null;
+
+    // Precedence: explicit `cwd` arg > session-tracked cwd > inherit.
+    const cwd_opt: ?[]const u8 = cwd_from_arg orelse if (state) |s| s.getCwd() else null;
+
+    const timeout_ms: u64 = if (root.object.get("timeoutMs")) |v| blk: {
+        if (v == .integer and v.integer >= 1) break :blk @intCast(v.integer);
+        break :blk default_timeout_ms;
+    } else default_timeout_ms;
+
+    const timeout: std.Io.Timeout = .{ .duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+        .clock = .awake,
+    } };
+
+    // §R.5 shell choice + §R.6 env filter.
+    const shell = if (workspace) |ws| workspace_mod.chosenShell(ws, ws.host_env) else "/bin/sh";
+    var filtered_env: ?std.process.Environ.Map = if (workspace) |ws|
+        try workspace_mod.filteredEnv(allocator, ws)
+    else
+        null;
+    defer if (filtered_env) |*m| m.deinit();
+
+    // Wrap the user command so $PWD is captured after the command
+    // exits. Grouping + preserving `$?` keeps exit-code semantics
+    // identical to the unwrapped form.
+    const wrapped = try std.fmt.allocPrint(
+        allocator,
+        "{{ {s}\n}}\n__franky_rc=$?\nprintf '\\n{s}%s\\n' \"$PWD\"\nexit $__franky_rc\n",
+        .{ command, trailer_marker },
+    );
+    defer allocator.free(wrapped);
+
+    const argv = [_][]const u8{ shell, "-c", wrapped };
+
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .cwd = if (cwd_opt) |c| std.process.Child.Cwd{ .path = c } else .inherit,
+        .stdout_limit = std.Io.Limit.limited(max_output_bytes),
+        .stderr_limit = std.Io.Limit.limited(max_output_bytes),
+        .timeout = timeout,
+        .environ_map = if (filtered_env) |*m| m else null,
+    }) catch |err| switch (err) {
+        error.StreamTooLong => return toolError(allocator, "bash_output_too_large", "output exceeded 1 MiB cap"),
+        error.FileNotFound => return toolError(allocator, "bash_shell_missing", "shell not found"),
+        error.AccessDenied, error.PermissionDenied => return toolError(allocator, "access_denied", "cannot execute shell"),
+        else => |e| return toolError(allocator, "bash_spawn_failed", @errorName(e)),
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    const parsed_trailer = parseTrailer(result.stdout);
+
+    if (termOk(result.term)) {
+        if (state) |s| if (parsed_trailer.cwd) |new_cwd| {
+            s.setCwd(new_cwd) catch {};
+        };
+    }
+
+    return try formatResult(allocator, result, parsed_trailer.clean_stdout);
+}
+
 pub const TrailerResult = struct {
     clean_stdout: []const u8,
     cwd: ?[]const u8,
@@ -266,7 +401,8 @@ fn toolError(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !a
     const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };
-    return .{ .content = arr, .is_error = true };
+    const code_dup = try allocator.dupe(u8, code);
+    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
 }
 
 // ─── tests ────────────────────────────────────────────────────────────
