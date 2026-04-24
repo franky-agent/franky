@@ -12,6 +12,7 @@ const ai = struct {
 };
 const at = @import("../../agent/types.zig");
 const workspace_mod = @import("workspace.zig");
+const common = @import("common.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -62,8 +63,8 @@ fn execute(
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), args_json, .{});
     const root = parsed.value;
 
-    const user_path = (root.object.get("path") orelse return toolError(allocator, "invalid_args", "missing path")).string;
-    const content = (root.object.get("content") orelse return toolError(allocator, "invalid_args", "missing content")).string;
+    const user_path = (root.object.get("path") orelse return common.toolError(allocator, "invalid_args", "missing path")).string;
+    const content = (root.object.get("content") orelse return common.toolError(allocator, "invalid_args", "missing content")).string;
     const overwrite: bool = if (root.object.get("overwrite")) |v| (v == .bool and v.bool) else false;
 
     var canon_path: ?[]u8 = null;
@@ -76,7 +77,7 @@ fn execute(
                 canon_path = c.abs;
                 break :blk c.abs;
             },
-            .err => |e| return toolError(allocator, e.code, e.message),
+            .err => |e| return common.toolError(allocator, e.code, e.message),
         }
     } else user_path;
 
@@ -95,10 +96,10 @@ pub fn writeFile(
     // Check existence unless overwrite requested.
     if (!overwrite) {
         if (cwd.access(io, path, .{})) {
-            return toolError(allocator, "write_exists", "file already exists; set overwrite=true to replace");
+            return common.toolError(allocator, "write_exists", "file already exists; set overwrite=true to replace");
         } else |e| switch (e) {
             error.FileNotFound => {}, // expected
-            else => return toolError(allocator, "access_failed", @errorName(e)),
+            else => return common.toolError(allocator, "access_failed", @errorName(e)),
         }
     }
 
@@ -110,18 +111,18 @@ pub fn writeFile(
         } else |e| switch (e) {
             error.FileNotFound => {
                 cwd.createDirPath(io, parent) catch |err|
-                    return toolError(allocator, "mkdir_failed", @errorName(err));
+                    return common.toolError(allocator, "mkdir_failed", @errorName(err));
                 parent_created = true;
             },
-            else => return toolError(allocator, "access_failed", @errorName(e)),
+            else => return common.toolError(allocator, "access_failed", @errorName(e)),
         }
     };
 
     var file = cwd.createFile(io, path, .{}) catch |err|
-        return toolError(allocator, "create_failed", @errorName(err));
+        return common.toolError(allocator, "create_failed", @errorName(err));
     defer file.close(io);
     file.writeStreamingAll(io, content) catch |err|
-        return toolError(allocator, "write_failed", @errorName(err));
+        return common.toolError(allocator, "write_failed", @errorName(err));
 
     const details = try std.fmt.allocPrint(allocator, "{{\"bytesWritten\":{d},\"parentCreated\":{}}}", .{ content.len, parent_created });
     const text = try std.fmt.allocPrint(allocator, "wrote {d} bytes to {s}", .{ content.len, path });
@@ -130,27 +131,14 @@ pub fn writeFile(
     return .{ .content = arr, .details_json = details };
 }
 
-fn toolError(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !at.ToolResult {
-    const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
-    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
-    arr[0] = .{ .text = .{ .text = text } };
-    const code_dup = try allocator.dupe(u8, code);
-    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
-}
 
 // ─── tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
+const test_h = @import("../../test_helpers.zig");
 
 test "write creates a new file" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -166,7 +154,7 @@ test "write creates a new file" {
 }
 
 test "write refuses to overwrite by default" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -185,7 +173,7 @@ test "write refuses to overwrite by default" {
 }
 
 test "write overwrite=true replaces file" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 

@@ -412,17 +412,13 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     defer bw.deinit();
 
     const endpoint: []const u8 = ctx.options.base_url orelse url;
-    const result = http_mod.fetchWithRetryAndTimeouts(&client, .{
+    const result = http_mod.fetchWithRetryAndTimeoutsAndHooks(&client, .{
         .location = .{ .url = endpoint },
         .method = .POST,
         .payload = body,
         .extra_headers = http_headers,
-    }, &bw, cancel, .{}, ctx.options.timeouts) catch |e| {
-        try ctx.out.push(ctx.io, .start);
-        ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
-            .code = errors.Code.transport,
-            .message = try std.fmt.allocPrint(ctx.allocator, "http error: {s}", .{@errorName(e)}),
-        } });
+    }, &bw, cancel, .{}, ctx.options.timeouts, http_mod.hooksFromOptions(ctx.options)) catch |e| {
+        try http_mod.reportTransportError(ctx.out, ctx.io, ctx.allocator, e);
         return;
     };
 
@@ -445,10 +441,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
-}
+const test_h = @import("../../test_helpers.zig");
 
 test "buildRequestJson: contents + systemInstruction shape" {
     const gpa = testing.allocator;
@@ -511,7 +504,7 @@ test "buildRequestJson: assistant role renders as 'model'" {
 
 test "runFromSse: text + finishReason STOP → done" {
     const gpa = testing.allocator;
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -548,7 +541,7 @@ test "runFromSse: text + finishReason STOP → done" {
 
 test "runFromSse: SAFETY → refusal" {
     const gpa = testing.allocator;
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 

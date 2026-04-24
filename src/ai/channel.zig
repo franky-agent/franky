@@ -210,15 +210,10 @@ pub fn Channel(comptime T: type) type {
 // ─── tests ────────────────────────────────────────────────────────────
 
 // Build a threaded Io for tests. Caller must deinit.
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
+const test_h = @import("../test_helpers.zig");
 
 test "Channel push/next round-trips in order" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -234,7 +229,7 @@ test "Channel push/next round-trips in order" {
 }
 
 test "closeWithFinal bypasses capacity" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -251,7 +246,7 @@ test "closeWithFinal bypasses capacity" {
 }
 
 test "push after close errors" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -264,7 +259,7 @@ test "push after close errors" {
 }
 
 test "tryNext reports empty / event / closed without blocking" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -285,7 +280,7 @@ test "tryNext reports empty / event / closed without blocking" {
 }
 
 test "closeWithFinal is idempotent" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -308,7 +303,7 @@ const DropRecording = struct {
 };
 
 test "deinit frees undrained items via drop_fn" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -328,7 +323,7 @@ test "deinit frees undrained items via drop_fn" {
 }
 
 test "producer/consumer on separate threads" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 

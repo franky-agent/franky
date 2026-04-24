@@ -1053,6 +1053,7 @@ fn readWholeFileOpt(
 // ─── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
+const test_h = @import("../../test_helpers.zig");
 
 test "resolveAnthropicAlias maps short names to current ids" {
     try testing.expectEqualStrings("claude-opus-4-6", resolveAnthropicAlias("opus"));
@@ -1224,10 +1225,6 @@ test "systemMdPathFrom: FRANKY_HOME wins, else HOME/.franky" {
     try testing.expect((try systemMdPathFrom(a, null, null)) == null);
 }
 
-fn testIoThreaded() std.Io.Threaded {
-    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
-}
-
 test "finalize: disk-extras shadow built-in catalog on id collision" {
     const gpa = testing.allocator;
     var cfg = try makeCfg("claude-sonnet-4-6", .off, false);
@@ -1286,7 +1283,7 @@ test "buildSystemPromptIo: missing system.md falls back to default" {
     var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
     defer cfg.deinit();
 
-    var threaded = testIoThreaded();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 

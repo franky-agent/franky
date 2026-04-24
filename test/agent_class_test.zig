@@ -7,13 +7,6 @@ const agent_mod = franky.agent;
 const at = agent_mod.types;
 const testing = std.testing;
 
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
-
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     const faux_ptr: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try faux_ptr.runSync(ctx.io, ctx.context, ctx.out);
@@ -38,7 +31,7 @@ const EventCounter = struct {
 };
 
 test "Agent.prompt runs a turn and broadcasts events" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -80,7 +73,7 @@ test "Agent.prompt runs a turn and broadcasts events" {
 }
 
 test "Agent.prompt rejects when already streaming" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -126,7 +119,7 @@ test "Agent.prompt rejects when already streaming" {
 }
 
 test "Agent.reset clears transcript" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -155,7 +148,7 @@ test "Agent.reset clears transcript" {
 }
 
 test "Agent.steer: queue + drain round-trip" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -189,7 +182,7 @@ test "Agent.steer: queue + drain round-trip" {
 }
 
 test "Agent.followUp: separate queue from steer" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -230,7 +223,7 @@ test "Agent.followUp: separate queue from steer" {
 }
 
 test "Agent: deinit frees queued-but-not-drained messages" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;

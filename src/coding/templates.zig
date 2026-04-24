@@ -105,10 +105,7 @@ pub fn loadTemplate(
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
-}
+const test_h = @import("../test_helpers.zig");
 
 test "expand: no placeholders passes through verbatim" {
     const gpa = testing.allocator;
@@ -157,7 +154,7 @@ test "expand: multiple placeholders + literal $" {
 }
 
 test "loadTemplate: round-trip on disk" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -183,7 +180,7 @@ test "loadTemplate: round-trip on disk" {
 }
 
 test "loadTemplate: missing file → NotFound" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const err = loadTemplate(testing.allocator, io, "/tmp/franky_templates_nosuch", "ghost");

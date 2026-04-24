@@ -172,13 +172,10 @@ pub fn readObject(
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
-}
+const test_h = @import("../test_helpers.zig");
 
 test "store: small blob returned inline" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -196,7 +193,7 @@ test "store: small blob returned inline" {
 }
 
 test "store: boundary 32767 bytes stays inline" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -218,7 +215,7 @@ test "store: boundary 32767 bytes stays inline" {
 }
 
 test "store: boundary 32768 bytes is external" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -247,7 +244,7 @@ test "store: boundary 32768 bytes is external" {
 }
 
 test "shard: first-2-hex / remaining-62-hex file layout on disk" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -279,7 +276,7 @@ test "shard: first-2-hex / remaining-62-hex file layout on disk" {
 }
 
 test "store: dedupes byte-identical writers (idempotent rename)" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -317,7 +314,7 @@ test "store: dedupes byte-identical writers (idempotent rename)" {
 }
 
 test "sweep: GC removes unreferenced objects" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -373,7 +370,7 @@ test "sweep: GC removes unreferenced objects" {
 // ─── v1.6.1 — coverage gap fills ─────────────────────────────────
 
 test "readObject: non-64 hex → InvalidHash" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const err = readObject(testing.allocator, io, "/tmp/franky_objstore_ignored", "abc");
@@ -381,7 +378,7 @@ test "readObject: non-64 hex → InvalidHash" {
 }
 
 test "writeObject: non-64 hex → InvalidHash" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const err = writeObject(testing.allocator, io, "/tmp/franky_objstore_ignored", "abc", "x");
@@ -389,7 +386,7 @@ test "writeObject: non-64 hex → InvalidHash" {
 }
 
 test "sweep: missing store dir is a no-op (0 deletions)" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -401,7 +398,7 @@ test "sweep: missing store dir is a no-op (0 deletions)" {
 }
 
 test "store: zero-length input stays inline" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 

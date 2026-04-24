@@ -145,6 +145,37 @@ pub fn freeSessionHeader(allocator: std.mem.Allocator, h: SessionHeader) void {
     allocator.free(h.system_prompt_hash);
 }
 
+/// Render a transcript's canonical JSON into `out`. Oversize
+/// content blocks are spilled to `<session_dir>/objects/…` and
+/// replaced with `{"type":"ref","hash":"sha256:<hex>"}` per §H.4.
+///
+/// v1.3.0 R2 — shared body between `writeTranscript` (top-level
+/// `transcript.json`) and `writeBranchTranscript` (per-branch
+/// snapshot at `transcripts/<branch>.json`). Both wrappers handle
+/// only the path-construction + file IO around this renderer.
+fn renderTranscriptJson(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_dir: []const u8,
+    transcript: *const agent_mod.loop.Transcript,
+    branch: []const u8,
+) !void {
+    const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
+    defer allocator.free(store_dir);
+
+    try out.appendSlice(allocator, "{\n");
+    try writeJsonField(out, allocator, "version", current_transcript_version, false);
+    try writeJsonStrField(out, allocator, "branch", branch, false);
+    try out.appendSlice(allocator, "  \"messages\": [\n");
+    for (transcript.messages.items, 0..) |m, i| {
+        if (i > 0) try out.appendSlice(allocator, ",\n");
+        try out.appendSlice(allocator, "    ");
+        try appendMessageJson(out, allocator, io, store_dir, m);
+    }
+    try out.appendSlice(allocator, "\n  ]\n}\n");
+}
+
 /// Serialize the transcript to `session_dir/transcript.json`. Content
 /// blocks whose canonical JSON is ≥ `object_store.inline_threshold_bytes`
 /// are spilled to `<session_dir>/objects/<first2>/<rest62>` and
@@ -159,21 +190,7 @@ pub fn writeTranscript(
 ) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-
-    const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
-    defer allocator.free(store_dir);
-
-    try buf.appendSlice(allocator, "{\n");
-    try writeJsonField(&buf, allocator, "version", current_transcript_version, false);
-    try writeJsonStrField(&buf, allocator, "branch", branch, false);
-    try buf.appendSlice(allocator, "  \"messages\": [\n");
-
-    for (transcript.messages.items, 0..) |m, i| {
-        if (i > 0) try buf.appendSlice(allocator, ",\n");
-        try buf.appendSlice(allocator, "    ");
-        try appendMessageJson(&buf, allocator, io, store_dir, m);
-    }
-    try buf.appendSlice(allocator, "\n  ]\n}\n");
+    try renderTranscriptJson(&buf, allocator, io, session_dir, transcript, branch);
 
     const path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.json" });
     defer allocator.free(path);
@@ -240,20 +257,7 @@ pub fn writeBranchTranscript(
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-
-    const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
-    defer allocator.free(store_dir);
-
-    try buf.appendSlice(allocator, "{\n");
-    try writeJsonField(&buf, allocator, "version", current_transcript_version, false);
-    try writeJsonStrField(&buf, allocator, "branch", branch, false);
-    try buf.appendSlice(allocator, "  \"messages\": [\n");
-    for (transcript.messages.items, 0..) |m, i| {
-        if (i > 0) try buf.appendSlice(allocator, ",\n");
-        try buf.appendSlice(allocator, "    ");
-        try appendMessageJson(&buf, allocator, io, store_dir, m);
-    }
-    try buf.appendSlice(allocator, "\n  ]\n}\n");
+    try renderTranscriptJson(&buf, allocator, io, session_dir, transcript, branch);
 
     const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{branch});
     defer allocator.free(file_name);
@@ -810,13 +814,7 @@ pub fn load(
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
+const test_h = @import("../test_helpers.zig");
 
 test "ULID renders 26 Crockford-base32 chars" {
     var prng = std.Random.DefaultPrng.init(0);
@@ -829,7 +827,7 @@ test "ULID renders 26 Crockford-base32 chars" {
 }
 
 test "session round-trips through disk" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -906,7 +904,7 @@ test "session round-trips through disk" {
 }
 
 test "migrateSessionIfNeeded: v1 → current backs up + rewrites" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -952,7 +950,7 @@ test "migrateSessionIfNeeded: v1 → current backs up + rewrites" {
 }
 
 test "migrateSessionIfNeeded: same-version session is a no-op" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -986,7 +984,7 @@ test "migrateSessionIfNeeded: same-version session is a no-op" {
 }
 
 test "migrateSessionIfNeeded: future version rejected" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -1022,7 +1020,7 @@ test "sha256Hex produces 64-char lowercase hex" {
 // ─── v1.5.0 — $ref round-trip via object_store ────────────────────
 
 test "transcript: small block stays inline; objects/ dir stays empty" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -1071,7 +1069,7 @@ test "transcript: small block stays inline; objects/ dir stays empty" {
 }
 
 test "transcript: 32 KiB block externalized and round-trips through $ref" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -1124,7 +1122,7 @@ test "transcript: 32 KiB block externalized and round-trips through $ref" {
 }
 
 test "transcript: missing blob during load surfaces a structured error" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -1165,7 +1163,7 @@ test "transcript: missing blob during load surfaces a structured error" {
 }
 
 test "writeBranchTranscript + readBranchTranscript: round-trip preserves messages" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -1190,7 +1188,7 @@ test "writeBranchTranscript + readBranchTranscript: round-trip preserves message
 }
 
 test "readBranchTranscript: missing snapshot yields FileNotFound" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -1205,7 +1203,7 @@ test "readBranchTranscript: missing snapshot yields FileNotFound" {
 }
 
 test "writeBranchTranscript: large blocks still spill to shared objects/" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -1241,7 +1239,7 @@ test "writeBranchTranscript: large blocks still spill to shared objects/" {
 }
 
 test "transcript: threshold edge — just below stays inline, at threshold spills" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;

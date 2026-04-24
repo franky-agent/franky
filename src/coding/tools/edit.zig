@@ -18,6 +18,7 @@ const ai = struct {
     pub const stream = @import("../../ai/stream.zig");
 };
 const at = @import("../../agent/types.zig");
+const common = @import("common.zig");
 const workspace_mod = @import("workspace.zig");
 
 pub const parameters_json: []const u8 =
@@ -80,9 +81,9 @@ fn execute(
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), args_json, .{});
     const root = parsed.value;
 
-    const user_path = (root.object.get("path") orelse return err(allocator, "invalid_args", "missing path")).string;
-    const edits_val = root.object.get("edits") orelse return err(allocator, "invalid_args", "missing edits");
-    if (edits_val != .array) return err(allocator, "invalid_args", "edits must be an array");
+    const user_path = (root.object.get("path") orelse return common.toolError(allocator, "invalid_args", "missing path")).string;
+    const edits_val = root.object.get("edits") orelse return common.toolError(allocator, "invalid_args", "missing edits");
+    if (edits_val != .array) return common.toolError(allocator, "invalid_args", "edits must be an array");
 
     var canon_path: ?[]u8 = null;
     defer if (canon_path) |p| allocator.free(p);
@@ -94,17 +95,17 @@ fn execute(
                 canon_path = c.abs;
                 break :blk c.abs;
             },
-            .err => |e| return err(allocator, e.code, e.message),
+            .err => |e| return common.toolError(allocator, e.code, e.message),
         }
     } else user_path;
 
     var edits: std.ArrayList(EditOp) = .empty;
     defer edits.deinit(allocator);
     for (edits_val.array.items) |ev| {
-        if (ev != .object) return err(allocator, "invalid_args", "edits[i] must be an object");
-        const old_v = ev.object.get("old") orelse return err(allocator, "invalid_args", "edit missing old");
-        const new_v = ev.object.get("new") orelse return err(allocator, "invalid_args", "edit missing new");
-        if (old_v != .string or new_v != .string) return err(allocator, "invalid_args", "edit old/new must be strings");
+        if (ev != .object) return common.toolError(allocator, "invalid_args", "edits[i] must be an object");
+        const old_v = ev.object.get("old") orelse return common.toolError(allocator, "invalid_args", "edit missing old");
+        const new_v = ev.object.get("new") orelse return common.toolError(allocator, "invalid_args", "edit missing new");
+        if (old_v != .string or new_v != .string) return common.toolError(allocator, "invalid_args", "edit old/new must be strings");
         const replace_all = if (ev.object.get("replaceAll")) |x| (x == .bool and x.bool) else false;
         try edits.append(allocator, .{ .old = old_v.string, .new = new_v.string, .replace_all = replace_all });
     }
@@ -128,18 +129,18 @@ pub fn applyEdits(
 
     // Load the file.
     var file = cwd.openFile(io, path, .{}) catch |e| switch (e) {
-        error.FileNotFound => return err(allocator, "file_not_found", "file does not exist"),
-        else => return err(allocator, "open_failed", @errorName(e)),
+        error.FileNotFound => return common.toolError(allocator, "file_not_found", "file does not exist"),
+        else => return common.toolError(allocator, "open_failed", @errorName(e)),
     };
     const len = file.length(io) catch |e| {
         file.close(io);
-        return err(allocator, "stat_failed", @errorName(e));
+        return common.toolError(allocator, "stat_failed", @errorName(e));
     };
     const original = try allocator.alloc(u8, @intCast(len));
     defer allocator.free(original);
     _ = file.readPositionalAll(io, original, 0) catch |e| {
         file.close(io);
-        return err(allocator, "read_failed", @errorName(e));
+        return common.toolError(allocator, "read_failed", @errorName(e));
     };
     file.close(io);
 
@@ -156,7 +157,7 @@ pub fn applyEdits(
         if (found == null) {
             const msg = try std.fmt.allocPrint(allocator, "edit {d}: `old` not found", .{idx});
             defer allocator.free(msg);
-            return err(allocator, "edit_no_match", msg);
+            return common.toolError(allocator, "edit_no_match", msg);
         }
         if (!ed.replace_all) {
             // Unique match required.
@@ -164,7 +165,7 @@ pub fn applyEdits(
             if (second != null) {
                 const msg = try std.fmt.allocPrint(allocator, "edit {d}: `old` matches multiple times", .{idx});
                 defer allocator.free(msg);
-                return err(allocator, "edit_ambiguous", msg);
+                return common.toolError(allocator, "edit_ambiguous", msg);
             }
             try replaceOnce(&buf, allocator, ed.old, ed.new);
         } else {
@@ -261,24 +262,11 @@ fn atomicWrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
 
 var tmp_counter: std.atomic.Value(u32) = .init(0);
 
-fn err(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !at.ToolResult {
-    const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
-    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
-    arr[0] = .{ .text = .{ .text = text } };
-    const code_dup = try allocator.dupe(u8, code);
-    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
-}
 
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
+const test_h = @import("../../test_helpers.zig");
 
 fn writeTempFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
@@ -298,7 +286,7 @@ fn readAllAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u
 }
 
 test "edit replaces a unique match" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -317,7 +305,7 @@ test "edit replaces a unique match" {
 }
 
 test "edit refuses ambiguous match without replaceAll" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -334,7 +322,7 @@ test "edit refuses ambiguous match without replaceAll" {
 }
 
 test "edit replaceAll replaces every occurrence" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -353,7 +341,7 @@ test "edit replaceAll replaces every occurrence" {
 }
 
 test "edit errors when `old` not found" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -370,7 +358,7 @@ test "edit errors when `old` not found" {
 }
 
 test "edit applies multiple edits in order atomically" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;

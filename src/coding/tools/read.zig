@@ -12,6 +12,7 @@ const ai = struct {
 };
 const at = @import("../../agent/types.zig");
 const workspace_mod = @import("workspace.zig");
+const common = @import("common.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -73,8 +74,8 @@ fn execute(
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), args_json, .{});
     const root = parsed.value;
     const path_val = root.object.get("path") orelse
-        return toolError(allocator, "invalid_args", "missing path");
-    if (path_val != .string) return toolError(allocator, "invalid_args", "path must be a string");
+        return common.toolError(allocator, "invalid_args", "missing path");
+    if (path_val != .string) return common.toolError(allocator, "invalid_args", "path must be a string");
     const user_path = path_val.string;
 
     const offset: usize = if (root.object.get("offset")) |v| blk: {
@@ -98,7 +99,7 @@ fn execute(
                 canon_path = c.abs;
                 break :blk c.abs;
             },
-            .err => |e| return toolError(allocator, e.code, e.message),
+            .err => |e| return common.toolError(allocator, e.code, e.message),
         }
     } else user_path;
 
@@ -114,27 +115,27 @@ pub fn readFile(
 ) !at.ToolResult {
     const cwd = std.Io.Dir.cwd();
     var file = cwd.openFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return toolError(allocator, "file_not_found", "file does not exist"),
-        error.AccessDenied, error.PermissionDenied => return toolError(allocator, "access_denied", "cannot read file"),
-        else => return toolError(allocator, "open_failed", @errorName(err)),
+        error.FileNotFound => return common.toolError(allocator, "file_not_found", "file does not exist"),
+        error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", "cannot read file"),
+        else => return common.toolError(allocator, "open_failed", @errorName(err)),
     };
     defer file.close(io);
 
     const len = file.length(io) catch |err|
-        return toolError(allocator, "stat_failed", @errorName(err));
+        return common.toolError(allocator, "stat_failed", @errorName(err));
     if (limit == null and len > max_bytes_without_limit) {
-        return toolError(allocator, "read_too_large", "file exceeds 256 KiB without explicit limit");
+        return common.toolError(allocator, "read_too_large", "file exceeds 256 KiB without explicit limit");
     }
 
     const buf = try allocator.alloc(u8, @intCast(len));
     defer allocator.free(buf);
     const n = file.readPositionalAll(io, buf, 0) catch |err|
-        return toolError(allocator, "read_failed", @errorName(err));
+        return common.toolError(allocator, "read_failed", @errorName(err));
     const bytes = buf[0..n];
 
     const sniff_len = @min(bytes.len, binary_sniff_bytes);
     if (std.mem.indexOfScalar(u8, bytes[0..sniff_len], 0) != null) {
-        return toolError(allocator, "read_binary", "file appears to be binary");
+        return common.toolError(allocator, "read_binary", "file appears to be binary");
     }
 
     return try formatLineNumbered(allocator, bytes, offset, limit orelse default_limit);
@@ -172,24 +173,11 @@ fn formatLineNumbered(
     return .{ .content = arr };
 }
 
-fn toolError(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !at.ToolResult {
-    const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
-    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
-    arr[0] = .{ .text = .{ .text = text } };
-    const code_dup = try allocator.dupe(u8, code);
-    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
-}
 
 // ─── tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
+const test_h = @import("../../test_helpers.zig");
 
 fn writeTempFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
@@ -203,7 +191,7 @@ fn deleteTempFile(io: std.Io, path: []const u8) void {
 }
 
 test "read tool returns line-numbered output" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -222,7 +210,7 @@ test "read tool returns line-numbered output" {
 }
 
 test "read tool refuses binary files" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -238,7 +226,7 @@ test "read tool refuses binary files" {
 }
 
 test "read tool honors offset and limit" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -265,7 +253,7 @@ test "read tool honors offset and limit" {
 }
 
 test "read tool with workspace: rejects workspace escape" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;

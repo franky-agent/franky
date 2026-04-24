@@ -621,17 +621,13 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     // retried up to 3 times with decorrelated-jitter backoff.
     // `fetchWithRetry` resets `bw` between attempts so a failed
     // attempt doesn't leak body bytes into the next.
-    const result = http_mod.fetchWithRetryAndTimeouts(&client, .{
+    const result = http_mod.fetchWithRetryAndTimeoutsAndHooks(&client, .{
         .location = .{ .url = default_endpoint },
         .method = .POST,
         .payload = body,
         .extra_headers = http_headers,
-    }, &bw, cancel, .{}, ctx.options.timeouts) catch |e| {
-        try ctx.out.push(ctx.io, .start);
-        ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
-            .code = errors.Code.transport,
-            .message = try std.fmt.allocPrint(ctx.allocator, "http error: {s}", .{@errorName(e)}),
-        } });
+    }, &bw, cancel, .{}, ctx.options.timeouts, http_mod.hooksFromOptions(ctx.options)) catch |e| {
+        try http_mod.reportTransportError(ctx.out, ctx.io, ctx.allocator, e);
         return;
     };
 
@@ -657,13 +653,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
+const test_h = @import("../../test_helpers.zig");
 
 fn newFauxChannel(gpa: std.mem.Allocator) !Channel {
     return try Channel.initWithDrop(gpa, 64, stream_mod.StreamEvent.deinit, gpa);
@@ -800,7 +790,7 @@ test "buildRequestJson avoids duplicating the Claude Code prefix on bearer auth"
 }
 
 test "runFromSse parses a synthetic text-only Anthropic stream" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -830,7 +820,7 @@ test "runFromSse parses a synthetic text-only Anthropic stream" {
 }
 
 test "runFromSse handles a tool_use block" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;

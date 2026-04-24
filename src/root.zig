@@ -17,8 +17,12 @@ pub const tui = @import("tui/mod.zig");
 /// learning the ai/ vs agent/ vs coding/ layering. Deeper modules
 /// stay reachable via `franky.ai`/`franky.agent`/`franky.coding`.
 pub const sdk = @import("sdk.zig");
+/// v1.3.0 — shared `testIo()` helper. Integration tests use
+/// `franky.test_helpers.threadedIo()`; src-internal tests import
+/// `test_helpers.zig` relatively.
+pub const test_helpers = @import("test_helpers.zig");
 
-pub const version = "1.7.1";
+pub const version = "1.3.0";
 
 test {
     _ = ai;
@@ -26,4 +30,5 @@ test {
     _ = coding;
     _ = tui;
     _ = sdk;
+    _ = test_helpers;
 }

@@ -202,6 +202,12 @@ pub const FetchRetryCtx = struct {
     /// and short-circuits with `error.Timeout` if exceeded.
     deadline_ms: u64 = 0,
     start_ms: i64 = 0,
+    /// §3.5 hooks (v1.7.2) — forwarded from `StreamOptions.hooks`.
+    /// `on_payload` fires before each `client.fetch`; `on_response`
+    /// fires after each attempt returns.
+    hook_userdata: ?*anyopaque = null,
+    on_payload: ?*const fn (userdata: ?*anyopaque, payload: []const u8) void = null,
+    on_response: ?*const fn (userdata: ?*anyopaque, status: u16) void = null,
 };
 
 /// Shared attempt callback used by `fetchWithRetry`. Classifies
@@ -228,12 +234,23 @@ pub fn fetchAttempt(userdata: ?*anyopaque, attempt: u32) retry_mod.AttemptResult
     // doesn't leave garbage that a successful call-2 appends to.
     ctx.body_writer.clearRetainingCapacity();
 
+    // §3.5 on_payload hook — fires before the outgoing request.
+    if (ctx.on_payload) |hook| {
+        const payload = ctx.options.payload orelse "";
+        hook(ctx.hook_userdata, payload);
+    }
+
     const result = ctx.client.fetch(ctx.options.*) catch |e| {
         ctx.last_err = e;
         return .{ .outcome = classifyTransport(e) };
     };
     ctx.last_status = result.status;
     ctx.last_err = null;
+
+    // §3.5 on_response hook — fires after headers/body land.
+    if (ctx.on_response) |hook| {
+        hook(ctx.hook_userdata, @intFromEnum(result.status));
+    }
 
     const status_code = @intFromEnum(result.status);
     if (status_code < 400) {
@@ -296,6 +313,56 @@ pub fn fetchWithRetryAndTimeouts(
     policy: retry_mod.Policy,
     timeouts: Timeouts,
 ) !std.http.Client.FetchResult {
+    return fetchWithRetryAndTimeoutsAndHooks(client, options, body_writer, cancel, policy, timeouts, .{});
+}
+
+/// v1.7.2 — §3.5 hooks: fires `on_payload` before every attempt,
+/// `on_response` after each one. When both hooks are null this is
+/// byte-for-byte equivalent to `fetchWithRetryAndTimeouts`.
+pub const Hooks = struct {
+    userdata: ?*anyopaque = null,
+    on_payload: ?*const fn (userdata: ?*anyopaque, payload: []const u8) void = null,
+    on_response: ?*const fn (userdata: ?*anyopaque, status: u16) void = null,
+};
+
+/// v1.3.0 R5 — pull the hooks out of a `StreamOptions` (from
+/// registry.zig). Factored so every provider's `streamFn`
+/// doesn't spell the three-field copy out inline.
+pub fn hooksFromOptions(opts: anytype) Hooks {
+    return .{
+        .userdata = opts.hooks.userdata,
+        .on_payload = opts.hooks.on_payload,
+        .on_response = opts.hooks.on_response,
+    };
+}
+
+/// v1.3.0 R5 — push the canonical `.start` → `error_ev(transport)`
+/// → close-channel sequence when a provider's HTTP fetch fails
+/// with a transport-level error (connection refused, DNS failure,
+/// deadline exceeded, etc.). 5 provider `streamFn`s had this
+/// 5-line catch block verbatim — this is the shared form.
+pub fn reportTransportError(
+    out: *stream_mod.Channel,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    err: anyerror,
+) !void {
+    try out.push(io, .start);
+    out.closeWithFinal(io, .{ .error_ev = .{
+        .code = @import("errors.zig").Code.transport,
+        .message = try std.fmt.allocPrint(allocator, "http error: {s}", .{@errorName(err)}),
+    } });
+}
+
+pub fn fetchWithRetryAndTimeoutsAndHooks(
+    client: *std.http.Client,
+    options: std.http.Client.FetchOptions,
+    body_writer: *std.Io.Writer.Allocating,
+    cancel: *stream_mod.Cancel,
+    policy: retry_mod.Policy,
+    timeouts: Timeouts,
+    hooks: Hooks,
+) !std.http.Client.FetchResult {
     var opts_copy = options;
     // Inject our body writer into the fetch options.
     opts_copy.response_writer = &body_writer.writer;
@@ -311,6 +378,9 @@ pub fn fetchWithRetryAndTimeouts(
         .bytes_flowed = &bytes_flowed,
         .deadline_ms = deadline_ms,
         .start_ms = start_ms,
+        .hook_userdata = hooks.userdata,
+        .on_payload = hooks.on_payload,
+        .on_response = hooks.on_response,
     };
 
     const result = retry_mod.run(

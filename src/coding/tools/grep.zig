@@ -25,6 +25,7 @@ const at = @import("../../agent/types.zig");
 const find_mod = @import("find.zig");
 const regex_mod = @import("../regex.zig");
 const workspace_mod = @import("workspace.zig");
+const common = @import("common.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -88,10 +89,10 @@ fn execute(
     const root = parsed.value;
 
     const pattern_val = root.object.get("pattern") orelse
-        return toolError(allocator, "invalid_args", "missing pattern");
-    if (pattern_val != .string) return toolError(allocator, "invalid_args", "pattern must be a string");
+        return common.toolError(allocator, "invalid_args", "missing pattern");
+    if (pattern_val != .string) return common.toolError(allocator, "invalid_args", "pattern must be a string");
     const pattern = pattern_val.string;
-    if (pattern.len == 0) return toolError(allocator, "invalid_args", "pattern cannot be empty");
+    if (pattern.len == 0) return common.toolError(allocator, "invalid_args", "pattern cannot be empty");
 
     const user_path: []const u8 = if (root.object.get("path")) |v|
         (if (v == .string) v.string else ".")
@@ -107,7 +108,7 @@ fn execute(
                 canon_path = c.abs;
                 break :blk c.abs;
             },
-            .err => |e| return toolError(allocator, e.code, e.message),
+            .err => |e| return common.toolError(allocator, e.code, e.message),
         }
     } else user_path;
     const files_glob: ?[]const u8 = if (root.object.get("filesGlob")) |v|
@@ -207,7 +208,7 @@ fn badRegexError(
         .{ kind, pos, pattern },
     );
     defer allocator.free(msg);
-    return toolError(allocator, "grep_bad_regex", msg);
+    return common.toolError(allocator, "grep_bad_regex", msg);
 }
 
 pub fn grepTree(
@@ -222,10 +223,10 @@ pub fn grepTree(
     cancel: *ai.stream.Cancel,
 ) !at.ToolResult {
     const root_dir = std.Io.Dir.cwd().openDir(io, cwd, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return toolError(allocator, "file_not_found", cwd),
-        error.NotDir => return toolError(allocator, "not_a_directory", cwd),
-        error.AccessDenied, error.PermissionDenied => return toolError(allocator, "access_denied", cwd),
-        else => return toolError(allocator, "open_failed", @errorName(err)),
+        error.FileNotFound => return common.toolError(allocator, "file_not_found", cwd),
+        error.NotDir => return common.toolError(allocator, "not_a_directory", cwd),
+        error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", cwd),
+        else => return common.toolError(allocator, "open_failed", @errorName(err)),
     };
     var dir = root_dir;
     defer dir.close(io);
@@ -237,8 +238,8 @@ pub fn grepTree(
     defer out.deinit(allocator);
 
     var total: usize = 0;
-    while (walker.next(io) catch |e| return toolError(allocator, "walk_failed", @errorName(e))) |entry| {
-        if (cancel.isFired()) return toolError(allocator, "aborted", "cancelled");
+    while (walker.next(io) catch |e| return common.toolError(allocator, "walk_failed", @errorName(e))) |entry| {
+        if (cancel.isFired()) return common.toolError(allocator, "aborted", "cancelled");
         if (entry.kind != .file) continue;
         if (files_glob) |g| if (!find_mod.globMatch(g, entry.path)) continue;
         if (total >= max_matches) {
@@ -394,24 +395,11 @@ fn indexOfNoCase(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
-fn toolError(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !at.ToolResult {
-    const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
-    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
-    arr[0] = .{ .text = .{ .text = text } };
-    const code_dup = try allocator.dupe(u8, code);
-    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
-}
 
 // ─── tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
+const test_h = @import("../../test_helpers.zig");
 
 fn literalMatcher(pattern: []const u8, case_sensitive: bool) Matcher {
     return .{ .literal = .{ .pattern = pattern, .case_sensitive = case_sensitive } };
@@ -428,7 +416,7 @@ fn regexMatcher(pattern: []const u8, case_insensitive: bool) !Matcher {
 }
 
 test "grep tool: finds literal matches with line numbers" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -455,7 +443,7 @@ test "grep tool: finds literal matches with line numbers" {
 }
 
 test "grep tool: case-insensitive literal match" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -480,7 +468,7 @@ test "grep tool: case-insensitive literal match" {
 }
 
 test "grep tool: context before/after" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -508,7 +496,7 @@ test "grep tool: context before/after" {
 }
 
 test "grep tool: skips binary files" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -535,7 +523,7 @@ test "grep tool: skips binary files" {
 // ─── regex mode ───────────────────────────────────────────────────────
 
 test "grep tool: regex metacharacters across files" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -570,7 +558,7 @@ test "grep tool: regex metacharacters across files" {
 }
 
 test "grep tool: regex + filesGlob combo" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -606,7 +594,7 @@ test "grep tool: grep_bad_regex error path" {
     const bad =
         \\{"pattern":"foo(bar","path":"/tmp"}
     ;
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     var cancel: ai.stream.Cancel = .{};
@@ -619,7 +607,7 @@ test "grep tool: grep_bad_regex error path" {
 }
 
 test "grep tool: regex=false preserves literal behavior" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -650,7 +638,7 @@ test "grep tool: regex=false preserves literal behavior" {
 }
 
 test "grep tool: cancellation fires cleanly with regex compiled" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;

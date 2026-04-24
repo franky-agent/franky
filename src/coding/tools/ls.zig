@@ -20,6 +20,7 @@ const ai = struct {
 const at = @import("../../agent/types.zig");
 const gitignore = @import("../gitignore.zig");
 const workspace_mod = @import("workspace.zig");
+const common = @import("common.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -103,7 +104,7 @@ fn execute(
                 canon_path = c.abs;
                 break :blk c.abs;
             },
-            .err => |e| return toolError(allocator, e.code, e.message),
+            .err => |e| return common.toolError(allocator, e.code, e.message),
         }
     } else user_path;
 
@@ -121,10 +122,10 @@ pub fn listPath(
 ) !at.ToolResult {
     const cwd = std.Io.Dir.cwd();
     var dir = cwd.openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return toolError(allocator, "file_not_found", path),
-        error.NotDir => return toolError(allocator, "not_a_directory", path),
-        error.AccessDenied, error.PermissionDenied => return toolError(allocator, "access_denied", path),
-        else => return toolError(allocator, "open_failed", @errorName(err)),
+        error.FileNotFound => return common.toolError(allocator, "file_not_found", path),
+        error.NotDir => return common.toolError(allocator, "not_a_directory", path),
+        error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", path),
+        else => return common.toolError(allocator, "open_failed", @errorName(err)),
     };
     defer dir.close(io);
 
@@ -148,7 +149,7 @@ pub fn listPath(
     if (!recursive) {
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
-            if (cancel.isFired()) return toolError(allocator, "aborted", "cancelled");
+            if (cancel.isFired()) return common.toolError(allocator, "aborted", "cancelled");
             if (count >= max_entries) {
                 try out.appendSlice(allocator, "(truncated: too many entries)\n");
                 break;
@@ -163,7 +164,7 @@ pub fn listPath(
         var walker = try dir.walk(allocator);
         defer walker.deinit();
         while (try walker.next(io)) |entry| {
-            if (cancel.isFired()) return toolError(allocator, "aborted", "cancelled");
+            if (cancel.isFired()) return common.toolError(allocator, "aborted", "cancelled");
             const depth = entry.depth();
             if (depth >= max_depth) continue;
             if (count >= max_entries) {
@@ -202,27 +203,14 @@ fn appendEntry(
     try out.append(allocator, '\n');
 }
 
-fn toolError(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !at.ToolResult {
-    const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
-    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
-    arr[0] = .{ .text = .{ .text = text } };
-    const code_dup = try allocator.dupe(u8, code);
-    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
-}
 
 // ─── tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
+const test_h = @import("../../test_helpers.zig");
 
 test "ls tool: non-recursive lists entries" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -249,7 +237,7 @@ test "ls tool: non-recursive lists entries" {
 }
 
 test "ls tool: recursive walks with depth cap" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -272,7 +260,7 @@ test "ls tool: recursive walks with depth cap" {
 }
 
 test "ls tool: reports file_not_found" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -288,7 +276,7 @@ test "ls tool: reports file_not_found" {
 }
 
 test "ls tool: respectGitignore skips ignored entries" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -330,7 +318,7 @@ test "ls tool: respectGitignore skips ignored entries" {
 }
 
 test "ls tool: respectGitignore=false preserves full listing" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;

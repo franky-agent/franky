@@ -42,7 +42,23 @@ pub const StreamOptions = struct {
     /// "use the provider's hard-coded default".
     base_url: ?[]const u8 = null,
 
+    /// §3.5 (v1.7.2) — observability hooks on the HTTP transport.
+    /// Both are called from `ai/http.zig`'s fetch path. `on_payload`
+    /// fires once per retry-attempt just before `std.http.Client.fetch`
+    /// is invoked, with the outgoing request body. `on_response`
+    /// fires after the fetch returns, with the HTTP status. Hooks
+    /// are pure observers — they can't mutate the payload or
+    /// response (payload mutation would invalidate the spec's
+    /// "bytes in the transcript match bytes on the wire" invariant).
+    hooks: Hooks = .{},
+
     pub const Header = struct { name: []const u8, value: []const u8 };
+
+    pub const Hooks = struct {
+        userdata: ?*anyopaque = null,
+        on_payload: ?*const fn (userdata: ?*anyopaque, payload: []const u8) void = null,
+        on_response: ?*const fn (userdata: ?*anyopaque, status: u16) void = null,
+    };
 };
 
 /// §G.4 phase timeouts. Zero on any individual field disables that phase's
@@ -135,20 +151,15 @@ pub const Registry = struct {
 
 // ─── tests ────────────────────────────────────────────────────────────
 
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
-
 fn countingStream(ctx: StreamCtx) anyerror!void {
     try ctx.out.push(ctx.io, .start);
     ctx.out.closeWithFinal(ctx.io, .{ .done = .{ .stop_reason = .stop } });
 }
 
+const test_h = @import("../test_helpers.zig");
+
 test "Registry dispatches by API tag" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -180,7 +191,7 @@ test "Registry dispatches by API tag" {
 }
 
 test "Registry returns error for unknown API tag" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 

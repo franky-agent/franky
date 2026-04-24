@@ -12,13 +12,6 @@ const at = franky.agent.types;
 const ls_tool = franky.coding.tools.ls;
 const find_tool = franky.coding.tools.find;
 
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
-
 /// Build a small canonical tree:
 ///   <base>/
 ///     .gitignore            → "*.log\nbuild/\ntmp/\n"
@@ -89,7 +82,7 @@ fn runTool(
 }
 
 test "integration: ls respects nested .gitignore" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const base = "/tmp/franky_int_gi_ls";
@@ -124,7 +117,7 @@ test "integration: ls respects nested .gitignore" {
 }
 
 test "integration: find respects nested .gitignore" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const base = "/tmp/franky_int_gi_find";
@@ -153,7 +146,7 @@ test "integration: find respects nested .gitignore" {
 }
 
 test "integration: respectGitignore=false restores full tree" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const base = "/tmp/franky_int_gi_off";

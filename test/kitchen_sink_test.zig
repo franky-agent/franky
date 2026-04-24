@@ -35,13 +35,6 @@ const object_store_mod = franky.coding.object_store;
 const rpc_mod = franky.coding.rpc;
 const testing = std.testing;
 
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
-
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     const fp: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try fp.runSync(ctx.io, ctx.context, ctx.out);
@@ -50,7 +43,7 @@ fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
 // ─── 1. multi-turn agent loop ─────────────────────────────────────
 
 test "kitchen-sink: three prompts through Agent append 6 messages" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -93,7 +86,7 @@ test "kitchen-sink: three prompts through Agent append 6 messages" {
 // ─── 2. compaction round ──────────────────────────────────────────
 
 test "kitchen-sink: compaction round checkpoints + replaces span" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -205,7 +198,7 @@ test "kitchen-sink: fork + switchTo + message_count update" {
 // ─── 5. branch tree saveTree / loadTree round-trip ────────────────
 
 test "kitchen-sink: tree.json round-trip under a session dir" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -235,7 +228,7 @@ test "kitchen-sink: tree.json round-trip under a session dir" {
 // ─── 6. session persistence with $ref extraction ──────────────────
 
 test "kitchen-sink: oversize block spills to objects/ and round-trips" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -290,7 +283,7 @@ test "kitchen-sink: oversize block spills to objects/ and round-trips" {
 // ─── 7. session save + tree save together (full disk layout) ──────
 
 test "kitchen-sink: session + tree persist side by side" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -396,7 +389,7 @@ test "kitchen-sink: renderSpanAsPrompt includes user text + tool call + result m
 
 test "kitchen-sink: franky.sdk re-exports compose into a working round-trip" {
     const gpa = testing.allocator;
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -441,7 +434,7 @@ fn sdkShim(ctx: franky.sdk.StreamCtx) anyerror!void {
 
 test "kitchen-sink: Agent.abort fires cancel + surfaces agent_error" {
     const gpa = testing.allocator;
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -474,7 +467,7 @@ test "kitchen-sink: Agent.abort fires cancel + surfaces agent_error" {
 // ─── 12. session persistence through the SDK façade ──────────────
 
 test "kitchen-sink: sdk.session round-trips a simple transcript" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -533,7 +526,7 @@ test "kitchen-sink: fork at head + diverge on child doesn't touch parent" {
 
 test "kitchen-sink: Agent.prompt twice in a row preserves order" {
     const gpa = testing.allocator;
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -575,7 +568,7 @@ test "kitchen-sink: Agent.prompt twice in a row preserves order" {
 
 test "kitchen-sink: Reducer preserves block-open order on drain" {
     const gpa = testing.allocator;
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 

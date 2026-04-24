@@ -541,17 +541,13 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     var bw = std.Io.Writer.Allocating.init(ctx.allocator);
     defer bw.deinit();
 
-    const result = http_mod.fetchWithRetryAndTimeouts(&client, .{
+    const result = http_mod.fetchWithRetryAndTimeoutsAndHooks(&client, .{
         .location = .{ .url = endpoint },
         .method = .POST,
         .payload = body,
         .extra_headers = http_headers,
-    }, &bw, cancel, .{}, ctx.options.timeouts) catch |e| {
-        try ctx.out.push(ctx.io, .start);
-        ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
-            .code = errors.Code.transport,
-            .message = try std.fmt.allocPrint(ctx.allocator, "http error: {s}", .{@errorName(e)}),
-        } });
+    }, &bw, cancel, .{}, ctx.options.timeouts, http_mod.hooksFromOptions(ctx.options)) catch |e| {
+        try http_mod.reportTransportError(ctx.out, ctx.io, ctx.allocator, e);
         return;
     };
 
@@ -576,10 +572,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
-}
+const test_h = @import("../../test_helpers.zig");
 
 test "buildRequestJson: system prompt + user text + model + stream flag" {
     const gpa = testing.allocator;
@@ -681,7 +674,7 @@ test "buildRequestJson: assistant-with-tool_calls serializes tool_calls array" {
 
 test "runFromSse: text delta + finish_reason → done" {
     const gpa = testing.allocator;
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -723,7 +716,7 @@ test "runFromSse: text delta + finish_reason → done" {
 
 test "runFromSse: tool-call argument streaming" {
     const gpa = testing.allocator;
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -778,7 +771,7 @@ test "runFromSse: tool-call argument streaming" {
 
 test "runFromSse: content_filter → refusal stop_reason" {
     const gpa = testing.allocator;
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -812,7 +805,7 @@ test "mapFinishReason covers all documented variants" {
 
 test "runFromSse: ignores malformed chunks, preserves earlier deltas" {
     const gpa = testing.allocator;
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 

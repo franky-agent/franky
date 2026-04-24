@@ -10,13 +10,6 @@ const loop = franky.agent.loop;
 const faux_mod = ai.providers.faux;
 const testing = std.testing;
 
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
-
 // Simple echo tool for testing — returns "got: <args>" as text.
 fn echoTool(
     tool: *const at.AgentTool,
@@ -55,7 +48,7 @@ fn newAgentChannel(gpa: std.mem.Allocator) !loop.AgentChannel {
 }
 
 test "agent loop: text-only assistant produces message_end + turn_end" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -123,7 +116,7 @@ test "agent loop: text-only assistant produces message_end + turn_end" {
 }
 
 test "agent loop: tool call round-trips — text then tool then text" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -222,7 +215,7 @@ test "agent loop: tool call round-trips — text then tool then text" {
 }
 
 test "agent loop: before_tool_call can block a call" {
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 

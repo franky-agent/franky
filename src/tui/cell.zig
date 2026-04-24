@@ -66,6 +66,23 @@ pub const Style = struct {
             a.reverse == b.reverse and
             a.dim == b.dim;
     }
+
+    /// v1.2.0 — honor the NO_COLOR env-var spec (no-color.org).
+    /// Strips fg/bg back to `.default` while leaving SGR
+    /// attributes (bold/italic/underline/reverse/dim) intact —
+    /// the spec targets *color*, not typographic emphasis.
+    pub fn neutralize(self: Style, no_color: bool) Style {
+        if (!no_color) return self;
+        return .{
+            .fg = .default,
+            .bg = .default,
+            .bold = self.bold,
+            .italic = self.italic,
+            .underline = self.underline,
+            .reverse = self.reverse,
+            .dim = self.dim,
+        };
+    }
 };
 
 /// Cell width in columns on a typical terminal:
@@ -174,4 +191,26 @@ test "codepointWidth: control characters classified as narrow" {
     try testing.expectEqual(Width.narrow, codepointWidth(0));
     try testing.expectEqual(Width.narrow, codepointWidth(0x7F));
     try testing.expectEqual(Width.narrow, codepointWidth('\n'));
+}
+
+test "Style.neutralize: NO_COLOR strips fg/bg, keeps attributes" {
+    const s: Style = .{
+        .fg = .{ .basic = .red },
+        .bg = .{ .basic = .yellow },
+        .bold = true,
+        .italic = true,
+        .underline = true,
+        .reverse = true,
+        .dim = true,
+    };
+    const n = s.neutralize(true);
+    try testing.expect(n.fg == .default);
+    try testing.expect(n.bg == .default);
+    try testing.expect(n.bold and n.italic and n.underline and n.reverse and n.dim);
+}
+
+test "Style.neutralize: no_color=false is a no-op" {
+    const s: Style = .{ .fg = .{ .basic = .red }, .bold = true };
+    const n = s.neutralize(false);
+    try testing.expect(Style.eql(n, s));
 }

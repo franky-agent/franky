@@ -22,6 +22,7 @@ const ai = struct {
 const at = @import("../../agent/types.zig");
 const gitignore = @import("../gitignore.zig");
 const workspace_mod = @import("workspace.zig");
+const common = @import("common.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -80,8 +81,8 @@ fn execute(
     const root = parsed.value;
 
     const pattern_val = root.object.get("pattern") orelse
-        return toolError(allocator, "invalid_args", "missing pattern");
-    if (pattern_val != .string) return toolError(allocator, "invalid_args", "pattern must be a string");
+        return common.toolError(allocator, "invalid_args", "missing pattern");
+    if (pattern_val != .string) return common.toolError(allocator, "invalid_args", "pattern must be a string");
     const pattern = pattern_val.string;
 
     const user_cwd: []const u8 = if (root.object.get("cwd")) |v|
@@ -107,7 +108,7 @@ fn execute(
                 canon_path = c.abs;
                 break :blk c.abs;
             },
-            .err => |e| return toolError(allocator, e.code, e.message),
+            .err => |e| return common.toolError(allocator, e.code, e.message),
         }
     } else user_cwd;
 
@@ -124,10 +125,10 @@ pub fn findMatches(
     cancel: *ai.stream.Cancel,
 ) !at.ToolResult {
     const root_dir = std.Io.Dir.cwd().openDir(io, cwd, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return toolError(allocator, "file_not_found", cwd),
-        error.NotDir => return toolError(allocator, "not_a_directory", cwd),
-        error.AccessDenied, error.PermissionDenied => return toolError(allocator, "access_denied", cwd),
-        else => return toolError(allocator, "open_failed", @errorName(err)),
+        error.FileNotFound => return common.toolError(allocator, "file_not_found", cwd),
+        error.NotDir => return common.toolError(allocator, "not_a_directory", cwd),
+        error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", cwd),
+        else => return common.toolError(allocator, "open_failed", @errorName(err)),
     };
     var dir = root_dir;
     defer dir.close(io);
@@ -146,8 +147,8 @@ pub fn findMatches(
 
     var found: usize = 0;
     var visited: usize = 0;
-    while (walker.next(io) catch |e| return toolError(allocator, "walk_failed", @errorName(e))) |entry| {
-        if (cancel.isFired()) return toolError(allocator, "aborted", "cancelled");
+    while (walker.next(io) catch |e| return common.toolError(allocator, "walk_failed", @errorName(e))) |entry| {
+        if (cancel.isFired()) return common.toolError(allocator, "aborted", "cancelled");
         visited += 1;
         if (visited > max_walk_entries) {
             try out.appendSlice(allocator, "(walk aborted: too many entries)\n");
@@ -272,24 +273,11 @@ fn matchInner(pat: []const u8, pi0: usize, s: []const u8, si0: usize) bool {
     return si == s.len;
 }
 
-fn toolError(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !at.ToolResult {
-    const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
-    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
-    arr[0] = .{ .text = .{ .text = text } };
-    const code_dup = try allocator.dupe(u8, code);
-    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
-}
 
 // ─── tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
+const test_h = @import("../../test_helpers.zig");
 
 test "find globMatch: literal + wildcard" {
     try testing.expect(globMatch("foo", "foo"));
@@ -310,7 +298,7 @@ test "find globMatch: literal + wildcard" {
 }
 
 test "find tool: returns matching files" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -346,7 +334,7 @@ test "find tool: returns matching files" {
 }
 
 test "find tool: respectGitignore drops ignored matches" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;

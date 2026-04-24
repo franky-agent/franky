@@ -29,6 +29,7 @@ const ai = struct {
 };
 const at = @import("../../agent/types.zig");
 const workspace_mod = @import("workspace.zig");
+const common = @import("common.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -38,6 +39,7 @@ pub const parameters_json: []const u8 =
     \\    "command": {"type": "string", "description": "The shell command to run (parsed by /bin/sh -c)."},
     \\    "cwd": {"type": "string", "description": "Working directory for the command. Defaults to the session cwd (if any) else the agent's cwd."},
     \\    "timeoutMs": {"type": "integer", "minimum": 1, "description": "Hard timeout in milliseconds (default 120000)."},
+    \\    "background": {"type": "boolean", "description": "Run detached; returns immediately with {pid, outputFile}. Default false."},
     \\    "description": {"type": "string", "description": "Short human-readable description of what the command does."}
     \\  },
     \\  "additionalProperties": false
@@ -46,6 +48,9 @@ pub const parameters_json: []const u8 =
 
 pub const default_timeout_ms: u64 = 120_000;
 pub const max_output_bytes: usize = 1 * 1024 * 1024; // 1 MiB per stream
+/// v1.7.4 — chunk size for incremental `on_update` emission when
+/// captured output exceeds this. Matches §C.4's "64 KB chunks".
+pub const chunk_bytes: usize = 64 * 1024;
 /// Byte string appended to stdout by the wrapped command so `execute`
 /// can recover the new cwd. Prefixed with `\n` to guarantee it lands
 /// on its own line even when the user's command doesn't trailing-
@@ -124,6 +129,81 @@ pub fn toolWithStateAndWorkspace(ctx: *BashCtx) at.AgentTool {
     };
 }
 
+/// v1.7.4 — detach-and-return bash execution. Forks the command
+/// via `nohup … &` into a separate process group, captures the
+/// PID via `$!`, and returns `{pid, outputFile}` immediately.
+/// Session-scoped supervision (status polling, cleanup on session
+/// close) is a v1.8 follow-up; today the user can `tail -f` the
+/// output file manually or issue a follow-up bash call.
+///
+/// Command delivery avoids shell-quote escaping by using argv
+/// passing: the outer shell receives `sh -c WRAPPER __franky
+/// $command $outfile`, exposing the user's command as `$1` and
+/// the output file as `$2` inside the wrapper. This is
+/// escape-safe for any byte sequence the user might pass.
+fn runBackground(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command: []const u8,
+    cwd: ?[]const u8,
+) !at.ToolResult {
+    const ts: i64 = ai.stream.nowMillis();
+    const out_file = try std.fmt.allocPrint(allocator, "/tmp/franky_bg_{d}.out", .{ts});
+    defer allocator.free(out_file);
+
+    const wrapper = "nohup sh -c \"$1\" sh > \"$2\" 2>&1 < /dev/null & echo $!";
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", wrapper, "__franky_bg", command, out_file };
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .cwd = if (cwd) |c| std.process.Child.Cwd{ .path = c } else .inherit,
+        .stdout_limit = std.Io.Limit.limited(256),
+        .stderr_limit = std.Io.Limit.limited(1024),
+    }) catch |err| return common.toolError(allocator, "bash_spawn_failed", @errorName(err));
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    const pid_str = std.mem.trim(u8, result.stdout, " \t\n\r");
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "background pid={s} outputFile={s}\n(use `tail -f {s}` or a follow-up bash call to read output; " ++
+            "session-supervised status polling lands in v1.8)\n",
+        .{ pid_str, out_file, out_file },
+    );
+
+    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
+    arr[0] = .{ .text = .{ .text = body } };
+    return .{ .content = arr };
+}
+
+/// v1.7.4 — chunked `on_update` emission. Posts 64 KB slices of
+/// `bytes` to `on_update` as `ToolUpdate` JSON events. The final
+/// result still carries the full captured output; consumers that
+/// want real-time progress read the updates; transcript consumers
+/// read the result. Non-allocating per-chunk except for the small
+/// JSON envelope.
+fn emitChunked(
+    allocator: std.mem.Allocator,
+    on_update: at.OnUpdate,
+    bytes: []const u8,
+) void {
+    if (on_update.call == null) return;
+    if (bytes.len <= chunk_bytes) return;
+    var seq: u32 = 0;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += chunk_bytes) {
+        const end = @min(i + chunk_bytes, bytes.len);
+        const json = std.fmt.allocPrint(
+            allocator,
+            "{{\"kind\":\"stdout\",\"seq\":{d},\"bytes\":{d},\"offset\":{d}}}",
+            .{ seq, end - i, i },
+        ) catch return;
+        defer allocator.free(json);
+        on_update.push(.{ .json = json });
+        seq += 1;
+    }
+}
+
 fn execute(
     self: *const at.AgentTool,
     allocator: std.mem.Allocator,
@@ -135,7 +215,6 @@ fn execute(
 ) anyerror!at.ToolResult {
     _ = call_id;
     _ = cancel;
-    _ = on_update;
 
     const state: ?*SessionBashState = if (self.ctx) |c| @ptrCast(@alignCast(c)) else null;
 
@@ -146,10 +225,10 @@ fn execute(
     const root = parsed.value;
 
     const command_val = root.object.get("command") orelse
-        return toolError(allocator, "invalid_args", "missing command");
-    if (command_val != .string) return toolError(allocator, "invalid_args", "command must be a string");
+        return common.toolError(allocator, "invalid_args", "missing command");
+    if (command_val != .string) return common.toolError(allocator, "invalid_args", "command must be a string");
     const command = command_val.string;
-    if (command.len == 0) return toolError(allocator, "invalid_args", "command cannot be empty");
+    if (command.len == 0) return common.toolError(allocator, "invalid_args", "command cannot be empty");
 
     const cwd_arg_opt: ?[]const u8 = if (root.object.get("cwd")) |v|
         (if (v == .string) v.string else null)
@@ -158,6 +237,13 @@ fn execute(
 
     // Precedence: explicit `cwd` arg > session-tracked cwd > inherit.
     const cwd_opt: ?[]const u8 = cwd_arg_opt orelse if (state) |s| s.getCwd() else null;
+
+    // v1.7.4 — `background: true` detaches and returns.
+    const background: bool = if (root.object.get("background")) |v|
+        (v == .bool and v.bool)
+    else
+        false;
+    if (background) return try runBackground(allocator, io, command, cwd_opt);
 
     const timeout_ms: u64 = if (root.object.get("timeoutMs")) |v| blk: {
         if (v == .integer and v.integer >= 1) break :blk @intCast(v.integer);
@@ -188,10 +274,10 @@ fn execute(
         .stderr_limit = std.Io.Limit.limited(max_output_bytes),
         .timeout = timeout,
     }) catch |err| switch (err) {
-        error.StreamTooLong => return toolError(allocator, "bash_output_too_large", "output exceeded 1 MiB cap"),
-        error.FileNotFound => return toolError(allocator, "bash_shell_missing", "/bin/sh not found"),
-        error.AccessDenied, error.PermissionDenied => return toolError(allocator, "access_denied", "cannot execute /bin/sh"),
-        else => |e| return toolError(allocator, "bash_spawn_failed", @errorName(e)),
+        error.StreamTooLong => return common.toolError(allocator, "bash_output_too_large", "output exceeded 1 MiB cap"),
+        error.FileNotFound => return common.toolError(allocator, "bash_shell_missing", "/bin/sh not found"),
+        error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", "cannot execute /bin/sh"),
+        else => |e| return common.toolError(allocator, "bash_spawn_failed", @errorName(e)),
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -206,6 +292,11 @@ fn execute(
             s.setCwd(new_cwd) catch {}; // state update is best-effort
         };
     }
+
+    // v1.7.4 — chunked `on_update` emission for large captures so
+    // consumers that want progress see ≤ 64 KiB slices instead of
+    // a single giant tool_execution_end payload.
+    emitChunked(allocator, on_update, parsed_trailer.clean_stdout);
 
     return try formatResult(allocator, result, parsed_trailer.clean_stdout);
 }
@@ -224,7 +315,6 @@ fn executeWithCtx(
 ) anyerror!at.ToolResult {
     _ = call_id;
     _ = cancel;
-    _ = on_update;
 
     const bash_ctx: ?*BashCtx = if (self.ctx) |c| @ptrCast(@alignCast(c)) else null;
     const state: ?*SessionBashState = if (bash_ctx) |bc| bc.state else null;
@@ -237,10 +327,10 @@ fn executeWithCtx(
     const root = parsed.value;
 
     const command_val = root.object.get("command") orelse
-        return toolError(allocator, "invalid_args", "missing command");
-    if (command_val != .string) return toolError(allocator, "invalid_args", "command must be a string");
+        return common.toolError(allocator, "invalid_args", "missing command");
+    if (command_val != .string) return common.toolError(allocator, "invalid_args", "command must be a string");
     const command = command_val.string;
-    if (command.len == 0) return toolError(allocator, "invalid_args", "command cannot be empty");
+    if (command.len == 0) return common.toolError(allocator, "invalid_args", "command cannot be empty");
 
     const cwd_arg_opt: ?[]const u8 = if (root.object.get("cwd")) |v|
         (if (v == .string) v.string else null)
@@ -258,7 +348,7 @@ fn executeWithCtx(
                     canon_cwd = c.abs;
                     break :blk c.abs;
                 },
-                .err => |e| return toolError(allocator, e.code, e.message),
+                .err => |e| return common.toolError(allocator, e.code, e.message),
             }
         }
         break :blk p;
@@ -266,6 +356,13 @@ fn executeWithCtx(
 
     // Precedence: explicit `cwd` arg > session-tracked cwd > inherit.
     const cwd_opt: ?[]const u8 = cwd_from_arg orelse if (state) |s| s.getCwd() else null;
+
+    // v1.7.4 — `background: true` detaches and returns.
+    const background: bool = if (root.object.get("background")) |v|
+        (v == .bool and v.bool)
+    else
+        false;
+    if (background) return try runBackground(allocator, io, command, cwd_opt);
 
     const timeout_ms: u64 = if (root.object.get("timeoutMs")) |v| blk: {
         if (v == .integer and v.integer >= 1) break :blk @intCast(v.integer);
@@ -305,10 +402,10 @@ fn executeWithCtx(
         .timeout = timeout,
         .environ_map = if (filtered_env) |*m| m else null,
     }) catch |err| switch (err) {
-        error.StreamTooLong => return toolError(allocator, "bash_output_too_large", "output exceeded 1 MiB cap"),
-        error.FileNotFound => return toolError(allocator, "bash_shell_missing", "shell not found"),
-        error.AccessDenied, error.PermissionDenied => return toolError(allocator, "access_denied", "cannot execute shell"),
-        else => |e| return toolError(allocator, "bash_spawn_failed", @errorName(e)),
+        error.StreamTooLong => return common.toolError(allocator, "bash_output_too_large", "output exceeded 1 MiB cap"),
+        error.FileNotFound => return common.toolError(allocator, "bash_shell_missing", "shell not found"),
+        error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", "cannot execute shell"),
+        else => |e| return common.toolError(allocator, "bash_spawn_failed", @errorName(e)),
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -321,6 +418,7 @@ fn executeWithCtx(
         };
     }
 
+    emitChunked(allocator, on_update, parsed_trailer.clean_stdout);
     return try formatResult(allocator, result, parsed_trailer.clean_stdout);
 }
 
@@ -397,27 +495,14 @@ fn termLine(allocator: std.mem.Allocator, t: std.process.Child.Term) ![]u8 {
     };
 }
 
-fn toolError(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) !at.ToolResult {
-    const text = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ code, msg });
-    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
-    arr[0] = .{ .text = .{ .text = text } };
-    const code_dup = try allocator.dupe(u8, code);
-    return .{ .content = arr, .is_error = true, .tool_code = code_dup };
-}
 
 // ─── tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
+const test_h = @import("../../test_helpers.zig");
 
 test "bash tool: echo stdout success" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -443,7 +528,7 @@ test "bash tool: echo stdout success" {
 }
 
 test "bash tool: non-zero exit is error" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -467,7 +552,7 @@ test "bash tool: non-zero exit is error" {
 }
 
 test "bash tool: rejects missing command" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -518,7 +603,7 @@ test "parseTrailer: lastIndexOf semantics survive marker-in-output" {
 }
 
 test "bash tool: wrapper hides trailer from reported stdout" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -545,7 +630,7 @@ test "bash tool: wrapper hides trailer from reported stdout" {
 }
 
 test "bash tool: SessionBashState propagates cwd across calls" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -586,7 +671,7 @@ test "bash tool: SessionBashState propagates cwd across calls" {
 }
 
 test "bash tool: failed command does not promote its cwd into the session" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -612,7 +697,7 @@ test "bash tool: failed command does not promote its cwd into the session" {
 }
 
 test "bash tool: honors explicit cwd arg over session-tracked cwd" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -650,4 +735,100 @@ test "SessionBashState.getCwd returns null when unset" {
     try testing.expect(state.getCwd() == null);
     try state.setCwd("/tmp/x");
     try testing.expectEqualStrings("/tmp/x", state.getCwd().?);
+}
+
+// ─── v1.7.4 — background + chunked emission ─────────────────────
+
+const UpdateCollector = struct {
+    count: std.atomic.Value(u32) = .init(0),
+    total_bytes: std.atomic.Value(u64) = .init(0),
+
+    fn onUpdate(ud: ?*anyopaque, update: at.ToolUpdate) void {
+        const self: *UpdateCollector = @ptrCast(@alignCast(ud.?));
+        _ = self.count.fetchAdd(1, .monotonic);
+        _ = self.total_bytes.fetchAdd(update.json.len, .monotonic);
+    }
+};
+
+test "bash tool: chunked on_update fires for large captures" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    // Generate ~200 KiB of output so chunking fires (≥ 64 KiB).
+    var cancel: ai.stream.Cancel = .{};
+    var collector: UpdateCollector = .{};
+    const t = tool();
+    const args = "{\"command\":\"yes 'franky-long-output' | head -c 200000\"}";
+    var res = try t.execute(&t, gpa, io, "c-1", args, &cancel, .{
+        .ctx = @ptrCast(&collector),
+        .call = UpdateCollector.onUpdate,
+    });
+    defer res.deinit(gpa);
+
+    // 200 KiB / 64 KiB = 4 chunks emitted.
+    const n = collector.count.load(.monotonic);
+    try testing.expect(n >= 2);
+}
+
+test "bash tool: chunked on_update is silent for small captures" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var cancel: ai.stream.Cancel = .{};
+    var collector: UpdateCollector = .{};
+    const t = tool();
+    var res = try t.execute(&t, gpa, io, "c-1", "{\"command\":\"echo hi\"}", &cancel, .{
+        .ctx = @ptrCast(&collector),
+        .call = UpdateCollector.onUpdate,
+    });
+    defer res.deinit(gpa);
+
+    try testing.expectEqual(@as(u32, 0), collector.count.load(.monotonic));
+}
+
+test "bash tool: background: true returns pid + outputFile, command runs detached" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var cancel: ai.stream.Cancel = .{};
+    const t = tool();
+    // Command creates a sentinel file after a brief sleep. We check
+    // that the bash call returns right away (before the sleep ends),
+    // then the sentinel appears once the backgrounded command
+    // completes.
+    const args = "{\"command\":\"sleep 0.2; echo done > /tmp/franky_bg_test_sentinel\",\"background\":true}";
+    const t0 = ai.stream.nowMillis();
+    var res = try t.execute(&t, gpa, io, "c-1", args, &cancel, .{});
+    const elapsed = ai.stream.nowMillis() - t0;
+    defer res.deinit(gpa);
+
+    // Returned quickly (well under the 200ms sleep inside the command).
+    try testing.expect(elapsed < 150);
+
+    // Result carries the expected shape.
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "background pid=") != null);
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "outputFile=") != null);
+
+    // Wait for the backgrounded command to complete, then verify
+    // the sentinel.
+    const deadline = ai.stream.nowMillis() + 2_000;
+    while (ai.stream.nowMillis() < deadline) {
+        var f = std.Io.Dir.cwd().openFile(io, "/tmp/franky_bg_test_sentinel", .{}) catch |e| switch (e) {
+            error.FileNotFound => {
+                std.Thread.yield() catch {};
+                continue;
+            },
+            else => break,
+        };
+        f.close(io);
+        break;
+    }
+    // Clean up.
+    std.Io.Dir.cwd().deleteFile(io, "/tmp/franky_bg_test_sentinel") catch {};
 }

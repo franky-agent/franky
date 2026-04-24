@@ -40,6 +40,10 @@ pub const stream = ai.stream;
 pub const channel = ai.channel;
 pub const retry = ai.retry;
 pub const log = ai.log;
+/// v1.7.2 — §3.6 cross-provider message transform (thinking-block
+/// adaptation, etc.). Use before dispatching a conversation that
+/// spans providers mid-session.
+pub const transform = ai.transform;
 
 // Friendly single-type aliases.
 pub const Message = ai.types.Message;

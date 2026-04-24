@@ -153,10 +153,7 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
-}
+const test_h = @import("../test_helpers.zig");
 
 test "defaults: sensible baselines per §H.2" {
     var s = try defaults(testing.allocator);
@@ -168,7 +165,7 @@ test "defaults: sensible baselines per §H.2" {
 }
 
 test "loadLayered: both dirs missing → defaults" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -178,7 +175,7 @@ test "loadLayered: both dirs missing → defaults" {
 }
 
 test "loadLayered: project layer overrides defaults" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -205,7 +202,7 @@ test "loadLayered: project layer overrides defaults" {
 }
 
 test "loadLayered: project beats user (CLI sits on top in caller)" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -241,7 +238,7 @@ test "loadLayered: project beats user (CLI sits on top in caller)" {
 }
 
 test "loadLayered: malformed JSON surfaces MalformedJson" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -259,7 +256,7 @@ test "loadLayered: malformed JSON surfaces MalformedJson" {
 }
 
 test "loadLayered: partial file preserves unspecified defaults" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 

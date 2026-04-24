@@ -17,13 +17,6 @@ const ai = franky.ai;
 const agent = franky.agent;
 const at = franky.agent.types;
 
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
-
 /// Shared across tool instances so each records its own start/end
 /// timestamps. The test inspects overlap after `waitForIdle`.
 const Timings = struct {
@@ -131,7 +124,7 @@ fn slowTool(name: []const u8, ctx: *SlowCtx) at.AgentTool {
 
 test "parallel tools: three calls complete in ~max(individual), not sum" {
     const gpa = std.testing.allocator;
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -282,7 +275,7 @@ fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
 
 test "parallel tools: cancel mid-batch tears down workers promptly and without leaks" {
     const gpa = std.testing.allocator;
-    var threaded = testIo();
+    var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -413,4 +406,121 @@ test "parallel tools: cancel mid-batch tears down workers promptly and without l
     // sleep. 900 ms cap proves cancel short-circuited the in-flight
     // batch even under CI jitter.
     try std.testing.expect(elapsed < 900);
+}
+
+// ─── v1.7.3 — completion-order events (§4.4) ──────────────────────
+
+test "parallel tools: end events fire in completion order; results stay source-ordered" {
+    const gpa = std.testing.allocator;
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Tools sleep different amounts so completion order ≠ source
+    // order: slot 'a' sleeps longest, 'c' shortest. Expected
+    // completion order: c → b → a. Expected source order: a, b, c.
+    var timings = Timings{};
+    var ctx_a = SlowCtx{ .timings = &timings, .slot = 'a', .sleep_ms = 120 };
+    var ctx_b = SlowCtx{ .timings = &timings, .slot = 'b', .sleep_ms = 80 };
+    var ctx_c = SlowCtx{ .timings = &timings, .slot = 'c', .sleep_ms = 40 };
+
+    const tools = [_]at.AgentTool{
+        slowTool("slow_a", &ctx_a),
+        slowTool("slow_b", &ctx_b),
+        slowTool("slow_c", &ctx_c),
+    };
+
+    var faux = ai.providers.faux.FauxProvider.init(gpa);
+    defer faux.deinit();
+    const events = [_]ai.providers.faux.Event{
+        .{ .tool_call = .{ .id = "c-a", .name = "slow_a", .args_json = "{}" } },
+        .{ .tool_call = .{ .id = "c-b", .name = "slow_b", .args_json = "{}" } },
+        .{ .tool_call = .{ .id = "c-c", .name = "slow_c", .args_json = "{}" } },
+        .{ .done = .{ .stop_reason = .tool_use } },
+    };
+    try faux.push(.{ .events = &events });
+    const ack_events = [_]ai.providers.faux.Event{
+        .{ .text = .{ .text = "ok", .chunk_size = 2 } },
+        .{ .done = .{ .stop_reason = .stop } },
+    };
+    try faux.push(.{ .events = &ack_events });
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel: ai.stream.Cancel = .{};
+    var ch = try agent.loop.AgentChannel.initWithDrop(gpa, 1024, at.AgentEvent.deinit, gpa);
+    defer ch.deinit();
+
+    var transcript = agent.loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    const user_content = try gpa.alloc(ai.types.ContentBlock, 1);
+    user_content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "go") } };
+    try transcript.append(.{ .role = .user, .content = user_content, .timestamp = 0 });
+
+    const Worker = struct {
+        fn run(
+            a: std.mem.Allocator,
+            i: std.Io,
+            t: *agent.loop.Transcript,
+            c: agent.loop.Config,
+            out: *agent.loop.AgentChannel,
+        ) void {
+            agent.loop.agentLoop(a, i, t, c, out);
+        }
+    };
+    const worker = try std.Thread.spawn(.{}, Worker.run, .{
+        gpa, io, &transcript, agent.loop.Config{
+            .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+            .tools = &tools,
+            .registry = &reg,
+            .execution_mode = .parallel,
+            .cancel = &cancel,
+        },
+        &ch,
+    });
+    defer worker.join();
+
+    // Collect end events in order of arrival and check they're sorted
+    // by completion (smallest sleep first).
+    var end_call_ids: std.ArrayList([]u8) = .empty;
+    defer {
+        for (end_call_ids.items) |id| gpa.free(id);
+        end_call_ids.deinit(gpa);
+    }
+    while (ch.next(io)) |ev| {
+        switch (ev) {
+            .tool_execution_end => |e| {
+                try end_call_ids.append(gpa, try gpa.dupe(u8, e.call_id));
+            },
+            else => {},
+        }
+        ev.deinit(gpa);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), end_call_ids.items.len);
+    // Completion order: c (40ms) → b (80ms) → a (120ms).
+    try std.testing.expectEqualStrings("c-c", end_call_ids.items[0]);
+    try std.testing.expectEqualStrings("c-b", end_call_ids.items[1]);
+    try std.testing.expectEqualStrings("c-a", end_call_ids.items[2]);
+
+    // Transcript assembled in source order regardless of completion
+    // order: user, assistant (tool_use), toolResult[a, b, c], assistant.
+    var tool_result_ids: std.ArrayList([]const u8) = .empty;
+    defer tool_result_ids.deinit(gpa);
+    for (transcript.messages.items) |m| {
+        if (m.role == .tool_result) {
+            if (m.tool_call_id) |id| try tool_result_ids.append(gpa, id);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), tool_result_ids.items.len);
+    try std.testing.expectEqualStrings("c-a", tool_result_ids.items[0]);
+    try std.testing.expectEqualStrings("c-b", tool_result_ids.items[1]);
+    try std.testing.expectEqualStrings("c-c", tool_result_ids.items[2]);
 }

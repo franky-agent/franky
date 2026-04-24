@@ -388,10 +388,7 @@ pub fn resolveAuthToken(
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
-}
+const test_h = @import("../test_helpers.zig");
 
 test "resolveApiKey: CLI flag beats env beats file" {
     try testing.expectEqualStrings("cli", resolveApiKey("cli", "env", "file").?);
@@ -407,7 +404,7 @@ test "resolveAuthToken: identical precedence to API key" {
 }
 
 test "load: missing file returns empty Auth" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -418,7 +415,7 @@ test "load: missing file returns empty Auth" {
 }
 
 test "load: reads apiKey + oauth provider round-trip" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -449,7 +446,7 @@ test "load: reads apiKey + oauth provider round-trip" {
 }
 
 test "load: malformed JSON surfaces MalformedJson" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -467,7 +464,7 @@ test "load: malformed JSON surfaces MalformedJson" {
 }
 
 test "load: unknown provider ignored; known providers preserved" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -520,7 +517,7 @@ test "providerFromToken: mints an oauth ProviderAuth with expires_at" {
 }
 
 test "save: writes an atomic file that load() round-trips" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -549,7 +546,7 @@ test "save: writes an atomic file that load() round-trips" {
 }
 
 test "save: escapes embedded quotes + control chars" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;

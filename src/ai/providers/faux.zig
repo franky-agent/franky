@@ -263,13 +263,6 @@ pub const FauxProvider = struct {
 
 // ─── tests ────────────────────────────────────────────────────────────
 
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-}
-
 fn emptyContext() types.Context {
     return .{
         .system_prompt = "",
@@ -282,8 +275,10 @@ fn newFauxChannel(gpa: std.mem.Allocator) !Channel {
     return try Channel.initWithDrop(gpa, 64, stream_mod.StreamEvent.deinit, gpa);
 }
 
+const test_h = @import("../../test_helpers.zig");
+
 test "faux emits streamed text and auto-done" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -308,7 +303,7 @@ test "faux emits streamed text and auto-done" {
 }
 
 test "faux emits tool call with streamed args" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -339,7 +334,7 @@ test "faux emits tool call with streamed args" {
 }
 
 test "faux emits error event instead of done" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -362,7 +357,7 @@ test "faux emits error event instead of done" {
 }
 
 test "faux matcher selects by last_user_text_equals" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -410,7 +405,7 @@ test "faux matcher selects by last_user_text_equals" {
 }
 
 test "channel deinit with undrained faux events does not leak" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 

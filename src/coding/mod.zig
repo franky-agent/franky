@@ -9,6 +9,7 @@ pub const tools = struct {
     pub const find = @import("tools/find.zig");
     pub const grep = @import("tools/grep.zig");
     pub const workspace = @import("tools/workspace.zig");
+    pub const common = @import("tools/common.zig");
 };
 
 pub const modes = struct {
@@ -51,6 +52,7 @@ test {
     _ = tools.find;
     _ = tools.grep;
     _ = tools.workspace;
+    _ = tools.common;
     _ = modes.print;
     _ = modes.interactive;
     _ = modes.login;

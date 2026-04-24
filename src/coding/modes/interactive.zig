@@ -41,6 +41,7 @@ const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
 const compaction_mod = franky.coding.compaction;
 const branching_mod = franky.coding.branching;
+const models_mod = franky.coding.models;
 const term_mod = @import("../terminal.zig");
 const print_mode = @import("print.zig");
 
@@ -235,6 +236,39 @@ fn runInteractive(
     var status_text: []const u8 = "ready";
     var read_buf: [4096]u8 = undefined;
     var fd_writer = FdWriter{ .file = stdout, .io = io };
+    // v1.1.1 — scroll offset, expressed as "rows to walk back from
+    // the most recent line". 0 means "at the bottom" (normal paint).
+    // Page-Up increases it; Page-Down decreases; new character
+    // insertion auto-snaps to 0.
+    var scroll_offset: u32 = 0;
+
+    // v1.1.2 — transcript search. When non-null, keystrokes go to
+    // the search query instead of the main editor; matching
+    // scrollback lines get highlighted.
+    var search: ?SearchState = null;
+    defer if (search) |*s| s.deinit();
+
+    // v1.2.0 — NO_COLOR env-var spec (no-color.org). Set once at
+    // startup; paint-time `Style.neutralize(no_color)` strips
+    // fg/bg while preserving typographic attributes. Consumed
+    // by the paint path where semantic colors are applied
+    // (error/warn lines — QW4+5).
+    const no_color: bool = blk: {
+        const v = environ.getPosix("NO_COLOR") orelse break :blk false;
+        break :blk v.len > 0;
+    };
+
+    // v1.2.0 (QW6) — `?` help overlay. Full-screen modal listing
+    // keybindings + slash commands. Toggled by `?` (when the
+    // editor is empty + search is inactive); dismissed by any
+    // key.
+    var show_help: bool = false;
+
+    // v1.2.0 (QW7) — unread-below badge. Freezes the scrollback
+    // length at the moment the user scrolls off the live edge so
+    // we can compute how many new lines landed since. Returns to
+    // "auto-track" mode when they scroll back to bottom.
+    var scrollback_len_at_bottom: usize = 0;
 
     // Bridge struct that the slash handlers see through
     // `Ctx.userdata`. Declared AFTER `running` so both addresses
@@ -248,7 +282,7 @@ fn runInteractive(
         .prompts_dir = cfg.prompts_dir,
     };
 
-    paintFrame(&buf, &scrollback, &editor, status_text);
+    paintFrame(&buf, &scrollback, &editor, .{ .status = status_text });
     try renderer.render(&fd_writer, &buf);
     buf.clear();
 
@@ -265,7 +299,7 @@ fn runInteractive(
         // editor's last `submit` outcome).
         if (pending_prompt) |p| {
             status_text = "thinking…";
-            paintFrame(&buf, &scrollback, &editor, status_text);
+            paintFrame(&buf, &scrollback, &editor, .{ .status = status_text });
             try renderer.render(&fd_writer, &buf);
             buf.clear();
 
@@ -276,7 +310,14 @@ fn runInteractive(
             // text is owned by the session arena so it outlives the
             // stream drain.
             try session.seedFauxIfNeeded(p);
-            runOneTurn(allocator, io, &session, p, &scrollback, &buf, &renderer, &editor, stdout, &size, &decoder, &read_buf) catch |err| {
+            const turn_io: TurnIo = .{
+                .editor = &editor,
+                .history = &history,
+                .slash_registry = &slash_registry,
+                .slash_bridge = &slash_bridge,
+                .pending_prompt = &pending_prompt,
+            };
+            runOneTurn(allocator, io, &session, p, &scrollback, &buf, &renderer, turn_io, stdout, &size, &decoder, &read_buf) catch |err| {
                 try scrollback.appendLine(try std.fmt.allocPrint(allocator, "error: {s}", .{@errorName(err)}));
             };
             allocator.free(p);
@@ -297,6 +338,94 @@ fn runInteractive(
         var any_input = false;
         while (try decoder.next()) |key| {
             any_input = true;
+
+            // v1.2.0 (QW6) — `?` help overlay. When visible, any
+            // key dismisses. When hidden and the editor is empty
+            // and search is inactive, `?` opens it. If the editor
+            // has text, `?` passes through as a normal character.
+            if (show_help) {
+                show_help = false;
+                continue;
+            }
+            switch (key) {
+                .char => |c| if (c.cp == '?' and !c.mods.ctrl and !c.mods.alt and
+                    search == null and editor.text().len == 0)
+                {
+                    show_help = true;
+                    continue;
+                },
+                else => {},
+            }
+
+            // v1.1.2 — Ctrl-F (preferred) / Ctrl-S (legacy) enter
+            // or exit search. Ctrl-F is the de facto standard
+            // (less, lazygit, k9s, fzf); Ctrl-S is kept as a
+            // backup but collides with XON/XOFF flow control on
+            // many terminals, so users should prefer Ctrl-F.
+            switch (key) {
+                .char => |c| if (c.mods.ctrl and (c.cp == 'f' or c.cp == 's')) {
+                    if (search == null) {
+                        search = SearchState.init(allocator);
+                    } else {
+                        search.?.deinit();
+                        search = null;
+                    }
+                    continue;
+                },
+                .escape => if (search != null) {
+                    search.?.deinit();
+                    search = null;
+                    continue;
+                },
+                else => {},
+            }
+            if (search) |*s| {
+                try handleSearchKey(s, &scrollback, &scroll_offset, buf.rows, key);
+                continue;
+            }
+
+            // v1.1.1 — scroll keys are consumed before the editor
+            // so PgUp/PgDn/Ctrl-Home/Ctrl-End never turn into text.
+            // Typing any printable character auto-snaps to the
+            // bottom so new messages aren't hidden.
+            const transcript_rows_guess: u32 = if (buf.rows >= 3) @max(1, buf.rows / 2) else 1;
+            switch (key) {
+                .page_up => {
+                    const max_offset: u32 = @intCast(@min(
+                        @as(u64, std.math.maxInt(u32)),
+                        scrollback.lines.items.len,
+                    ));
+                    scroll_offset = @min(scroll_offset + transcript_rows_guess, max_offset);
+                    continue;
+                },
+                .page_down => {
+                    if (scroll_offset >= transcript_rows_guess) {
+                        scroll_offset -= transcript_rows_guess;
+                    } else {
+                        scroll_offset = 0;
+                    }
+                    continue;
+                },
+                .end => {
+                    // Not Ctrl-End — plain End is line-end in the
+                    // editor. We route this only when the editor is
+                    // empty so the user still gets normal editor
+                    // End-key behavior on non-empty lines.
+                    if (editor.text().len == 0) {
+                        scroll_offset = 0;
+                        continue;
+                    }
+                },
+                .char => |c| {
+                    if (!c.mods.ctrl and !c.mods.alt) {
+                        // Normal character typed — snap to bottom so
+                        // the next message lands visibly.
+                        scroll_offset = 0;
+                    }
+                },
+                else => {},
+            }
+
             const outcome = try editor.feedKey(key);
             switch (outcome) {
                 .none => {},
@@ -353,7 +482,59 @@ fn runInteractive(
         // overhead is flat regardless of typing speed.
         const palette_line = try computeSlashHint(allocator, &slash_registry, editor.text());
         defer if (palette_line) |p| allocator.free(p);
-        paintFrameWithPalette(&buf, &scrollback, &editor, status_text, palette_line);
+
+        // v1.1.1 — when scrolled into history, append a "[scrolled
+        // N/total]" marker to the status so the user sees the
+        // offset. v1.1.2 — when search is active, status becomes
+        // the `find: <query>` prompt + match counter.
+        // v1.2.0 (QW7) — when scrolled away and new content has
+        // arrived, also show a "↓ N new ↓" badge.
+        const n_lines: u32 = @intCast(@min(@as(u64, std.math.maxInt(u32)), scrollback.lines.items.len));
+
+        // QW7: auto-track the live-edge length while at bottom.
+        // When the user scrolls up (offset becomes > 0), the
+        // previous value sticks as the "last-seen" watermark.
+        if (scroll_offset == 0) scrollback_len_at_bottom = scrollback.lines.items.len;
+        const unread: usize = if (scroll_offset > 0 and scrollback.lines.items.len > scrollback_len_at_bottom)
+            scrollback.lines.items.len - scrollback_len_at_bottom
+        else
+            0;
+
+        const status_line = blk: {
+            if (search) |s| {
+                const cm = s.current_match orelse 0;
+                const total = s.matches.items.len;
+                const pos_shown = if (total == 0) 0 else cm + 1;
+                break :blk try std.fmt.allocPrint(
+                    allocator,
+                    "find: {s}   ({d}/{d} matches, Esc to exit, Enter/↓ next, ↑ prev)",
+                    .{ s.query.items, pos_shown, total },
+                );
+            }
+            if (scroll_offset > 0) {
+                if (unread > 0) break :blk try std.fmt.allocPrint(
+                    allocator,
+                    "{s} [scrolled {d}/{d}]   ↓ {d} new ↓  (End: jump to bottom)",
+                    .{ status_text, scroll_offset, n_lines, unread },
+                );
+                break :blk try std.fmt.allocPrint(
+                    allocator,
+                    "{s} [scrolled {d}/{d}]",
+                    .{ status_text, scroll_offset, n_lines },
+                );
+            }
+            break :blk try allocator.dupe(u8, status_text);
+        };
+        defer allocator.free(status_line);
+        const search_query: ?[]const u8 = if (search) |s|
+            (if (s.query.items.len > 0) s.query.items else null)
+        else
+            null;
+        if (show_help) {
+            paintHelpOverlay(&buf, no_color);
+        } else {
+            paintFrame(&buf, &scrollback, &editor, .{ .status = status_line, .palette = palette_line, .scroll_offset = scroll_offset, .search_query = search_query, .no_color = no_color });
+        }
         try renderer.render(&fd_writer, &buf);
         buf.clear();
 
@@ -369,24 +550,23 @@ fn runInteractive(
 
 // ─── rendering ──────────────────────────────────────────────────
 
+/// v1.3.0 R3 — single paint entry point. All layout decisions
+/// (scroll offset, palette hint, search highlight, NO_COLOR)
+/// travel through `cfg`; every field has a sensible default so
+/// the common case is `paintFrame(&buf, &sb, &ed, .{ .status = s })`.
+pub const PaintConfig = struct {
+    status: []const u8 = "",
+    palette: ?[]const u8 = null,
+    scroll_offset: u32 = 0,
+    search_query: ?[]const u8 = null,
+    no_color: bool = false,
+};
+
 fn paintFrame(
     buf: *tui.buffer.Buffer,
     scrollback: *Scrollback,
     editor: *const tui.editor.Editor,
-    status: []const u8,
-) void {
-    paintFrameWithPalette(buf, scrollback, editor, status, null);
-}
-
-/// v1.5.5 — paints the regular transcript/status/editor layout
-/// plus, when `palette_lines` is non-empty, a one-row hint strip
-/// directly above the editor showing matching slash commands.
-fn paintFrameWithPalette(
-    buf: *tui.buffer.Buffer,
-    scrollback: *Scrollback,
-    editor: *const tui.editor.Editor,
-    status: []const u8,
-    palette: ?[]const u8,
+    cfg: PaintConfig,
 ) void {
     buf.clear();
     if (buf.rows == 0 or buf.cols == 0) return;
@@ -398,7 +578,7 @@ fn paintFrameWithPalette(
     const max_editor_rows = @max(@as(u32, 1), rows / 3);
     const desired_editor_rows = @min(editor.lineCount(), max_editor_rows);
     const editor_rows: u32 = if (rows >= 3) desired_editor_rows else 1;
-    const palette_rows: u32 = if (palette != null and rows >= 4) 1 else 0;
+    const palette_rows: u32 = if (cfg.palette != null and rows >= 4) 1 else 0;
     const editor_first_row: u32 = rows - editor_rows;
     const palette_row: u32 = if (palette_rows > 0 and editor_first_row > 0) editor_first_row - 1 else 0;
     const status_row: u32 = blk: {
@@ -408,14 +588,36 @@ fn paintFrameWithPalette(
     };
     const transcript_rows: u32 = if (status_row > 0) status_row else 0;
 
-    // Transcript — paint the tail of scrollback that fits.
+    // Transcript — paint the window of scrollback that fits. With
+    // `cfg.scroll_offset == 0` this is the tail (the original
+    // behavior). When cfg.scroll_offset > 0, the window walks back
+    // into history — `cfg.scroll_offset` rows further up than the
+    // tail. Clamped so we never paint past the end or the start.
     if (transcript_rows > 0) {
-        const n = scrollback.lines.items.len;
-        const start = if (n > transcript_rows) n - transcript_rows else 0;
+        const n_u: u32 = @intCast(@min(@as(u64, std.math.maxInt(u32)), scrollback.lines.items.len));
+        // `end` is exclusive: the last line to include in the
+        // window. offset=0 → end=n (tail); offset=k → end=n-k.
+        const clamped_offset: u32 = @min(cfg.scroll_offset, n_u);
+        const end: u32 = n_u - clamped_offset;
+        const start: u32 = if (end > transcript_rows) end - transcript_rows else 0;
         var r: u32 = 0;
-        for (scrollback.lines.items[start..]) |line| {
+        var i: u32 = start;
+        while (i < end) : (i += 1) {
             if (r >= transcript_rows) break;
-            _ = buf.writeUtf8(r, 0, .{}, line);
+            const line = scrollback.lines.items[i];
+            // v1.2.0 — per-line style from the scrollback's
+            // parallel `styles` array, neutralized for NO_COLOR.
+            const base_style = if (i < scrollback.styles.items.len)
+                scrollback.styles.items[i].neutralize(cfg.no_color)
+            else
+                tui.cell.Style{};
+            // v1.1.2 — search highlight: reverse-video trumps the
+            // base style for match lines so the user can locate
+            // them at a glance.
+            const highlighted = cfg.search_query != null and
+                containsCaseInsensitive(line, cfg.search_query.?);
+            const style: tui.cell.Style = if (highlighted) .{ .reverse = true } else base_style;
+            _ = buf.writeUtf8(r, 0, style, line);
             r += 1;
         }
     }
@@ -428,7 +630,7 @@ fn paintFrameWithPalette(
             .width = .narrow,
             .style = style,
         });
-        _ = buf.writeUtf8(status_row, 1, style, status);
+        _ = buf.writeUtf8(status_row, 1, style, cfg.status);
     }
 
     // Editor — multi-row region; `draw` renders each `\n`-separated
@@ -438,10 +640,17 @@ fn paintFrameWithPalette(
     // Visual prompt marker on the first row.
     _ = ed_region.writeUtf8(0, 0, .{ .bold = true }, "› ");
     const inner = region_mod.Region.fromBuffer(buf).subRegion(editor_first_row, 2, editor_rows, if (buf.cols >= 2) buf.cols - 2 else 0);
+    // v1.2.0 — placeholder hint when empty (disappears on first
+    // keystroke because the editor stops being empty). Painted
+    // *before* editor.draw so the editor's cursor still lands on
+    // top of whichever cell it wants.
+    if (editor.text().len == 0) {
+        _ = inner.writeUtf8(0, 0, .{ .dim = true }, "Type a message or /help");
+    }
     editor.draw(inner, .{});
 
     // Slash-command hint strip directly above the editor.
-    if (palette) |line| if (palette_rows > 0) {
+    if (cfg.palette) |line| if (palette_rows > 0) {
         const hint_style: tui.cell.Style = .{ .dim = true };
         buf.fill(palette_row, 0, palette_row + 1, buf.cols, .{
             .codepoint = ' ',
@@ -450,6 +659,92 @@ fn paintFrameWithPalette(
         });
         _ = buf.writeUtf8(palette_row, 1, hint_style, line);
     };
+}
+
+/// v1.2.0 (QW6) — `?` help overlay. Full-screen modal showing
+/// keybindings and the slash-command surface. Any key dismisses.
+/// Read-only (no interaction beyond dismiss); listing is static
+/// to keep the rendering cheap.
+fn paintHelpOverlay(buf: *tui.buffer.Buffer, no_color: bool) void {
+    buf.clear();
+    if (buf.rows == 0 or buf.cols == 0) return;
+
+    const title = "franky — help  (press any key to dismiss)";
+    const title_style = (tui.cell.Style{ .bold = true, .reverse = true }).neutralize(no_color);
+    const hdr_style = (tui.cell.Style{ .bold = true }).neutralize(no_color);
+    const dim_style = (tui.cell.Style{ .dim = true }).neutralize(no_color);
+
+    _ = buf.writeUtf8(0, 1, title_style, title);
+
+    // Two columns: keybindings on the left, slash commands on the
+    // right. Column width = cols / 2 - 1.
+    const left_col: u32 = 2;
+    const right_col: u32 = if (buf.cols >= 48) buf.cols / 2 + 1 else 2;
+
+    const keys = [_][2][]const u8{
+        .{ "Enter", "submit prompt / next search match" },
+        .{ "Alt-Enter", "insert newline (multi-line compose)" },
+        .{ "Shift-Enter", "insert newline (terminal-dependent)" },
+        .{ "Tab", "complete slash-command prefix" },
+        .{ "↑ / ↓", "walk prompt history / nav search matches" },
+        .{ "Page-Up / Down", "scroll transcript" },
+        .{ "End (empty)", "jump transcript to bottom" },
+        .{ "Ctrl-F / Ctrl-S", "enter transcript search" },
+        .{ "Ctrl-C", "abort in-flight turn / exit at prompt" },
+        .{ "Ctrl-D", "exit at empty prompt" },
+        .{ "?", "toggle this help overlay" },
+        .{ "Esc", "exit search / dismiss help" },
+    };
+    const slash = [_][2][]const u8{
+        .{ "/help", "slash-command list" },
+        .{ "/model [id]", "show or swap the active model" },
+        .{ "/thinking LVL", "set thinking level" },
+        .{ "/tools", "list registered tools" },
+        .{ "/tool NAME", "show a tool's schema" },
+        .{ "/cost", "accumulated usage" },
+        .{ "/cwd", "show workspace root" },
+        .{ "/retry", "re-run the last user turn" },
+        .{ "/edit TEXT", "edit + resubmit last user msg" },
+        .{ "/export md|json", "dump transcript to /tmp" },
+        .{ "/compact", "summarize + compact transcript" },
+        .{ "/branch NAME", "fork a new branch" },
+        .{ "/branches", "list branches" },
+        .{ "/checkout NAME", "switch active branch" },
+        .{ "/template NAME", "expand + submit a prompt template" },
+        .{ "/clear", "reset the transcript" },
+        .{ "/login / logout", "OAuth flow info" },
+        .{ "/quit", "exit franky" },
+    };
+
+    _ = buf.writeUtf8(2, left_col, hdr_style, "Keybindings");
+    var r: u32 = 3;
+    for (keys) |pair| {
+        if (r >= buf.rows - 1) break;
+        _ = buf.writeUtf8(r, left_col, hdr_style, pair[0]);
+        _ = buf.writeUtf8(r, left_col + 20, dim_style, pair[1]);
+        r += 1;
+    }
+
+    _ = buf.writeUtf8(2, right_col, hdr_style, "Slash commands");
+    r = 3;
+    for (slash) |pair| {
+        if (r >= buf.rows - 1) break;
+        _ = buf.writeUtf8(r, right_col, hdr_style, pair[0]);
+        _ = buf.writeUtf8(r, right_col + 18, dim_style, pair[1]);
+        r += 1;
+    }
+
+    // Footer hint.
+    const footer = "any key dismisses — see franky-spec-v1.md §J for full surface";
+    if (buf.rows >= 1) {
+        const footer_style = (tui.cell.Style{ .dim = true, .reverse = true }).neutralize(no_color);
+        buf.fill(buf.rows - 1, 0, buf.rows, buf.cols, .{
+            .codepoint = ' ',
+            .width = .narrow,
+            .style = footer_style,
+        });
+        _ = buf.writeUtf8(buf.rows - 1, 1, footer_style, footer);
+    }
 }
 
 /// v1.5.5 — compute the palette hint line for `buffer`. Returns an
@@ -538,6 +833,18 @@ fn completeSlash(
 
 // ─── one agent turn ─────────────────────────────────────────────
 
+/// v1.1.0 — bundle the REPL state that `runOneTurn` needs to keep
+/// the editor live while a turn is streaming (typing while the
+/// model is thinking). Pointers so mutations stick when runOneTurn
+/// returns.
+const TurnIo = struct {
+    editor: *tui.editor.Editor,
+    history: *PromptHistory,
+    slash_registry: *slash_mod.Registry,
+    slash_bridge: *SlashBridge,
+    pending_prompt: *?[]u8,
+};
+
 fn runOneTurn(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -546,13 +853,14 @@ fn runOneTurn(
     scrollback: *Scrollback,
     buf: *tui.buffer.Buffer,
     renderer: *tui.diff_renderer.Renderer,
-    editor: *const tui.editor.Editor,
+    turn_io: TurnIo,
     stdout: std.Io.File,
     size: *term_mod.Size,
     decoder: *tui.key_decoder.Decoder,
     read_buf: *[4096]u8,
 ) !void {
     _ = size;
+    const editor = turn_io.editor;
     // Append the user prompt to the live transcript so the agent
     // sees it.
     {
@@ -573,6 +881,9 @@ fn runOneTurn(
         allocator,
     );
     defer ch.deinit();
+
+    // v1.1.4 — live status-line data.
+    const turn_start_ms: i64 = ai.stream.nowMillis();
 
     const worker_args: WorkerArgs = .{
         .allocator = allocator,
@@ -620,11 +931,21 @@ fn runOneTurn(
                         ));
                     },
                     .agent_error => |d| {
-                        try scrollback.appendLine(try std.fmt.allocPrint(
+                        // v1.2.0 (QW4+5) — semantic red + inline
+                        // ✗ glyph. Glyph survives NO_COLOR mode;
+                        // colorblind users still see the error
+                        // prefix. `tool_code` subcode is appended
+                        // in parens for callers that want to
+                        // diagnose the failure mode.
+                        const line = try std.fmt.allocPrint(
                             allocator,
-                            "  · error: {s} ({s})",
+                            "✗ error: {s} ({s})",
                             .{ d.message, d.code.toString() },
-                        ));
+                        );
+                        try scrollback.appendStyledLine(line, .{
+                            .fg = .{ .basic = .red },
+                            .bold = true,
+                        });
                     },
                     .turn_end => {
                         // Commit any accumulated text as a scrollback
@@ -644,25 +965,87 @@ fn runOneTurn(
                 }
             },
             .empty => {
-                // Service stdin so Ctrl-C can fire cancel.
+                // v1.1.0 — typing-while-thinking. Keep the editor
+                // live during the turn: feed keys the same way the
+                // main REPL loop does. Submissions queue into
+                // `pending_prompt` so the main loop dispatches them
+                // immediately after this turn ends. Slash commands
+                // must NOT dispatch mid-turn — they mutate shared
+                // session state (transcript, cfg) while the worker
+                // reads it. We queue the slash line as a pending
+                // prompt and let the main loop's dispatch path run
+                // it after this turn closes.
                 const n = std.posix.read(std.Io.File.stdin().handle, read_buf) catch |err| switch (err) {
                     error.WouldBlock => 0,
                     else => 0,
                 };
                 if (n > 0) try decoder.feed(read_buf[0..n]);
                 while (try decoder.next()) |key| {
-                    switch (key) {
-                        .char => |c| {
-                            if (c.mods.ctrl and (c.cp == 'c' or c.cp == 'd')) {
-                                cancel.fire();
+                    const outcome = editor.feedKey(key) catch continue;
+                    switch (outcome) {
+                        .none => {},
+                        .submit => {
+                            const txt = editor.text();
+                            if (txt.len > 0) {
+                                // Stash for post-turn dispatch;
+                                // replace any earlier queued line
+                                // (last-write-wins — the editor has
+                                // one buffer anyway).
+                                if (turn_io.pending_prompt.*) |old| allocator.free(old);
+                                turn_io.pending_prompt.* = try allocator.dupe(u8, txt);
+                                try turn_io.history.push(txt);
+                                editor.reset();
                             }
+                        },
+                        .history_prev => {
+                            if (try turn_io.history.prev(editor.text())) |entry| {
+                                try editor.setText(entry);
+                            }
+                        },
+                        .history_next => {
+                            if (turn_io.history.next()) |entry| {
+                                try editor.setText(entry);
+                            }
+                        },
+                        .completion_trigger => {
+                            if (try completeSlash(allocator, turn_io.slash_registry, editor.text())) |completed| {
+                                defer allocator.free(completed);
+                                try editor.setText(completed);
+                            }
+                        },
+                        .cancel, .quit => {
+                            // Ctrl-C / Ctrl-D during a turn aborts
+                            // the turn (not the REPL). The user can
+                            // hit it again at the idle prompt to
+                            // actually exit.
+                            cancel.fire();
                         },
                         else => {},
                     }
                 }
                 // Repaint the status bar / partial assistant output
                 // so the user sees progress.
-                paintFrame(buf, scrollback, editor, if (cancel.isFired()) "cancelling…" else "thinking…");
+                const palette_line = try computeSlashHint(allocator, turn_io.slash_registry, editor.text());
+                defer if (palette_line) |p| allocator.free(p);
+                const queued_marker: []const u8 = if (turn_io.pending_prompt.*) |_| " ▸ queued" else "";
+                const status = if (cancel.isFired()) "cancelling…" else "thinking…";
+                // v1.1.4 — live elapsed + running usage total.
+                const elapsed_s: i64 = @divFloor(ai.stream.nowMillis() - turn_start_ms, 1000);
+                var usage_in: u64 = 0;
+                var usage_out: u64 = 0;
+                for (session.transcript.messages.items) |m| {
+                    if (m.role == .assistant) if (m.usage) |u| {
+                        usage_in += u.input;
+                        usage_out += u.output;
+                    };
+                }
+                const status_full = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}{s}  ({d}s · in {d} + out {d} tokens)",
+                    .{ status, queued_marker, elapsed_s, usage_in, usage_out },
+                );
+                defer allocator.free(status_full);
+                paintFrame(buf, scrollback, editor, .{ .status = status_full, .palette = palette_line });
                 if (assistant_accum.items.len > 0) {
                     // Echo the partial text at the last transcript row.
                     const row = if (buf.rows >= 3) buf.rows - 3 else 0;
@@ -689,6 +1072,139 @@ const WorkerArgs = struct {
 
 fn workerMain(args: WorkerArgs) void {
     agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
+}
+
+// ─── transcript search (v1.1.2) ────────────────────────────────
+
+/// Search state lives in the REPL while `Ctrl-S` has been pressed
+/// and not yet `Esc`'d. Keys go to `query` instead of the main
+/// editor; matching scrollback lines get highlighted.
+pub const SearchState = struct {
+    allocator: std.mem.Allocator,
+    query: std.ArrayList(u8) = .empty,
+    /// Indices into `scrollback.lines` that match the current
+    /// query. Cleared + re-computed on every query mutation.
+    matches: std.ArrayList(usize) = .empty,
+    /// Index into `matches` — which match the user is focused on.
+    /// When non-null, the REPL sets `scroll_offset` to land that
+    /// match near the top of the visible window.
+    current_match: ?usize = null,
+
+    pub fn init(allocator: std.mem.Allocator) SearchState {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *SearchState) void {
+        self.query.deinit(self.allocator);
+        self.matches.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Recompute match indices for the current query against
+    /// `lines`. Case-insensitive substring match.
+    pub fn recompute(
+        self: *SearchState,
+        lines: []const []const u8,
+    ) !void {
+        self.matches.clearRetainingCapacity();
+        if (self.query.items.len == 0) {
+            self.current_match = null;
+            return;
+        }
+        for (lines, 0..) |line, i| {
+            if (containsCaseInsensitive(line, self.query.items)) {
+                try self.matches.append(self.allocator, i);
+            }
+        }
+        self.current_match = if (self.matches.items.len > 0) 0 else null;
+    }
+};
+
+fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) break;
+        }
+        if (j == needle.len) return true;
+    }
+    return false;
+}
+
+/// v1.1.2 — key dispatch while search is active. Supports query
+/// editing (chars, backspace), navigation (Enter → next match,
+/// up/down arrows → prev/next), and recomputes matches when the
+/// query changes. On each recompute, `scroll_offset` jumps to the
+/// current match so it's visible.
+fn handleSearchKey(
+    search: *SearchState,
+    scrollback: *Scrollback,
+    scroll_offset: *u32,
+    buf_rows: u32,
+    key: tui.key_decoder.Key,
+) !void {
+    var dirty = false;
+    switch (key) {
+        .char => |c| {
+            if (c.mods.ctrl or c.mods.alt) return;
+            // Simple: allocate one byte if it fits UTF-8 in 1 byte.
+            if (c.cp < 0x80) {
+                try search.query.append(search.allocator, @intCast(c.cp));
+                dirty = true;
+            }
+        },
+        .backspace => {
+            if (search.query.items.len > 0) {
+                _ = search.query.pop();
+                dirty = true;
+            }
+        },
+        .enter => {
+            // Cycle to next match.
+            if (search.current_match) |cm| {
+                if (search.matches.items.len > 0) {
+                    search.current_match = (cm + 1) % search.matches.items.len;
+                    dirty = true;
+                }
+            }
+        },
+        .up => {
+            if (search.current_match) |cm| {
+                if (search.matches.items.len > 0) {
+                    search.current_match = if (cm == 0)
+                        search.matches.items.len - 1
+                    else
+                        cm - 1;
+                    dirty = true;
+                }
+            }
+        },
+        .down => {
+            if (search.current_match) |cm| {
+                if (search.matches.items.len > 0) {
+                    search.current_match = (cm + 1) % search.matches.items.len;
+                    dirty = true;
+                }
+            }
+        },
+        else => {},
+    }
+    if (dirty) {
+        try search.recompute(scrollback.lines.items);
+    }
+    // Land the current match near the top of the visible window.
+    if (search.current_match) |cm| {
+        const match_idx = search.matches.items[cm];
+        const n: usize = scrollback.lines.items.len;
+        const transcript_rows: u32 = if (buf_rows >= 3) @max(1, buf_rows - 2) else 1;
+        // Want `match_idx` to appear at row 0 of the window:
+        //   end = match_idx + 1 → offset = n - end.
+        const end: usize = match_idx + @min(transcript_rows, @as(u32, @intCast(n - match_idx)));
+        scroll_offset.* = @intCast(@min(@as(u64, std.math.maxInt(u32)), n - end));
+    }
 }
 
 // ─── prompt history ring (v1.5.5) ──────────────────────────────
@@ -789,6 +1305,12 @@ pub const PromptHistory = struct {
 pub const Scrollback = struct {
     allocator: std.mem.Allocator,
     lines: std.ArrayList([]u8) = .empty,
+    /// v1.2.0 (QW4+5) — parallel style array. `styles[i]` is
+    /// applied to `lines[i]` at paint time. Default `.{}` keeps
+    /// normal rendering; error lines use red, warnings use yellow,
+    /// metadata can use `.dim`. `Style.neutralize(no_color)` in
+    /// the paint path honors the NO_COLOR env var.
+    styles: std.ArrayList(tui.cell.Style) = .empty,
     capacity: usize = 1_000,
 
     pub fn init(allocator: std.mem.Allocator) Scrollback {
@@ -798,16 +1320,25 @@ pub const Scrollback = struct {
     pub fn deinit(self: *Scrollback) void {
         for (self.lines.items) |l| self.allocator.free(l);
         self.lines.deinit(self.allocator);
+        self.styles.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Takes ownership of `line`.
+    /// Takes ownership of `line`. Style defaults to `.{}`.
     pub fn appendLine(self: *Scrollback, line: []u8) !void {
+        return self.appendStyledLine(line, .{});
+    }
+
+    /// Takes ownership of `line`. `style` is applied verbatim at
+    /// paint time (modulo NO_COLOR neutralization).
+    pub fn appendStyledLine(self: *Scrollback, line: []u8, style: tui.cell.Style) !void {
         if (self.lines.items.len >= self.capacity) {
             const dropped = self.lines.orderedRemove(0);
             self.allocator.free(dropped);
+            _ = self.styles.orderedRemove(0);
         }
         try self.lines.append(self.allocator, line);
+        try self.styles.append(self.allocator, style);
     }
 };
 
@@ -1074,11 +1605,36 @@ fn interactiveModelHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_
         try ctx.output.appendSlice(ctx.allocator, msg);
         return;
     }
-    // Mid-session provider/model swap is a v1.4.* follow-up (needs
-    // `Agent.setModel` threaded into interactive mode). For now
-    // surface a clear message so the user knows the primitive is
-    // not wired yet.
-    try ctx.output.appendSlice(ctx.allocator, "model swap mid-session: see v1.4.* roadmap; restart franky with --model <id>");
+    // v1.1.3 — live model swap. Dupe the new id into the session's
+    // arena (the old slice stays referenced by `provider.model_id`
+    // until overwritten, which is safe because arena outlives it).
+    // Re-lookup in the built-in catalog so `context_window`,
+    // `max_output`, `capabilities` refresh for the new model;
+    // unknown ids keep the conservative defaults.
+    const new_id = try bridge.session.arena.allocator().dupe(u8, args[0]);
+    bridge.session.provider.model_id = new_id;
+    if (models_mod.lookup(&.{}, new_id)) |entry| {
+        bridge.session.provider.context_window = entry.context_window;
+        bridge.session.provider.max_output = entry.max_output;
+        bridge.session.provider.capabilities = .{
+            .vision = entry.capabilities.vision,
+            .tool_use = entry.capabilities.tool_use,
+            .reasoning = if (bridge.session.cfg.thinking != .off)
+                true
+            else
+                entry.capabilities.reasoning,
+            .cache = entry.capabilities.cache,
+            .streaming = entry.capabilities.streaming,
+        };
+    }
+    const entry_tag = if (models_mod.lookup(&.{}, new_id) != null) "known" else "unknown";
+    const msg = try std.fmt.allocPrint(
+        ctx.allocator,
+        "model swapped to '{s}' ({s}); next turn uses it",
+        .{ new_id, entry_tag },
+    );
+    defer ctx.allocator.free(msg);
+    try ctx.output.appendSlice(ctx.allocator, msg);
 }
 
 fn interactiveTemplateHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!void {
@@ -1559,7 +2115,7 @@ test "paintFrame places the prompt marker and editor glyphs at the bottom" {
     defer ed.deinit();
     try ed.buffer.setText("hi");
 
-    paintFrame(&buf, &sb, &ed, "ready");
+    paintFrame(&buf, &sb, &ed, .{ .status = "ready" });
 
     // Transcript: row 0 shows 'hello'.
     try testing.expectEqual(@as(u21, 'h'), buf.get(0, 0).codepoint);
@@ -1674,6 +2230,217 @@ test "Editor: multi-line lineCount + cursorRow/Column" {
     try testing.expectEqual(@as(u32, 3), ed.cursorColumn()); // "you" = 3 cells
 }
 
+// ─── v1.1.2 — transcript search tests ─────────────────────────
+
+test "containsCaseInsensitive: basic + case + empty + no-match" {
+    try testing.expect(containsCaseInsensitive("Hello World", "world"));
+    try testing.expect(containsCaseInsensitive("Hello World", "WORLD"));
+    try testing.expect(containsCaseInsensitive("Hello World", ""));
+    try testing.expect(!containsCaseInsensitive("Hello World", "foo"));
+    try testing.expect(!containsCaseInsensitive("abc", "abcd"));
+}
+
+test "SearchState.recompute: matches lines that contain the query" {
+    const gpa = testing.allocator;
+    var s = SearchState.init(gpa);
+    defer s.deinit();
+    try s.query.appendSlice(gpa, "error");
+    const lines = [_][]const u8{
+        "hello world",
+        "got an ERROR here",
+        "more logs",
+        "another error at end",
+    };
+    try s.recompute(&lines);
+    try testing.expectEqual(@as(usize, 2), s.matches.items.len);
+    try testing.expectEqual(@as(usize, 1), s.matches.items[0]);
+    try testing.expectEqual(@as(usize, 3), s.matches.items[1]);
+    try testing.expectEqual(@as(?usize, 0), s.current_match);
+}
+
+test "SearchState.recompute: empty query clears matches" {
+    const gpa = testing.allocator;
+    var s = SearchState.init(gpa);
+    defer s.deinit();
+    try s.query.appendSlice(gpa, "x");
+    const lines = [_][]const u8{"hello"};
+    try s.recompute(&lines);
+    try testing.expectEqual(@as(usize, 0), s.matches.items.len);
+
+    // Now clear the query and recompute — no matches + no current.
+    s.query.clearRetainingCapacity();
+    try s.recompute(&lines);
+    try testing.expectEqual(@as(?usize, null), s.current_match);
+}
+
+test "paintHelpOverlay: renders title + both columns" {
+    const gpa = testing.allocator;
+    var buf = try tui.buffer.Buffer.init(gpa, 20, 80);
+    defer buf.deinit();
+
+    paintHelpOverlay(&buf, false);
+
+    // Title at row 0 col 1.
+    try testing.expectEqual(@as(u21, 'f'), buf.get(0, 1).codepoint);
+    try testing.expectEqual(@as(u21, 'r'), buf.get(0, 2).codepoint);
+    // Header "Keybindings" at row 2 col 2.
+    try testing.expectEqual(@as(u21, 'K'), buf.get(2, 2).codepoint);
+    // "Slash commands" header on the same row, right column.
+    const right_col: u32 = 80 / 2 + 1;
+    try testing.expectEqual(@as(u21, 'S'), buf.get(2, right_col).codepoint);
+}
+
+test "paintHelpOverlay: NO_COLOR strips fg on header styles" {
+    const gpa = testing.allocator;
+    var buf = try tui.buffer.Buffer.init(gpa, 10, 60);
+    defer buf.deinit();
+
+    paintHelpOverlay(&buf, true);
+    // Title cell — reverse-video SGR stays, but fg/bg are default.
+    const title_cell = buf.get(0, 1);
+    try testing.expect(title_cell.style.fg == .default);
+    try testing.expect(title_cell.style.bg == .default);
+}
+
+test "Scrollback.appendStyledLine: stores a parallel style per line" {
+    const gpa = testing.allocator;
+    var sb = Scrollback.init(gpa);
+    defer sb.deinit();
+
+    try sb.appendLine(try gpa.dupe(u8, "normal"));
+    try sb.appendStyledLine(
+        try gpa.dupe(u8, "✗ error: boom"),
+        .{ .fg = .{ .basic = .red }, .bold = true },
+    );
+    try sb.appendLine(try gpa.dupe(u8, "another normal"));
+
+    try testing.expectEqual(@as(usize, 3), sb.lines.items.len);
+    try testing.expectEqual(@as(usize, 3), sb.styles.items.len);
+    try testing.expect(sb.styles.items[0].fg == .default);
+    try testing.expect(sb.styles.items[1].fg != .default);
+    try testing.expect(sb.styles.items[1].bold);
+    try testing.expect(sb.styles.items[2].fg == .default);
+}
+
+test "paintFrame: error style paints red + bold; NO_COLOR strips fg" {
+    const gpa = testing.allocator;
+    var buf = try tui.buffer.Buffer.init(gpa, 5, 30);
+    defer buf.deinit();
+    var sb = Scrollback.init(gpa);
+    defer sb.deinit();
+    try sb.appendStyledLine(
+        try gpa.dupe(u8, "✗ error: boom"),
+        .{ .fg = .{ .basic = .red }, .bold = true },
+    );
+
+    var ed = tui.editor.Editor.init(gpa);
+    defer ed.deinit();
+
+    // no_color=false: fg stays red, bold stays on.
+    paintFrame(&buf, &sb, &ed, .{ .status = "ready", .palette = null, .scroll_offset = 0, .search_query = null, .no_color = false });
+    const colored = buf.get(0, 0);
+    try testing.expect(colored.style.fg != .default);
+    try testing.expect(colored.style.bold);
+
+    // no_color=true: fg flattens to default, bold survives.
+    paintFrame(&buf, &sb, &ed, .{ .status = "ready", .palette = null, .scroll_offset = 0, .search_query = null, .no_color = true });
+    const neutral = buf.get(0, 0);
+    try testing.expect(neutral.style.fg == .default);
+    try testing.expect(neutral.style.bold);
+}
+
+test "paintFrame: search_query highlights matching lines in reverse-video" {
+    const gpa = testing.allocator;
+    var buf = try tui.buffer.Buffer.init(gpa, 5, 20);
+    defer buf.deinit();
+    var sb = Scrollback.init(gpa);
+    defer sb.deinit();
+    try sb.appendLine(try gpa.dupe(u8, "hello"));
+    try sb.appendLine(try gpa.dupe(u8, "an error happened"));
+    try sb.appendLine(try gpa.dupe(u8, "more text"));
+
+    var ed = tui.editor.Editor.init(gpa);
+    defer ed.deinit();
+    paintFrame(&buf, &sb, &ed, .{ .status = "find: error", .palette = null, .scroll_offset = 0, .search_query = "error", .no_color = false });
+
+    // Row 0: "hello" (no match → normal style).
+    try testing.expect(!buf.get(0, 0).style.reverse);
+    // Row 1: "an error happened" (match → reverse).
+    try testing.expect(buf.get(1, 0).style.reverse);
+    // Row 2: "more text" (no match).
+    try testing.expect(!buf.get(2, 0).style.reverse);
+}
+
+// ─── v1.1.1 — scrollable transcript tests ─────────────────────
+
+test "paintFrame: scroll_offset=0 paints the tail (regression check)" {
+    const gpa = testing.allocator;
+    var buf = try tui.buffer.Buffer.init(gpa, 5, 20);
+    defer buf.deinit();
+    var sb = Scrollback.init(gpa);
+    defer sb.deinit();
+    // 5 lines, only 3 rows of transcript → shows lines 2, 3, 4.
+    for (0..5) |i| {
+        const line = try std.fmt.allocPrint(gpa, "line-{d}", .{i});
+        try sb.appendLine(line);
+    }
+
+    var ed = tui.editor.Editor.init(gpa);
+    defer ed.deinit();
+    paintFrame(&buf, &sb, &ed, .{ .status = "ready", .palette = null, .scroll_offset = 0 });
+
+    // Transcript rows 0..2 (rows reserved: transcript=3, status=1, editor=1).
+    // offset=0 → last 3 of 5: line-2, line-3, line-4.
+    try testing.expectEqual(@as(u21, '2'), buf.get(0, 5).codepoint);
+    try testing.expectEqual(@as(u21, '3'), buf.get(1, 5).codepoint);
+    try testing.expectEqual(@as(u21, '4'), buf.get(2, 5).codepoint);
+}
+
+test "paintFrame: scroll_offset=2 walks the window 2 lines backwards" {
+    const gpa = testing.allocator;
+    var buf = try tui.buffer.Buffer.init(gpa, 5, 20);
+    defer buf.deinit();
+    var sb = Scrollback.init(gpa);
+    defer sb.deinit();
+    for (0..5) |i| {
+        const line = try std.fmt.allocPrint(gpa, "line-{d}", .{i});
+        try sb.appendLine(line);
+    }
+
+    var ed = tui.editor.Editor.init(gpa);
+    defer ed.deinit();
+    paintFrame(&buf, &sb, &ed, .{ .status = "scrolled", .palette = null, .scroll_offset = 2 });
+
+    // offset=2 → end=3 → slice [0..3] → line-0, line-1, line-2.
+    try testing.expectEqual(@as(u21, '0'), buf.get(0, 5).codepoint);
+    try testing.expectEqual(@as(u21, '1'), buf.get(1, 5).codepoint);
+    try testing.expectEqual(@as(u21, '2'), buf.get(2, 5).codepoint);
+}
+
+test "paintFrame: scroll_offset clamps to scrollback length" {
+    const gpa = testing.allocator;
+    var buf = try tui.buffer.Buffer.init(gpa, 5, 20);
+    defer buf.deinit();
+    var sb = Scrollback.init(gpa);
+    defer sb.deinit();
+    for (0..5) |i| {
+        const line = try std.fmt.allocPrint(gpa, "line-{d}", .{i});
+        try sb.appendLine(line);
+    }
+
+    var ed = tui.editor.Editor.init(gpa);
+    defer ed.deinit();
+    // offset=999 — far past the top. Expect: paint nothing (end=0 → slice empty).
+    paintFrame(&buf, &sb, &ed, .{ .status = "top", .palette = null, .scroll_offset = 999 });
+
+    // Rows 0..2 should have no transcript digit painted — the
+    // cells remain as blank (space = 0x20) set by `buf.clear`.
+    const c0 = buf.get(0, 5).codepoint;
+    const c1 = buf.get(1, 5).codepoint;
+    try testing.expect(c0 != '0' and c0 != '1' and c0 != '2' and c0 != '3' and c0 != '4');
+    try testing.expect(c1 != '0' and c1 != '1' and c1 != '2' and c1 != '3' and c1 != '4');
+}
+
 test "paintFrame: multi-line editor grows the editor region down" {
     const gpa = testing.allocator;
     var buf = try tui.buffer.Buffer.init(gpa, 10, 20);
@@ -1685,7 +2452,7 @@ test "paintFrame: multi-line editor grows the editor region down" {
     defer ed.deinit();
     try ed.setText("line1\nline2\nline3");
 
-    paintFrame(&buf, &sb, &ed, "ready");
+    paintFrame(&buf, &sb, &ed, .{ .status = "ready" });
 
     // Editor now takes 3 rows (capped at rows/3 = 3). So first
     // editor row is at rows - 3 = 7. Prompt marker on row 7.

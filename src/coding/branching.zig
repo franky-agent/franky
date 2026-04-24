@@ -321,6 +321,7 @@ pub fn loadTree(
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const test_h = @import("../test_helpers.zig");
 
 test "Tree: init starts on main with 0 messages" {
     var t = try Tree.init(testing.allocator);
@@ -418,10 +419,6 @@ test "Tree.isForkLegal: honors turn-boundary vector" {
 
 // ─── tree.json persistence (v1.4.0) ──────────────────────────────
 
-fn testIoMod() std.Io.Threaded {
-    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
-}
-
 test "renderTreeJson: root-only tree includes version + active + branches" {
     var t = try Tree.init(testing.allocator);
     defer t.deinit();
@@ -466,7 +463,7 @@ test "parseTreeJson: malformed JSON → MalformedJson" {
 }
 
 test "saveTree + loadTree: atomic round-trip under a temp dir" {
-    var threaded = testIoMod();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -489,7 +486,7 @@ test "saveTree + loadTree: atomic round-trip under a temp dir" {
 }
 
 test "loadTree: missing file yields fresh tree with default main branch" {
-    var threaded = testIoMod();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const dir = "/tmp/franky_tree_missing_7";

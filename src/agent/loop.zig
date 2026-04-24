@@ -470,9 +470,14 @@ const ParWork = struct {
     /// threw. Exactly one of the two fields is set on return.
     out_result: ?at.ToolResult = null,
     err_name: ?[]const u8 = null,
+    /// v1.7.3 — flipped true by the worker right before return.
+    /// Main thread polls this to emit `tool_execution_end` in
+    /// completion order (§4.4).
+    done_flag: std.atomic.Value(bool) = .init(false),
 };
 
 fn parallelWorker(w: *ParWork) void {
+    defer w.done_flag.store(true, .release);
     const r = w.tool_def.execute(
         &w.tool_def,
         w.allocator,
@@ -542,29 +547,63 @@ fn runToolsParallel(
         threads[i] = try std.Thread.spawn(.{}, parallelWorker, .{w});
     }
 
-    // Join in source order; emit each completion's end event as the
-    // join unblocks. Source-order join means wall-time is bounded by
-    // `max(individual)` but end events fire in source order rather
-    // than completion order — §4.4's completion-order-events
-    // requirement is tracked under v0.5.1 (needs a separate
-    // arrival-channel).
+    // v1.7.3 §4.4: poll `done_flag` atomics until every non-vetoed
+    // worker has flipped. Emit `tool_execution_end` in completion
+    // order (the order flags flip) so the UI sees real-time
+    // progress. Results get collected into a source-indexed slot
+    // array so the transcript assembly below stays deterministic
+    // regardless of which tool finished first.
+    var slot_results = try allocator.alloc(?at.ToolResult, n);
+    defer allocator.free(slot_results);
+    for (slot_results) |*s| s.* = null;
+    var emitted = try allocator.alloc(bool, n);
+    defer allocator.free(emitted);
+    @memset(emitted, false);
+
+    // Vetoed calls complete instantly — emit their end events first
+    // so their "completion time" is t=0 (which matches the user's
+    // intuition: a blocked call never actually ran).
     for (workers, 0..) |*w, i| {
         if (vetoed[i]) |veto_res| {
             try pushToolEnd(out, io, allocator, w.tc.id, w.tool_def, veto_res);
-            try results.append(allocator, .{ .call_id = w.tc.id, .result = veto_res, .terminate = false });
-            continue;
+            slot_results[i] = veto_res;
+            emitted[i] = true;
         }
-        threads[i].?.join();
-        var call_res: at.ToolResult = undefined;
-        if (w.out_result) |r| {
-            call_res = r;
-        } else {
-            call_res = try makeErrorResult(allocator, w.err_name orelse "tool failed");
+    }
+
+    var remaining: usize = 0;
+    for (vetoed) |v| if (v == null) {
+        remaining += 1;
+    };
+
+    while (remaining > 0) {
+        var progress = false;
+        for (workers, 0..) |*w, i| {
+            if (emitted[i]) continue;
+            if (!w.done_flag.load(.acquire)) continue;
+
+            // This worker has completed. Join + process.
+            threads[i].?.join();
+            var call_res: at.ToolResult = if (w.out_result) |r|
+                r
+            else
+                try makeErrorResult(allocator, w.err_name orelse "tool failed");
+            if (config.after_tool_call) |hook| {
+                hook(config.hook_userdata, &w.tool_def, w.tc.id, &call_res);
+            }
+            try pushToolEnd(out, io, allocator, w.tc.id, w.tool_def, call_res);
+            slot_results[i] = call_res;
+            emitted[i] = true;
+            remaining -= 1;
+            progress = true;
         }
-        if (config.after_tool_call) |hook| {
-            hook(config.hook_userdata, &w.tool_def, w.tc.id, &call_res);
-        }
-        try pushToolEnd(out, io, allocator, w.tc.id, w.tool_def, call_res);
+        if (!progress) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+
+    // Results appended in source order — deterministic-transcript
+    // invariant from §9.10.
+    for (workers, 0..) |*w, i| {
+        const call_res = slot_results[i].?;
         try results.append(allocator, .{
             .call_id = w.tc.id,
             .result = call_res,

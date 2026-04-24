@@ -147,6 +147,7 @@ fn respondRaw(stream: *std.Io.net.Stream, io: std.Io, body: []const u8) void {
 // ─── tests ──────────────────────────────────────────────────────
 
 const testing = std.testing;
+const test_h = @import("../../test_helpers.zig");
 
 test "default port range constant" {
     try testing.expectEqual(@as(u16, 8976), default_port_range[0]);
@@ -154,12 +155,8 @@ test "default port range constant" {
     try testing.expect(default_port_range[1] > default_port_range[0]);
 }
 
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
-}
-
 test "listen: binds to some port in the default range" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     var l = listen(io, default_port_range[0], default_port_range[1]) catch |err| switch (err) {
@@ -174,7 +171,7 @@ test "listen: binds to some port in the default range" {
 }
 
 test "redirectUri renders with the bound port" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     var l = listen(io, default_port_range[0], default_port_range[1]) catch |err| switch (err) {
@@ -193,7 +190,7 @@ test "redirectUri renders with the bound port" {
 // Callback back. Skipped if we can't bind/connect.
 
 test "listen + awaitCallback: roundtrips code + state via loopback" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     var l = listen(io, default_port_range[0], default_port_range[1]) catch |err| switch (err) {

@@ -554,6 +554,7 @@ fn replaceSpanWithSummary(
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const test_h = @import("../test_helpers.zig");
 
 test "estimateTokens: english divides bytes by 3.5 (rounded up)" {
     // 2 / 3.5 = 0.57 → 1
@@ -671,10 +672,6 @@ test "selectSpan: pinned messages are preserved" {
 
 const faux = @import("../ai/providers/faux.zig");
 
-fn testIo() std.Io.Threaded {
-    return std.Io.Threaded.init(testing.allocator, .{ .argv0 = .empty, .environ = .empty });
-}
-
 test "renderSpanAsPrompt: text, tool-call, tool-result formatted per §E.3" {
     const gpa = testing.allocator;
     var c_u: [1]types.ContentBlock = .{.{ .text = .{ .text = "please list the files" } }};
@@ -698,7 +695,7 @@ test "renderSpanAsPrompt: text, tool-call, tool-result formatted per §E.3" {
 }
 
 test "run: forks a pre-compact branch and splices compaction_summary in" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -782,7 +779,7 @@ test "run: forks a pre-compact branch and splices compaction_summary in" {
 }
 
 test "run: proceed=false when the span is too short, no mutation" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -831,7 +828,7 @@ fn fauxStreamShim(ctx: registry_mod.StreamCtx) anyerror!void {
 // ─── v1.6.1 — coverage gap fills ─────────────────────────────────
 
 test "run: empty summarizer output → EmptySummary error" {
-    var threaded = testIo();
+    var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
