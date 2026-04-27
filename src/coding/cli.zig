@@ -86,7 +86,9 @@ pub const Config = struct {
     /// `--skills <dir>` — load a skill bundle (§5.8). Multi-value
     /// future; one path today.
     skills_path: ?[]const u8 = null,
-    /// `--prompts <dir>` — root for `/template <name>` lookups.
+    /// `--prompts-dir <dir>` — root for `/template <name>` lookups.
+    /// Was `--prompts <dir>` until v1.11.0; renamed to free up
+    /// `--prompts` for the per-tool permission gate.
     prompts_dir: ?[]const u8 = null,
     /// `--themes <name>` — TUI theme; no-op until the TUI ships.
     theme: ?[]const u8 = null,
@@ -116,6 +118,35 @@ pub const Config = struct {
     /// events while streaming. Env: `FRANKY_EVENT_GAP_TIMEOUT_MS`.
     /// Default 60_000.
     event_gap_timeout_ms: ?u32 = null,
+
+    // ── Per-tool permission gate (Approach A — `permission.md`) ──
+    /// `--prompts` — opt in to the per-tool permission gate. When
+    /// off (default) the gate isn't installed, preserving v1.10.x
+    /// behavior. When on, the default policy auto-allows
+    /// read/ls/find/grep and refuses write/edit/bash unless
+    /// `--yes`, `--allow-tools`, or (v1.11.1+) interactive
+    /// approval permits the call.
+    prompts: bool = false,
+    /// `--yes` / `-y` — every "ask" decision becomes auto-allow.
+    /// Primarily for CI; pairs with `--prompts`.
+    yes: bool = false,
+    /// `--allow-tools <csv>` — pre-seed the always-allow set.
+    /// Entries are tool names (`write`, `edit`) or scoped bash
+    /// fingerprints (`bash:git`, `bash:ls`).
+    allow_tools_csv: ?[]const u8 = null,
+    /// `--deny-tools <csv>` — pre-seed the always-deny set.
+    /// Same syntax as `--allow-tools`. Takes precedence over allow.
+    deny_tools_csv: ?[]const u8 = null,
+    /// `--ask-tools <csv>` — demote each entry from default-allow
+    /// to `ask` so the gate prompts for it. Reserved sentinel
+    /// `all` flips every default-auto_allow tool to ask (typically
+    /// `read`/`ls`/`find`/`grep`). Composes with `--allow-tools`
+    /// and `--deny-tools` (deny wins, then allow, then ask).
+    ask_tools_csv: ?[]const u8 = null,
+    /// `--remember-permissions` — persist `*_always` resolutions
+    /// to `$FRANKY_HOME/permissions.json` so they survive across
+    /// runs. Off by default — every session is fresh-state.
+    remember_permissions: bool = false,
 
     /// Concatenated positional args — the user's prompt.
     prompt: []const u8 = "",
@@ -195,6 +226,18 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.no_session = true;
             continue;
         }
+        if (std.mem.eql(u8, name, "--prompts")) {
+            cfg.prompts = true;
+            continue;
+        }
+        if (std.mem.eql(u8, name, "-y") or std.mem.eql(u8, name, "--yes")) {
+            cfg.yes = true;
+            continue;
+        }
+        if (std.mem.eql(u8, name, "--remember-permissions")) {
+            cfg.remember_permissions = true;
+            continue;
+        }
 
         // Valued flags.
         const take_value = struct {
@@ -246,7 +289,7 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.tools_filter = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--skills")) {
             cfg.skills_path = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--prompts")) {
+        } else if (std.mem.eql(u8, name, "--prompts-dir")) {
             cfg.prompts_dir = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--themes") or std.mem.eql(u8, name, "--theme")) {
             cfg.theme = try a.dupe(u8, try take_value(argv, &i, inline_value));
@@ -269,6 +312,12 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
         } else if (std.mem.eql(u8, name, "--event-gap-timeout-ms")) {
             const v = try take_value(argv, &i, inline_value);
             cfg.event_gap_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+        } else if (std.mem.eql(u8, name, "--allow-tools")) {
+            cfg.allow_tools_csv = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--deny-tools")) {
+            cfg.deny_tools_csv = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--ask-tools")) {
+            cfg.ask_tools_csv = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--mode")) {
             const v = try take_value(argv, &i, inline_value);
             if (std.mem.eql(u8, v, "print")) cfg.mode = .print
@@ -341,7 +390,7 @@ pub const usage_text: []const u8 =
     \\  --export FORMAT              Dump transcript (markdown|json) and exit
     \\  --tools LIST                 Comma-separated tool subset for this run
     \\  --skills PATH                Load a skill bundle (§5.8)
-    \\  --prompts DIR                Root for /template <name> lookups
+    \\  --prompts-dir DIR            Root for /template <name> lookups
     \\  --theme NAME                 TUI theme (no-op until TUI ships)
     \\  --offline                    Force faux provider even when a key is set
     \\  --extensions LIST            Opt in Tier-1 extensions (§5.4/§N.4)
@@ -350,6 +399,14 @@ pub const usage_text: []const u8 =
     \\  --first-byte-timeout-ms N    Max wait for first response byte (default 30000;
     \\                               raise for slow local LLMs e.g. Ollama on CPU)
     \\  --event-gap-timeout-ms N     Max gap between SSE events (default 60000)
+    \\  --prompts                    Enable per-tool permission gate (Approach A)
+    \\  --yes, -y                    Auto-allow every "ask" decision (CI mode)
+    \\  --allow-tools LIST           CSV of tool names or bash:<fingerprint>
+    \\                               (e.g. read,write,bash:git)
+    \\  --deny-tools LIST            CSV; takes precedence over --allow-tools
+    \\  --ask-tools LIST             CSV; demote default-auto_allow tools to "ask"
+    \\                               (e.g. read,find or "all" for every tool)
+    \\  --remember-permissions       Persist always-allow/deny to permissions.json
     \\  --verbose                    Extra logging to stderr
     \\  -h, --help                   Show this help
     \\      --version                Print version and exit
@@ -488,19 +545,47 @@ test "parse: --export + --offline combined" {
     try testing.expect(cfg.offline);
 }
 
-test "parse: --tools + --skills + --prompts + --extensions" {
+test "parse: --tools + --skills + --prompts-dir + --extensions" {
     var cfg = try parse(testing.allocator, &.{
         "franky",
-        "--tools",      "read,grep",
-        "--skills",     "/tmp/skills",
-        "--prompts",    "/tmp/prompts",
-        "--extensions", "fmt,linter",
+        "--tools",       "read,grep",
+        "--skills",      "/tmp/skills",
+        "--prompts-dir", "/tmp/prompts",
+        "--extensions",  "fmt,linter",
     });
     defer cfg.deinit();
     try testing.expectEqualStrings("read,grep", cfg.tools_filter.?);
     try testing.expectEqualStrings("/tmp/skills", cfg.skills_path.?);
     try testing.expectEqualStrings("/tmp/prompts", cfg.prompts_dir.?);
     try testing.expectEqualStrings("fmt,linter", cfg.extensions.?);
+}
+
+test "parse: --prompts toggle + --yes + --allow-tools / --deny-tools" {
+    var cfg = try parse(testing.allocator, &.{
+        "franky",
+        "--prompts",
+        "-y",
+        "--allow-tools", "read,bash:git",
+        "--deny-tools",  "bash:rm",
+    });
+    defer cfg.deinit();
+    try testing.expect(cfg.prompts);
+    try testing.expect(cfg.yes);
+    try testing.expectEqualStrings("read,bash:git", cfg.allow_tools_csv.?);
+    try testing.expectEqualStrings("bash:rm", cfg.deny_tools_csv.?);
+}
+
+test "parse: --ask-tools threads through to ask_tools_csv" {
+    var cfg = try parse(testing.allocator, &.{
+        "franky", "--prompts", "--ask-tools", "read,find,bash:cat",
+    });
+    defer cfg.deinit();
+    try testing.expect(cfg.prompts);
+    try testing.expectEqualStrings("read,find,bash:cat", cfg.ask_tools_csv.?);
+
+    var cfg2 = try parse(testing.allocator, &.{ "franky", "--ask-tools", "all" });
+    defer cfg2.deinit();
+    try testing.expectEqualStrings("all", cfg2.ask_tools_csv.?);
 }
 
 test "parse: --theme accepts both --theme and --themes spelling" {

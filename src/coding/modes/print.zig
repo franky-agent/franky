@@ -22,6 +22,7 @@ const agent = franky.agent;
 const at = agent.types;
 const tools_mod = franky.coding.tools;
 const role_mod = franky.coding.role;
+const permissions_mod = franky.coding.permissions;
 const session_mod = franky.coding.session;
 const cli_mod = franky.coding.cli;
 const auth_mod = franky.coding.auth;
@@ -240,6 +241,28 @@ fn runPrint(
     const filtered_tools = try role_mod.filterTools(allocator, &all_tools, role_gate.set);
     defer allocator.free(filtered_tools);
 
+    // Permission gate (Approach A). Disabled by default to keep
+    // backward compat; `--prompts` opts in. Print mode has no
+    // pause-and-prompt UI, so any "ask" decision falls through to
+    // deny with a hint pointing at --yes / --allow-tools.
+    var permission_store = permissions_mod.Store.init(allocator);
+    defer permission_store.deinit();
+    permission_store.yes_to_all = cfg.yes;
+    if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
+    if (cfg.deny_tools_csv) |s| try permission_store.addDenyList(s);
+    if (cfg.ask_tools_csv) |s| try permission_store.addAskList(s);
+    try permissions_mod.maybeAttachPersistence(
+        &permission_store,
+        cfg.remember_permissions,
+        cfg.arena.allocator(),
+        io,
+        environ_map,
+    );
+    var session_gates: permissions_mod.SessionGates = .{
+        .role = &role_gate,
+        .permissions = if (cfg.prompts) &permission_store else null,
+    };
+
     // The sandbox warning fires only when role is `code`/`full`
     // outside a detected sandbox — host filesystem reachable from
     // a shell is the dangerous combination.
@@ -327,8 +350,9 @@ fn runPrint(
             .tools = filtered_tools,
             .registry = &reg,
             .cancel = &cancel,
-            .hook_userdata = @ptrCast(&role_gate),
-            .role_denied = role_mod.RoleGate.check,
+            .hook_userdata = @ptrCast(&session_gates),
+            .role_denied = permissions_mod.SessionGates.roleDenied,
+            .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .stream_options = .{
                 .api_key = provider_info.api_key,
                 .auth_token = provider_info.auth_token,
@@ -450,18 +474,29 @@ pub fn resolveLogLevel(cfg: *const cli_mod.Config, environ: std.process.Environ)
     return .warn;
 }
 
-/// Resolve `ai.registry.Timeouts` for this run. Precedence per
-/// field: CLI flag → env var → registry default. Each phase
-/// resolves independently, so a user can raise just the
-/// first-byte cap (slow local LLM) without affecting connect /
-/// upload / event-gap. Map-based so every mode (print stays on
-/// the live `Environ`; interactive/rpc/proxy hold a `Map`) can
-/// share the same resolver.
+/// Resolve `ai.registry.Timeouts` for this run.
+///
+/// Precedence per field: CLI flag → env var → autodetected default.
+///
+/// The autodetected default is normally `Timeouts{}` (the §G.4
+/// standard), but bumps `first_byte_ms` to 10 minutes when
+/// `cfg.base_url` points at a loopback host (Ollama on
+/// `localhost:11434`, LM-Studio on `localhost:1234`, vLLM on
+/// `localhost:8000`, …). Local LLMs commonly take longer than
+/// 30 s to emit a first token under reasoning workloads, and the
+/// hard cap surfaced as the misleading `transport: http error:
+/// Timeout` the user reported pre-v1.10. An explicit
+/// `--first-byte-timeout-ms` (or env var) still wins.
+///
+/// Map-based so every mode (print stays on the live `Environ`;
+/// interactive/rpc/proxy hold a `Map`) can share the same resolver.
 pub fn resolveTimeoutsFromMap(
     cfg: *const cli_mod.Config,
     environ_map: *const std.process.Environ.Map,
 ) ai.registry.Timeouts {
     var t: ai.registry.Timeouts = .{};
+    if (isLoopbackBaseUrl(cfg.base_url)) t.first_byte_ms = 600_000;
+
     if (cfg.connect_timeout_ms) |v| t.connect_ms = v
     else if (parseEnvMapU32(environ_map, "FRANKY_CONNECT_TIMEOUT_MS")) |v| t.connect_ms = v;
     if (cfg.upload_timeout_ms) |v| t.upload_ms = v
@@ -476,6 +511,28 @@ pub fn resolveTimeoutsFromMap(
 fn parseEnvMapU32(map: *const std.process.Environ.Map, key: []const u8) ?u32 {
     const v = map.get(key) orelse return null;
     return std.fmt.parseInt(u32, v, 10) catch null;
+}
+
+/// True when `base_url` parses to a loopback host. Whole-host
+/// match (not substring) so we don't false-positive on
+/// `https://localhost-prod.example.com/`.
+pub fn isLoopbackBaseUrl(maybe_url: ?[]const u8) bool {
+    const url = maybe_url orelse return false;
+    const after_scheme = blk: {
+        if (std.mem.indexOf(u8, url, "://")) |i| break :blk url[i + 3 ..];
+        break :blk url;
+    };
+    // Bracketed IPv6 host: `[::1]` (port follows after `]`).
+    if (after_scheme.len > 0 and after_scheme[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, after_scheme, ']') orelse return false;
+        const inner = after_scheme[1..close];
+        return std.mem.eql(u8, inner, "::1");
+    }
+    const host_end = std.mem.indexOfAny(u8, after_scheme, ":/?#") orelse after_scheme.len;
+    const host = after_scheme[0..host_end];
+    return std.mem.eql(u8, host, "localhost") or
+        std.mem.eql(u8, host, "127.0.0.1") or
+        std.mem.eql(u8, host, "::1");
 }
 
 // ─── provider selection ──────────────────────────────────────────
@@ -1189,6 +1246,59 @@ test "resolveTimeoutsFromMap: garbage env value falls back to default" {
     var m = std.process.Environ.Map.init(testing.allocator);
     defer m.deinit();
     try m.put("FRANKY_FIRST_BYTE_TIMEOUT_MS", "not-a-number");
+    const t = resolveTimeoutsFromMap(&cfg, &m);
+    try testing.expectEqual(@as(u32, 30_000), t.first_byte_ms);
+}
+
+test "isLoopbackBaseUrl: matches loopback hosts" {
+    try testing.expect(isLoopbackBaseUrl("http://localhost:11434/v1/messages"));
+    try testing.expect(isLoopbackBaseUrl("http://127.0.0.1:11434"));
+    try testing.expect(isLoopbackBaseUrl("https://localhost"));
+    try testing.expect(isLoopbackBaseUrl("http://[::1]:8000/v1"));
+    try testing.expect(isLoopbackBaseUrl("https://[::1]"));
+    try testing.expect(isLoopbackBaseUrl("localhost:1234"));
+}
+
+test "isLoopbackBaseUrl: rejects non-loopback hosts and lookalikes" {
+    try testing.expect(!isLoopbackBaseUrl(null));
+    try testing.expect(!isLoopbackBaseUrl(""));
+    try testing.expect(!isLoopbackBaseUrl("https://api.anthropic.com"));
+    // Don't false-positive on hostnames that contain `localhost`.
+    try testing.expect(!isLoopbackBaseUrl("https://localhost-prod.example.com"));
+    try testing.expect(!isLoopbackBaseUrl("https://my.localhost.dev"));
+}
+
+test "resolveTimeoutsFromMap: loopback base_url bumps first_byte to 10 min" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{
+        "franky", "--base-url", "http://localhost:11434/v1/messages",
+    });
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    const t = resolveTimeoutsFromMap(&cfg, &m);
+    try testing.expectEqual(@as(u32, 600_000), t.first_byte_ms);
+}
+
+test "resolveTimeoutsFromMap: explicit flag still wins over loopback bump" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{
+        "franky",
+        "--base-url",         "http://127.0.0.1:11434",
+        "--first-byte-timeout-ms", "120000",
+    });
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    const t = resolveTimeoutsFromMap(&cfg, &m);
+    try testing.expectEqual(@as(u32, 120_000), t.first_byte_ms);
+}
+
+test "resolveTimeoutsFromMap: cloud base_url keeps the 30s default" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{
+        "franky", "--base-url", "https://api.anthropic.com",
+    });
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
     const t = resolveTimeoutsFromMap(&cfg, &m);
     try testing.expectEqual(@as(u32, 30_000), t.first_byte_ms);
 }

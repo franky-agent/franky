@@ -85,6 +85,12 @@ pub const AgentEventKind = enum {
     tool_execution_start,
     tool_execution_update,
     tool_execution_end,
+    /// v1.11.1 — pause-and-prompt for the permission overlay
+    /// (§5.11). Emitted from `before_tool_call` when policy says
+    /// `ask`; mode drivers handle the prompt and call back via
+    /// `permissions.PermissionPrompter.resolve`. The worker
+    /// thread blocks on a `Condition` until then.
+    tool_permission_request,
     turn_end,
     agent_error,
 };
@@ -116,6 +122,19 @@ pub const AgentEvent = union(AgentEventKind) {
     tool_execution_end: struct {
         call_id: []const u8,
         result: ToolResult,
+    },
+    tool_permission_request: struct {
+        call_id: []const u8,
+        tool_name: []const u8,
+        /// Raw arguments JSON the model emitted — clients use it
+        /// to render `bash: rm -rf /tmp/foo` in the prompt.
+        args_json: []const u8,
+        /// Best-effort verb fingerprint (`fingerprintBash` for
+        /// bash; tool name for everything else). Surfaces the
+        /// "this is what an `always_*` decision will remember"
+        /// hint without forcing every client to re-implement
+        /// fingerprint logic.
+        fingerprint: []const u8,
     },
     turn_end: void,
     agent_error: ai.errors.ErrorDetails,
@@ -152,6 +171,12 @@ pub const AgentEvent = union(AgentEventKind) {
                 allocator.free(e.call_id);
                 var r = e.result;
                 r.deinit(allocator);
+            },
+            .tool_permission_request => |r| {
+                allocator.free(r.call_id);
+                allocator.free(r.tool_name);
+                allocator.free(r.args_json);
+                allocator.free(r.fingerprint);
             },
             .agent_error => |d| {
                 allocator.free(d.message);

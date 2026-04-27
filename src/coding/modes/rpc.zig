@@ -30,6 +30,7 @@ const cli_mod = franky.coding.cli;
 const print_mode = @import("print.zig");
 const tools_mod = franky.coding.tools;
 const role_mod = franky.coding.role;
+const permissions_mod = franky.coding.permissions;
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -94,6 +95,18 @@ const Session = struct {
     tools: []const at.AgentTool,
     role_arena: std.heap.ArenaAllocator,
     role_gate: role_mod.RoleGate,
+    permission_store: permissions_mod.Store,
+    session_gates: permissions_mod.SessionGates = .{},
+    /// v1.11.3 — set during `runPrompt` so the dispatcher's
+    /// `permission/resolve` arm can find the live prompter. Null
+    /// outside a prompt; resolve calls then return a "no
+    /// pending prompt" error.
+    current_prompter: ?*permissions_mod.PermissionPrompter = null,
+    /// v1.11.3 — guard against `prompt` re-entry while a prompt
+    /// is already running. The drain loop interleaves stdin reads
+    /// to pick up `permission/resolve`/`abort`; rejecting nested
+    /// `prompt` keeps the worker count bounded.
+    in_prompt: bool = false,
     system_prompt: []u8,
     transcript: agent.loop.Transcript,
     cfg: *cli_mod.Config,
@@ -105,6 +118,7 @@ const Session = struct {
         self.allocator.free(self.system_prompt);
         self.registry.deinit();
         self.faux.deinit();
+        self.permission_store.deinit();
         self.role_arena.deinit();
     }
 };
@@ -135,6 +149,20 @@ fn initSession(
     };
     const filtered = try role_mod.filterTools(role_arena.allocator(), &all_tools, role_gate.set);
 
+    var permission_store = permissions_mod.Store.init(allocator);
+    errdefer permission_store.deinit();
+    permission_store.yes_to_all = cfg.yes;
+    if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
+    if (cfg.deny_tools_csv) |s| try permission_store.addDenyList(s);
+    if (cfg.ask_tools_csv) |s| try permission_store.addAskList(s);
+    try permissions_mod.maybeAttachPersistence(
+        &permission_store,
+        cfg.remember_permissions,
+        cfg.arena.allocator(),
+        io,
+        environ_map,
+    );
+
     session.* = .{
         .allocator = allocator,
         .io = io,
@@ -144,10 +172,15 @@ fn initSession(
         .tools = filtered,
         .role_arena = role_arena,
         .role_gate = role_gate,
+        .permission_store = permission_store,
         .system_prompt = undefined,
         .transcript = agent.loop.Transcript.init(allocator),
         .cfg = cfg,
         .environ_map = environ_map,
+    };
+    session.session_gates = .{
+        .role = &session.role_gate,
+        .permissions = if (cfg.prompts) &session.permission_store else null,
     };
     errdefer session.registry.deinit();
     errdefer session.faux.deinit();
@@ -221,11 +254,130 @@ fn dispatchOne(
         try writeResultFrame(allocator, io, stdout, req.id, "{\"aborted\":true}");
         return;
     }
+    if (std.mem.eql(u8, req.method, "permission/resolve")) {
+        try handleResolve(allocator, io, stdout, session, req);
+        return;
+    }
     if (std.mem.eql(u8, req.method, "prompt")) {
+        if (session.in_prompt) {
+            try writeErrorFrame(allocator, io, stdout, req.id, error.PromptInFlight);
+            return;
+        }
         try runPrompt(allocator, io, stdout, session, req);
         return;
     }
     try writeErrorFrame(allocator, io, stdout, req.id, error.UnknownMethod);
+}
+
+/// In-prompt frame dispatcher — used by `runPrompt`'s inline
+/// stdin pump. Only `permission/resolve`, `abort`, and `ping` make
+/// sense while a prompt is in flight; everything else (notably
+/// nested `prompt`) gets rejected with `error.PromptInFlight`.
+///
+/// This is a dedicated function rather than a re-entrant call to
+/// `dispatchOne` because Zig 0.16 rejects the inferred-error-set
+/// cycle (`dispatchOne` → `runPrompt` → `dispatchOne`). Restricting
+/// the mid-prompt surface is also a real safety win — a nested
+/// `prompt` would spawn a second worker, and `version`/`role`
+/// answers don't change mid-turn.
+fn dispatchInPromptFrame(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout: std.Io.File,
+    session: *Session,
+    body: []const u8,
+) !void {
+    var req = rpc.parseRequest(allocator, body) catch |err| {
+        try writeErrorFrame(allocator, io, stdout, null, err);
+        return;
+    };
+    defer rpc.freeRequest(allocator, &req);
+
+    if (std.mem.eql(u8, req.method, "permission/resolve")) {
+        try handleResolve(allocator, io, stdout, session, req);
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "abort")) {
+        session.cancel.fire();
+        try writeResultFrame(allocator, io, stdout, req.id, "{\"aborted\":true}");
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "ping")) {
+        try writeResultFrame(allocator, io, stdout, req.id, "{\"pong\":true}");
+        return;
+    }
+    try writeErrorFrame(allocator, io, stdout, req.id, error.PromptInFlight);
+}
+
+/// `permission/resolve({call_id, resolution})` — wakes the worker
+/// thread suspended inside `before_tool_call` (§5.11). Valid only
+/// while a prompt is in flight; replies with an error otherwise.
+fn handleResolve(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout: std.Io.File,
+    session: *Session,
+    req: rpc.Request,
+) !void {
+    const prompter = session.current_prompter orelse {
+        try writeErrorFrame(allocator, io, stdout, req.id, error.NoPendingPrompt);
+        return;
+    };
+    const params = req.params_raw orelse {
+        try writeErrorFrame(allocator, io, stdout, req.id, error.InvalidParams);
+        return;
+    };
+    const call_id = extractStringField(params, "call_id") orelse {
+        try writeErrorFrame(allocator, io, stdout, req.id, error.InvalidParams);
+        return;
+    };
+    const resolution_str = extractStringField(params, "resolution") orelse {
+        try writeErrorFrame(allocator, io, stdout, req.id, error.InvalidParams);
+        return;
+    };
+    const resolution = permissions_mod.Resolution.fromString(resolution_str) orelse {
+        try writeErrorFrame(allocator, io, stdout, req.id, error.InvalidParams);
+        return;
+    };
+    prompter.resolve(call_id, resolution) catch {
+        // The only error `resolve` returns is `error.NotPending`
+        // (call_id no longer in the pending map — usually because
+        // the worker already moved on / the prompter was torn
+        // down). Surface it to the client either way.
+        try writeErrorFrame(allocator, io, stdout, req.id, error.NotPending);
+        return;
+    };
+    try writeResultFrame(allocator, io, stdout, req.id, "{\"ok\":true}");
+}
+
+/// Tiny ad-hoc string-field extractor for the resolve handler's
+/// JSON params. Mirrors `extractPromptText` below — we don't pull
+/// in a full parser for two-field bodies.
+fn extractStringField(json: []const u8, field: []const u8) ?[]const u8 {
+    var search_buf: [64]u8 = undefined;
+    if (field.len + 2 > search_buf.len) return null;
+    var i: usize = 0;
+    search_buf[i] = '"';
+    i += 1;
+    @memcpy(search_buf[i .. i + field.len], field);
+    i += field.len;
+    search_buf[i] = '"';
+    i += 1;
+    const key = search_buf[0..i];
+    const k = std.mem.indexOf(u8, json, key) orelse return null;
+    var p = k + key.len;
+    while (p < json.len and (json[p] == ' ' or json[p] == ':' or json[p] == '\t')) : (p += 1) {}
+    if (p >= json.len or json[p] != '"') return null;
+    p += 1;
+    const start = p;
+    while (p < json.len) : (p += 1) {
+        if (json[p] == '\\') {
+            p += 1;
+            continue;
+        }
+        if (json[p] == '"') return json[start..p];
+    }
+    return null;
 }
 
 fn runPrompt(
@@ -272,6 +424,20 @@ fn runPrompt(
     var ch = try agent.loop.AgentChannel.initWithDrop(allocator, 1024, at.AgentEvent.deinit, allocator);
     defer ch.deinit();
 
+    // v1.11.3 — per-turn prompter so the worker can suspend on
+    // `ask`. The dispatcher's `permission/resolve` arm reads
+    // `session.current_prompter` to wake it.
+    var prompter = permissions_mod.PermissionPrompter.init(allocator, io, &ch);
+    defer prompter.deinit();
+    if (session.cfg.prompts) {
+        session.session_gates.prompter = &prompter;
+    }
+    defer session.session_gates.prompter = null;
+    session.current_prompter = &prompter;
+    defer session.current_prompter = null;
+    session.in_prompt = true;
+    defer session.in_prompt = false;
+
     session.cancel = .{}; // reset per-prompt
     const worker_args: WorkerArgs = .{
         .allocator = allocator,
@@ -290,8 +456,9 @@ fn runPrompt(
             .tools = session.tools,
             .registry = &session.registry,
             .cancel = &session.cancel,
-            .hook_userdata = @ptrCast(&session.role_gate),
-            .role_denied = role_mod.RoleGate.check,
+            .hook_userdata = @ptrCast(&session.session_gates),
+            .role_denied = permissions_mod.SessionGates.roleDenied,
+            .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .stream_options = .{
                 .api_key = session.provider.api_key,
                 .auth_token = session.provider.auth_token,
@@ -306,22 +473,61 @@ fn runPrompt(
     const worker = try std.Thread.spawn(.{}, workerMain, .{worker_args});
     defer worker.join();
 
-    while (ch.next(io)) |ev| {
-        const payload = agent.proxy.encodeEventJson(allocator, ev) catch {
-            ev.deinit(allocator);
-            continue;
-        };
-        defer allocator.free(payload);
-        const notif = std.fmt.allocPrint(allocator,
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"event\",\"params\":{s}}}",
-            .{payload},
-        ) catch {
-            ev.deinit(allocator);
-            continue;
-        };
-        defer allocator.free(notif);
-        writeFrameToStdout(io, stdout, notif) catch {};
-        ev.deinit(allocator);
+    // v1.11.3 — interleave channel + stdin so a client can send
+    // `permission/resolve` (or `abort`) while the worker is
+    // suspended on a permission prompt. Outer-loop blocking on
+    // stdin would deadlock — the user can't unblock a prompt if
+    // we never read their reply.
+    const stdin = std.Io.File.stdin();
+    var inflight: std.ArrayList(u8) = .empty;
+    defer inflight.deinit(allocator);
+    var inflight_cursor: usize = 0;
+    var scratch: [4096]u8 = undefined;
+
+    drain: while (true) {
+        switch (ch.tryNext(io)) {
+            .closed => break :drain,
+            .event => |ev| {
+                const payload = agent.proxy.encodeEventJson(allocator, ev) catch {
+                    ev.deinit(allocator);
+                    continue;
+                };
+                defer allocator.free(payload);
+                const notif = std.fmt.allocPrint(allocator,
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"event\",\"params\":{s}}}",
+                    .{payload},
+                ) catch {
+                    ev.deinit(allocator);
+                    continue;
+                };
+                defer allocator.free(notif);
+                writeFrameToStdout(io, stdout, notif) catch {};
+                ev.deinit(allocator);
+            },
+            .empty => {
+                // Non-blocking stdin pump.
+                const n = std.posix.read(stdin.handle, &scratch) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => 0,
+                };
+                if (n > 0) try inflight.appendSlice(allocator, scratch[0..n]);
+                while (true) {
+                    const span = rpc.readFrame(inflight.items, inflight_cursor) catch break;
+                    if (span) |s| {
+                        const body = inflight.items[s.body_start..s.body_end];
+                        try dispatchInPromptFrame(allocator, io, stdout, session, body);
+                        inflight_cursor = s.body_end;
+                        if (inflight_cursor > 16 * 1024) {
+                            const remaining = inflight.items[inflight_cursor..];
+                            std.mem.copyForwards(u8, inflight.items[0..remaining.len], remaining);
+                            inflight.items.len = remaining.len;
+                            inflight_cursor = 0;
+                        }
+                    } else break;
+                }
+                io.sleep(.fromMilliseconds(5), .awake) catch {};
+            },
+        }
     }
 
     try writeResultFrame(allocator, io, stdout, req.id, "{\"done\":true}");
@@ -439,4 +645,27 @@ test "extractPromptText: finds text field in params" {
 test "extractPromptText: missing field → null" {
     try testing.expect(extractPromptText("{\"other\":\"x\"}") == null);
     try testing.expect(extractPromptText(null) == null);
+}
+
+test "extractStringField: pulls call_id + resolution from resolve params" {
+    const body = "{\"call_id\":\"c-42\",\"resolution\":\"allow_once\"}";
+    try testing.expectEqualStrings("c-42", extractStringField(body, "call_id").?);
+    try testing.expectEqualStrings("allow_once", extractStringField(body, "resolution").?);
+}
+
+test "extractStringField: missing field → null" {
+    try testing.expect(extractStringField("{}", "call_id") == null);
+    try testing.expect(extractStringField("{\"other\":1}", "call_id") == null);
+}
+
+test "extractStringField: tolerates whitespace + extra fields" {
+    const body = "{ \"call_id\" :  \"c-1\" , \"resolution\":\"deny_once\", \"x\":1 }";
+    try testing.expectEqualStrings("c-1", extractStringField(body, "call_id").?);
+    try testing.expectEqualStrings("deny_once", extractStringField(body, "resolution").?);
+}
+
+test "extractStringField: ignores escaped quote inside string" {
+    const body = "{\"call_id\":\"c\\\"x\"}";
+    // The extractor doesn't unescape; it just walks past `\"`.
+    try testing.expectEqualStrings("c\\\"x", extractStringField(body, "call_id").?);
 }

@@ -64,7 +64,8 @@ v1.0.0 release (2026-04-24). Legend:
 | 5.3 | Sessions on disk | ✅ | ULID + atomic round-trip + resume wired (v0.5.*); object_store `$ref` emission for oversize blobs (v1.5.0); branch tree persisted via `tree.json` on every turn, loaded on resume (v1.6.0); per-branch transcript snapshots at `transcripts/<branch>.json` written on every save (v1.7.0). `--checkout <branch>` rehydrates a specific branch's transcript on resume; `--fork <name>` snapshots the new branch immediately so checkout round-trips work |
 | 5.4 | Extension system | ⏳ | Tier-1 (compile-time static modules) shipped end-to-end in v1.1.3: `--extensions <csv>` runtime opt-in, built-in catalog in `src/coding/extensions_builtin/catalog.zig`, sample `echo` extension. **Tier-2 (`.so`/`.dylib`) and Tier-3 (Wasm) are explicitly post-1.0** — see §N.4 for the ABI design. Blocker: dynamic extension loading requires a sandbox (capability gating at load time) and a versioned ABI, both of which are substantial work; Tier-1 covers the in-practice extension surface (build-time opt-in of first-party modules) |
 | 5.5 | Run modes | ✅ | All four run modes live: print (always), interactive (v0.11.3, v1.5.5 depth pass), rpc (v1.4.3 — ping/version/abort/prompt over LSP Content-Length framing with streaming event notifications), **proxy (v1.4.0 — HTTP/SSE listener; §4.7).** Interactive ships history nav (up/down through prior prompts, bounded ring with duplicate coalescing), multi-line compose (Shift-Enter inserts `\n`, editor grows to ⅓ of terminal), and slash-command palette hint (lists matching commands above the editor; Tab completes unique prefix) |
-| 5.6 | CLI arguments | ✅ | Full flag set incl. `--continue`, `--fork`, `--export`, `--tools`, `--skills`, `--prompts`, `--theme`, `--offline`, `--extensions`, `--base-url`, `--role`, `--proxy-port`, plus the v1.10.0 §G.4 phase-timeout overrides (`--connect-timeout-ms` / `--upload-timeout-ms` / `--first-byte-timeout-ms` / `--event-gap-timeout-ms`) with matching `FRANKY_*` env-var fallbacks |
+| 5.6 | CLI arguments | ✅ | Full flag set incl. `--continue`, `--fork`, `--export`, `--tools`, `--skills`, `--prompts-dir` (renamed from `--prompts` in v1.11.0), `--theme`, `--offline`, `--extensions`, `--base-url`, `--role`, `--proxy-port`, the v1.10.0 §G.4 phase-timeout overrides (`--connect-timeout-ms` / `--upload-timeout-ms` / `--first-byte-timeout-ms` / `--event-gap-timeout-ms`) with matching `FRANKY_*` env-var fallbacks, and the v1.11.0 permission-gate overlay (`--prompts` toggle, `--yes`/`-y`, `--allow-tools`, `--deny-tools`) |
+| 5.11 | Permission overlay | ✅ | `src/coding/permissions.zig` (v1.11.0). Off by default; `--prompts` opts in. `Store` carries allow/deny/ask lists + `yes_to_all` + `ask_all` bool; `Store.check` runs a four-step precedence ladder (deny → allow → force-ask → default policy). `fingerprintBash` is the verb-level lever ("git status" → "git"). Combined `SessionGates { role, permissions, prompter }` shares the agent loop's single `hook_userdata` pointer between gates. **v1.11.0** = foundation. **v1.11.1** = pause-and-prompt protocol (`Resolution` enum + `AgentEventKind.tool_permission_request` + `PermissionPrompter` Mutex/Condition map; `*_always` promotes into the store). **v1.11.2** = interactive-mode modal (per-turn prompter; yellow overlay + key legend; `a/A/d/D/Esc` keystrokes drive `prompter.resolve`). **v1.11.3** = RPC: new `permission/resolve` JSON-RPC method + `runPrompt` interleaves channel + stdin so a client can resolve while the worker is suspended; nested `prompt` rejected with `error.PromptInFlight`. **v1.11.4** = proxy + web UI: `POST /permission/resolve` HTTP endpoint with `Session.resolve_mutex` guarding `current_prompter` from connection threads; `web/app.js` renders an inline yellow modal in the conversation pane on the SSE `tool_permission_request` event with four buttons that POST to `/permission/resolve`. **v1.11.5** = `--ask-tools <csv>` demote-to-ask flag (sentinel `all` for "ask before every tool call, no exceptions"). **v1.12.0** = `--remember-permissions` opts in to `$FRANKY_HOME/permissions.json` round-trip (atomic write, sorted keys, schema per `permission.md` §A.6); `*_always` resolutions auto-persist inside `waitForPrompt`; corrupt or missing files degrade silently to in-memory state. Permission overlay surface complete across all four modes |
 | 5.10 | Capability roles | ✅ | `src/coding/role.zig` + `--role <read\|plan\|code\|full>` (v1.9.0). Tool-registry filter + runtime role gate (`tool_code = "role_denied"`) + sandbox detection across print/interactive/rpc/proxy. Single-source `tool_table` drives all derivations; `role.zig::renderRoleStatusJson` is the shared wire format for `GET /role` (proxy) and `role` (rpc). `scripts/franky-zerobox` wrapper + `docs/sandbox.md` recipes (zerobox primary). Mid-session escalation explicitly out of scope |
 | 5.7 | Settings | ✅ | `loadLayered` shipped and wired through `print.zig::resolveProviderIo` (v1.1.0). Order: defaults → `$HOME/.franky/agent/settings.json` → `$PWD/.franky/settings.json` → CLI flags. `thinking_explicit` disambiguates "user set --thinking" from "default off" so `settings.thinking` participates as a fallback |
 | 5.8 | Prompt templates & skills | ✅ | `expand` + `loadTemplate` + `/template <name> [args…]` slash handler wired in interactive mode (v1.1.1). `--prompts <dir>` supplies the lookup root. Skill-bundle metadata loader still deferred |
@@ -298,6 +299,15 @@ order).
 | v1.7.11 | Web UI: actual root cause of "responding forever" (post-1.0) | §7; v1.6.2 added `active.toolArgs` but `startAssistantMessage` never got the field added to its rebuilt literal. Every `endAssistantMessage` after the first `message_start` threw on `active.toolArgs.keys()`, propagating out of the SSE listener and skipping `setStreaming(false)`. v1.7.9 Stop fix recovered on click; v1.7.11 actually fixes the cause: one-line literal fix + defensive guards in `endAssistantMessage`/`appendToolArgsDelta`. Pinned by a regression test |
 | v1.8.0 | §G.4 per-phase HTTP timeouts | §G.4 closed (last `⏳` in §G core); `fetchAttemptPhased` migrates from single-shot `client.fetch` to lower-level `connect → request+sendBody → receiveHead`; per-phase watchdog `shutdown(.both)`s the connection on timeout; phase tag reported via `*PhaseInfo`; new `fetchWithRetryAndTimeoutsAndHooksAndPhases` entry point, existing wrapper delegates with null for backward compat |
 | v1.9.0 → v1.9.5 | **Capability roles** (post-1.0) | New §5.10 (open). Six iterative milestones — labeled `v1.4.0`–`v1.4.5` in `permission.md` (the role-roadmap doc), shipped at binary versions v1.9.0–v1.9.5. **v1.9.0**: `Role` enum, `--role` flag, `tool_table` + `ToolSet`, sandbox detection, registry filter at session init. **v1.9.1**: runtime role gate (`agent_loop.RoleDeniedFn` callback, `tool_code = "role_denied"` constant in `agent/types.zig`, `pushToolEnd` carries `tool_code` through to event), full `tool_execution_end` JSON includes `toolCode`. **v1.9.2**: mode UX — print stderr banner, interactive `/role` slash + sandbox warning, rpc `version`+`role` methods. **v1.9.3**: proxy/web — `GET /role` HTTP endpoint, role pill in header, `is-role-denied` tool-card styling. **v1.9.4**: `scripts/franky-zerobox` shell wrapper + `docs/sandbox.md` (zerobox primary, Docker, devcontainer, Lima recipes). **v1.9.5**: franky-do Slack-bot pattern docs (untrusted-input posture). Simplify pass at v1.9.5 collapsed `respondRole`/`writeRoleResult` onto a shared `role.zig::renderRoleStatusJson`, hoisted a single-source `tool_table` + `StaticBitSet`-based `ToolSet`, dropped the duplicate `Session.role` field in favor of `session.role_gate.role`, added `RoleGate.init(role)` factory, deduplicated sandbox env-var list |
+| v1.10.0 | **User-configurable phase timeouts** (post-1.0) | §G.4 row updated. Triggered by a real Ollama-on-CPU bug — the hardcoded 30 s `first_byte_ms` fired before the model produced its first token, surfacing as the misleading `transport: http error: Timeout` (Ollama saw franky drop the connection and logged a 30-s 500 in turn). Added `--connect-timeout-ms` / `--upload-timeout-ms` / `--first-byte-timeout-ms` / `--event-gap-timeout-ms` (+ matching `FRANKY_*` env vars) wired through `resolveTimeoutsFromMap` and threaded into `stream_options.timeouts` from print/interactive/rpc/proxy. Refactored every provider (anthropic, openai_chat, openai_responses, google_gemini, google_vertex) to use `fetchWithRetryAndTimeoutsAndHooksAndPhases` + a local `PhaseInfo`, and the new `reportTransportErrorWithPhase` so timeouts surface as `code = .timeout` with a phase-specific actionable message. +9 tests (resolveTimeoutsFromMap precedence, formatTimeoutMessage shapes, error-event roundtrip) |
+| v1.10.1 | **Local-gateway timeout autodetection** (post-1.0) | `resolveTimeoutsFromMap` now bumps the `first_byte_ms` *default* to 600 000 (10 min) when `cfg.base_url` parses to a loopback host (`localhost`, `127.0.0.1`, `::1`). Removes the need to set `--first-byte-timeout-ms` for the most common slow path (Ollama on CPU, LM-Studio, vLLM with cold cache). Explicit CLI flag / env var still wins. New `isLoopbackBaseUrl` helper does whole-host matching (no false positives on `localhost-prod.example.com`); +5 tests |
+| v1.11.0 | **Per-tool permission overlay foundation** (post-1.0) | New §5.11. `src/coding/permissions.zig` ships `Store` (allowlist/denylist + yes_to_all + default policy), `Decision` enum, `fingerprintBash`, and the combined `SessionGates` wrapper that shares the agent loop's `hook_userdata` between the role gate (§5.10) and the new permission gate. CLI: `--prompts` (opt-in toggle), `--yes` / `-y` (CI auto-allow), `--allow-tools <csv>`, `--deny-tools <csv>`; the existing `--prompts <dir>` template-root flag was renamed to `--prompts-dir` to free the name. All four modes (print/interactive/rpc/proxy) install the gate but no mode pauses yet — `ask` falls through to `auto_deny` with a hint pointing at the escape hatches. Pause-and-prompt protocol (`tool_permission_request` event + `Agent.resolvePermission`) is post-v1.11.0. +14 tests (Store, fingerprint, extractBashCommand, SessionGates adapters, CLI parser) |
+| v1.11.1 | **Pause-and-prompt protocol** (post-1.0) | §5.11 expanded. Adds `Resolution` enum (allow_once / deny_once / always_allow / always_deny), new `AgentEventKind.tool_permission_request` variant + JSON serialization in `agent/proxy.zig`, and `PermissionPrompter` — per-call_id `Mutex`+`Condition` map that suspends the worker thread on `ask` until a mode driver calls `resolve(call_id, Resolution)`. `*_always` resolutions promote the tool name (or bash fingerprint) into the store so future calls of the same shape don't re-ask. `prompter.deinit` broadcasts `deny_once` to in-flight slots for safe shutdown. Stale `resolve` returns `error.NotPending`. Foundation only — no mode wires a prompter yet; v1.11.2 adds the interactive modal overlay, v1.11.3 the RPC notify+method, v1.11.4 the proxy/web UI POST endpoint + browser modal. +6 tests (Resolution.fromString, fingerprintFor, race-free worker→drain→resolve round-trip for allow_once / always_allow / deny_once, NotPending stale resolve) |
+| v1.11.2 | **Interactive-mode permission modal** (post-1.0) | First mode driver to consume the v1.11.1 protocol. `runOneTurn` creates a per-turn `PermissionPrompter` (channel pointer rebinds per turn since the channel is per-`runOneTurn`), wires it into `session.session_gates.prompter` for the worker, and clears it on `t.join()`. New `ModalState` struct on the `runOneTurn` stack tracks `{ active, call_id, tool_name, args_preview, fingerprint }` with owned strings; `arm` auto-frees the previous slot so re-arming is leak-safe. The drain loop's `tool_permission_request` arm appends three styled scrollback lines (header + args preview + key legend) and arms the modal. The stdin handler intercepts keys when `modal.active`: `a`→`allow_once`, `A`→`always_allow`, `d`→`deny_once`, `D`→`always_deny`, `Esc`→`deny_once`; unrecognized keys are no-ops. Resolution flows through `prompter.resolve`, the worker wakes, the loop appends a green ✓ or red ✗ result line and clears the modal. `franky --prompts --mode interactive` is now the canonical "ask before every tool call" entry point. +6 tests (modalKeyResolution mappings + Esc + null on unrelated keys, ModalState arm/clear leak-safety, argsPreviewSlice truncation) |
+| v1.11.3 | **RPC permission protocol** (post-1.0) | New `permission/resolve` JSON-RPC method taking `{call_id, resolution}` from params; calls `session.current_prompter.resolve` and replies with `{ok:true}` or one of `error.NoPendingPrompt` / `error.NotPending` / `error.InvalidParams`. The RPC dispatcher is single-threaded, so `runPrompt` was rewritten to interleave the channel drain (now `ch.tryNext`) with a non-blocking stdin pump that dispatches incoming frames inline — without that, a client couldn't deliver `permission/resolve` while a prompt was in flight. Nested `prompt` is now rejected with `error.PromptInFlight` to keep the worker count bounded; `Session.in_prompt` and `Session.current_prompter` track the in-flight state. New `extractStringField` helper for the resolve params (mirrors the existing `extractPromptText` ad-hoc parser; we still don't pull in a full JSON parser for two-field bodies). +4 tests (extractStringField across simple / missing / whitespace / escaped-quote inputs) |
+| v1.11.4 | **Proxy + web UI permission protocol** (post-1.0) | Completes the §5.11 mode-coverage track. New `POST /permission/resolve` HTTP route reads `{call_id, resolution}` JSON and forwards to `session.current_prompter.resolve`. `Session.resolve_mutex` guards `current_prompter` reads from connection threads (the proxy is multi-threaded — listener spawns a connection thread per request) so the runPrompt teardown can't deinit the prompter mid-call. Returns 200 with `{ok:true}`, 409 when no prompt is in flight, 404 on stale `call_id`. `web/app.js` adds a `tool_permission_request` SSE listener that renders an inline yellow modal in the conversation pane (header + args preview + four buttons: `Allow once` / `Always allow` / `Deny once` / `Always deny`); button click POSTs to `/permission/resolve`, on 200 the modal collapses to a green ✓ or red ✗ result line. New CSS classes `.permission-modal`, `.permission-args`, `.permission-buttons`, `.permission-btn-{allow,deny}`, `.permission-result-{allow,deny}` keep the modal styled in the existing yellow "needs your attention" tone. +2 integration tests (POST /permission/resolve returns 409 with no in-flight prompt; succeeds + wakes a synthetically-spawned worker thread) |
+| v1.11.5 | **Demote-to-ask overlay** (post-1.0) | New `--ask-tools <csv>` flag sits between `--allow-tools` and `--deny-tools` in precedence; entries demote the matching tool name (or bash fingerprint) from default `auto_allow` to `ask`. Reserved `all` sentinel sets `Store.ask_all = true` which flips every default-auto_allow tool to `ask` while still honoring explicit allow/deny lists — the "ask before every single tool call, no exceptions" mode users hitting `--prompts` for the first time often want. `Store` gains `ask_tools` / `ask_bash` `StringHashMap`s and an `ask_all` bool; `Store.check` consults them between the allow-list step and the default-policy step. Plumbed through every mode (`cfg.ask_tools_csv`). +6 tests (precedence sanity, ask_all sentinel, deny-still-wins-over-ask, allow-still-wins-over-ask, bash:fingerprint scoping, yes_to_all + ask_all interaction) |
+| v1.12.0 | **Persistent permissions.json** (post-1.0) | New `--remember-permissions` flag opts in to disk persistence of `*_always` decisions. Path is `$FRANKY_HOME/permissions.json` (falls back to `$HOME/.franky/permissions.json`); schema mirrors `permission.md` §A.6 with sorted-key arrays for diff-friendly storage: `{ "version": 1, "always_allow": { "tools": [...], "bash": [...] }, "always_deny": { ... } }`. New `permissions.loadFromDisk` / `saveToDisk` helpers (atomic tempfile+rename + 0600 mode + `sync` like `auth.json`); `Store.persist_path` + `Store.persist_io` fields trigger an auto-save inside `waitForPrompt` after every promotion. New `permissions.maybeAttachPersistence` shared helper threads the load+attach step into all four modes. Failures (malformed file, missing $HOME) silently degrade to in-memory state — disk hiccups never abort an in-flight turn. +7 tests (render skeleton, sorted output, round-trip, missing file, malformed JSON, defaultPath precedence, auto-persist round-trip) |
 
 **What stays `⏳` at the cut (all post-1.0 with named unlocks):**
 
@@ -898,6 +908,134 @@ Representative fields: default models per provider, keybinding preset (`vi` / `e
 ### 5.9 Programmatic SDK
 
 `sdk.ts` exposes the key classes/functions as a library API: `AgentSession`, `createAgentSessionServices`, `createAgentSessionFromServices`, plus all tool definitions, auth storage backends, and compaction helpers. Consumers (Slack bot, web backend) build sessions without going through `main.ts`.
+
+### 5.11 Per-tool permission overlay
+
+Layered on top of the §5.10 role system: roles control which
+tools the model *sees*; the permission overlay controls which
+calls actually *run*. Approach A from `permission.md`. Lives at
+`src/coding/permissions.zig`. Off by default — enable per run
+via `--prompts`.
+
+**Per-call decision values** (`permissions.Decision`):
+
+- `auto_allow` — run without asking.
+- `auto_deny` — refuse the call; the loop synthesizes a tool error.
+- `ask` — prompt the user. Without a UI (print/RPC/proxy on
+  v1.11.0) `ask` falls through to `auto_deny` plus a hint
+  pointing at `--yes` / `--allow-tools`. Pause-and-prompt is the
+  v1.11.1+ extension.
+
+**Default policy** (when `--prompts` is on): `read`/`ls`/
+`find`/`grep` auto-allow (§R already canonicalizes paths inside
+the workspace); `write`/`edit`/`bash` ask.
+
+**CLI knobs:**
+
+| Flag | Effect |
+|---|---|
+| `--prompts` | Master opt-in. Off by default → gate isn't installed at all (v1.10.x behavior preserved). |
+| `--yes` / `-y` | Every `ask` becomes `auto_allow`. Primarily for CI. |
+| `--allow-tools <csv>` | Pre-seed the always-allow set. Entries are tool names (`write`) or scoped bash fingerprints (`bash:git`). |
+| `--deny-tools <csv>` | Same syntax; takes precedence over allow. |
+
+**Bash command fingerprint.** Verb-level (first non-path token):
+`"git status"` → `git`, `"/usr/local/bin/zig build"` → `zig`,
+`"npm install foo"` → `npm`. Coarse enough to drive ~5–10
+session decisions, fine enough that `rm` and `git` are distinct.
+Argv-prefix scoping is post-v1.11.0.
+
+**SessionGates wrapper.** The agent loop has a single
+`hook_userdata` pointer that all hook callbacks dereference,
+so the role gate (§5.10) and the permission store now coexist
+in a single `permissions.SessionGates` struct. Two adapters
+(`SessionGates.roleDenied`, `SessionGates.beforeToolCall`)
+downcast the userdata pointer to that struct, then forward to
+the matching gate. This stays internal to the coding modes —
+SDK consumers can wire their own hooks directly.
+
+**Pause-and-prompt protocol (v1.11.1).** When the policy
+returns `ask` and a `PermissionPrompter` is wired into
+`SessionGates`, the gate emits a `tool_permission_request`
+agent event and **suspends the worker thread on a
+`std.Io.Condition`** until the mode driver calls
+`prompter.resolve(call_id, resolution)`. The protocol shape:
+
+- **`Resolution` enum**: `allow_once` / `deny_once` /
+  `always_allow` / `always_deny`. The `*_always` flavors
+  promote the call's tool-name (or bash fingerprint) into the
+  store's allow/deny set so future calls of the same shape
+  don't re-ask.
+- **`tool_permission_request` event** (new `AgentEventKind`
+  variant): carries `call_id`, `tool_name`, raw `args_json`,
+  and the pre-computed `fingerprint` so clients render the
+  prompt without recomputing the verb-level lookup. JSON
+  shape from `agent.proxy.encodeEventJson`:
+  `{"kind":"tool_permission_request","callId":"…","toolName":"bash","argsJson":"…","fingerprint":"git"}`.
+- **`PermissionPrompter`**: holds the channel pointer + io +
+  per-`call_id` pending map (`Mutex` + per-slot `Condition`).
+  `requestAndWait` is what the worker thread calls inside
+  `before_tool_call`; `resolve` is the mode-driver entry point.
+  Stale resolutions (call_id not pending) return
+  `error.NotPending` rather than panic.
+- **Shutdown safety**: `PermissionPrompter.deinit` broadcasts
+  `deny_once` to any in-flight slots so a session teardown
+  doesn't hang the worker thread forever.
+
+**Mode coverage track.**
+
+- **v1.11.0** — gate scaffolding installed in print/interactive/rpc/proxy
+  with no UI; `ask` falls through to `auto_deny` plus a hint.
+- **v1.11.1** — pause-and-prompt protocol scaffolding (this section).
+  Still no UI consumer, so behavior is identical to v1.11.0 unless a
+  caller programmatically wires a `PermissionPrompter`.
+- **v1.11.2 — interactive modal overlay (✅ shipped).** Each
+  `runOneTurn` creates a per-turn `PermissionPrompter` (the channel
+  is per-turn) and binds it into `session.session_gates.prompter`
+  for the worker; clears on `t.join()`. A `ModalState` struct on
+  the stack carries the active call's owned `{call_id, tool_name,
+  args_preview, fingerprint}` strings; `arm` auto-frees the previous
+  slot so re-arming is leak-safe. The drain loop's
+  `tool_permission_request` arm appends three styled scrollback
+  lines (`🔒 permission required: <tool> (fingerprint: <fp>)`, the
+  args preview, and the key legend `[a]llow once · [A]lways allow ·
+  [d]eny once · [D]eny always · Esc=deny`) and arms the modal. The
+  stdin handler intercepts keys while `modal.active`:
+  `a`→`allow_once`, `A`→`always_allow`, `d`→`deny_once`,
+  `D`→`always_deny`, `Esc`→`deny_once`; unrecognized keys no-op
+  (explicit choice required — no "Enter accepts"). On resolve, the
+  loop appends a green ✓ or red ✗ result line and clears the modal.
+- **v1.11.3 — RPC (✅ shipped).** New `permission/resolve` JSON-RPC
+  method takes `{call_id, resolution}` and forwards to
+  `session.current_prompter.resolve`. The `runPrompt` drain loop now
+  uses `ch.tryNext` and interleaves a non-blocking stdin pump so a
+  client can deliver `permission/resolve` (or `abort`) while the
+  worker is suspended on a prompt. Nested `prompt` is rejected with
+  `error.PromptInFlight` to keep worker count bounded.
+- **v1.11.4 — proxy + web UI (✅ shipped).** New `POST
+  /permission/resolve` HTTP route reads `{call_id, resolution}` JSON
+  and forwards to `session.current_prompter.resolve`.
+  `Session.resolve_mutex` guards reads/writes of `current_prompter`
+  so connection threads can't see a stale pointer mid-teardown. SSE
+  `tool_permission_request` was already wired in v1.11.1 — `web/app.js`
+  now renders an inline yellow modal in the conversation pane (header
+  + args preview + four buttons) and POSTs the user's choice; on 200
+  the modal collapses to a green/red result line.
+- **v1.11.5 — demote-to-ask overlay (✅ shipped).** New
+  `--ask-tools <csv>` flag at the precedence layer between
+  `--allow-tools` and the default policy. Each entry forces the
+  matching tool name (or `bash:<fingerprint>`) to `ask` even when
+  the default policy would auto-allow. Reserved sentinel `all`
+  flips every default-auto_allow tool to `ask` — the "ask before
+  every tool call, no exceptions" mode. Composes with the existing
+  knobs: deny still wins, then explicit allow, then ask, then
+  default policy. `--yes` continues to flip a final `ask` into
+  `auto_allow`, so `--ask-tools all --yes` is the CI shape that
+  fires the gate (audit trail) but auto-confirms each call.
+
+`--prompts --mode interactive` is the canonical interactive entry
+point. CI users can still pair `--prompts` with `--yes` or
+`--allow-tools` to skip the prompts entirely.
 
 ---
 

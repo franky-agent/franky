@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# franky-zerobox — run franky inside a zerobox sandbox.
+#
+# zerobox provides:
+#   • macOS Seatbelt + Linux bubblewrap+seccomp filesystem isolation
+#   • domain allowlist for outbound network (no exfiltration)
+#   • single static binary, no daemon, no extra cgroup setup
+#
+# Sets ZEROBOX_ACTIVE=1 so franky's startup banner skips the
+# "outside a sandbox" warning. The default role is `code`
+# (workspace-scoped bash) — pass `--role full` if you want every
+# tool on, but only inside a sandbox.
+#
+# Usage:
+#   ./scripts/franky-zerobox [--role <name>] [-- ... franky args ...]
+#
+# Examples:
+#   ./scripts/franky-zerobox                       # role=code, interactive
+#   ./scripts/franky-zerobox --role full --        # full role
+#   ./scripts/franky-zerobox -- --mode print "hi"  # one-shot
+#
+# Override the sandbox profile via ZEROBOX_PROFILE; override the
+# allowlist via ZEROBOX_ALLOW (comma-separated domains).
+
+set -euo pipefail
+
+ROLE="code"
+EXTRA=()
+while (( "$#" )); do
+    case "$1" in
+        --role)
+            ROLE="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            EXTRA=("$@")
+            break
+            ;;
+        *)
+            EXTRA+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if ! command -v zerobox >/dev/null 2>&1; then
+    echo "error: zerobox not found in PATH" >&2
+    echo "install: https://github.com/afshinm/zerobox" >&2
+    exit 127
+fi
+
+# Resolve franky binary. Prefer `zig-out/bin/franky` from this repo;
+# fall back to whatever's on PATH so the wrapper works post-install.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FRANKY_BIN="${FRANKY_BIN:-$SCRIPT_DIR/../zig-out/bin/franky}"
+if [[ ! -x "$FRANKY_BIN" ]]; then
+    FRANKY_BIN="$(command -v franky || true)"
+fi
+if [[ -z "$FRANKY_BIN" || ! -x "$FRANKY_BIN" ]]; then
+    echo "error: franky binary not found (tried $SCRIPT_DIR/../zig-out/bin/franky and PATH)" >&2
+    echo "build: zig build" >&2
+    exit 127
+fi
+
+# Default network allowlist — provider hosts only. Override with
+# ZEROBOX_ALLOW=...,... to broaden or restrict.
+ALLOW="${ZEROBOX_ALLOW:-api.anthropic.com,api.openai.com,generativelanguage.googleapis.com,oauth2.googleapis.com}"
+
+# Default profile — workspace-rw + tmp-rw + everything else read-
+# only. Override via ZEROBOX_PROFILE for stricter setups.
+PROFILE="${ZEROBOX_PROFILE:-default}"
+
+exec env ZEROBOX_ACTIVE=1 zerobox \
+    --profile "$PROFILE" \
+    --allow-net "$ALLOW" \
+    -- "$FRANKY_BIN" --role "$ROLE" "${EXTRA[@]}"

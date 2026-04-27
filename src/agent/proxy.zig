@@ -111,6 +111,16 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
                 try appendJsonStr(&buf, allocator, code);
             }
         },
+        .tool_permission_request => |r| {
+            try buf.appendSlice(allocator, "\"kind\":\"tool_permission_request\",\"callId\":");
+            try appendJsonStr(&buf, allocator, r.call_id);
+            try buf.appendSlice(allocator, ",\"toolName\":");
+            try appendJsonStr(&buf, allocator, r.tool_name);
+            try buf.appendSlice(allocator, ",\"argsJson\":");
+            try appendJsonStr(&buf, allocator, r.args_json);
+            try buf.appendSlice(allocator, ",\"fingerprint\":");
+            try appendJsonStr(&buf, allocator, r.fingerprint);
+        },
         .agent_error => |d| {
             try buf.appendSlice(allocator, "\"kind\":\"agent_error\",\"code\":");
             try appendJsonStr(&buf, allocator, d.code.toString());

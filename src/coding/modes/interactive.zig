@@ -42,6 +42,7 @@ const ext_catalog = franky.coding.extensions_builtin.catalog;
 const compaction_mod = franky.coding.compaction;
 const branching_mod = franky.coding.branching;
 const role_mod = franky.coding.role;
+const permissions_mod = franky.coding.permissions;
 const models_mod = franky.coding.models;
 const term_mod = @import("../terminal.zig");
 const print_mode = @import("print.zig");
@@ -858,6 +859,101 @@ const TurnIo = struct {
     pending_prompt: *?[]u8,
 };
 
+/// v1.11.2 — interactive permission-prompt modal. When `active`
+/// is true, the drain loop's stdin handler intercepts `a/A/d/D/Esc`
+/// and routes them to the resolver instead of the editor.
+const ModalState = struct {
+    active: bool = false,
+    /// Owned copies of the request payload — used to render the
+    /// prompt and keep the call_id / tool name available after the
+    /// originating event has been freed.
+    call_id: []u8 = &[_]u8{},
+    tool_name: []u8 = &[_]u8{},
+    args_preview: []u8 = &[_]u8{},
+    fingerprint: []u8 = &[_]u8{},
+
+    fn arm(
+        self: *ModalState,
+        allocator: std.mem.Allocator,
+        call_id: []const u8,
+        tool_name: []const u8,
+        args_json: []const u8,
+        fingerprint: []const u8,
+    ) !void {
+        // If a stale modal is still armed, clear it first so we
+        // don't leak its strings.
+        self.deinit(allocator);
+        self.* = .{
+            .active = true,
+            .call_id = try allocator.dupe(u8, call_id),
+            .tool_name = try allocator.dupe(u8, tool_name),
+            .args_preview = try allocator.dupe(u8, argsPreviewSlice(args_json)),
+            .fingerprint = try allocator.dupe(u8, fingerprint),
+        };
+    }
+
+    fn clear(self: *ModalState, allocator: std.mem.Allocator) void {
+        self.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn deinit(self: *ModalState, allocator: std.mem.Allocator) void {
+        if (self.call_id.len > 0) allocator.free(self.call_id);
+        if (self.tool_name.len > 0) allocator.free(self.tool_name);
+        if (self.args_preview.len > 0) allocator.free(self.args_preview);
+        if (self.fingerprint.len > 0) allocator.free(self.fingerprint);
+    }
+};
+
+/// v1.11.2 — keystroke → permission `Resolution`. `null` means
+/// the key isn't a modal binding and should be ignored. Esc and
+/// the `q` quit binding both resolve as `deny_once` so the user
+/// can't accidentally allow a tool by mashing keys.
+fn modalKeyResolution(key: tui.key_decoder.Key) ?permissions_mod.Resolution {
+    return switch (key) {
+        .escape => .deny_once,
+        .char => |c| switch (c.cp) {
+            'a' => .allow_once,
+            'A' => .always_allow,
+            'd' => .deny_once,
+            'D' => .always_deny,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// First ~80 bytes of the args JSON for the modal preview.
+/// Truncates with an ellipsis on overflow; preserves the full
+/// `command` field literal for bash since that's what the user
+/// most needs to see.
+fn argsPreviewSlice(args_json: []const u8) []const u8 {
+    const max = 160;
+    if (args_json.len <= max) return args_json;
+    return args_json[0..max];
+}
+
+fn renderResolutionLine(
+    allocator: std.mem.Allocator,
+    scrollback: *Scrollback,
+    tool_name: []const u8,
+    resolution: permissions_mod.Resolution,
+) !void {
+    const allowed = resolution.isAllow();
+    const glyph: []const u8 = if (allowed) "✓ allowed:" else "✗ denied:";
+    const tag: []const u8 = switch (resolution) {
+        .allow_once => "allow_once",
+        .always_allow => "always_allow",
+        .deny_once => "deny_once",
+        .always_deny => "always_deny",
+    };
+    const line = try std.fmt.allocPrint(allocator, "{s} {s} ({s})", .{ glyph, tool_name, tag });
+    try scrollback.appendStyledLine(line, .{
+        .fg = .{ .basic = if (allowed) .green else .red },
+        .bold = true,
+    });
+}
+
 fn runOneTurn(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -895,6 +991,21 @@ fn runOneTurn(
     );
     defer ch.deinit();
 
+    // v1.11.2 — per-turn `PermissionPrompter`. The channel is
+    // per-turn but `session_gates` lives on `SessionBinding`; we
+    // bind the prompter for this turn and clear it after the
+    // worker joins so a slash handler can't reach into a freed
+    // prompter between turns.
+    var prompter = permissions_mod.PermissionPrompter.init(allocator, io, &ch);
+    defer prompter.deinit();
+    if (session.cfg.prompts) {
+        session.session_gates.prompter = &prompter;
+    }
+    defer session.session_gates.prompter = null;
+
+    var modal: ModalState = .{};
+    defer modal.deinit(allocator);
+
     // v1.1.4 — live status-line data.
     const turn_start_ms: i64 = ai.stream.nowMillis();
 
@@ -908,8 +1019,9 @@ fn runOneTurn(
             .tools = session.tools,
             .registry = &session.registry,
             .cancel = &cancel,
-            .hook_userdata = @ptrCast(&session.role_gate),
-            .role_denied = role_mod.RoleGate.check,
+            .hook_userdata = @ptrCast(&session.session_gates),
+            .role_denied = permissions_mod.SessionGates.roleDenied,
+            .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .stream_options = .{
                 .api_key = session.provider.api_key,
                 .auth_token = session.provider.auth_token,
@@ -945,6 +1057,37 @@ fn runOneTurn(
                             "  · tool {s} (id={s})",
                             .{ s.name, s.call_id },
                         ));
+                    },
+                    .tool_permission_request => |r| {
+                        // v1.11.2 — render prompt + arm the modal.
+                        // Worker is suspended on a Condition until
+                        // we route the user's keystroke to
+                        // `prompter.resolve(call_id, …)`.
+                        try modal.arm(allocator, r.call_id, r.tool_name, r.args_json, r.fingerprint);
+                        const header = try std.fmt.allocPrint(
+                            allocator,
+                            "🔒 permission required: {s} (fingerprint: {s})",
+                            .{ r.tool_name, r.fingerprint },
+                        );
+                        try scrollback.appendStyledLine(header, .{
+                            .fg = .{ .basic = .yellow },
+                            .bold = true,
+                        });
+                        const args_line = try std.fmt.allocPrint(
+                            allocator,
+                            "   args: {s}{s}",
+                            .{ modal.args_preview, if (r.args_json.len > modal.args_preview.len) "…" else "" },
+                        );
+                        try scrollback.appendStyledLine(args_line, .{
+                            .fg = .{ .basic = .yellow },
+                        });
+                        const legend = try allocator.dupe(
+                            u8,
+                            "   [a]llow once  [A]lways allow  [d]eny once  [D]eny always  (Esc=deny)",
+                        );
+                        try scrollback.appendStyledLine(legend, .{
+                            .fg = .{ .basic = .yellow },
+                        });
                     },
                     .agent_error => |d| {
                         // v1.2.0 (QW4+5) — semantic red + inline
@@ -997,6 +1140,19 @@ fn runOneTurn(
                 };
                 if (n > 0) try decoder.feed(read_buf[0..n]);
                 while (try decoder.next()) |key| {
+                    if (modal.active) {
+                        // v1.11.2 — consume keys for the modal.
+                        // Unrecognized keys are dropped (no-op);
+                        // a/A/d/D/Esc resolve and clear the modal.
+                        if (modalKeyResolution(key)) |resolution| {
+                            const tool_name_owned = try allocator.dupe(u8, modal.tool_name);
+                            defer allocator.free(tool_name_owned);
+                            prompter.resolve(modal.call_id, resolution) catch {};
+                            try renderResolutionLine(allocator, scrollback, tool_name_owned, resolution);
+                            modal.clear(allocator);
+                        }
+                        continue;
+                    }
                     const outcome = editor.feedKey(key) catch continue;
                     switch (outcome) {
                         .none => {},
@@ -1379,6 +1535,11 @@ const SessionBinding = struct {
     /// Capability role + filtered ToolSet bound at session init.
     /// Stable address for the worker thread's `hook_userdata`.
     role_gate: role_mod.RoleGate = role_mod.RoleGate.init(.plan),
+    /// v1.11.0 — per-tool permission gate. Disabled by default;
+    /// `--prompts` opts in. Stable address (worker thread reads).
+    permission_store: permissions_mod.Store = undefined,
+    /// Combined gates struct passed as `hook_userdata`.
+    session_gates: permissions_mod.SessionGates = .{},
     system_prompt: []u8,
     transcript: agent.loop.Transcript,
     /// v1.6.0 — persistent branch tree. Mirrors print.zig's
@@ -1452,9 +1613,27 @@ const SessionBinding = struct {
             role_mod.Role.plan;
         binding.role_gate = role_mod.RoleGate.init(active_role);
         binding.tools = try role_mod.filterTools(binding.arena.allocator(), &all_tools, binding.role_gate.set);
+
+        binding.permission_store = permissions_mod.Store.init(allocator);
+        binding.permission_store.yes_to_all = cfg.yes;
+        if (cfg.allow_tools_csv) |s| try binding.permission_store.addAllowList(s);
+        if (cfg.deny_tools_csv) |s| try binding.permission_store.addDenyList(s);
+        if (cfg.ask_tools_csv) |s| try binding.permission_store.addAskList(s);
+        try permissions_mod.maybeAttachPersistence(
+            &binding.permission_store,
+            cfg.remember_permissions,
+            cfg.arena.allocator(),
+            io,
+            environ_map,
+        );
+        binding.session_gates = .{
+            .role = &binding.role_gate,
+            .permissions = if (cfg.prompts) &binding.permission_store else null,
+        };
         errdefer binding.registry.deinit();
         errdefer binding.faux.deinit();
         errdefer binding.arena.deinit();
+        errdefer binding.permission_store.deinit();
 
         binding.provider = try print_mode.resolveProvider(allocator, environ, cfg);
         try binding.registry.register(.{
@@ -1488,6 +1667,7 @@ const SessionBinding = struct {
         self.allocator.free(self.system_prompt);
         self.registry.deinit();
         self.faux.deinit();
+        self.permission_store.deinit();
         self.bash_state.deinit();
         self.arena.deinit();
     }
@@ -2517,4 +2697,61 @@ test "paintFrame: multi-line editor grows the editor region down" {
     try testing.expectEqual(@as(u21, '2'), buf.get(8, 6).codepoint);
     try testing.expectEqual(@as(u21, 'l'), buf.get(9, 2).codepoint);
     try testing.expectEqual(@as(u21, '3'), buf.get(9, 6).codepoint);
+}
+
+// ─── v1.11.2 — permission-prompt modal ────────────────────────────
+
+test "modalKeyResolution: a/A/d/D map to the four resolutions" {
+    try testing.expectEqual(permissions_mod.Resolution.allow_once, modalKeyResolution(.{ .char = .{ .cp = 'a' } }).?);
+    try testing.expectEqual(permissions_mod.Resolution.always_allow, modalKeyResolution(.{ .char = .{ .cp = 'A' } }).?);
+    try testing.expectEqual(permissions_mod.Resolution.deny_once, modalKeyResolution(.{ .char = .{ .cp = 'd' } }).?);
+    try testing.expectEqual(permissions_mod.Resolution.always_deny, modalKeyResolution(.{ .char = .{ .cp = 'D' } }).?);
+}
+
+test "modalKeyResolution: Esc resolves as deny_once (cancel = deny)" {
+    try testing.expectEqual(permissions_mod.Resolution.deny_once, modalKeyResolution(.escape).?);
+}
+
+test "modalKeyResolution: unrelated keys return null (no-op)" {
+    try testing.expect(modalKeyResolution(.enter) == null);
+    try testing.expect(modalKeyResolution(.{ .char = .{ .cp = 'x' } }) == null);
+    try testing.expect(modalKeyResolution(.up) == null);
+    try testing.expect(modalKeyResolution(.tab) == null);
+}
+
+test "ModalState.arm/clear: round-trip frees owned strings" {
+    const gpa = testing.allocator;
+    var m: ModalState = .{};
+    defer m.deinit(gpa);
+
+    try m.arm(gpa, "c1", "bash", "{\"command\":\"git status\"}", "git");
+    try testing.expect(m.active);
+    try testing.expectEqualStrings("c1", m.call_id);
+    try testing.expectEqualStrings("bash", m.tool_name);
+    try testing.expectEqualStrings("git", m.fingerprint);
+
+    m.clear(gpa);
+    try testing.expect(!m.active);
+    try testing.expectEqual(@as(usize, 0), m.call_id.len);
+}
+
+test "ModalState.arm: re-arming releases previous strings (no leak)" {
+    const gpa = testing.allocator;
+    var m: ModalState = .{};
+    defer m.deinit(gpa);
+
+    try m.arm(gpa, "c1", "bash", "{}", "git");
+    // Re-arm with a different call (e.g. previous resolve was lost
+    // and a fresh request landed). The first arm's strings must be
+    // freed by `arm` itself or the gpa's leak detector trips.
+    try m.arm(gpa, "c2", "write", "{\"path\":\"x\"}", "write");
+    try testing.expectEqualStrings("c2", m.call_id);
+    try testing.expectEqualStrings("write", m.tool_name);
+}
+
+test "argsPreviewSlice: short input returns whole, long input truncates" {
+    try testing.expectEqualStrings("{}", argsPreviewSlice("{}"));
+    const long = "x" ** 200;
+    const preview = argsPreviewSlice(long);
+    try testing.expectEqual(@as(usize, 160), preview.len);
 }

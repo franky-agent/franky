@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>franky</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <header>
+        <button id="sidebar-toggle" type="button" aria-label="Toggle sidebar" title="Toggle sidebar">☰</button>
+        <h1>franky</h1>
+        <span id="status" class="status status-idle">disconnected</span>
+        <span id="role-pill" class="role-pill role-pill-plan" title="capability role" aria-live="polite">role: …</span>
+        <span id="activity" class="activity activity-idle" aria-live="polite">
+            <span class="activity-dot"></span>
+            <span class="activity-label">idle</span>
+        </span>
+        <span id="status-line" class="status-line" aria-live="polite"></span>
+        <button id="help-toggle" type="button" aria-label="Show help" title="Help (?)">?</button>
+    </header>
+    <div id="help-overlay" class="help-overlay" role="dialog" aria-modal="true" aria-labelledby="help-title" hidden>
+        <div class="help-card">
+            <header class="help-header">
+                <h2 id="help-title">Keyboard &amp; commands</h2>
+                <button id="help-close" type="button" aria-label="Close help">×</button>
+            </header>
+            <section>
+                <h3>Composer</h3>
+                <ul class="help-keys">
+                    <li><kbd>Enter</kbd>Send message (or run slash command)</li>
+                    <li><kbd>Shift</kbd>+<kbd>Enter</kbd>Insert newline</li>
+                    <li><kbd>↑</kbd> / <kbd>↓</kbd>Cycle previous prompts (when input is empty)</li>
+                    <li><kbd>Esc</kbd>Reset history navigation / cancel completion</li>
+                    <li><kbd>/</kbd>Open the slash-command palette</li>
+                </ul>
+            </section>
+            <section>
+                <h3>Page</h3>
+                <ul class="help-keys">
+                    <li><kbd>?</kbd>Toggle this help overlay</li>
+                </ul>
+            </section>
+            <section>
+                <h3>Slash commands</h3>
+                <ul id="help-commands" class="help-cmds"></ul>
+            </section>
+        </div>
+    </div>
+    <div id="layout">
+        <aside id="sidebar" aria-label="Sessions">
+            <div class="sidebar-head">
+                <span class="sidebar-title">Conversations</span>
+                <button id="new-session" type="button" title="Start a new conversation">+ New</button>
+            </div>
+            <ul id="session-list" role="list"></ul>
+        </aside>
+        <div id="main-pane">
+            <main id="conversation" aria-live="polite"></main>
+            <div id="composer-wrap">
+                <ul id="cmd-palette" role="listbox" aria-label="Slash commands"></ul>
+                <form id="composer">
+                    <textarea
+                        id="input"
+                        placeholder="Type a message…  (Enter to send, Shift-Enter for newline, / for commands)"
+                        rows="2"
+                        autofocus
+                        spellcheck="false"
+                    ></textarea>
+                    <button type="submit" id="send">Send</button>
+                </form>
+            </div>
+        </div>
+    </div>
+    <script src="/app.js"></script>
+</body>
+</html>

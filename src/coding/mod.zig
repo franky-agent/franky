@@ -32,6 +32,7 @@ pub const object_store = @import("object_store.zig");
 pub const branching = @import("branching.zig");
 pub const compaction = @import("compaction.zig");
 pub const role = @import("role.zig");
+pub const permissions = @import("permissions.zig");
 pub const settings = @import("settings.zig");
 pub const auth = @import("auth.zig");
 pub const oauth = @import("oauth/mod.zig");
@@ -71,6 +72,7 @@ test {
     _ = branching;
     _ = compaction;
     _ = role;
+    _ = permissions;
     _ = settings;
     _ = auth;
     _ = oauth;
