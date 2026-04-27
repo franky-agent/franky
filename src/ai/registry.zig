@@ -52,6 +52,16 @@ pub const StreamOptions = struct {
     /// "bytes in the transcript match bytes on the wire" invariant).
     hooks: Hooks = .{},
 
+    /// v1.16.1 — opt-in HTTP trace directory. When non-null, every
+    /// successful provider fetch writes a `<unix_ms>-<seq>.txt`
+    /// file under this directory containing: provider tag, URL,
+    /// method, status, the full request body, and the **full
+    /// response body** (no truncation — large reasoning replies
+    /// are exactly the case this exists to debug). No-op when null.
+    /// Wire via `--http-trace-dir <path>`. Diagnostic only — should
+    /// not be left on for long-running workloads (disk pressure).
+    http_trace_dir: ?[]const u8 = null,
+
     pub const Header = struct { name: []const u8, value: []const u8 };
 
     pub const Hooks = struct {

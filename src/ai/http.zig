@@ -870,6 +870,98 @@ pub fn mapHttpError(e: anyerror) errors_mod.AgentError {
     };
 }
 
+// ─── v1.16.1 — opt-in HTTP trace files ─────────────────────────
+
+/// Process-global sequence counter so concurrent provider calls
+/// land in distinct files even when they fire in the same
+/// millisecond.
+var trace_seq: std.atomic.Value(u64) = .init(0);
+
+/// Write a full request/response trace file when `dir` is non-null.
+/// No-op when null. Best-effort: any IO error is swallowed (a trace
+/// failure must never break the live fetch path). Filename:
+/// `<unix_ms>-<seq>-<provider>.txt`.
+///
+/// File format (plain text, easy to grep / diff):
+///
+///     === franky http trace ===
+///     ts: <iso8601-ms>
+///     seq: <u64>
+///     provider: <tag>
+///     url: <full URL>
+///     method: <GET|POST|...>
+///     status: <code>
+///     request_body_bytes: <n>
+///     response_body_bytes: <n>
+///
+///     --- request body ---
+///     <full request body, verbatim>
+///
+///     --- response body ---
+///     <full response body, verbatim>
+///
+/// The response body is written **without truncation** — debugging
+/// a 5 MB reasoning reply is the use case this exists for. Caller
+/// keeps the trace dir on its toes (no rotation in this revision).
+pub fn writeTraceFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: ?[]const u8,
+    provider: []const u8,
+    url: []const u8,
+    method: []const u8,
+    status: u16,
+    request_body: []const u8,
+    response_body: []const u8,
+) void {
+    const trace_dir = dir orelse return;
+    const seq = trace_seq.fetchAdd(1, .monotonic);
+    const ts_ms = stream_mod.nowMillis();
+
+    // mkdir -p the trace dir. Anything other than "already exists"
+    // is a soft fail — give up on this trace silently.
+    std.Io.Dir.cwd().createDirPath(io, trace_dir) catch return;
+
+    const path = std.fmt.allocPrint(
+        allocator,
+        "{s}/{d}-{d:0>4}-{s}.txt",
+        .{ trace_dir, ts_ms, seq, provider },
+    ) catch return;
+    defer allocator.free(path);
+
+    var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch return;
+    defer file.close(io);
+
+    var buf: [256]u8 = undefined;
+    var w = file.writer(io, &buf);
+    const out = &w.interface;
+
+    const header = std.fmt.allocPrint(
+        allocator,
+        \\=== franky http trace ===
+        \\ts_ms: {d}
+        \\seq: {d}
+        \\provider: {s}
+        \\url: {s}
+        \\method: {s}
+        \\status: {d}
+        \\request_body_bytes: {d}
+        \\response_body_bytes: {d}
+        \\
+        \\--- request body ---
+        \\
+    ,
+        .{ ts_ms, seq, provider, url, method, status, request_body.len, response_body.len },
+    ) catch return;
+    defer allocator.free(header);
+
+    out.writeAll(header) catch return;
+    out.writeAll(request_body) catch return;
+    out.writeAll("\n\n--- response body ---\n") catch return;
+    out.writeAll(response_body) catch return;
+    out.flush() catch return;
+}
+
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1284,4 +1376,100 @@ test "fetchPhased: PhaseTag.label returns canonical phase names" {
     try testing.expectEqualStrings("connect", PhaseTag.connect.label());
     try testing.expectEqualStrings("upload", PhaseTag.upload.label());
     try testing.expectEqualStrings("first_byte", PhaseTag.first_byte.label());
+}
+
+// ─── v1.16.1 — writeTraceFile tests ────────────────────────────
+
+test "writeTraceFile: null dir is a no-op" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    // Just verify it doesn't crash and doesn't error.
+    writeTraceFile(testing.allocator, io, null, "x", "http://x", "POST", 200, "req", "resp");
+}
+
+test "writeTraceFile: writes a file with header + bodies, mkdir-p semantics" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    // Use a unique dir under /tmp so the trace files don't collide
+    // with anything else (and we can clean up afterwards).
+    const ts = stream_mod.nowMillis();
+    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/franky-trace-test-{d}/nested", .{ts});
+    defer gpa.free(dir_path);
+    defer std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+
+    writeTraceFile(
+        gpa,
+        io,
+        dir_path,
+        "anthropic",
+        "https://api.anthropic.com/v1/messages",
+        "POST",
+        200,
+        "{\"hello\":\"req\"}",
+        "data: {\"hello\":\"resp\"}\n\n",
+    );
+
+    // Read the directory and find the one file we wrote.
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |e| {
+        std.debug.print("openDir failed: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    const entry = (try it.next(io)) orelse return error.NoTraceFileWritten;
+    try testing.expect(std.mem.endsWith(u8, entry.name, "-anthropic.txt"));
+
+    // Read the file back and check the structure.
+    var f = try dir.openFile(io, entry.name, .{});
+    defer f.close(io);
+    var read_buf: std.ArrayList(u8) = .empty;
+    defer read_buf.deinit(gpa);
+    var rb: [1024]u8 = undefined;
+    var r = f.reader(io, &rb);
+    var rbuf: [1024]u8 = undefined;
+    while (true) {
+        var vecs: [1][]u8 = .{&rbuf};
+        const n = r.interface.readVec(&vecs) catch break;
+        if (n == 0) break;
+        try read_buf.appendSlice(gpa, rbuf[0..n]);
+    }
+    const contents = read_buf.items;
+    try testing.expect(std.mem.indexOf(u8, contents, "=== franky http trace ===") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "provider: anthropic") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "url: https://api.anthropic.com/v1/messages") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "method: POST") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "status: 200") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "{\"hello\":\"req\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "{\"hello\":\"resp\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "--- request body ---") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "--- response body ---") != null);
+}
+
+test "writeTraceFile: monotonic seq across concurrent calls in same ms" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const ts = stream_mod.nowMillis();
+    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/franky-trace-seq-{d}", .{ts});
+    defer gpa.free(dir_path);
+    defer std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        writeTraceFile(gpa, io, dir_path, "test", "http://x", "GET", 200, "req", "resp");
+    }
+
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    var count: usize = 0;
+    while (try it.next(io)) |_| count += 1;
+    try testing.expectEqual(@as(usize, 5), count);
 }

@@ -30,6 +30,7 @@ const registry_mod = @import("../registry.zig");
 const sse_mod = @import("../sse.zig");
 const http_mod = @import("../http.zig");
 const log = @import("../log.zig");
+const utils = @import("../utils.zig");
 
 const Channel = channel_mod.Channel(stream_mod.StreamEvent);
 
@@ -208,8 +209,16 @@ fn appendAssistantMessage(
             try buf.appendSlice(allocator, ",\"arguments\":");
             // `arguments` must be a string in Chat Completions even
             // though it's JSON underneath. Escape as a string.
-            const json_args = if (tc.arguments_json.len == 0) "{}" else tc.arguments_json;
-            try appendJsonStr(buf, allocator, json_args);
+            //
+            // v1.16.2 — sanitize first: strict openai-compat gateways
+            // (Cloudflare Workers AI) reparse the inner string as
+            // JSON, so a model that emitted an invalid escape (e.g.
+            // `\c`) would 400 the next request. `sanitizeJsonString`
+            // doubles malformed backslashes so the inner JSON parses.
+            const raw_args = if (tc.arguments_json.len == 0) "{}" else tc.arguments_json;
+            const safe_args = try utils.sanitizeJsonString(allocator, raw_args);
+            defer allocator.free(safe_args);
+            try appendJsonStr(buf, allocator, safe_args);
             try buf.appendSlice(allocator, "}}");
         }
         try buf.append(allocator, ']');
@@ -554,6 +563,17 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 
     const response_body = bw.written();
     log.log(.debug, "http", "response", "status={d} body_bytes={d}", .{ @intFromEnum(result.status), response_body.len });
+    http_mod.writeTraceFile(
+        ctx.allocator,
+        ctx.io,
+        ctx.options.http_trace_dir,
+        if (is_gateway) "openai-gateway" else "openai-chat",
+        endpoint,
+        "POST",
+        @intFromEnum(result.status),
+        body,
+        response_body,
+    );
 
     if (@intFromEnum(result.status) >= 400) {
         try ctx.out.push(ctx.io, .start);

@@ -357,6 +357,7 @@ fn runPrint(
             .hook_userdata = @ptrCast(&session_gates),
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
+            .text_tool_call_fallback = cfg.text_tool_call_fallback,
             .stream_options = .{
                 .api_key = provider_info.api_key,
                 .auth_token = provider_info.auth_token,
@@ -364,6 +365,7 @@ fn runPrint(
                 .environ_map = environ_map,
                 .thinking = cfg.thinking,
                 .timeouts = resolveTimeoutsFromMap(cfg, environ_map),
+                .http_trace_dir = resolveHttpTraceDirFromMap(cfg, environ_map),
             },
         },
         .ch = &ch,
@@ -527,6 +529,17 @@ pub fn resolveLogFileFromMap(
 ) ?[]const u8 {
     if (cfg.log_file) |p| if (p.len > 0) return p;
     if (environ_map.get("FRANKY_LOG_FILE")) |p| if (p.len > 0) return p;
+    return null;
+}
+
+/// v1.16.1 — resolve `--http-trace-dir`.
+/// Precedence: CLI flag → `FRANKY_HTTP_TRACE_DIR` env var → null.
+pub fn resolveHttpTraceDirFromMap(
+    cfg: *const cli_mod.Config,
+    environ_map: *const std.process.Environ.Map,
+) ?[]const u8 {
+    if (cfg.http_trace_dir) |p| if (p.len > 0) return p;
+    if (environ_map.get("FRANKY_HTTP_TRACE_DIR")) |p| if (p.len > 0) return p;
     return null;
 }
 

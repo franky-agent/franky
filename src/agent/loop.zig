@@ -183,6 +183,16 @@ pub const Config = struct {
     stream_options: ai.registry.StreamOptions = .{},
     /// Hard cap on turn count — guards against infinite loops.
     max_turns: u32 = 50,
+    /// v1.16.3 — when true, if the assistant ends a turn with text
+    /// content that parses as a recognized tool-call shape (e.g.
+    /// `{"name": "X", "parameters": {...}}` or `{"type": "function",
+    /// ...}`) and no structured `tool_calls[]` ever fired, synthesize
+    /// a tool_call from the parsed object. Off by default — heuristic,
+    /// risky for models that legitimately emit JSON as their text
+    /// reply. Required for some gateway/model combos (Cloudflare's
+    /// openai-compat shim with Llama, Cloudflare native endpoint with
+    /// any model) where tool-call output isn't structurally translated.
+    text_tool_call_fallback: bool = false,
 };
 
 /// Transcript owned by the loop.
@@ -344,11 +354,23 @@ fn runTurn(
         return false;
     }
 
-    const assistant_msg = try reducer.finalize(
+    var assistant_msg = try reducer.finalize(
         config.model.provider,
         config.model.id,
         config.model.api,
     );
+    // v1.16.3 — text-tool-call fallback: some gateway/model combos
+    // (Cloudflare's openai-compat shim with Llama, the native CF
+    // endpoint with any model) deliver tool calls as text content
+    // rather than structured `tool_calls[]`. When the user opts in,
+    // we attempt to parse the text as a recognized tool-call shape
+    // and rewrite the message in-place before broadcasting it, so
+    // both the UI and the transcript see a normal tool_call event.
+    if (config.text_tool_call_fallback) {
+        maybeApplyTextToolCallFallback(allocator, &assistant_msg, config.tools) catch |e| {
+            ai.log.log(.debug, "loop", "text_tool_fallback_failed", "err={s}", .{@errorName(e)});
+        };
+    }
     // Push a duplicate into the event and keep the original for transcript.
     try out.push(io, .{ .message_end = try dupeMessage(allocator, assistant_msg) });
     if (ai.log.enabled(.trace)) logMessageTrace("recv", 0, assistant_msg);
@@ -442,7 +464,20 @@ fn runTurn(
             config.cancel,
             on_update,
         ) catch |e| blk: {
-            break :blk try makeErrorResult(allocator, @errorName(e));
+            // v1.16.3 — until v1.16.3 the model received bare error
+            // tags like "SyntaxError" with no context. Now it gets
+            // the tool name, the error tag, a hint about the most
+            // common cause (JSON parse), and the first ~200 bytes of
+            // the args it sent — enough signal to retry with a
+            // corrected call.
+            const detail = formatToolExecutionError(
+                allocator,
+                tool_def.name,
+                e,
+                tc.arguments_json,
+            ) catch try allocator.dupe(u8, @errorName(e));
+            defer allocator.free(detail);
+            break :blk try makeErrorResult(allocator, detail);
         };
 
         if (config.after_tool_call) |hook| {
@@ -732,6 +767,215 @@ fn makeErrorResult(allocator: std.mem.Allocator, text: []const u8) !at.ToolResul
     return .{ .content = arr, .is_error = true };
 }
 
+/// v1.16.3 — render a model-facing message for an exception that
+/// escaped from a tool's `execute()`. Until v1.16.3 the agent loop
+/// just sent the bare Zig error name (e.g. `"SyntaxError"`) as the
+/// tool result content. The model couldn't tell *what* went wrong
+/// or *why*, so it had no signal to retry with corrected args.
+///
+/// The new message includes:
+/// - the tool name (so the model knows which call failed),
+/// - the error tag (`@errorName`),
+/// - a best-guess hint for the most common cause (JSON parse),
+/// - the first ~200 bytes of the args the model sent, so it can
+///   see what got rejected and self-correct.
+///
+/// Owned slice; caller frees.
+fn formatToolExecutionError(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    err: anyerror,
+    args_json: []const u8,
+) ![]u8 {
+    const err_name = @errorName(err);
+    const hint = if (looksLikeJsonError(err_name))
+        "Tool arguments must be a single valid JSON object matching the tool's parameters schema. Re-emit the call with valid JSON."
+    else
+        "The tool failed unexpectedly. Re-check the arguments and try again, or pick a different approach.";
+
+    const max_preview: usize = 200;
+    const preview = if (args_json.len <= max_preview) args_json else args_json[0..max_preview];
+    const ellipsis = if (args_json.len > max_preview) "...(truncated)" else "";
+
+    return std.fmt.allocPrint(
+        allocator,
+        "Tool '{s}' failed: {s}. {s} Args sent (first {d} bytes): {s}{s}",
+        .{ tool_name, err_name, hint, preview.len, preview, ellipsis },
+    );
+}
+
+/// Heuristic: is this error name from `std.json`'s parser?
+/// Substring-free: an exact-match table because std.json's error
+/// surface is small and the variants are known. Adding a future
+/// `error.SomethingNew` to std.json doesn't break us — it just
+/// gets the generic non-JSON hint, which is still a strict
+/// improvement over the pre-v1.16.3 bare-error-name behavior.
+fn looksLikeJsonError(name: []const u8) bool {
+    const json_markers = [_][]const u8{
+        "SyntaxError",         "UnexpectedToken",
+        "UnexpectedEndOfInput", "InvalidNumber",
+        "InvalidEscape",       "InvalidString",
+        "InvalidCharacter",    "DuplicateField",
+        "MissingField",
+    };
+    for (json_markers) |m| {
+        if (std.mem.eql(u8, name, m)) return true;
+    }
+    return false;
+}
+
+// ─── v1.16.3 — text-tool-call fallback ────────────────────────
+
+/// Process-global counter so synthesized tool-call ids are unique
+/// across concurrent turns.
+var synth_tool_id_seq: std.atomic.Value(u64) = .init(0);
+
+/// Inspect `msg`. If it carries text content that parses as a
+/// recognized tool-call shape AND the named tool is in `tools`,
+/// rewrite the matching text block into a `tool_call` block in
+/// place. Idempotent on messages that already have a tool_call.
+fn maybeApplyTextToolCallFallback(
+    allocator: std.mem.Allocator,
+    msg: *AgentMessage,
+    tools: []const at.AgentTool,
+) !void {
+    // Skip if the message already has a tool_call.
+    for (msg.content) |cb| switch (cb) {
+        .tool_call => return,
+        else => {},
+    };
+
+    // Find the first text block.
+    var text_idx: ?usize = null;
+    for (msg.content, 0..) |cb, i| switch (cb) {
+        .text => {
+            text_idx = i;
+            break;
+        },
+        else => {},
+    };
+    if (text_idx == null) return;
+
+    const text = msg.content[text_idx.?].text.text;
+
+    // Try to extract a tool-call from the text.
+    const extracted = (try extractTextToolCall(allocator, text, tools)) orelse return;
+
+    // Replace the text block with a tool_call block. Free the old
+    // text bytes; ownership of `extracted.name` / `extracted.args`
+    // transfers to the new ToolCall.
+    allocator.free(text);
+
+    const seq = synth_tool_id_seq.fetchAdd(1, .monotonic);
+    const id = try std.fmt.allocPrint(allocator, "txtcall_{x:0>8}", .{seq});
+
+    msg.content[text_idx.?] = .{ .tool_call = .{
+        .id = id,
+        .name = extracted.name,
+        .arguments_json = extracted.args,
+    } };
+
+    ai.log.log(.debug, "loop", "text_tool_fallback_hit", "name={s} args_bytes={d}", .{
+        extracted.name,
+        extracted.args.len,
+    });
+}
+
+const ExtractedToolCall = struct {
+    name: []u8,
+    args: []u8,
+};
+
+/// Recognized tool-call text shapes:
+///   1. `{"type": "function", "name": "X", "parameters": {...}}`
+///   2. `{"name": "X", "parameters": {...}}`
+///   3. `{"name": "X", "arguments": {...}}` (object)
+///   4. `{"name": "X", "arguments": "..."}` (string-encoded JSON, OpenAI)
+///   5. Any of the above wrapped in `<tool_call>...</tool_call>` or
+///      `<|python_tag|>...`.
+///
+/// Returns null when:
+///   - the text doesn't contain a JSON object,
+///   - the JSON parses but `name` is missing or not a string,
+///   - the named tool isn't in `tools`,
+///   - neither `parameters` nor `arguments` is present.
+fn extractTextToolCall(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    tools: []const at.AgentTool,
+) !?ExtractedToolCall {
+    const inner = stripToolCallWrappers(text);
+    const trimmed = std.mem.trim(u8, inner, " \t\n\r");
+    if (trimmed.len == 0 or trimmed[0] != '{') return null;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        trimmed,
+        .{},
+    ) catch return null;
+    if (parsed.value != .object) return null;
+    const root = parsed.value.object;
+
+    const name_val = root.get("name") orelse return null;
+    if (name_val != .string) return null;
+    const name = name_val.string;
+
+    // Validate name against tool registry.
+    var matched = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name, name)) {
+            matched = true;
+            break;
+        }
+    }
+    if (!matched) return null;
+
+    // Args: prefer `parameters` (CF/Llama style), fall back to
+    // `arguments` (OpenAI-string-style or legacy object).
+    const args: []u8 = if (root.get("parameters")) |p|
+        try std.json.Stringify.valueAlloc(allocator, p, .{})
+    else if (root.get("arguments")) |a|
+        if (a == .string)
+            try allocator.dupe(u8, a.string)
+        else
+            try std.json.Stringify.valueAlloc(allocator, a, .{})
+    else
+        return null;
+    errdefer allocator.free(args);
+    const owned_name = try allocator.dupe(u8, name);
+
+    return .{ .name = owned_name, .args = args };
+}
+
+/// Strip leading `<tool_call>` / trailing `</tool_call>` and a
+/// leading `<|python_tag|>` if present. Returns a sub-slice of
+/// `text`; never allocates.
+fn stripToolCallWrappers(text: []const u8) []const u8 {
+    var s = text;
+    s = std.mem.trim(u8, s, " \t\n\r");
+
+    const py_tag = "<|python_tag|>";
+    if (std.mem.startsWith(u8, s, py_tag)) {
+        s = s[py_tag.len..];
+        s = std.mem.trim(u8, s, " \t\n\r");
+    }
+
+    const open = "<tool_call>";
+    const close = "</tool_call>";
+    if (std.mem.startsWith(u8, s, open)) {
+        s = s[open.len..];
+        if (std.mem.endsWith(u8, s, close)) {
+            s = s[0 .. s.len - close.len];
+        }
+        s = std.mem.trim(u8, s, " \t\n\r");
+    }
+
+    return s;
+}
+
 fn makeRoleDeniedResult(
     allocator: std.mem.Allocator,
     tool_name: []const u8,
@@ -912,4 +1156,232 @@ test "defaultConvertToLlm: unknown .custom role is filtered out" {
     }
     try testing.expectEqual(@as(usize, 1), out.len);
     try testing.expectEqualStrings("kept", out[0].content[0].text.text);
+}
+
+// ─── v1.16.3 — formatToolExecutionError tests ─────────────────────
+
+test "formatToolExecutionError: JSON-parse error includes hint + args preview" {
+    const gpa = testing.allocator;
+    const args = "{\"path\": \"foo.zig\", \"new\": <|broken|>}";
+    const msg = try formatToolExecutionError(gpa, "edit", error.SyntaxError, args);
+    defer gpa.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "Tool 'edit' failed") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "SyntaxError") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "JSON object") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "<|broken|>") != null);
+}
+
+test "formatToolExecutionError: non-JSON error gets generic hint" {
+    const gpa = testing.allocator;
+    const msg = try formatToolExecutionError(gpa, "bash", error.AccessDenied, "{\"command\":\"ls\"}");
+    defer gpa.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "Tool 'bash' failed") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "AccessDenied") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "different approach") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "JSON object") == null);
+}
+
+test "formatToolExecutionError: long args get truncated with ellipsis" {
+    const gpa = testing.allocator;
+    var long_args: [400]u8 = undefined;
+    @memset(&long_args, 'x');
+    const msg = try formatToolExecutionError(gpa, "write", error.SyntaxError, &long_args);
+    defer gpa.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "(truncated)") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "first 200 bytes") != null);
+}
+
+test "looksLikeJsonError: matches std.json error tags" {
+    try testing.expect(looksLikeJsonError("SyntaxError"));
+    try testing.expect(looksLikeJsonError("UnexpectedToken"));
+    try testing.expect(looksLikeJsonError("InvalidEscape"));
+    try testing.expect(looksLikeJsonError("MissingField"));
+    try testing.expect(!looksLikeJsonError("AccessDenied"));
+    try testing.expect(!looksLikeJsonError("OutOfMemory"));
+    try testing.expect(!looksLikeJsonError("FileNotFound"));
+}
+
+// ─── v1.16.3 — text-tool-call fallback tests ──────────────────
+
+fn fakeToolForTest(comptime name: []const u8) at.AgentTool {
+    const Stub = struct {
+        fn execute(
+            _: *const at.AgentTool,
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: []const u8,
+            _: []const u8,
+            _: *ai.stream.Cancel,
+            _: at.OnUpdate,
+        ) anyerror!at.ToolResult {
+            return error.Unsupported;
+        }
+    };
+    return .{
+        .name = name,
+        .description = "test",
+        .parameters_json = "{}",
+        .execute = Stub.execute,
+    };
+}
+
+test "extractTextToolCall: cloudflare-style {type, name, parameters}" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const text =
+        \\{"type": "function", "name": "read", "parameters": {"path": "code-analyse.md"}}
+    ;
+    const result = try extractTextToolCall(gpa, text, &tools);
+    try testing.expect(result != null);
+    defer gpa.free(result.?.name);
+    defer gpa.free(result.?.args);
+    try testing.expectEqualStrings("read", result.?.name);
+    try testing.expect(std.mem.indexOf(u8, result.?.args, "code-analyse.md") != null);
+}
+
+test "extractTextToolCall: llama-style {name, parameters}" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const text =
+        \\{"name": "read", "parameters": {"path": "foo.zig"}}
+    ;
+    const result = try extractTextToolCall(gpa, text, &tools);
+    try testing.expect(result != null);
+    defer gpa.free(result.?.name);
+    defer gpa.free(result.?.args);
+    try testing.expectEqualStrings("read", result.?.name);
+}
+
+test "extractTextToolCall: openai-style {name, arguments-as-string}" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const text =
+        \\{"name": "read", "arguments": "{\"path\":\"x.zig\"}"}
+    ;
+    const result = try extractTextToolCall(gpa, text, &tools);
+    try testing.expect(result != null);
+    defer gpa.free(result.?.name);
+    defer gpa.free(result.?.args);
+    try testing.expectEqualStrings("{\"path\":\"x.zig\"}", result.?.args);
+}
+
+test "extractTextToolCall: <tool_call> wrapper is stripped" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const text =
+        \\<tool_call>{"name": "read", "parameters": {"path": "x"}}</tool_call>
+    ;
+    const result = try extractTextToolCall(gpa, text, &tools);
+    try testing.expect(result != null);
+    defer gpa.free(result.?.name);
+    defer gpa.free(result.?.args);
+    try testing.expectEqualStrings("read", result.?.name);
+}
+
+test "extractTextToolCall: <|python_tag|> wrapper is stripped" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const text =
+        \\<|python_tag|>{"name": "read", "parameters": {"path": "x"}}
+    ;
+    const result = try extractTextToolCall(gpa, text, &tools);
+    try testing.expect(result != null);
+    defer gpa.free(result.?.name);
+    defer gpa.free(result.?.args);
+    try testing.expectEqualStrings("read", result.?.name);
+}
+
+test "extractTextToolCall: name not in registry → null" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const text =
+        \\{"name": "delete_universe", "parameters": {"why_not": "yolo"}}
+    ;
+    const result = try extractTextToolCall(gpa, text, &tools);
+    try testing.expect(result == null);
+}
+
+test "extractTextToolCall: plain text reply (not JSON) → null" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const result = try extractTextToolCall(gpa, "Sure, I'll help with that.", &tools);
+    try testing.expect(result == null);
+}
+
+test "extractTextToolCall: JSON without name → null" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const text = "{\"hello\": \"world\"}";
+    const result = try extractTextToolCall(gpa, text, &tools);
+    try testing.expect(result == null);
+}
+
+test "extractTextToolCall: malformed JSON → null (doesn't throw)" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const text = "{\"name\": \"read\", broken}";
+    const result = try extractTextToolCall(gpa, text, &tools);
+    try testing.expect(result == null);
+}
+
+test "stripToolCallWrappers: handles wrapper variants" {
+    try testing.expectEqualStrings("{}", stripToolCallWrappers("{}"));
+    try testing.expectEqualStrings("{}", stripToolCallWrappers("  {}  "));
+    try testing.expectEqualStrings("{}", stripToolCallWrappers("<|python_tag|>{}"));
+    try testing.expectEqualStrings("{}", stripToolCallWrappers("<tool_call>{}</tool_call>"));
+    try testing.expectEqualStrings(
+        "{}",
+        stripToolCallWrappers("<|python_tag|><tool_call>{}</tool_call>"),
+    );
+}
+
+test "maybeApplyTextToolCallFallback: rewrites text → tool_call" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+
+    // Build a message with a single text block that holds a CF-style
+    // text-shaped tool call.
+    const text_payload = try gpa.dupe(
+        u8,
+        "{\"type\": \"function\", \"name\": \"read\", \"parameters\": {\"path\": \"x.zig\"}}",
+    );
+    var content_blocks = try gpa.alloc(ai.types.ContentBlock, 1);
+    content_blocks[0] = .{ .text = .{ .text = text_payload } };
+
+    var msg = AgentMessage{
+        .role = .assistant,
+        .content = content_blocks,
+        .timestamp = 0,
+    };
+    defer msg.deinit(gpa);
+
+    try maybeApplyTextToolCallFallback(gpa, &msg, &tools);
+
+    // Now the block at index 0 should be a tool_call, not text.
+    try testing.expect(msg.content[0] == .tool_call);
+    try testing.expectEqualStrings("read", msg.content[0].tool_call.name);
+    try testing.expect(std.mem.indexOf(u8, msg.content[0].tool_call.arguments_json, "x.zig") != null);
+    try testing.expect(std.mem.startsWith(u8, msg.content[0].tool_call.id, "txtcall_"));
+}
+
+test "maybeApplyTextToolCallFallback: leaves message untouched when no match" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+
+    const text_payload = try gpa.dupe(u8, "Sure, I'll think about it.");
+    var content_blocks = try gpa.alloc(ai.types.ContentBlock, 1);
+    content_blocks[0] = .{ .text = .{ .text = text_payload } };
+
+    var msg = AgentMessage{
+        .role = .assistant,
+        .content = content_blocks,
+        .timestamp = 0,
+    };
+    defer msg.deinit(gpa);
+
+    try maybeApplyTextToolCallFallback(gpa, &msg, &tools);
+
+    // Still text — fallback didn't touch it.
+    try testing.expect(msg.content[0] == .text);
+    try testing.expectEqualStrings("Sure, I'll think about it.", msg.content[0].text.text);
 }

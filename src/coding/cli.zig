@@ -56,6 +56,22 @@ pub const Config = struct {
     /// stderr would otherwise garble the TUI on the same TTY.
     /// Env fallback: `FRANKY_LOG_FILE`.
     log_file: ?[]const u8 = null,
+    /// `--http-trace-dir <path>` (v1.16.1). When set, every
+    /// successful provider HTTP fetch writes a full request +
+    /// response trace file into this directory, named
+    /// `<unix_ms>-<seq>-<provider>.txt`. Diagnostic only; leaves
+    /// no rotation or size cap so don't leave on for long runs.
+    /// Env fallback: `FRANKY_HTTP_TRACE_DIR`.
+    http_trace_dir: ?[]const u8 = null,
+    /// `--text-tool-call-fallback` (v1.16.3). When the assistant
+    /// ends a turn with text content that parses as a recognized
+    /// tool-call shape (e.g. `{"name": "X", "parameters": {...}}`)
+    /// and no structured `tool_calls[]` ever fired, synthesize a
+    /// tool_call from the parsed object. Off by default — heuristic,
+    /// risky for models that legitimately emit JSON as text reply.
+    /// Required for some gateway/model combos (Cloudflare's
+    /// openai-compat shim with Llama, native CF endpoint).
+    text_tool_call_fallback: bool = false,
     session_id: ?[]const u8 = null,
     session_dir: ?[]const u8 = null,
     resume_id: ?[]const u8 = null,
@@ -277,6 +293,10 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.log_level = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--log-file")) {
             cfg.log_file = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--http-trace-dir")) {
+            cfg.http_trace_dir = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--text-tool-call-fallback")) {
+            cfg.text_tool_call_fallback = true;
         } else if (std.mem.eql(u8, name, "--session")) {
             cfg.session_id = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--session-dir")) {
@@ -388,6 +408,14 @@ pub const usage_text: []const u8 =
     \\  --log-file PATH              Route logs to PATH instead of stderr (essential
     \\                               when pairing --mode interactive with verbose levels;
     \\                               env: FRANKY_LOG_FILE)
+    \\  --http-trace-dir DIR         Diagnostic: dump full request + response of every
+    \\                               provider HTTP fetch into <DIR>/<unix_ms>-<seq>-<provider>.txt.
+    \\                               Diagnostic only; no rotation or size cap.
+    \\                               env: FRANKY_HTTP_TRACE_DIR
+    \\  --text-tool-call-fallback    Parse assistant text as a tool call when the gateway
+    \\                               returns tool calls in content instead of structured
+    \\                               tool_calls[] (e.g. Cloudflare openai-compat with Llama,
+    \\                               native CF /run endpoint). Heuristic, opt-in.
     \\  --session ID                 Use a specific session id
     \\  --session-dir DIR            Parent dir (default: $FRANKY_HOME/sessions or ~/.franky/sessions)
     \\  --resume ID                  Resume a prior session (implies --session)

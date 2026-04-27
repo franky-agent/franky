@@ -48,3 +48,4 @@ test "toolError: renders [code] msg + sets tool_code + is_error=true" {
         res.content[0].text.text,
     );
 }
+

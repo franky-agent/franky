@@ -424,6 +424,17 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     };
 
     const response_body = bw.written();
+    http_mod.writeTraceFile(
+        ctx.allocator,
+        ctx.io,
+        ctx.options.http_trace_dir,
+        "google-gemini",
+        endpoint,
+        "POST",
+        @intFromEnum(result.status),
+        body,
+        response_body,
+    );
     if (@intFromEnum(result.status) >= 400) {
         try ctx.out.push(ctx.io, .start);
         const details = try @import("../error_map.zig").mapError(

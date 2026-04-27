@@ -7,6 +7,283 @@ versions correspond to the roadmap milestones in `franky-spec-v1.md`
 `franky-spec-v0.md` under "Port implementation log" and the v0.\*
 roadmap section — this file starts from v1.x.
 
+## [1.16.3] — 2026-04-27 — defensive features for sloppy gateways/models
+
+Two related improvements driven by the Cloudflare Workers AI debug
+session: a model that emits malformed tool args now gets a useful
+error back instead of `"SyntaxError"`, and a gateway that delivers
+tool calls as text (instead of structured `tool_calls[]`) can be
+flagged to extract them anyway. Both changes are universal — they
+help any provider/model combo with the same shape of bug.
+
+### What shipped — better tool error messages
+
+Until v1.16.3 the agent loop's tool-execution catch site
+(`loop.zig:445`) sent the bare Zig error name (e.g.
+`"SyntaxError"`) as the tool result content. The model couldn't
+tell *which* tool failed, *why*, or *what* it had sent — so it
+had no signal to retry with corrected args.
+
+`formatToolExecutionError` now produces a model-facing message
+that includes:
+
+- The tool name (so the model knows which call failed).
+- The error tag.
+- A best-guess hint: for JSON-parse-shaped errors,
+  *"Tool arguments must be a single valid JSON object…"*; for
+  everything else, a generic *"re-check the args, try a
+  different approach"*.
+- The first ~200 bytes of the args the model sent, so it can see
+  what got rejected and self-correct.
+
+Heuristic detection of JSON parse errors via an exact-match table
+(`SyntaxError`, `UnexpectedToken`, `InvalidEscape`, `MissingField`,
+…). New std.json variants in future Zig releases fall through to
+the generic hint, which is still strictly better than the bare
+error name.
+
+### What shipped — `--text-tool-call-fallback`
+
+When opted-in via `--text-tool-call-fallback`, the agent loop
+inspects each assistant turn's content. If:
+
+1. The message has no structured `tool_call` blocks, AND
+2. The accumulated text content parses as a recognized tool-call
+   JSON shape, AND
+3. The named tool exists in the active tool registry,
+
+then franky **rewrites the message in place**: the text block
+becomes a `tool_call` block with a synthetic `txtcall_<n>` id,
+the parsed `parameters` (or `arguments`) become the args, and
+the existing tool-execution loop runs the call as if it had
+arrived structured.
+
+Recognized shapes:
+
+| Shape | Source |
+|---|---|
+| `{"type": "function", "name": "X", "parameters": {...}}` | Cloudflare native `/run` endpoint |
+| `{"name": "X", "parameters": {...}}` | Llama variants on Cloudflare openai-compat |
+| `{"name": "X", "arguments": {...}}` | Some model variants |
+| `{"name": "X", "arguments": "..."}` (string-encoded JSON) | OpenAI-shaped, rare |
+| `<tool_call>{...}</tool_call>` wrapping any of the above | Llama-3 chat template |
+| `<|python_tag|>{...}` wrapping any of the above | Llama-3.x raw |
+
+Validation gates:
+
+- Name must match a registered tool — otherwise it's just JSON
+  as text and we don't molest it.
+- Malformed JSON returns null silently (logged at debug level).
+- Already-structured messages are skipped (idempotent on
+  successful turns).
+
+Off by default. Risky for models that legitimately emit JSON as
+text reply, so the user opts in per session. Future v1.17.0
+profile system will let presets enable it on a per-provider
+basis (e.g. `cloudflare-llama`).
+
+### Defense in depth — the new layered story
+
+Today the franky → strict-gateway → small-model path looks like:
+
+1. `--http-trace-dir` (v1.16.1) — see exactly what's going over the wire.
+2. `sanitizeJsonString` (v1.16.2) — repair malformed JSON escapes (`\c` → `\\c`) on outgoing tool args.
+3. **`formatToolExecutionError` (v1.16.3)** — when a tool fails, give the model enough info to self-correct on retry.
+4. **`--text-tool-call-fallback` (v1.16.3)** — when the gateway delivers tool calls as text, extract them anyway.
+
+Together these unlock Cloudflare Workers AI for tool-heavy work:
+- Gemma + simple tools → works clean (structural shape was always right).
+- Gemma + complex tools → still fails (model-capability ceiling) but now with actionable error feedback.
+- Llama on Cloudflare openai-compat → works with `--text-tool-call-fallback`.
+- Native Cloudflare `/run` endpoint → would work with the same fallback (provider not yet implemented).
+
+### Architecture
+
+- `formatToolExecutionError` + `looksLikeJsonError` live in
+  `agent/loop.zig` (private). The agent layer can't import from
+  `coding/`, so the helper sits alongside the catch site that
+  uses it.
+- `maybeApplyTextToolCallFallback` runs in `runTurn` between
+  `reducer.finalize()` and the `message_end` event push. This
+  ordering means the broadcast event AND the persisted transcript
+  AND the in-memory state all see the rewritten tool_call shape —
+  no UI confusion from "JSON-as-text rendered then tool also ran."
+- `extractTextToolCall` keeps the recognized-shape table small
+  and explicit. Adding a new model's quirky tool-call format is
+  ~5 LOC plus a fixture test.
+- Synthetic ids are `txtcall_<hex>` from a process-global atomic
+  counter, so concurrent turns produce distinct ids.
+
+### Tests (+12 → 833)
+
+- `formatToolExecutionError` × 4 (JSON hint, generic hint,
+  truncation, error-name table coverage)
+- `looksLikeJsonError` table membership
+- `extractTextToolCall` × 7 (Cloudflare style, Llama style,
+  OpenAI string args, `<tool_call>` wrapper, `<|python_tag|>`
+  wrapper, name-not-in-registry, plain-text-non-JSON,
+  malformed-JSON, JSON-without-name)
+- `stripToolCallWrappers` covering each variant in isolation
+- `maybeApplyTextToolCallFallback` × 2 (rewrites a matching
+  message; leaves a non-matching plain-text message alone)
+
+### Files changed
+
+- `src/agent/loop.zig` (~+200 prod + tests).
+- `src/coding/cli.zig` (`text_tool_call_fallback` field, flag
+  parser, help text).
+- `src/coding/modes/{print,interactive,rpc,proxy}.zig` (one
+  `text_tool_call_fallback` field per loop.Config site).
+- `build.zig.zon` (1.16.2 → 1.16.3).
+
+## [1.16.2] — 2026-04-27 — sanitize tool_call arguments for strict gateways
+
+A real Cloudflare Workers AI debug session — caught instantly by
+the v1.16.1 `--http-trace-dir` flag — surfaced this: smaller
+open-source models (Gemma in this case) emit invalid JSON in
+their `tool_call.arguments` strings. Most commonly a stray `\c`
+sequence the model meant as a literal backslash before code. The
+trace file showed Cloudflare returning `400 "Invalid \\escape: line
+1 column 23 (char 22)"` — its strict openai-compat layer reparses
+the inner `arguments` string as JSON, which OpenAI proper and
+Anthropic don't.
+
+Franky now sanitizes the `arguments_json` bytes before
+re-emission, so a sloppy upstream model can't break the next
+request to a strict gateway.
+
+### What shipped
+
+- **`utils.sanitizeJsonString(allocator, input) ![]u8`** — walks
+  the input string. For every `\`, peeks at the next character.
+  If it's a valid JSON escape (`"\/bfnrt` or `u<4-hex>`), passes
+  through unchanged. Otherwise, doubles the backslash so the
+  result decodes to a literal `\` at that position instead of
+  failing JSON parse. Always allocates an owned slice (caller
+  frees, even on no-op) so callers don't branch on whether work
+  happened.
+- **`openai_chat.zig`** — applies sanitization to
+  `tool_call.arguments_json` before `appendJsonStr` in the
+  request body builder. Covers the gateway path too (gateway
+  re-uses openai_chat's `streamFn`).
+- **`openai_responses.zig`** — same fix at the equivalent call
+  site for the Responses API.
+- Anthropic and Google Gemini embed tool args as JSON **objects**
+  (not strings), so they go through a different code path and
+  don't have this bug. Out of scope for this patch.
+
+### Why this is the right shape
+
+The model's malformed bytes mean *something* — the user (or
+agent) wanted that text. Repairing the escape preserves intent:
+`<|\const x` decodes to a string with a literal `\c` at that
+position, which is what the model was trying to express. The
+alternative (replace `arguments` with `{}` on parse failure)
+would silently drop the tool call — worse UX.
+
+We don't validate full structural JSON correctness here. If a
+model emits `{` with no closing `}`, the gateway will still 400
+— but those bugs are rarer than the escape-class bug and harder
+to repair without semantic guessing. Worth the simplicity.
+
+### Tests (+8 → 817)
+
+- valid JSON (no escapes) passes through unchanged
+- valid escapes (`\n`, `\t`, `\\`, `\"`, `\/`, `\b`, `\f`, `\r`)
+  pass through
+- `\c` (the real-world Cloudflare bug) → `\\c`
+- trailing lone `\` → `\\`
+- valid `\uXXXX` (`☃`) passes through
+- truncated `\u00` (only 2 hex digits) → `\\u00`
+- non-hex `\uZZZZ` → `\\uZZZZ`
+- empty input → empty output
+- end-to-end: feed a Cloudflare-style broken tool-call args string
+  through `sanitizeJsonString`, then `std.json.parseFromSlice` on
+  the result — parse succeeds and the decoded value matches the
+  model's intent
+
+### Files changed
+
+- `src/ai/utils.zig` (~+95 prod + tests).
+- `src/ai/providers/openai_chat.zig` (+1 import, ~5 LOC at call site).
+- `src/ai/providers/openai_responses.zig` (+1 import, ~5 LOC at call site).
+- `build.zig.zon` (1.16.1 → 1.16.2).
+
+## [1.16.1] — 2026-04-27 — `--http-trace-dir` diagnostic
+
+Diagnostic-only opt-in flag to dump the full HTTP request and
+response of every provider fetch into a directory. Triggered by a
+real Cloudflare Workers AI debugging session: a 5.8 MB response
+landed but nothing rendered, and there was no way to inspect the
+SSE bytes after the fact. Now there is.
+
+### What shipped
+
+- **`--http-trace-dir <path>`** CLI flag (env fallback:
+  `FRANKY_HTTP_TRACE_DIR`). When set, every successful provider
+  HTTP fetch writes a file `<path>/<unix_ms>-<seq>-<provider>.txt`
+  containing:
+  - Header section (`ts_ms`, `seq`, `provider`, `url`, `method`,
+    `status`, `request_body_bytes`, `response_body_bytes`).
+  - Full request body, verbatim.
+  - Full response body, verbatim — **no truncation** (the case
+    we built this for is exactly the >1 MB reasoning reply).
+- **`http_trace_dir: ?[]const u8`** field on `StreamOptions`.
+- **`pub fn http.writeTraceFile(...)`** helper centralizes the
+  write. Best-effort: any IO failure (mkdir, file create, write)
+  is swallowed silently — a trace failure must never break the
+  live fetch path.
+- **All 5 real providers** call `writeTraceFile` after their
+  fetch returns: `anthropic`, `openai_chat` (also tagged as
+  `openai-gateway` when `base_url` is set), `openai_responses`,
+  `google_gemini`, `google_vertex`. Faux is unaffected (no HTTP).
+- **Plumbed through every mode** — `print`, `interactive`, `rpc`,
+  `proxy` — via `print.resolveHttpTraceDirFromMap`.
+
+### Why a directory, not a single file
+
+One file per request — sortable by `unix_ms` prefix, no need to
+parse separators, no concurrency issue between simultaneous
+provider calls (process-global atomic `seq` counter resolves
+ms-collisions). Easy to `ls -t`, `grep -l`, or `cat` individual
+traces.
+
+### Diagnostic-only — explicit non-goals
+
+- **No rotation, no size cap.** A long run with this flag on
+  produces unbounded disk pressure. Documented in the help text;
+  the user is expected to enable it for a debug session and turn
+  it off afterward.
+- **No SSE event-by-event splitting.** The response body is
+  written as one verbatim blob. Inspecting individual events is
+  done with grep / awk / a one-off parser.
+- **No request/response header capture.** Status code is
+  recorded; the rest of the headers are not. Add later if a real
+  debug case wants them.
+
+### Tests (+3 → 809)
+
+- `writeTraceFile: null dir is a no-op` — verifies the disabled
+  path doesn't allocate or error.
+- `writeTraceFile: writes a file with header + bodies, mkdir-p
+  semantics` — full round-trip into a temp dir, reads back the
+  file, asserts every field appears.
+- `writeTraceFile: monotonic seq across concurrent calls in same
+  ms` — fires 5 traces in tight succession; asserts each lands
+  in its own file (no collision).
+
+### Files changed
+
+- `src/ai/http.zig` (~+110 prod, ~+90 test).
+- `src/ai/registry.zig` (`StreamOptions.http_trace_dir`).
+- `src/coding/cli.zig` (flag parsing + help text).
+- `src/coding/modes/print.zig` (`resolveHttpTraceDirFromMap` +
+  one stream_options site).
+- `src/coding/modes/{interactive,rpc,proxy}.zig` (one
+  stream_options site each).
+- 5 provider files (one `writeTraceFile` call after fetch).
+- `build.zig.zon` (1.16.0 → 1.16.1).
+
 ## [1.16.0] — 2026-04-27 — SSE reconnect-with-event-replay (closes v2 §2.3)
 
 Web-UI / proxy-mode reliability: when the browser's `EventSource`

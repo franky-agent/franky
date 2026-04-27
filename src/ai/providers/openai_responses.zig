@@ -28,6 +28,7 @@ const registry_mod = @import("../registry.zig");
 const sse_mod = @import("../sse.zig");
 const http_mod = @import("../http.zig");
 const log = @import("../log.zig");
+const utils = @import("../utils.zig");
 
 const Channel = channel_mod.Channel(stream_mod.StreamEvent);
 
@@ -136,7 +137,14 @@ fn appendInputItem(
                     try buf.appendSlice(allocator, ",\"name\":");
                     try appendJsonStr(buf, allocator, tc.name);
                     try buf.appendSlice(allocator, ",\"arguments\":");
-                    try appendJsonStr(buf, allocator, if (tc.arguments_json.len == 0) "{}" else tc.arguments_json);
+                    // v1.16.2 — sanitize first: strict openai-compat gateways
+                    // reparse `arguments` as JSON and reject malformed escapes
+                    // (e.g. `\c`) that some open-source models emit. See
+                    // `utils.sanitizeJsonString`.
+                    const raw_args = if (tc.arguments_json.len == 0) "{}" else tc.arguments_json;
+                    const safe_args = try utils.sanitizeJsonString(allocator, raw_args);
+                    defer allocator.free(safe_args);
+                    try appendJsonStr(buf, allocator, safe_args);
                     try buf.append(allocator, '}');
                     emitted = true;
                 },
@@ -404,6 +412,17 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     };
 
     const response_body = bw.written();
+    http_mod.writeTraceFile(
+        ctx.allocator,
+        ctx.io,
+        ctx.options.http_trace_dir,
+        "openai-responses",
+        endpoint,
+        "POST",
+        @intFromEnum(result.status),
+        body,
+        response_body,
+    );
     if (@intFromEnum(result.status) >= 400) {
         try ctx.out.push(ctx.io, .start);
         const details = try @import("../error_map.zig").mapError(

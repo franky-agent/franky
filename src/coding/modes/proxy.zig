@@ -851,6 +851,7 @@ fn compactHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!vo
             .environ_map = session.environ_map,
             .thinking = session.cfg.thinking,
             .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
+            .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
         },
         .pinned = pinned,
         .timestamp_ms = ai.stream.nowMillis(),
@@ -1567,6 +1568,7 @@ fn runOneTurnInternal(
             .hook_userdata = @ptrCast(&session.session_gates),
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
+            .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
             .stream_options = .{
                 .api_key = session.provider.api_key,
                 .auth_token = session.provider.auth_token,
@@ -1574,6 +1576,7 @@ fn runOneTurnInternal(
                 .environ_map = session.environ_map,
                 .thinking = session.cfg.thinking,
                 .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
+                .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
             },
         },
         .ch = &ch,

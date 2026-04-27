@@ -635,6 +635,17 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     const response_body = bw.written();
     log.log(.debug, "http", "response", "status={d} body_bytes={d}", .{ @intFromEnum(result.status), response_body.len });
     log.body(.trace, "http", "response_body", response_body, 64 * 1024);
+    http_mod.writeTraceFile(
+        ctx.allocator,
+        ctx.io,
+        ctx.options.http_trace_dir,
+        "anthropic",
+        default_endpoint,
+        "POST",
+        @intFromEnum(result.status),
+        body,
+        response_body,
+    );
 
     if (@intFromEnum(result.status) >= 400) {
         try ctx.out.push(ctx.io, .start);
