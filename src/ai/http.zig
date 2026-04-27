@@ -875,7 +875,10 @@ pub fn mapHttpError(e: anyerror) errors_mod.AgentError {
 /// Process-global sequence counter so concurrent provider calls
 /// land in distinct files even when they fire in the same
 /// millisecond.
-var trace_seq: std.atomic.Value(u64) = .init(0);
+// 32-bit (not u64) so atomic ops work on i386 / 32-bit ARM targets
+// where 64-bit atomic RMW isn't a single-instruction primitive.
+// 4 billion traces per process lifetime is plenty for a diagnostic.
+var trace_seq: std.atomic.Value(u32) = .init(0);
 
 /// Write a full request/response trace file when `dir` is non-null.
 /// No-op when null. Best-effort: any IO error is swallowed (a trace

@@ -72,6 +72,22 @@ pub const Config = struct {
     /// Required for some gateway/model combos (Cloudflare's
     /// openai-compat shim with Llama, native CF endpoint).
     text_tool_call_fallback: bool = false,
+    /// `--profile <name>` (v1.17.0). Applies the named bundle of
+    /// flag defaults from `<settings.json>.profiles.<name>` before
+    /// the rest of the CLI parser walk. Implements the v2 §5
+    /// profile system — collapses ten-flag commands into one.
+    /// Resolved by `coding.profiles.applyProfile` after parse().
+    profile: ?[]const u8 = null,
+    /// `--list-profiles` (v1.17.0 Phase 2). Print every available
+    /// profile (built-in + user) with provenance + description and
+    /// exit 0. Handled in `print.run` before mode dispatch.
+    list_profiles: bool = false,
+    /// `--save-profile <name>` (v1.17.0 Phase 2). Materialize the
+    /// named built-in preset into `$FRANKY_HOME/settings.json`
+    /// under `profiles.<name>` so the user can edit it freely, then
+    /// exit 0. Refuses if a user profile of the same name already
+    /// exists. Handled in `print.run` before mode dispatch.
+    save_profile: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     session_dir: ?[]const u8 = null,
     resume_id: ?[]const u8 = null,
@@ -297,6 +313,12 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.http_trace_dir = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--text-tool-call-fallback")) {
             cfg.text_tool_call_fallback = true;
+        } else if (std.mem.eql(u8, name, "--profile")) {
+            cfg.profile = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--list-profiles")) {
+            cfg.list_profiles = true;
+        } else if (std.mem.eql(u8, name, "--save-profile")) {
+            cfg.save_profile = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--session")) {
             cfg.session_id = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--session-dir")) {
@@ -416,6 +438,15 @@ pub const usage_text: []const u8 =
     \\                               returns tool calls in content instead of structured
     \\                               tool_calls[] (e.g. Cloudflare openai-compat with Llama,
     \\                               native CF /run endpoint). Heuristic, opt-in.
+    \\  --profile NAME               Apply the named bundle of flag defaults from
+    \\                               <settings.json>.profiles.NAME before the rest of the
+    \\                               argv walk. CLI flags still win. See v2 spec §5.
+    \\                               Built-ins: cloudflare-gemma, cloudflare-llama, groq,
+    \\                               cerebras, openrouter, ollama, lm-studio.
+    \\  --list-profiles              Print every available profile (built-in + user) and exit.
+    \\  --save-profile NAME          Materialize the named built-in preset into
+    \\                               $FRANKY_HOME/settings.json so you can edit it freely,
+    \\                               then exit. User profiles override built-ins.
     \\  --session ID                 Use a specific session id
     \\  --session-dir DIR            Parent dir (default: $FRANKY_HOME/sessions or ~/.franky/sessions)
     \\  --resume ID                  Resume a prior session (implies --session)

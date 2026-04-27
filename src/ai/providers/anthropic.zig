@@ -23,6 +23,7 @@ const registry_mod = @import("../registry.zig");
 const sse_mod = @import("../sse.zig");
 const http_mod = @import("../http.zig");
 const log = @import("../log.zig");
+const utils = @import("../utils.zig");
 
 const Channel = channel_mod
     .Channel(stream_mod.StreamEvent);
@@ -58,7 +59,7 @@ pub fn buildRequestJson(
     defer buf.deinit(allocator);
 
     try buf.appendSlice(allocator, "{\"model\":");
-    try appendJsonStr(&buf, allocator, model.id);
+    try utils.appendJsonStr(&buf, allocator, model.id);
 
     // max_tokens is required by the API. When extended thinking is on,
     // Anthropic requires `budget_tokens < max_tokens`; auto-bump
@@ -71,13 +72,13 @@ pub fn buildRequestJson(
     else
         base_max_tokens;
     try buf.appendSlice(allocator, ",\"max_tokens\":");
-    try appendJsonInt(&buf, allocator, @intCast(max_tokens));
+    try utils.appendJsonInt(&buf, allocator, @intCast(max_tokens));
 
     try buf.appendSlice(allocator, ",\"stream\":true");
 
     if (options.temperature) |t| {
         try buf.appendSlice(allocator, ",\"temperature\":");
-        try appendJsonFloat(&buf, allocator, t);
+        try utils.appendJsonFloat(&buf, allocator, t);
     }
 
     // OAuth path: emit `system` as a 1- or 2-element array whose first
@@ -85,24 +86,24 @@ pub fn buildRequestJson(
     // anything else on non-Haiku models.
     if (options.auth_token != null) {
         try buf.appendSlice(allocator, ",\"system\":[{\"type\":\"text\",\"text\":");
-        try appendJsonStr(&buf, allocator, oauth_system_prefix);
+        try utils.appendJsonStr(&buf, allocator, oauth_system_prefix);
         try buf.append(allocator, '}');
         if (context.system_prompt.len > 0 and
             !std.mem.eql(u8, context.system_prompt, oauth_system_prefix))
         {
             try buf.appendSlice(allocator, ",{\"type\":\"text\",\"text\":");
-            try appendJsonStr(&buf, allocator, context.system_prompt);
+            try utils.appendJsonStr(&buf, allocator, context.system_prompt);
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');
     } else if (context.system_prompt.len > 0) {
         try buf.appendSlice(allocator, ",\"system\":");
-        try appendJsonStr(&buf, allocator, context.system_prompt);
+        try utils.appendJsonStr(&buf, allocator, context.system_prompt);
     }
 
     if (options.thinking.anthropicBudget()) |budget| {
         try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":");
-        try appendJsonInt(&buf, allocator, @intCast(budget));
+        try utils.appendJsonInt(&buf, allocator, @intCast(budget));
         try buf.appendSlice(allocator, "}");
     }
 
@@ -111,9 +112,9 @@ pub fn buildRequestJson(
         for (context.tools, 0..) |t, i| {
             if (i > 0) try buf.append(allocator, ',');
             try buf.appendSlice(allocator, "{\"name\":");
-            try appendJsonStr(&buf, allocator, t.name);
+            try utils.appendJsonStr(&buf, allocator, t.name);
             try buf.appendSlice(allocator, ",\"description\":");
-            try appendJsonStr(&buf, allocator, t.description);
+            try utils.appendJsonStr(&buf, allocator, t.description);
             try buf.appendSlice(allocator, ",\"input_schema\":");
             try buf.appendSlice(allocator, t.parameters_json);
             try buf.append(allocator, '}');
@@ -152,12 +153,12 @@ fn appendMessage(
         .assistant => "assistant",
         .custom => unreachable,
     };
-    try appendJsonStr(buf, allocator, role_str);
+    try utils.appendJsonStr(buf, allocator, role_str);
     try buf.appendSlice(allocator, ",\"content\":[");
 
     if (m.role == .tool_result) {
         try buf.appendSlice(allocator, "{\"type\":\"tool_result\",\"tool_use_id\":");
-        try appendJsonStr(buf, allocator, m.tool_call_id orelse "");
+        try utils.appendJsonStr(buf, allocator, m.tool_call_id orelse "");
         try buf.appendSlice(allocator, ",\"is_error\":");
         try buf.appendSlice(allocator, if (m.is_error) "true" else "false");
         try buf.appendSlice(allocator, ",\"content\":[");
@@ -184,36 +185,36 @@ fn appendContentBlock(
     switch (cb) {
         .text => |t| {
             try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
-            try appendJsonStr(buf, allocator, t.text);
+            try utils.appendJsonStr(buf, allocator, t.text);
             try buf.append(allocator, '}');
         },
         .thinking => |t| {
             if (t.redacted) {
                 try buf.appendSlice(allocator, "{\"type\":\"redacted_thinking\",\"data\":");
-                try appendJsonStr(buf, allocator, t.thinking_signature orelse "");
+                try utils.appendJsonStr(buf, allocator, t.thinking_signature orelse "");
                 try buf.append(allocator, '}');
             } else {
                 try buf.appendSlice(allocator, "{\"type\":\"thinking\",\"thinking\":");
-                try appendJsonStr(buf, allocator, t.thinking);
+                try utils.appendJsonStr(buf, allocator, t.thinking);
                 if (t.thinking_signature) |sig| {
                     try buf.appendSlice(allocator, ",\"signature\":");
-                    try appendJsonStr(buf, allocator, sig);
+                    try utils.appendJsonStr(buf, allocator, sig);
                 }
                 try buf.append(allocator, '}');
             }
         },
         .image => |img| {
             try buf.appendSlice(allocator, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
-            try appendJsonStr(buf, allocator, img.mime_type);
+            try utils.appendJsonStr(buf, allocator, img.mime_type);
             try buf.appendSlice(allocator, ",\"data\":");
-            try appendJsonStr(buf, allocator, img.data);
+            try utils.appendJsonStr(buf, allocator, img.data);
             try buf.appendSlice(allocator, "}}");
         },
         .tool_call => |tc| {
             try buf.appendSlice(allocator, "{\"type\":\"tool_use\",\"id\":");
-            try appendJsonStr(buf, allocator, tc.id);
+            try utils.appendJsonStr(buf, allocator, tc.id);
             try buf.appendSlice(allocator, ",\"name\":");
-            try appendJsonStr(buf, allocator, tc.name);
+            try utils.appendJsonStr(buf, allocator, tc.name);
             try buf.appendSlice(allocator, ",\"input\":");
             if (tc.arguments_json.len == 0) {
                 try buf.appendSlice(allocator, "{}");
@@ -233,14 +234,14 @@ fn appendToolResultBlock(
     switch (cb) {
         .text => |t| {
             try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
-            try appendJsonStr(buf, allocator, t.text);
+            try utils.appendJsonStr(buf, allocator, t.text);
             try buf.append(allocator, '}');
         },
         .image => |img| {
             try buf.appendSlice(allocator, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
-            try appendJsonStr(buf, allocator, img.mime_type);
+            try utils.appendJsonStr(buf, allocator, img.mime_type);
             try buf.appendSlice(allocator, ",\"data\":");
-            try appendJsonStr(buf, allocator, img.data);
+            try utils.appendJsonStr(buf, allocator, img.data);
             try buf.appendSlice(allocator, "}}");
         },
         else => {
@@ -248,36 +249,6 @@ fn appendToolResultBlock(
             try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":\"[unsupported block]\"}");
         },
     }
-}
-
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const written = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, written);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
-
-fn appendJsonInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: i64) !void {
-    var tmp: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
-    try buf.appendSlice(allocator, s);
-}
-
-fn appendJsonFloat(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, f: f32) !void {
-    var tmp: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
-    try buf.appendSlice(allocator, s);
 }
 
 // ─── SSE → StreamEvent ────────────────────────────────────────────

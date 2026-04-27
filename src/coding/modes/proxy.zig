@@ -354,7 +354,10 @@ const Session = struct {
             return;
         };
 
-        const slot = id % replay_ring_capacity;
+        // `id` is u64 but replay_ring is indexed by usize. The
+        // modulus is bounded by replay_ring_capacity (256), so the
+        // narrow cast is always safe.
+        const slot: usize = @intCast(id % replay_ring_capacity);
         if (self.replay_ring[slot]) |old| {
             self.allocator.free(old.frame);
         }
@@ -1331,7 +1334,8 @@ fn runSseStream(
             const start: u64 = @max(last_event_id + 1, oldest);
             var i: u64 = start;
             while (i < session.next_event_id) : (i += 1) {
-                const slot = i % replay_ring_capacity;
+                // Cast bounded by replay_ring_capacity (256); always safe.
+                const slot: usize = @intCast(i % replay_ring_capacity);
                 if (session.replay_ring[slot]) |entry| {
                     if (entry.id == i) writeReplayFrame(&sub, entry.frame);
                 }

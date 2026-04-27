@@ -34,6 +34,7 @@ pub const compaction = @import("compaction.zig");
 pub const role = @import("role.zig");
 pub const permissions = @import("permissions.zig");
 pub const settings = @import("settings.zig");
+pub const profiles = @import("profiles.zig");
 pub const auth = @import("auth.zig");
 pub const oauth = @import("oauth/mod.zig");
 pub const models = @import("models.zig");
@@ -76,6 +77,7 @@ test {
     _ = role;
     _ = permissions;
     _ = settings;
+    _ = profiles;
     _ = auth;
     _ = oauth;
     _ = models;

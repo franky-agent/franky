@@ -491,7 +491,13 @@ defaults) — likely a single combined milestone.
 
 ---
 
-## 5. Settings & profile system (planned)
+## 5. Settings & profile system (✅ shipped v1.17.0)
+
+**Status: closed.** Both phases landed in v1.17.0. See the
+v1.17.0 entry in the v1 spec's "what shipped" log + CHANGELOG.md
+for implementation details. The original design notes below are
+retained for §6 migration audit and as the design rationale —
+new deferred-work readers can skip.
 
 **Status: open, scheduled.** Targeting v1.17.x. Triggered by a
 real pain point: invoking franky against a non-default provider
@@ -751,6 +757,15 @@ v2.x readers can see what's been retired without diffing v1's
   frames before going live. Synthetic `replay_gap` event signals
   when the gap exceeds the ring horizon (client falls back to
   `GET /transcript` for completed turns). +8 tests; 798 → 806.
+- **§5 — Settings & profile system** → shipped v1.17.0. Phase 1
+  loader (`--profile <name>` + `${VAR}` interpolation +
+  `api_key_env` indirection + `env: {}` block + layered
+  settings.json discovery) + Phase 2 catalog (seven built-in
+  presets: cloudflare-gemma, cloudflare-llama, groq, cerebras,
+  openrouter, ollama, lm-studio) + `--list-profiles` +
+  `--save-profile <name>`. Closes the user-pain ten-flag-command
+  problem: `franky --profile cloudflare-llama` now replaces a
+  full Cloudflare invocation. +16 tests; 833 → 849.
 
 ---
 

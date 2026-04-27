@@ -46,21 +46,21 @@ pub fn buildRequestJson(
     defer buf.deinit(allocator);
 
     try buf.appendSlice(allocator, "{\"model\":");
-    try appendJsonStr(&buf, allocator, model.id);
+    try utils.appendJsonStr(&buf, allocator, model.id);
     try buf.appendSlice(allocator, ",\"stream\":true");
 
     if (options.max_tokens) |mt| {
         try buf.appendSlice(allocator, ",\"max_output_tokens\":");
-        try appendJsonInt(&buf, allocator, @intCast(mt));
+        try utils.appendJsonInt(&buf, allocator, @intCast(mt));
     }
     if (options.temperature) |t| {
         try buf.appendSlice(allocator, ",\"temperature\":");
-        try appendJsonFloat(&buf, allocator, t);
+        try utils.appendJsonFloat(&buf, allocator, t);
     }
 
     if (options.thinking.openaiResponsesEffort()) |effort| {
         try buf.appendSlice(allocator, ",\"reasoning\":{\"effort\":");
-        try appendJsonStr(&buf, allocator, effort);
+        try utils.appendJsonStr(&buf, allocator, effort);
         try buf.append(allocator, '}');
     }
 
@@ -69,9 +69,9 @@ pub fn buildRequestJson(
         for (context.tools, 0..) |t, i| {
             if (i > 0) try buf.append(allocator, ',');
             try buf.appendSlice(allocator, "{\"type\":\"function\",\"name\":");
-            try appendJsonStr(&buf, allocator, t.name);
+            try utils.appendJsonStr(&buf, allocator, t.name);
             try buf.appendSlice(allocator, ",\"description\":");
-            try appendJsonStr(&buf, allocator, t.description);
+            try utils.appendJsonStr(&buf, allocator, t.description);
             try buf.appendSlice(allocator, ",\"parameters\":");
             try buf.appendSlice(allocator, t.parameters_json);
             try buf.append(allocator, '}');
@@ -82,7 +82,7 @@ pub fn buildRequestJson(
     // System message is supported via `instructions`.
     if (context.system_prompt.len > 0) {
         try buf.appendSlice(allocator, ",\"instructions\":");
-        try appendJsonStr(&buf, allocator, context.system_prompt);
+        try utils.appendJsonStr(&buf, allocator, context.system_prompt);
     }
 
     try buf.appendSlice(allocator, ",\"input\":[");
@@ -117,7 +117,7 @@ fn appendInputItem(
                 switch (cb) {
                     .text => |t| {
                         try buf.appendSlice(allocator, "{\"type\":\"input_text\",\"text\":");
-                        try appendJsonStr(buf, allocator, t.text);
+                        try utils.appendJsonStr(buf, allocator, t.text);
                         try buf.append(allocator, '}');
                     },
                     else => try buf.appendSlice(allocator, "{\"type\":\"input_text\",\"text\":\"[unsupported]\"}"),
@@ -133,9 +133,9 @@ fn appendInputItem(
                 .tool_call => |tc| {
                     if (emitted) try buf.append(allocator, ',');
                     try buf.appendSlice(allocator, "{\"type\":\"function_call\",\"call_id\":");
-                    try appendJsonStr(buf, allocator, tc.id);
+                    try utils.appendJsonStr(buf, allocator, tc.id);
                     try buf.appendSlice(allocator, ",\"name\":");
-                    try appendJsonStr(buf, allocator, tc.name);
+                    try utils.appendJsonStr(buf, allocator, tc.name);
                     try buf.appendSlice(allocator, ",\"arguments\":");
                     // v1.16.2 — sanitize first: strict openai-compat gateways
                     // reparse `arguments` as JSON and reject malformed escapes
@@ -144,14 +144,14 @@ fn appendInputItem(
                     const raw_args = if (tc.arguments_json.len == 0) "{}" else tc.arguments_json;
                     const safe_args = try utils.sanitizeJsonString(allocator, raw_args);
                     defer allocator.free(safe_args);
-                    try appendJsonStr(buf, allocator, safe_args);
+                    try utils.appendJsonStr(buf, allocator, safe_args);
                     try buf.append(allocator, '}');
                     emitted = true;
                 },
                 .text => |t| {
                     if (emitted) try buf.append(allocator, ',');
                     try buf.appendSlice(allocator, "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":");
-                    try appendJsonStr(buf, allocator, t.text);
+                    try utils.appendJsonStr(buf, allocator, t.text);
                     try buf.appendSlice(allocator, "}]}");
                     emitted = true;
                 },
@@ -161,7 +161,7 @@ fn appendInputItem(
         },
         .tool_result => {
             try buf.appendSlice(allocator, "{\"type\":\"function_call_output\",\"call_id\":");
-            try appendJsonStr(buf, allocator, m.tool_call_id orelse "");
+            try utils.appendJsonStr(buf, allocator, m.tool_call_id orelse "");
             try buf.appendSlice(allocator, ",\"output\":");
             var text_buf: std.ArrayList(u8) = .empty;
             defer text_buf.deinit(allocator);
@@ -169,42 +169,12 @@ fn appendInputItem(
                 .text => |t| try text_buf.appendSlice(allocator, t.text),
                 else => {},
             };
-            try appendJsonStr(buf, allocator, text_buf.items);
+            try utils.appendJsonStr(buf, allocator, text_buf.items);
             try buf.append(allocator, '}');
         },
         .custom => unreachable,
     }
     return true;
-}
-
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
-
-fn appendJsonInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: i64) !void {
-    var tmp: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
-    try buf.appendSlice(allocator, s);
-}
-
-fn appendJsonFloat(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, f: f32) !void {
-    var tmp: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
-    try buf.appendSlice(allocator, s);
 }
 
 // ─── SSE → StreamEvent ────────────────────────────────────────────

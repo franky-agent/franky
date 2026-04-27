@@ -48,25 +48,25 @@ pub fn buildRequestJson(
     defer buf.deinit(allocator);
 
     try buf.appendSlice(allocator, "{\"model\":");
-    try appendJsonStr(&buf, allocator, model.id);
+    try utils.appendJsonStr(&buf, allocator, model.id);
 
     try buf.appendSlice(allocator, ",\"stream\":true");
     try buf.appendSlice(allocator, ",\"stream_options\":{\"include_usage\":true}");
 
     if (options.max_tokens) |mt| {
         try buf.appendSlice(allocator, ",\"max_completion_tokens\":");
-        try appendJsonInt(&buf, allocator, @intCast(mt));
+        try utils.appendJsonInt(&buf, allocator, @intCast(mt));
     }
     if (options.temperature) |t| {
         try buf.appendSlice(allocator, ",\"temperature\":");
-        try appendJsonFloat(&buf, allocator, t);
+        try utils.appendJsonFloat(&buf, allocator, t);
     }
 
     // §B reasoning effort — Chat Completions uses the same string values
     // as the Responses API. Models without reasoning support ignore it.
     if (options.thinking.openaiResponsesEffort()) |effort| {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":");
-        try appendJsonStr(&buf, allocator, effort);
+        try utils.appendJsonStr(&buf, allocator, effort);
     }
 
     if (context.tools.len > 0) {
@@ -74,9 +74,9 @@ pub fn buildRequestJson(
         for (context.tools, 0..) |t, i| {
             if (i > 0) try buf.append(allocator, ',');
             try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
-            try appendJsonStr(&buf, allocator, t.name);
+            try utils.appendJsonStr(&buf, allocator, t.name);
             try buf.appendSlice(allocator, ",\"description\":");
-            try appendJsonStr(&buf, allocator, t.description);
+            try utils.appendJsonStr(&buf, allocator, t.description);
             try buf.appendSlice(allocator, ",\"parameters\":");
             try buf.appendSlice(allocator, t.parameters_json);
             try buf.appendSlice(allocator, "}}");
@@ -88,7 +88,7 @@ pub fn buildRequestJson(
     var first = true;
     if (context.system_prompt.len > 0) {
         try buf.appendSlice(allocator, "{\"role\":\"system\",\"content\":");
-        try appendJsonStr(&buf, allocator, context.system_prompt);
+        try utils.appendJsonStr(&buf, allocator, context.system_prompt);
         try buf.append(allocator, '}');
         first = false;
     }
@@ -132,7 +132,7 @@ fn appendUserMessage(
     // Simple shape: single text block → plain string.
     // Multi/image → array of content parts.
     if (m.content.len == 1 and m.content[0] == .text) {
-        try appendJsonStr(buf, allocator, m.content[0].text.text);
+        try utils.appendJsonStr(buf, allocator, m.content[0].text.text);
     } else {
         try buf.append(allocator, '[');
         for (m.content, 0..) |cb, i| {
@@ -152,15 +152,15 @@ fn appendUserContentPart(
     switch (cb) {
         .text => |t| {
             try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
-            try appendJsonStr(buf, allocator, t.text);
+            try utils.appendJsonStr(buf, allocator, t.text);
             try buf.append(allocator, '}');
         },
         .image => |img| {
             // OpenAI accepts data: URIs for inline images.
             try buf.appendSlice(allocator, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
-            try appendJsonRaw(buf, allocator, img.mime_type);
+            try utils.appendJsonRaw(buf, allocator, img.mime_type);
             try buf.appendSlice(allocator, ";base64,");
-            try appendJsonRaw(buf, allocator, img.data);
+            try utils.appendJsonRaw(buf, allocator, img.data);
             try buf.appendSlice(allocator, "\"}}");
         },
         // Thinking / tool_call blocks are never inside a user message
@@ -191,7 +191,7 @@ fn appendAssistantMessage(
 
     if (text_buf.items.len > 0) {
         try buf.appendSlice(allocator, ",\"content\":");
-        try appendJsonStr(buf, allocator, text_buf.items);
+        try utils.appendJsonStr(buf, allocator, text_buf.items);
     } else if (tool_calls.items.len > 0) {
         try buf.appendSlice(allocator, ",\"content\":null");
     } else {
@@ -203,9 +203,9 @@ fn appendAssistantMessage(
         for (tool_calls.items, 0..) |tc, i| {
             if (i > 0) try buf.append(allocator, ',');
             try buf.appendSlice(allocator, "{\"id\":");
-            try appendJsonStr(buf, allocator, tc.id);
+            try utils.appendJsonStr(buf, allocator, tc.id);
             try buf.appendSlice(allocator, ",\"type\":\"function\",\"function\":{\"name\":");
-            try appendJsonStr(buf, allocator, tc.name);
+            try utils.appendJsonStr(buf, allocator, tc.name);
             try buf.appendSlice(allocator, ",\"arguments\":");
             // `arguments` must be a string in Chat Completions even
             // though it's JSON underneath. Escape as a string.
@@ -218,7 +218,7 @@ fn appendAssistantMessage(
             const raw_args = if (tc.arguments_json.len == 0) "{}" else tc.arguments_json;
             const safe_args = try utils.sanitizeJsonString(allocator, raw_args);
             defer allocator.free(safe_args);
-            try appendJsonStr(buf, allocator, safe_args);
+            try utils.appendJsonStr(buf, allocator, safe_args);
             try buf.appendSlice(allocator, "}}");
         }
         try buf.append(allocator, ']');
@@ -232,7 +232,7 @@ fn appendToolResultMessage(
     m: types.Message,
 ) !void {
     try buf.appendSlice(allocator, "{\"role\":\"tool\",\"tool_call_id\":");
-    try appendJsonStr(buf, allocator, m.tool_call_id orelse "");
+    try utils.appendJsonStr(buf, allocator, m.tool_call_id orelse "");
     try buf.appendSlice(allocator, ",\"content\":");
     var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(allocator);
@@ -240,44 +240,8 @@ fn appendToolResultMessage(
         .text => |t| try text_buf.appendSlice(allocator, t.text),
         else => {},
     };
-    try appendJsonStr(buf, allocator, text_buf.items);
+    try utils.appendJsonStr(buf, allocator, text_buf.items);
     try buf.append(allocator, '}');
-}
-
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const written = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, written);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
-
-fn appendJsonRaw(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    // For fragments already destined to live inside a quoted string
-    // (e.g. data: URI components). No escaping.
-    try buf.appendSlice(allocator, s);
-}
-
-fn appendJsonInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: i64) !void {
-    var tmp: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
-    try buf.appendSlice(allocator, s);
-}
-
-fn appendJsonFloat(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, f: f32) !void {
-    var tmp: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
-    try buf.appendSlice(allocator, s);
 }
 
 // ─── SSE → StreamEvent ────────────────────────────────────────────

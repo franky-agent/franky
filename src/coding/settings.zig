@@ -4,7 +4,7 @@
 //!
 //!   1. CLI flags (applied by the caller after `loadLayered` returns)
 //!   2. Project: `<project_dir>/.franky/settings.json`
-//!   3. User:    `<home_dir>/.franky/agent/settings.json`
+//!   3. User:    `<home_dir>/.franky/settings.json`
 //!   4. Built-in defaults (`default_settings` below)
 //!
 //! Missing files at any layer are silent — the layer contributes
@@ -84,7 +84,7 @@ pub fn loadLayered(
     errdefer settings.deinit();
 
     if (home_dir) |hd| {
-        const path = try std.fs.path.join(allocator, &.{ hd, ".franky", "agent", "settings.json" });
+        const path = try std.fs.path.join(allocator, &.{ hd, ".franky", "settings.json" });
         defer allocator.free(path);
         try applyLayer(&settings, io, path);
     }
@@ -210,9 +210,9 @@ test "loadLayered: project beats user (CLI sits on top in caller)" {
     const user_base = "/tmp/franky_settings_user";
     _ = std.Io.Dir.cwd().deleteTree(io, user_base) catch {};
     defer _ = std.Io.Dir.cwd().deleteTree(io, user_base) catch {};
-    try std.Io.Dir.cwd().createDirPath(io, user_base ++ "/.franky/agent");
+    try std.Io.Dir.cwd().createDirPath(io, user_base ++ "/.franky");
     {
-        var f = try std.Io.Dir.cwd().createFile(io, user_base ++ "/.franky/agent/settings.json", .{});
+        var f = try std.Io.Dir.cwd().createFile(io, user_base ++ "/.franky/settings.json", .{});
         defer f.close(io);
         try f.writeStreamingAll(io,
             \\{"defaultProvider":"openai","theme":"dark"}

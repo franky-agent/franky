@@ -828,7 +828,10 @@ fn looksLikeJsonError(name: []const u8) bool {
 
 /// Process-global counter so synthesized tool-call ids are unique
 /// across concurrent turns.
-var synth_tool_id_seq: std.atomic.Value(u64) = .init(0);
+// 32-bit (not u64) so atomic ops work on i386 / 32-bit ARM targets
+// where 64-bit atomic RMW isn't a single-instruction primitive.
+// 4 billion synthetic ids per process is plenty.
+var synth_tool_id_seq: std.atomic.Value(u32) = .init(0);
 
 /// Inspect `msg`. If it carries text content that parses as a
 /// recognized tool-call shape AND the named tool is in `tools`,

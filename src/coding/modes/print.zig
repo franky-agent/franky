@@ -25,6 +25,7 @@ const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
 const session_mod = franky.coding.session;
 const cli_mod = franky.coding.cli;
+const profiles_mod = franky.coding.profiles;
 const auth_mod = franky.coding.auth;
 const settings_mod = franky.coding.settings;
 const models_mod = franky.coding.models;
@@ -67,11 +68,64 @@ pub fn run(
     };
     defer cfg.deinit();
 
+    // v1.17.0 — apply --profile <name> right after CLI parse, before
+    // help/version short-circuits. Profile values fill in for any
+    // CLI flag the user didn't pass; the profile system spec is in
+    // franky-spec-v2.md §5.
+    if (cfg.profile) |profile_name| {
+        profiles_mod.applyProfile(&cfg, io, environ_map, profile_name) catch |e| switch (e) {
+            error.ProfileNotFound => {
+                const msg = try std.fmt.allocPrint(
+                    allocator,
+                    "profile '{s}' not found in any settings.json layer\n",
+                    .{profile_name},
+                );
+                defer allocator.free(msg);
+                return exitWithMessage(io, msg, 2);
+            },
+            error.MalformedProfile => return exitWithMessage(io, "malformed profile in settings.json\n", 2),
+            error.UnknownMode => return exitWithMessage(io, "profile contains unknown mode\n", 2),
+            error.UnknownThinkingLevel => return exitWithMessage(io, "profile contains unknown thinking level\n", 2),
+            else => |err| return err,
+        };
+    }
+
     if (cfg.show_help) {
         return writeOut(io, cli_mod.usage_text);
     }
     if (cfg.show_version) {
         const msg = try std.fmt.allocPrint(allocator, "franky {s}\n", .{franky.version});
+        defer allocator.free(msg);
+        return writeOut(io, msg);
+    }
+
+    // v1.17.0 Phase 2 — short-circuits for the profile catalog tools.
+    if (cfg.list_profiles) {
+        const text = try profiles_mod.listProfiles(allocator, io, environ_map);
+        defer allocator.free(text);
+        return writeOut(io, text);
+    }
+    if (cfg.save_profile) |save_name| {
+        profiles_mod.saveBuiltin(allocator, io, environ_map, save_name) catch |e| switch (e) {
+            error.UnknownBuiltin => {
+                const msg = try std.fmt.allocPrint(
+                    allocator,
+                    "no built-in profile named '{s}' (try --list-profiles)\n",
+                    .{save_name},
+                );
+                defer allocator.free(msg);
+                return exitWithMessage(io, msg, 2);
+            },
+            error.ProfileAlreadyExists => return exitWithMessage(io, "user profile already exists; remove it from settings.json first\n", 2),
+            error.NoHome => return exitWithMessage(io, "FRANKY_HOME or HOME must be set to save a profile\n", 2),
+            error.ExistingSettingsMalformed => return exitWithMessage(io, "existing settings.json is malformed; cannot merge\n", 2),
+            else => |err| return err,
+        };
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "✓ wrote built-in profile '{s}' to your settings.json — edit it freely.\n",
+            .{save_name},
+        );
         defer allocator.free(msg);
         return writeOut(io, msg);
     }
@@ -606,7 +660,7 @@ pub fn resolveProviderIo(
     const a = cfg.arena.allocator();
 
     // ── Layered settings ─────────────────────────────────────────
-    // Defaults → $HOME/.franky/agent/settings.json → cwd/.franky/settings.json.
+    // Defaults → $HOME/.franky/settings.json → cwd/.franky/settings.json.
     // Missing files fall through silently; CLI flags take precedence
     // over everything below.
     var settings = blk: {

@@ -7,6 +7,354 @@ versions correspond to the roadmap milestones in `franky-spec-v1.md`
 `franky-spec-v0.md` under "Port implementation log" and the v0.\*
 roadmap section — this file starts from v1.x.
 
+## [1.17.4] — 2026-04-27 — 32-bit Linux portability fixes
+
+CI build for `x86-linux-gnu` (32-bit Linux) failed in ReleaseSafe
+with four errors. v1.16.1 (`trace_seq`) and v1.16.3
+(`synth_tool_id_seq`) introduced `std.atomic.Value(u64)`
+process-counters, and v1.16.0's SSE replay-ring used a `u64`
+expression as an array index. Both patterns hold up on 64-bit
+targets but break on 32-bit.
+
+### What was wrong
+
+- **`@atomicRmw` on a 64-bit integer** isn't a single-instruction
+  primitive on i386 / 32-bit ARM. Zig's `std.atomic.Value(T)`
+  asserts `@bitSizeOf(T) <= 32` on those targets to make the
+  guarantee explicit. `trace_seq` (`ai/http.zig:878`) and
+  `synth_tool_id_seq` (`agent/loop.zig:831`) both blew that
+  assert.
+- **`replay_ring[u64_expr]`** — `id % replay_ring_capacity` is
+  `u64 % usize`, which Zig promotes to u64. On 32-bit targets
+  `usize` is u32, so the index doesn't coerce. Two call sites in
+  `proxy.zig` (`broadcastEvent` line 357, replay loop line 1334).
+
+### Fix
+
+- `trace_seq` and `synth_tool_id_seq` are now `std.atomic.Value(u32)`.
+  Both are process-local diagnostic / synthetic-id counters; ~4
+  billion per process is plenty.
+- Both `slot` computations narrow-cast: `const slot: usize =
+  @intCast(id % replay_ring_capacity)`. Result is bounded by
+  `replay_ring_capacity` (256), so the cast is always safe; we
+  just need `usize` for the array subscript.
+
+### Verification
+
+- Native build: still 853/853 tests passing.
+- Cross-compile target `-Dtarget=x86-linux-gnu -Doptimize=ReleaseSafe`:
+  builds clean.
+
+### Files changed
+
+- `src/ai/http.zig` (`trace_seq` u64 → u32)
+- `src/agent/loop.zig` (`synth_tool_id_seq` u64 → u32)
+- `src/coding/modes/proxy.zig` (two `slot` narrow-casts)
+- `src/root.zig`, `build.zig.zon` (1.17.3 → 1.17.4)
+
+## [1.17.3] — 2026-04-27 — drop legacy `.franky/agent/settings.json` path
+
+The legacy `$HOME/.franky/agent/settings.json` location (the path
+`settings.zig::loadLayered` used since v0.7.0) is gone. The
+canonical `$HOME/.franky/settings.json` is the only `$HOME`-side
+location. v1.17.2 added the canonical path to the loader's read
+list while keeping the legacy path as a fallback; v1.17.3 removes
+the fallback so the surface is consistent.
+
+### What changed
+
+- `profiles.zig::settingsPaths` no longer returns a `home_legacy`
+  field. Read order is project → `$FRANKY_HOME/settings.json` →
+  `$HOME/.franky/settings.json`.
+- `settings.zig::loadLayered` now reads the user layer from
+  `$HOME/.franky/settings.json` (not `…/agent/settings.json`).
+  Its docstring + project-vs-user precedence test are updated to
+  match.
+- `print.zig` comment about layered settings updated.
+
+### Migration
+
+Anyone with an existing settings file at
+`$HOME/.franky/agent/settings.json` should move it:
+
+```sh
+mv ~/.franky/agent/settings.json ~/.franky/settings.json
+rmdir ~/.franky/agent  # if empty
+```
+
+The new path matches `auth.json`, `permissions.json`, and the
+`$HOME/.franky/sessions/` session-store convention.
+
+### Files changed
+
+- `src/coding/profiles.zig` (drop legacy path field + iteration entry)
+- `src/coding/settings.zig` (loader path + docstring + test fixture)
+- `src/coding/modes/print.zig` (comment)
+- `src/root.zig`, `build.zig.zon` (1.17.2 → 1.17.3)
+
+## [1.17.2] — 2026-04-27 — profile loader / saver path consistency
+
+A real user reported `"role": "full"` in their `~/.franky/settings.json`
+profile not taking effect — `cfg.role` stayed null and proxy mode
+defaulted to `.plan`. Root cause: the load and save paths
+disagreed on **where the user's settings.json lives**.
+
+### What was wrong
+
+- v1.17.0/v1.17.1 **read** from `$HOME/.franky/agent/settings.json`
+  (the legacy path the existing `settings.zig::loadLayered` uses
+  since v0.7.0).
+- `--save-profile` **wrote** to `$HOME/.franky/settings.json`
+  (the canonical path matching `permissions.json`, `auth.json`).
+
+A user creating a settings file at the natural location
+(`$HOME/.franky/settings.json`) — or who used `--save-profile`
+and then edited it — got the profile silently ignored on load.
+The loader fell through to the built-in catalog, which doesn't
+set `role`, so the user's `"role": "full"` was never applied.
+
+### Fix
+
+Loader path order is now (priority high → low):
+
+1. `<cwd>/.franky/settings.json` (project)
+2. `$FRANKY_HOME/settings.json`
+3. `$HOME/.franky/settings.json` (canonical, **new**)
+4. `$HOME/.franky/agent/settings.json` (legacy — kept readable
+   so users with files there still work)
+
+`--save-profile` writes to `$HOME/.franky/settings.json` (or
+`$FRANKY_HOME/settings.json` if set) — same as before. Now the
+canonical location is in the load list, so save and load agree.
+
+The legacy `/.franky/agent/` path stays in the load list so
+v0.7-era settings.json files don't silently break.
+
+### Diagnostic improvement
+
+`profiles.loadFromSettings` now logs at `debug` level whenever a
+profile resolves, with the source path. Pair with
+`--log-level debug` (or `--log-file <path>`) to see exactly which
+file was used, or `source=builtin` if the loader fell through to
+the catalog.
+
+### Files changed
+
+- `src/coding/profiles.zig` (path list + debug log).
+- `src/root.zig`, `build.zig.zon` (1.17.1 → 1.17.2).
+
+## [1.17.1] — 2026-04-27 — profile parser accepts kebab-case + snake_case
+
+A real user file like:
+
+```json
+{
+  "profiles": {
+    "cloudflare-gemma": {
+      "base-url": "https://...",
+      "api-key-env": "CF_API_TOKEN",
+      "ask-tools": "all",
+      "log-level": "trace",
+      "http-trace-dir": "..."
+    }
+  }
+}
+```
+
+silently failed to load `base-url`, `api-key-env`, `ask-tools`,
+`log-level`, and `http-trace-dir` because v1.17.0's parser only
+read snake_case keys. The request then went to the default
+provider endpoint with a Cloudflare model id, returning HTTP 404.
+
+The honest fix is on the parser side: users intuitively type
+the literal CLI flag name (kebab-case) when filling in a profile,
+because that's what `--help` displays. The v1.17.0 spec said
+"keys mirror CLI flag names with `-` rewritten as `_`" — but
+that's a tax users shouldn't have to remember.
+
+### What shipped
+
+- New private helper `lookupField(obj, key)` in `profiles.zig`
+  that tries the canonical key first, then the alternate form
+  with `_`/`-` swapped. Stack-buffered (key length capped at 64),
+  no allocation. Used by `optString` and `optBool`.
+- All profile fields now accept either form. `base-url` and
+  `base_url` both load. Same for `api-key-env`, `auth-token-env`,
+  `ask-tools`, `allow-tools`, `deny-tools`, `log-level`,
+  `log-file`, `http-trace-dir`, `system-prompt`,
+  `append-system-prompt`, `text-tool-call-fallback`.
+- Single-word fields (`provider`, `model`, `mode`, `thinking`,
+  `prompts`, `yes`, `role`) are unaffected — same key in both
+  conventions.
+- The `env: { ... }` block is **not** normalized (those keys are
+  user-defined env-variable names, not field names; preserving
+  their case is correct).
+
+### Tests (+4 → 853)
+
+- `lookupField` × 3 (snake key matches both lookups, kebab key
+  matches both lookups, unrelated key returns null)
+- `applyProfile` round-trip on a kebab-case profile mirroring the
+  user-reported file shape — verifies `base-url`, `api-key-env`,
+  `ask-tools`, `log-level`, `http-trace-dir`,
+  `text-tool-call-fallback`, `${VAR}` interpolation, and env-block
+  application all work end-to-end.
+
+### Files changed
+
+- `src/coding/profiles.zig` (~+30 prod + 4 tests).
+- `src/root.zig`, `build.zig.zon` (1.17.0 → 1.17.1).
+
+## [1.17.0] — 2026-04-27 — `--profile` system + built-in preset catalog (closes v2 §5)
+
+The user pain point that triggered this was a ten-flag command:
+
+```sh
+FRANKY_FIRST_BYTE_TIMEOUT_MS=1200000 franky --mode proxy \
+  --provider gateway --model "@cf/google/gemma-4-26b-a4b-it" \
+  --base-url "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions" \
+  --api-key "$CF_API_TOKEN" --thinking xhigh --prompts \
+  --ask-tools all --log-level trace
+```
+
+Now collapses to:
+
+```sh
+franky --profile cloudflare-llama
+```
+
+Closes v2 §5. Implements both phases of the spec — the
+settings.json profile loader and the compiled-in preset catalog
+with `--save-profile` + `--list-profiles` ergonomics.
+
+### What shipped — Phase 1: settings.json profile loader
+
+- New module `src/coding/profiles.zig` (~300 LOC prod + tests).
+- `Profile` struct with optional fields mirroring the CLI
+  flag-shaped subset of `cli.Config` (provider, model, base_url,
+  api_key, thinking, mode, prompts, ask_tools, http_trace_dir,
+  text_tool_call_fallback, …).
+- `applyProfile(*Config, io, environ_map, name)` reads
+  `<settings.json>.profiles.<name>`, expands `${VAR}` references
+  against the parent env, and overlays each field onto cfg —
+  but only for fields the CLI didn't set explicitly. CLI flags
+  always win.
+- Settings.json layers searched in order: project
+  (`./.franky/settings.json`) → `$FRANKY_HOME/settings.json` →
+  `$HOME/.franky/agent/settings.json`. First match wins
+  (profiles are atomic bundles per v2 §5.4 — no per-field merge).
+- `api_key_env: "VAR_NAME"` indirection: at apply time, read
+  `VAR_NAME` from env and use as `--api-key`. Same for
+  `auth_token_env`. Profiles never carry literal credentials.
+- `env: { "K": "V", ... }` block: directly applied to the
+  process env via `environ_map.put`, so `FRANKY_*` knobs (e.g.
+  `FRANKY_FIRST_BYTE_TIMEOUT_MS`) read by later code see the
+  profile's values without an explicit shell export.
+- `${VAR}` interpolation in any string value, expanded against
+  the parent env. Unset → empty string (matches shell behavior).
+  Unterminated `${` is treated literally.
+- New `--profile <name>` CLI flag, parsed in `cli.zig` and
+  applied by `print.run` between `cli.parse()` and mode dispatch
+  (so help / version short-circuits run normally if the user
+  asks for them).
+
+### What shipped — Phase 2: built-in preset catalog
+
+Seven compile-time embedded presets covering the most common
+non-default flows:
+
+| Name | Path | Required env |
+|---|---|---|
+| `cloudflare-gemma` | gateway → CF Workers AI / Gemma | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` |
+| `cloudflare-llama` | gateway → CF Workers AI / Llama-3.3-70b (with `text_tool_call_fallback`) | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` |
+| `groq` | gateway → Groq | `GROQ_API_KEY` |
+| `cerebras` | gateway → Cerebras | `CEREBRAS_API_KEY` |
+| `openrouter` | gateway → OpenRouter | `OPENROUTER_API_KEY` |
+| `ollama` | gateway → local Ollama (loopback, no auth, 10-min first-byte) | — |
+| `lm-studio` | gateway → local LM Studio (loopback, no auth) | — |
+
+Built-ins are stored as inline string literals in `profiles.zig`
+(`builtin_catalog: [_]Builtin{...}`), each carrying a name,
+description, and JSON body that goes through the same parser as
+user profiles. User profiles in settings.json **fully override**
+a built-in of the same name (matches the v2 §5.4 atomic-bundle
+contract).
+
+CLI surface added:
+
+- **`--list-profiles`** — print every profile (built-in + user)
+  with provenance markers and exit. Built-ins shadowed by a user
+  override are flagged `[overridden]` so the precedence is
+  visible without inspection.
+- **`--save-profile <name>`** — materialize a built-in into
+  `$FRANKY_HOME/settings.json` (or `$HOME/.franky/settings.json`)
+  under `profiles.<name>` so the user can edit it freely. Refuses
+  to overwrite an existing user profile of the same name. Atomic
+  tempfile + rename. Existing top-level fields and unrelated
+  profiles are preserved verbatim.
+
+### Precedence (per v2 §5.3)
+
+```
+defaults < env vars < settings.json (top-level) < profile < CLI flags
+```
+
+CLI flags are never overridden. Sensitive things (API keys,
+auth tokens) always flow from env or `auth.json`, never from the
+profile file directly — `api_key_env` is the only credential
+binding mechanism.
+
+### Cloudflare-Llama story closed
+
+After v1.16.1 (`--http-trace-dir`), v1.16.2 (sanitize escapes),
+v1.16.3 (better tool errors + `--text-tool-call-fallback`), and
+v1.17.0 (profile preset wiring it all up):
+
+```sh
+export CLOUDFLARE_ACCOUNT_ID=...
+export CLOUDFLARE_API_TOKEN=...
+franky --profile cloudflare-llama "Read code-analyse.md"
+```
+
+Just works. Multi-step Cloudflare-hosted Llama-3.3-70b tool flows
+that were silently broken at the start of this session are now
+single-flag.
+
+### Tests (+16 → 849)
+
+Phase 1:
+- `interpolate` × 4 (passthrough, single-var, unset-var, unterminated)
+- `applyProfile` × 3 (full settings.json profile, CLI-wins-over-profile, missing-name → error)
+- `parseThinking` / `parseMode` enum coverage
+
+Phase 2:
+- `getBuiltinBody` (known + unknown name)
+- Every built-in body parses without error (catalog smoke test)
+- `applyProfile` works against the catalog (no settings.json file present)
+- `saveBuiltin` writes preset to fresh settings.json
+- `saveBuiltin` refuses overwrite when name already exists
+- `saveBuiltin` returns `UnknownBuiltin` for nonexistent name
+- `listProfiles` enumerates every built-in
+
+### Files changed
+
+- `src/coding/profiles.zig` (new, ~700 LOC including tests).
+- `src/coding/mod.zig` (re-export).
+- `src/coding/cli.zig` (`profile`, `list_profiles`, `save_profile`
+  fields + flag parsers + help text).
+- `src/coding/modes/print.zig` (apply profile after parse;
+  `--list-profiles` / `--save-profile` short-circuits before mode
+  dispatch).
+- `build.zig.zon` (1.16.3 → 1.17.0).
+
+### Spec migration
+
+- Closes **v2 §5** (Settings & profile system). Entry will move
+  into `franky-spec-v2.md` §6 ("items shipped after v1.0.0") in a
+  follow-up doc commit; the full design (schema, CLI surface,
+  precedence rules, built-in catalog) was authored in v2 §5
+  before implementation.
+
 ## [1.16.3] — 2026-04-27 — defensive features for sloppy gateways/models
 
 Two related improvements driven by the Cloudflare Workers AI debug
