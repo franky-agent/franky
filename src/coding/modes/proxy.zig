@@ -139,6 +139,28 @@ pub fn run(
 
 const max_subs: usize = 16;
 
+/// v1.16.0 — replay ring capacity. Each replay-eligible event
+/// (real `AgentEvent` frame + the synthetic `session_switched`
+/// frame; **not** keepalive `ping`s) is stamped with a monotonic
+/// id and stashed in the ring so a reconnecting `/events`
+/// subscriber with a `Last-Event-ID` header can catch up via
+/// replay before going live. 256 ≈ 5 typical agent turns of
+/// headroom — well over any realistic disconnect-to-reconnect
+/// gap. When a reconnect's `last_id` is older than the oldest
+/// surviving ring entry, the listener emits a synthetic
+/// `replay_gap` event so the client can fall back to a full page
+/// reload via `GET /transcript` (v1.6.1) for completed turns.
+const replay_ring_capacity: usize = 256;
+
+/// One slot in the replay ring. `id` is the SSE event id we
+/// stamped; `frame` is the fully-rendered SSE frame ready to
+/// write to a socket (already includes the `id: N\n` prefix).
+/// Owned by the `Session` — freed on eviction or `deinit`.
+const ReplayEvent = struct {
+    id: u64,
+    frame: []u8,
+};
+
 /// Per-connection SSE writer (one slot per `/events` subscriber).
 /// One thread (the agent worker) writes to each subscriber's
 /// socket; the connection-handler thread only reads + closes. So
@@ -203,7 +225,27 @@ const Session = struct {
     /// Active `/events` subscribers. Capped at `max_subs` so a
     /// runaway client doesn't unbounded-allocate the listener.
     subs: [max_subs]?*SseSubscriber = .{null} ** max_subs,
-    subs_mutex: std.Io.Mutex = .init,
+
+    // ── v1.16.0 — SSE event-replay state (closes v2 §2.3) ─────────
+    //
+    // `events_mutex` (renamed from the v1.7.0 `subs_mutex`) now
+    // also guards `next_event_id` + `replay_ring`. Broadcasts and
+    // reconnect-replay both lock it so a late-joining subscriber
+    // can never observe a gap between the last replayed frame and
+    // the first live frame.
+
+    /// Monotonic event id for SSE replay. Starts at 1 because
+    /// `EventSource`'s `Last-Event-ID` defaults to 0 / "" — id=0
+    /// means "before any event" which makes "send everything"
+    /// the natural reconnect behavior for first-time clients.
+    next_event_id: u64 = 1,
+
+    /// Recent replay-eligible frames keyed by `id % capacity`.
+    /// Owned by the session — entries are freed on overwrite and
+    /// on `deinit`.
+    replay_ring: [replay_ring_capacity]?ReplayEvent = .{null} ** replay_ring_capacity,
+
+    events_mutex: std.Io.Mutex = .init,
 
     fn deinit(self: *Session) void {
         self.transcript.deinit();
@@ -214,11 +256,21 @@ const Session = struct {
         self.faux.deinit();
         self.permission_store.deinit();
         self.role_arena.deinit();
+        // v1.16.0 — release any retained replay frames.
+        for (self.replay_ring[0..]) |maybe| {
+            if (maybe) |entry| self.allocator.free(entry.frame);
+        }
     }
 
     fn addSub(self: *Session, sub: *SseSubscriber) bool {
-        self.subs_mutex.lockUncancelable(self.io);
-        defer self.subs_mutex.unlock(self.io);
+        self.events_mutex.lockUncancelable(self.io);
+        defer self.events_mutex.unlock(self.io);
+        return self.addSubLocked(sub);
+    }
+
+    /// Caller must hold `events_mutex`. Returns false if the
+    /// subscriber pool is full.
+    fn addSubLocked(self: *Session, sub: *SseSubscriber) bool {
         for (self.subs[0..], 0..) |s, i| {
             if (s == null) {
                 self.subs[i] = sub;
@@ -229,8 +281,8 @@ const Session = struct {
     }
 
     fn removeSub(self: *Session, sub: *SseSubscriber) void {
-        self.subs_mutex.lockUncancelable(self.io);
-        defer self.subs_mutex.unlock(self.io);
+        self.events_mutex.lockUncancelable(self.io);
+        defer self.events_mutex.unlock(self.io);
         for (self.subs[0..], 0..) |s, i| {
             if (s == sub) {
                 self.subs[i] = null;
@@ -242,9 +294,19 @@ const Session = struct {
     /// Fan out a fully-rendered SSE frame to every live subscriber.
     /// Subscribers whose write fails are flagged closed and the
     /// connection-handler thread will reap them.
+    ///
+    /// **Not replay-eligible** — used for keepalive `ping`s only.
+    /// Real agent events go through `broadcastEvent` which stamps
+    /// an id and writes the ring before fanning out.
     fn broadcastFrame(self: *Session, frame: []const u8) void {
-        self.subs_mutex.lockUncancelable(self.io);
-        defer self.subs_mutex.unlock(self.io);
+        self.events_mutex.lockUncancelable(self.io);
+        defer self.events_mutex.unlock(self.io);
+        self.fanOutLocked(frame);
+    }
+
+    /// Caller must hold `events_mutex`. Writes `frame` to every
+    /// live subscriber; failed writes flag the subscriber closed.
+    fn fanOutLocked(self: *Session, frame: []const u8) void {
         for (self.subs[0..]) |maybe| {
             const sub = maybe orelse continue;
             if (sub.closed.load(.acquire)) continue;
@@ -258,6 +320,47 @@ const Session = struct {
                 sub.closed.store(true, .release);
             };
         }
+    }
+
+    /// v1.16.0 — stamp `frame_body` (an SSE frame **without** an
+    /// `id:` line) with the next monotonic event id, push the
+    /// stamped copy into the replay ring, and fan out to live
+    /// subscribers. The stamped copy is owned by the ring; the
+    /// caller still owns `frame_body` and can free it after the
+    /// call returns.
+    ///
+    /// Replay-eligible — every real `AgentEvent` frame and the
+    /// synthetic `session_switched` frame should go through here.
+    /// Keepalive `ping`s should NOT — they're stateless heartbeats
+    /// and replaying old ones is meaningless.
+    fn broadcastEvent(self: *Session, allocator: std.mem.Allocator, frame_body: []const u8) void {
+        self.events_mutex.lockUncancelable(self.io);
+        defer self.events_mutex.unlock(self.io);
+
+        const id = self.next_event_id;
+        self.next_event_id += 1;
+
+        const stamped = std.fmt.allocPrint(
+            allocator,
+            "id: {d}\n{s}",
+            .{ id, frame_body },
+        ) catch {
+            // Allocation failed — give up on storing this event,
+            // but still try to fan out the unstamped frame so live
+            // subscribers don't miss it. Future reconnects after
+            // this point will see a `replay_gap` if they last
+            // received an id ≥ this one's predecessor.
+            self.fanOutLocked(frame_body);
+            return;
+        };
+
+        const slot = id % replay_ring_capacity;
+        if (self.replay_ring[slot]) |old| {
+            self.allocator.free(old.frame);
+        }
+        self.replay_ring[slot] = .{ .id = id, .frame = stamped };
+
+        self.fanOutLocked(stamped);
     }
 };
 
@@ -1086,7 +1189,7 @@ fn handleConnection(arg: ConnArg) void {
         }
     }
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/events")) {
-        runSseStream(arg.session, &stream, arg.io);
+        runSseStream(arg.session, &stream, arg.io, req.last_event_id orelse 0);
         return;
     }
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/prompt")) {
@@ -1138,6 +1241,11 @@ const Request = struct {
     method: []const u8,
     path: []const u8,
     content_length: ?usize = null,
+    /// v1.16.0 — `Last-Event-ID: <n>` header for SSE replay on
+    /// `/events`. Null when absent (first connection, or non-
+    /// SSE request). 0 means "before any event" — equivalent to
+    /// no header for replay purposes.
+    last_event_id: ?u64 = null,
 };
 
 fn parseRequest(headers: []const u8) ?Request {
@@ -1151,7 +1259,7 @@ fn parseRequest(headers: []const u8) ?Request {
 
     var req: Request = .{ .method = method, .path = path };
 
-    // Walk the remaining header lines for Content-Length.
+    // Walk the remaining header lines for headers we care about.
     var cursor: usize = line_end + 2;
     while (cursor < headers.len) {
         const next_eol = std.mem.indexOfPos(u8, headers, cursor, "\r\n") orelse break;
@@ -1160,6 +1268,9 @@ fn parseRequest(headers: []const u8) ?Request {
         if (std.ascii.startsWithIgnoreCase(header_line, "content-length:")) {
             const value = std.mem.trim(u8, header_line[15..], " \t");
             req.content_length = std.fmt.parseInt(usize, value, 10) catch null;
+        } else if (std.ascii.startsWithIgnoreCase(header_line, "last-event-id:")) {
+            const value = std.mem.trim(u8, header_line[14..], " \t");
+            req.last_event_id = std.fmt.parseInt(u64, value, 10) catch null;
         }
         cursor = next_eol + 2;
     }
@@ -1168,7 +1279,16 @@ fn parseRequest(headers: []const u8) ?Request {
 
 // ─── /events ─────────────────────────────────────────────────────
 
-fn runSseStream(session: *Session, stream: *std.Io.net.Stream, io: std.Io) void {
+fn runSseStream(
+    session: *Session,
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    /// v1.16.0 — `Last-Event-ID` header value (0 = absent / first
+    /// connection). When non-zero, frames in the replay ring with
+    /// id > last_event_id are written to this socket before the
+    /// subscriber registers for live broadcast.
+    last_event_id: u64,
+) void {
     // Send the SSE preamble.
     const preamble =
         "HTTP/1.1 200 OK\r\n" ++
@@ -1184,14 +1304,51 @@ fn runSseStream(session: *Session, stream: *std.Io.net.Stream, io: std.Io) void 
     pw.interface.flush() catch return;
 
     var sub = SseSubscriber{ .stream = stream.*, .io = io };
-    if (!session.addSub(&sub)) {
-        // Subscriber pool full — politely close.
-        const msg = "event: error\ndata: {\"kind\":\"error\",\"message\":\"too many subscribers\"}\n\n";
-        var ebuf: [256]u8 = undefined;
-        var ew = stream.writer(io, &ebuf);
-        ew.interface.writeAll(msg) catch {};
-        ew.interface.flush() catch {};
-        return;
+
+    // v1.16.0 — replay missed events under `events_mutex` so a
+    // broadcast can't slip an event between the last replayed
+    // frame and the moment we register as a live subscriber.
+    {
+        session.events_mutex.lockUncancelable(io);
+        defer session.events_mutex.unlock(io);
+
+        if (last_event_id > 0 and last_event_id + 1 < session.next_event_id) {
+            const oldest: u64 = if (session.next_event_id > replay_ring_capacity)
+                session.next_event_id - replay_ring_capacity
+            else
+                1;
+
+            // If the client lost more history than the ring can
+            // cover, emit a synthetic `replay_gap` so the client
+            // knows to reconcile (full page reload via
+            // `GET /transcript` for completed turns; the in-flight
+            // turn's prefix is genuinely lost).
+            if (last_event_id + 1 < oldest) {
+                writeReplayGap(&sub, session.allocator, last_event_id, oldest - 1);
+            }
+
+            const start: u64 = @max(last_event_id + 1, oldest);
+            var i: u64 = start;
+            while (i < session.next_event_id) : (i += 1) {
+                const slot = i % replay_ring_capacity;
+                if (session.replay_ring[slot]) |entry| {
+                    if (entry.id == i) writeReplayFrame(&sub, entry.frame);
+                }
+                if (sub.closed.load(.acquire)) break;
+            }
+        }
+
+        if (!session.addSubLocked(&sub)) {
+            // Subscriber pool full — politely close. Replay frames
+            // (if any) already landed; the client will see them
+            // and then this notice.
+            const msg = "event: error\ndata: {\"kind\":\"error\",\"message\":\"too many subscribers\"}\n\n";
+            var ebuf: [256]u8 = undefined;
+            var ew = stream.writer(io, &ebuf);
+            ew.interface.writeAll(msg) catch {};
+            ew.interface.flush() catch {};
+            return;
+        }
     }
     defer session.removeSub(&sub);
 
@@ -1206,6 +1363,42 @@ fn runSseStream(session: *Session, stream: *std.Io.net.Stream, io: std.Io) void 
         if (n == 0) break;
         // Discard whatever the client sent — events flow one way only.
     }
+}
+
+/// v1.16.0 — write a single replay frame to a fresh subscriber
+/// (not yet in the live `subs[]` array). On write failure the
+/// subscriber is flagged closed so the caller stops trying.
+fn writeReplayFrame(sub: *SseSubscriber, frame: []const u8) void {
+    var buf: [256]u8 = undefined;
+    var w = sub.stream.writer(sub.io, &buf);
+    w.interface.writeAll(frame) catch {
+        sub.closed.store(true, .release);
+        return;
+    };
+    w.interface.flush() catch {
+        sub.closed.store(true, .release);
+    };
+}
+
+/// v1.16.0 — emit a synthetic `replay_gap` event when the client's
+/// `Last-Event-ID` is older than the oldest entry still in the
+/// ring. Stamps it with `oldest - 1` so the client's `lastEventId`
+/// advances past the gap monotonically as it reads subsequent
+/// replayed frames (which start at `oldest`).
+fn writeReplayGap(
+    sub: *SseSubscriber,
+    allocator: std.mem.Allocator,
+    missed_from: u64,
+    missed_to: u64,
+) void {
+    const stamp_id: u64 = if (missed_to > 0) missed_to else 0;
+    const frame = std.fmt.allocPrint(
+        allocator,
+        "id: {d}\nevent: replay_gap\ndata: {{\"missed_from\":{d},\"missed_to\":{d}}}\n\n",
+        .{ stamp_id, missed_from + 1, missed_to },
+    ) catch return;
+    defer allocator.free(frame);
+    writeReplayFrame(sub, frame);
 }
 
 // ─── /prompt ─────────────────────────────────────────────────────
@@ -1407,7 +1600,8 @@ fn runOneTurnInternal(
             continue;
         };
         defer allocator.free(frame);
-        session.broadcastFrame(frame);
+        // v1.16.0 — replay-eligible: stamp id, push to ring, fan out.
+        session.broadcastEvent(allocator, frame);
         ev.deinit(allocator);
     }
 
@@ -1511,24 +1705,24 @@ fn respondJson(stream: *std.Io.net.Stream, io: std.Io, status: u16, body: []cons
 }
 
 /// `GET /transcript` (v1.6.1) — render the active session's
-/// transcript as UI-friendly JSON. Holds `subs_mutex` (the same
-/// guard `broadcastFrame` uses, repurposed since concurrent
-/// `runOneTurn` mutates `transcript.messages`) so we don't tear
-/// during snapshot. The body shape is the projection in
-/// `renderTranscriptForUi`.
+/// transcript as UI-friendly JSON. Holds `events_mutex` (the same
+/// guard `broadcastFrame` / `broadcastEvent` use, repurposed since
+/// concurrent `runOneTurn` mutates `transcript.messages`) so we
+/// don't tear during snapshot. The body shape is the projection
+/// in `renderTranscriptForUi`.
 fn respondTranscript(
     session: *Session,
     stream: *std.Io.net.Stream,
     io: std.Io,
     allocator: std.mem.Allocator,
 ) void {
-    session.subs_mutex.lockUncancelable(session.io);
+    session.events_mutex.lockUncancelable(session.io);
     const body = renderTranscriptForUi(allocator, &session.transcript) catch {
-        session.subs_mutex.unlock(session.io);
+        session.events_mutex.unlock(session.io);
         respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
-    session.subs_mutex.unlock(session.io);
+    session.events_mutex.unlock(session.io);
     defer allocator.free(body);
     respondJson(stream, io, 200, body);
 }
@@ -1678,14 +1872,14 @@ fn respondActiveSession(
     io: std.Io,
     allocator: std.mem.Allocator,
 ) void {
-    session.subs_mutex.lockUncancelable(session.io);
+    session.events_mutex.lockUncancelable(session.io);
     const count = session.transcript.messages.items.len;
     const id_copy = allocator.dupe(u8, session.session_id) catch {
-        session.subs_mutex.unlock(session.io);
+        session.events_mutex.unlock(session.io);
         respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
-    session.subs_mutex.unlock(session.io);
+    session.events_mutex.unlock(session.io);
     defer allocator.free(id_copy);
     const body = std.fmt.allocPrint(allocator,
         "{{\"id\":\"{s}\",\"messageCount\":{d},\"persisted\":{}}}",
@@ -2219,7 +2413,9 @@ fn broadcastSessionSwitched(session: *Session, allocator: std.mem.Allocator) voi
         .{session.session_id},
     ) catch return;
     defer allocator.free(frame);
-    session.broadcastFrame(frame);
+    // v1.16.0 — replay-eligible: a reconnecting client should know
+    // about a session swap that happened during the gap.
+    session.broadcastEvent(allocator, frame);
 }
 
 /// Read up to `cap` bytes of the request body. Concatenates the
@@ -4084,4 +4280,277 @@ test "proxy: POST /prompt fans assistant events to /events subscribers" {
     // The faux provider replies with "you said: hello" — the deltas
     // arrive chunked so check for a substring of the streamed text.
     try testing.expect(std.mem.indexOf(u8, sse_bytes.items, "you said") != null);
+    // v1.16.0 — every replay-eligible frame is stamped with `id: N\n`.
+    try testing.expect(std.mem.indexOf(u8, sse_bytes.items, "id: 1\n") != null);
+}
+
+// ─── v1.16.0 — SSE replay (closes v2 §2.3) ──────────────────────
+
+test "parseRequest: Last-Event-ID header" {
+    const headers =
+        "GET /events HTTP/1.1\r\n" ++
+        "Host: 127.0.0.1\r\n" ++
+        "Last-Event-ID: 42\r\n" ++
+        "\r\n";
+    const r = parseRequest(headers).?;
+    try testing.expectEqual(@as(u64, 42), r.last_event_id.?);
+}
+
+test "parseRequest: case-insensitive Last-Event-ID header" {
+    const headers =
+        "GET /events HTTP/1.1\r\n" ++
+        "last-event-id: 7\r\n" ++
+        "\r\n";
+    try testing.expectEqual(@as(u64, 7), parseRequest(headers).?.last_event_id.?);
+}
+
+test "parseRequest: missing Last-Event-ID is null" {
+    const headers = "GET /events HTTP/1.1\r\n\r\n";
+    try testing.expect(parseRequest(headers).?.last_event_id == null);
+}
+
+test "broadcastEvent: stamps frame with monotonic id and stores in ring" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var cfg = try cli_mod.parse(gpa, &.{"franky"});
+    defer cfg.deinit();
+    var environ_map = std.process.Environ.Map.init(gpa);
+    defer environ_map.deinit();
+
+    var session: Session = undefined;
+    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
+    defer session.deinit();
+
+    session.broadcastEvent(gpa, "event: turn_start\ndata: {}\n\n");
+    session.broadcastEvent(gpa, "event: turn_end\ndata: {}\n\n");
+
+    try testing.expectEqual(@as(u64, 3), session.next_event_id);
+
+    const slot1 = session.replay_ring[1 % replay_ring_capacity].?;
+    try testing.expectEqual(@as(u64, 1), slot1.id);
+    try testing.expectEqualStrings(
+        "id: 1\nevent: turn_start\ndata: {}\n\n",
+        slot1.frame,
+    );
+
+    const slot2 = session.replay_ring[2 % replay_ring_capacity].?;
+    try testing.expectEqual(@as(u64, 2), slot2.id);
+    try testing.expectEqualStrings(
+        "id: 2\nevent: turn_end\ndata: {}\n\n",
+        slot2.frame,
+    );
+}
+
+test "broadcastEvent: ring eviction frees evicted frame" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var cfg = try cli_mod.parse(gpa, &.{"franky"});
+    defer cfg.deinit();
+    var environ_map = std.process.Environ.Map.init(gpa);
+    defer environ_map.deinit();
+
+    var session: Session = undefined;
+    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
+    defer session.deinit();
+
+    // Push capacity+5 events. testing.allocator catches leaks if an
+    // evicted frame fails to free.
+    var i: u64 = 0;
+    while (i < replay_ring_capacity + 5) : (i += 1) {
+        session.broadcastEvent(gpa, "event: stub\ndata: {}\n\n");
+    }
+
+    try testing.expectEqual(@as(u64, replay_ring_capacity + 6), session.next_event_id);
+
+    // Slot 1 should now hold id (capacity + 1), not the original id 1.
+    const slot1 = session.replay_ring[1 % replay_ring_capacity].?;
+    try testing.expectEqual(@as(u64, replay_ring_capacity + 1), slot1.id);
+}
+
+test "broadcastFrame (keepalive): does NOT advance event id or touch ring" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var cfg = try cli_mod.parse(gpa, &.{"franky"});
+    defer cfg.deinit();
+    var environ_map = std.process.Environ.Map.init(gpa);
+    defer environ_map.deinit();
+
+    var session: Session = undefined;
+    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
+    defer session.deinit();
+
+    session.broadcastFrame("event: ping\ndata: {}\n\n");
+    session.broadcastFrame("event: ping\ndata: {}\n\n");
+
+    // Keepalive is intentionally stateless — heartbeat frames don't
+    // belong in the ring (replaying old pings is meaningless).
+    try testing.expectEqual(@as(u64, 1), session.next_event_id);
+    try testing.expect(session.replay_ring[1] == null);
+}
+
+test "proxy: GET /events with Last-Event-ID replays missed frames" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var setup = bindLoopback(io) orelse return; // sandbox can't bind
+    defer setup.server.deinit(io);
+
+    var cfg = try cli_mod.parse(gpa, &.{"franky"});
+    defer cfg.deinit();
+    var environ_map = std.process.Environ.Map.init(gpa);
+    defer environ_map.deinit();
+
+    var session: Session = undefined;
+    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
+    defer session.deinit();
+
+    // Pre-populate the ring with five events. No live subscriber is
+    // attached, so the fan-out is a no-op; only the ring grows.
+    session.broadcastEvent(gpa, "event: ev1\ndata: {}\n\n");
+    session.broadcastEvent(gpa, "event: ev2\ndata: {}\n\n");
+    session.broadcastEvent(gpa, "event: ev3\ndata: {}\n\n");
+    session.broadcastEvent(gpa, "event: ev4\ndata: {}\n\n");
+    session.broadcastEvent(gpa, "event: ev5\ndata: {}\n\n");
+
+    const Client = struct {
+        fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
+            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
+            var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
+            defer stream.close(client_io);
+            const req =
+                "GET /events HTTP/1.1\r\n" ++
+                "Host: 127.0.0.1\r\n" ++
+                "Last-Event-ID: 2\r\n" ++
+                "\r\n";
+            var wb: [256]u8 = undefined;
+            var w = stream.writer(client_io, &wb);
+            w.interface.writeAll(req) catch return;
+            w.interface.flush() catch return;
+
+            var buf: [1024]u8 = undefined;
+            var r = stream.reader(client_io, &.{});
+            const deadline_ms: i64 = ai.stream.nowMillis() + 3_000;
+            while (ai.stream.nowMillis() < deadline_ms) {
+                var vecs: [1][]u8 = .{&buf};
+                const n = r.interface.readVec(&vecs) catch break;
+                if (n == 0) break;
+                captured.appendSlice(alloc, buf[0..n]) catch break;
+                if (std.mem.indexOf(u8, captured.items, "event: ev5") != null) break;
+            }
+        }
+    };
+
+    var captured: std.ArrayList(u8) = .empty;
+    defer captured.deinit(gpa);
+    const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &captured, gpa });
+    const stream = try setup.server.accept(io);
+    const handler = try std.Thread.spawn(.{}, handleConnection, .{ConnArg{
+        .session = &session,
+        .stream = stream,
+        .io = io,
+        .allocator = gpa,
+    }});
+
+    cli.join();
+    handler.join();
+
+    // Replay should include ids 3-5 with their event names …
+    try testing.expect(std.mem.indexOf(u8, captured.items, "id: 3\n") != null);
+    try testing.expect(std.mem.indexOf(u8, captured.items, "event: ev3") != null);
+    try testing.expect(std.mem.indexOf(u8, captured.items, "id: 4\n") != null);
+    try testing.expect(std.mem.indexOf(u8, captured.items, "event: ev4") != null);
+    try testing.expect(std.mem.indexOf(u8, captured.items, "id: 5\n") != null);
+    try testing.expect(std.mem.indexOf(u8, captured.items, "event: ev5") != null);
+    // … but ids 1 and 2 (the client already had them) must NOT appear.
+    try testing.expect(std.mem.indexOf(u8, captured.items, "event: ev1") == null);
+    try testing.expect(std.mem.indexOf(u8, captured.items, "event: ev2") == null);
+}
+
+test "proxy: GET /events with too-old Last-Event-ID emits replay_gap" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var setup = bindLoopback(io) orelse return; // sandbox can't bind
+    defer setup.server.deinit(io);
+
+    var cfg = try cli_mod.parse(gpa, &.{"franky"});
+    defer cfg.deinit();
+    var environ_map = std.process.Environ.Map.init(gpa);
+    defer environ_map.deinit();
+
+    var session: Session = undefined;
+    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
+    defer session.deinit();
+
+    // Push capacity+10 events so the oldest 10 are evicted; a client
+    // claiming Last-Event-ID: 1 is past the gap horizon.
+    var i: u64 = 0;
+    while (i < replay_ring_capacity + 10) : (i += 1) {
+        session.broadcastEvent(gpa, "event: stub\ndata: {}\n\n");
+    }
+
+    const Client = struct {
+        fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
+            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
+            var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
+            defer stream.close(client_io);
+            const req =
+                "GET /events HTTP/1.1\r\n" ++
+                "Host: 127.0.0.1\r\n" ++
+                "Last-Event-ID: 1\r\n" ++
+                "\r\n";
+            var wb: [256]u8 = undefined;
+            var w = stream.writer(client_io, &wb);
+            w.interface.writeAll(req) catch return;
+            w.interface.flush() catch return;
+
+            var buf: [1024]u8 = undefined;
+            var r = stream.reader(client_io, &.{});
+            // The gap frame is emitted FIRST, before the ring replay
+            // sweep. Once the test sees `"missed_to":` in the captured
+            // bytes we have everything we need — drop the connection
+            // so the server-side handler unblocks from its read loop.
+            const deadline_ms: i64 = ai.stream.nowMillis() + 3_000;
+            while (ai.stream.nowMillis() < deadline_ms) {
+                var vecs: [1][]u8 = .{&buf};
+                const n = r.interface.readVec(&vecs) catch break;
+                if (n == 0) break;
+                captured.appendSlice(alloc, buf[0..n]) catch break;
+                if (std.mem.indexOf(u8, captured.items, "\"missed_to\":") != null) break;
+            }
+        }
+    };
+
+    var captured: std.ArrayList(u8) = .empty;
+    defer captured.deinit(gpa);
+    const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &captured, gpa });
+    const stream = try setup.server.accept(io);
+    const handler = try std.Thread.spawn(.{}, handleConnection, .{ConnArg{
+        .session = &session,
+        .stream = stream,
+        .io = io,
+        .allocator = gpa,
+    }});
+
+    cli.join();
+    handler.join();
+
+    try testing.expect(std.mem.indexOf(u8, captured.items, "event: replay_gap") != null);
+    // Gap range covers ids 2..10 (the evicted prefix). After capacity+10
+    // events, oldest = 11, so missed_to = 10.
+    try testing.expect(std.mem.indexOf(u8, captured.items, "\"missed_from\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, captured.items, "\"missed_to\":10") != null);
 }

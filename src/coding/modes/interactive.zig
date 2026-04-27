@@ -236,6 +236,7 @@ fn runInteractive(
     try slash_registry.register(.{ .name = "cwd", .description = "Show or set workspace cwd", .handler = interactiveCwdHandler });
     try slash_registry.register(.{ .name = "thinking", .description = "Set thinking level", .handler = interactiveThinkingHandler });
     try slash_registry.register(.{ .name = "role", .description = "Show current capability role + permitted tools", .handler = interactiveRoleHandler });
+    try slash_registry.register(.{ .name = "permissions", .description = "Inspect / clear / revoke per-tool permission entries", .handler = interactivePermissionsHandler });
     try slash_registry.register(.{ .name = "retry", .description = "Re-run the last user turn", .handler = interactiveRetryHandler });
     try slash_registry.register(.{ .name = "edit", .description = "Edit and resubmit the last user msg", .handler = interactiveEditHandler });
     try slash_registry.register(.{ .name = "export", .description = "Dump transcript to markdown|json", .handler = interactiveExportHandler });
@@ -2042,6 +2043,159 @@ fn interactiveRoleHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.
         ctx.allocator,
         "\n(read-only — restart with --role <name> to change)",
     );
+}
+
+/// `/permissions` (no args) → status. `/permissions clear` →
+/// wipe everything. `/permissions revoke <entry>` → drop one
+/// entry (e.g. `bash:git` or `write`). Auto-persists when
+/// `--remember-permissions` is on.
+fn interactivePermissionsHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!void {
+    const bridge = bridgeFromCtx(ctx);
+    const store = &bridge.session.permission_store;
+    const gate_active = bridge.session.session_gates.permissions != null;
+
+    if (args.len == 0) {
+        try renderPermissionsStatus(ctx, store, gate_active);
+        return;
+    }
+    const sub = args[0];
+
+    if (std.mem.eql(u8, sub, "clear")) {
+        store.clearAll();
+        const persisted_hint: []const u8 = if (store.persist_path != null)
+            " (persisted file rewritten with empty arrays)"
+        else
+            "";
+        const line = try std.fmt.allocPrint(
+            ctx.allocator,
+            "permissions: cleared all entries{s}",
+            .{persisted_hint},
+        );
+        defer ctx.allocator.free(line);
+        try ctx.output.appendSlice(ctx.allocator, line);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "revoke")) {
+        if (args.len < 2) {
+            try ctx.output.appendSlice(
+                ctx.allocator,
+                "usage: /permissions revoke <entry>\n  e.g. write, edit, bash:git, bash:rm",
+            );
+            return;
+        }
+        const entry = args[1];
+        const removed = store.revoke(entry);
+        const verb: []const u8 = if (removed) "removed" else "no entry to remove for";
+        const persisted_hint: []const u8 = if (removed and store.persist_path != null)
+            " (persisted)"
+        else
+            "";
+        const line = try std.fmt.allocPrint(
+            ctx.allocator,
+            "permissions: {s} {s}{s}",
+            .{ verb, entry, persisted_hint },
+        );
+        defer ctx.allocator.free(line);
+        try ctx.output.appendSlice(ctx.allocator, line);
+        return;
+    }
+
+    const usage = try std.fmt.allocPrint(
+        ctx.allocator,
+        "unknown subcommand: {s}\n" ++
+            "usage:\n" ++
+            "  /permissions             — show status\n" ++
+            "  /permissions clear       — wipe all entries\n" ++
+            "  /permissions revoke X    — drop one entry (write, bash:git, …)",
+        .{sub},
+    );
+    defer ctx.allocator.free(usage);
+    try ctx.output.appendSlice(ctx.allocator, usage);
+}
+
+fn renderPermissionsStatus(
+    ctx: *slash_mod.Ctx,
+    store: *const permissions_mod.Store,
+    gate_active: bool,
+) slash_mod.Error!void {
+    const allocator = ctx.allocator;
+
+    const header = try std.fmt.allocPrint(
+        allocator,
+        "permissions overlay:\n  enabled:  {s}\n  default:  read/ls/find/grep auto-allow; write/edit/bash ask",
+        .{if (gate_active) "yes (--prompts)" else "no (omit --prompts to enable)"},
+    );
+    defer allocator.free(header);
+    try ctx.output.appendSlice(allocator, header);
+
+    try appendSetLine(ctx, "allow (tools)", &store.allow_tools);
+    try appendSetLine(ctx, "deny  (tools)", &store.deny_tools);
+    try appendSetLine(ctx, "ask   (tools)", &store.ask_tools);
+    try appendSetLine(ctx, "allow (bash)", &store.allow_bash);
+    try appendSetLine(ctx, "deny  (bash)", &store.deny_bash);
+    try appendSetLine(ctx, "ask   (bash)", &store.ask_bash);
+
+    const flags = try std.fmt.allocPrint(
+        allocator,
+        "\n  yes_to_all: {s}\n  ask_all:    {s}",
+        .{
+            if (store.yes_to_all) "yes" else "no",
+            if (store.ask_all) "yes" else "no",
+        },
+    );
+    defer allocator.free(flags);
+    try ctx.output.appendSlice(allocator, flags);
+
+    if (store.persist_path) |p| {
+        const persisted = try std.fmt.allocPrint(
+            allocator,
+            "\n  persisted: {s} ({d} entries)",
+            .{ p, store.entryCount() },
+        );
+        defer allocator.free(persisted);
+        try ctx.output.appendSlice(allocator, persisted);
+    } else {
+        try ctx.output.appendSlice(allocator,
+            "\n  persisted: no (start with --remember-permissions to enable)");
+    }
+
+    try ctx.output.appendSlice(
+        allocator,
+        "\n\nuse `/permissions clear` or `/permissions revoke <entry>` to mutate.",
+    );
+}
+
+fn appendSetLine(
+    ctx: *slash_mod.Ctx,
+    label: []const u8,
+    set: *const std.StringHashMapUnmanaged(void),
+) slash_mod.Error!void {
+    const allocator = ctx.allocator;
+    if (set.count() == 0) {
+        const line = try std.fmt.allocPrint(allocator, "\n  {s}: (empty)", .{label});
+        defer allocator.free(line);
+        try ctx.output.appendSlice(allocator, line);
+        return;
+    }
+    // Sort keys for stable display.
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(allocator);
+    var it = set.keyIterator();
+    while (it.next()) |k| try keys.append(allocator, k.*);
+    std.mem.sort([]const u8, keys.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    const head = try std.fmt.allocPrint(allocator, "\n  {s}: ", .{label});
+    defer allocator.free(head);
+    try ctx.output.appendSlice(allocator, head);
+    for (keys.items, 0..) |k, i| {
+        if (i > 0) try ctx.output.appendSlice(allocator, ", ");
+        try ctx.output.appendSlice(allocator, k);
+    }
 }
 
 fn interactiveRetryHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {

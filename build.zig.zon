@@ -1,7 +1,7 @@
 .{
     .name = .franky,
     .fingerprint = 0x827ef3f35d829231,
-    .version = "1.13.0",
+    .version = "1.16.0",
     .minimum_zig_version = "0.17.0-dev",
     .dependencies = .{},
     .paths = .{

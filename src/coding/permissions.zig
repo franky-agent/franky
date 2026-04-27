@@ -188,6 +188,83 @@ pub const Store = struct {
         }
     }
 
+    /// Drop a single entry from any of the six allow/deny/ask
+    /// sets. Accepts the same shapes as `--allow-tools` etc.:
+    /// bare tool name (`write`) or scoped bash fingerprint
+    /// (`bash:git`). Returns whether anything was removed; `false`
+    /// surfaces "no such entry" to the caller without erroring.
+    /// Auto-persists on success when `persist_path` is set.
+    pub fn revoke(self: *Store, entry: []const u8) bool {
+        if (entry.len == 0) return false;
+        var removed: bool = false;
+        if (std.mem.indexOfScalar(u8, entry, ':')) |colon| {
+            const tool = entry[0..colon];
+            const fp = entry[colon + 1 ..];
+            if (!std.mem.eql(u8, tool, "bash") or fp.len == 0) return false;
+            const sets = [_]*std.StringHashMapUnmanaged(void){
+                &self.allow_bash, &self.deny_bash, &self.ask_bash,
+            };
+            for (sets) |set| {
+                if (set.fetchRemove(fp)) |old| {
+                    self.allocator.free(old.key);
+                    removed = true;
+                }
+            }
+        } else {
+            const sets = [_]*std.StringHashMapUnmanaged(void){
+                &self.allow_tools, &self.deny_tools, &self.ask_tools,
+            };
+            for (sets) |set| {
+                if (set.fetchRemove(entry)) |old| {
+                    self.allocator.free(old.key);
+                    removed = true;
+                }
+            }
+        }
+        if (removed) self.persistIfConfigured();
+        return removed;
+    }
+
+    /// Wipe every allow/deny/ask entry plus the `yes_to_all` /
+    /// `ask_all` flags. The store remains usable; the persisted
+    /// path (if any) is rewritten with empty arrays so the next
+    /// session loads the cleared state.
+    pub fn clearAll(self: *Store) void {
+        freeStringSet(self.allocator, &self.allow_tools);
+        freeStringSet(self.allocator, &self.deny_tools);
+        freeStringSet(self.allocator, &self.ask_tools);
+        freeStringSet(self.allocator, &self.allow_bash);
+        freeStringSet(self.allocator, &self.deny_bash);
+        freeStringSet(self.allocator, &self.ask_bash);
+        self.allow_tools = .empty;
+        self.deny_tools = .empty;
+        self.ask_tools = .empty;
+        self.allow_bash = .empty;
+        self.deny_bash = .empty;
+        self.ask_bash = .empty;
+        self.yes_to_all = false;
+        self.ask_all = false;
+        self.persistIfConfigured();
+    }
+
+    /// v1.12.0 helper exposed publicly for the `/permissions`
+    /// slash command's revoke/clear paths. No-op when no
+    /// persistence is configured.
+    pub fn persistIfConfigured(self: *const Store) void {
+        const path = self.persist_path orelse return;
+        const io = self.persist_io orelse return;
+        saveToDisk(self, self.allocator, io, path) catch {};
+    }
+
+    /// Total number of allow/deny/ask entries across all six sets.
+    /// Used by the `/permissions` status renderer to summarize
+    /// without having to itemize when there's nothing interesting.
+    pub fn entryCount(self: *const Store) usize {
+        return self.allow_tools.count() + self.deny_tools.count() +
+            self.ask_tools.count() + self.allow_bash.count() +
+            self.deny_bash.count() + self.ask_bash.count();
+    }
+
     /// Decide whether to permit a single tool call. `args_json` is
     /// the raw JSON the model sent; for bash we fingerprint the
     /// command, for other tools we ignore it.
@@ -1049,6 +1126,110 @@ test "Store auto-persists on always_allow when persist_path is set" {
     defer s2.deinit();
     try testing.expect(try loadFromDisk(&s2, gpa, io, path));
     try testing.expectEqual(Decision.auto_allow, s2.check("bash", "{\"command\":\"git status\"}"));
+}
+
+// ─── /permissions slash-command surface ───────────────────────────
+
+test "Store.revoke: drops bash-fingerprint entry from allow set" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try s.addAllowList("bash:git,bash:ls,write");
+
+    try testing.expect(s.revoke("bash:git"));
+    try testing.expectEqual(Decision.ask, s.check("bash", "{\"command\":\"git status\"}"));
+    // ls fingerprint untouched.
+    try testing.expectEqual(Decision.auto_allow, s.check("bash", "{\"command\":\"ls -la\"}"));
+    // write tool untouched.
+    try testing.expectEqual(Decision.auto_allow, s.check("write", "{}"));
+}
+
+test "Store.revoke: drops bare tool name from any set it appears in" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try s.addAllowList("write");
+    try s.addDenyList("edit");
+    try s.addAskList("read");
+
+    try testing.expect(s.revoke("write"));
+    try testing.expect(s.revoke("edit"));
+    try testing.expect(s.revoke("read"));
+    try testing.expectEqual(@as(usize, 0), s.entryCount());
+}
+
+test "Store.revoke: returns false for unknown entries" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try testing.expect(!s.revoke("nope"));
+    try testing.expect(!s.revoke("bash:nope"));
+    try testing.expect(!s.revoke(""));
+    // Wrong prefix → not bash-scoped → never matches anywhere.
+    try testing.expect(!s.revoke("foo:bar"));
+}
+
+test "Store.clearAll: wipes every set + flag" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try s.addAllowList("write,bash:git");
+    try s.addDenyList("bash:rm");
+    try s.addAskList("all");
+    s.yes_to_all = true;
+    try testing.expect(s.entryCount() > 0);
+    try testing.expect(s.ask_all);
+    try testing.expect(s.yes_to_all);
+
+    s.clearAll();
+    try testing.expectEqual(@as(usize, 0), s.entryCount());
+    try testing.expect(!s.ask_all);
+    try testing.expect(!s.yes_to_all);
+    // Defaults restored.
+    try testing.expectEqual(Decision.ask, s.check("bash", "{\"command\":\"git status\"}"));
+}
+
+test "Store.entryCount: sums across all six sets" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 0), s.entryCount());
+    try s.addAllowList("write,bash:git,bash:ls");
+    try s.addDenyList("bash:rm");
+    try s.addAskList("read");
+    try testing.expectEqual(@as(usize, 5), s.entryCount());
+}
+
+test "Store.revoke + persist_path: rewrite is observable from a fresh store" {
+    const gpa = testing.allocator;
+    var threaded = @import("../test_helpers.zig").threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "/tmp/franky_perm_revoke";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    const path = base ++ "/permissions.json";
+
+    var s = Store.init(gpa);
+    defer s.deinit();
+    s.persist_path = path;
+    s.persist_io = io;
+    try s.addAllowList("bash:git,bash:ls");
+    try saveToDisk(&s, gpa, io, path);
+
+    // Confirm both fingerprints land on disk first.
+    var loaded = Store.init(gpa);
+    defer loaded.deinit();
+    try testing.expect(try loadFromDisk(&loaded, gpa, io, path));
+    try testing.expectEqual(@as(usize, 2), loaded.entryCount());
+
+    // Revoke one — should auto-persist.
+    try testing.expect(s.revoke("bash:git"));
+
+    // Reload again; only `ls` should remain.
+    var after = Store.init(gpa);
+    defer after.deinit();
+    try testing.expect(try loadFromDisk(&after, gpa, io, path));
+    try testing.expectEqual(@as(usize, 1), after.entryCount());
+    try testing.expectEqual(Decision.auto_allow, after.check("bash", "{\"command\":\"ls -la\"}"));
+    try testing.expectEqual(Decision.ask, after.check("bash", "{\"command\":\"git status\"}"));
 }
 
 test "Store.check: yes_to_all + ask_all → auto_allow (CI gate-active mode)" {

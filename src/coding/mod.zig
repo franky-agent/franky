@@ -37,6 +37,8 @@ pub const settings = @import("settings.zig");
 pub const auth = @import("auth.zig");
 pub const oauth = @import("oauth/mod.zig");
 pub const models = @import("models.zig");
+pub const models_render = @import("models_render.zig");
+pub const models_fetch = @import("models_fetch.zig");
 pub const rpc = @import("rpc.zig");
 pub const slash = @import("slash.zig");
 pub const templates = @import("templates.zig");
@@ -77,6 +79,8 @@ test {
     _ = auth;
     _ = oauth;
     _ = models;
+    _ = models_render;
+    _ = models_fetch;
     _ = rpc;
     _ = slash;
     _ = templates;

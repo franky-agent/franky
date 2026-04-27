@@ -7,6 +7,375 @@ versions correspond to the roadmap milestones in `franky-spec-v1.md`
 `franky-spec-v0.md` under "Port implementation log" and the v0.\*
 roadmap section — this file starts from v1.x.
 
+## [1.16.0] — 2026-04-27 — SSE reconnect-with-event-replay (closes v2 §2.3)
+
+Web-UI / proxy-mode reliability: when the browser's `EventSource`
+connection drops mid-stream (network blip, laptop sleep+wake), the
+events emitted during the gap are no longer lost. The native
+`EventSource` automatically reconnects with `Last-Event-ID`; the
+listener now honors that header and replays the missed frames from
+an in-memory ring before resuming the live stream. Fills the
+in-flight gap that v1.6.1's `GET /transcript` (page-reload
+rehydration) couldn't cover — a turn that was streaming when the
+connection died now picks up where it left off.
+
+### What shipped
+
+- **Server-side ring** of the most recent **256** replay-eligible
+  SSE frames, keyed by a monotonic per-session event id. Every
+  real `AgentEvent` frame and the synthetic `session_switched`
+  frame are stamped with `id: N\n` and stored. Keepalive `ping`
+  frames are intentionally **not** stored — heartbeats are
+  stateless, replaying old ones is meaningless.
+- **`broadcastEvent(allocator, frame)`** alongside the existing
+  `broadcastFrame(frame)`. `broadcastEvent` stamps the id, pushes
+  the stamped copy into the ring (freeing any evicted entry), and
+  fans out to live subscribers. `broadcastFrame` stays put for
+  keepalive and is unchanged.
+- **`Last-Event-ID` parsing** in `parseRequest`. Case-insensitive,
+  null when absent.
+- **Replay flow** in `runSseStream`: under `events_mutex` (renamed
+  from `subs_mutex` since it now also guards the ring), walk the
+  ring for any entry with id > `last_event_id` and write it to the
+  new socket *before* registering as a live subscriber. The atomic
+  ordering means a broadcast can't slip an event between the last
+  replayed frame and the moment we go live.
+- **`replay_gap` synthetic event** when `last_event_id` is older
+  than the oldest entry still in the ring (256-frame horizon).
+  Carries `{missed_from, missed_to}` so the client can show a
+  banner and fall back to `GET /transcript` for completed turns.
+  Stamped with `oldest - 1` so the client's `lastEventId` advances
+  monotonically as it then reads the surviving replay frames.
+
+### Defense in depth (the new layered model)
+
+1. Drops within the 256-event horizon → ring replay catches up
+   silently, no UX impact.
+2. Drops past the horizon → `replay_gap` fires; client knows to
+   reconcile.
+3. Anything before the last completed turn → `GET /transcript`
+   page-reload (v1.6.1).
+
+### Architecture
+
+- `Session` gained `next_event_id: u64`, `replay_ring:
+  [256]?ReplayEvent`, and the renamed `events_mutex`. Old
+  `subs_mutex` callers (transcript snapshot, active-session
+  introspection) were renamed.
+- `addSubLocked` extracted from `addSub` so the replay+register
+  block in `runSseStream` doesn't double-lock.
+- `fanOutLocked` extracted from `broadcastFrame` so both the
+  keepalive path and the new event path share the same fan-out
+  body without nested locks.
+- `Session.deinit` now frees retained ring frames.
+- `writeReplayFrame` / `writeReplayGap` write directly to a
+  not-yet-registered subscriber's stream.
+
+### Client-side
+
+The browser's native `EventSource('/events')` does the rest for
+free — auto-reconnect with backoff, `Last-Event-ID` tracking, and
+header emission. No `web/app.js` change required for the MVP. A
+future polish could surface `replay_gap` as a "you may have missed
+events" banner; not blocking.
+
+### Tests
+
++8 unit + integration tests on top of the existing 798:
+
+- `parseRequest: Last-Event-ID header` (3 cases — present, case-
+  insensitive, absent).
+- `broadcastEvent: stamps frame with monotonic id and stores in
+  ring`.
+- `broadcastEvent: ring eviction frees evicted frame` (overflow by
+  capacity+5 under `testing.allocator`'s leak detector).
+- `broadcastFrame (keepalive): does NOT advance event id or touch
+  ring`.
+- `proxy: GET /events with Last-Event-ID replays missed frames`
+  (5-event seed, reconnect with id 2, assert ids 3-5 replayed and
+  ids 1-2 absent).
+- `proxy: GET /events with too-old Last-Event-ID emits
+  replay_gap` (capacity+10 events, reconnect with id 1, assert
+  `event: replay_gap` + `"missed_from":2` + `"missed_to":10`).
+
+Plus an `id: 1\n` assertion appended to the existing `POST /prompt
+fans assistant events to /events subscribers` test, since every
+real event is now id-stamped on the wire.
+
+**806 tests passing total.**
+
+### Spec migration
+
+- `franky-spec-v1.md` §4.7 row updated; §G/§7 narrative updated;
+  v1.16.0 added to "what shipped" line.
+- `franky-spec-v2.md` §2.3 entry moved into §5 ("items shipped
+  after the v1.0.0 cut") with an `Unlock`-via-shipped pointer.
+- `refactoring.md` unchanged (this work was an §A.4-shape v2
+  pickup, not the AgentService extraction it discusses).
+
+### Files changed
+
+- `src/coding/modes/proxy.zig` (~+140 prod, ~+170 test).
+- `build.zig.zon` (1.15.2 → 1.16.0).
+- `franky-spec-v1.md`, `franky-spec-v2.md`, `CHANGELOG.md`.
+
+## [1.15.2] — 2026-04-25 — gen-models: deep Ollama metadata via `/api/show`
+
+v1.15.1 added Ollama via `/api/tags`, but that endpoint exposes
+no context window or capability flags — every Ollama entry came
+out with `contextWindow: 0` and an optimistic capability set.
+v1.15.2 follows up with a per-model `POST /api/show` enrichment
+loop that fills in real metadata.
+
+### What's new
+
+- **Per-model `/api/show` calls** after `/api/tags` returns the
+  list. For each entry, gen-models POSTs `{"model":"<id>"}` and
+  parses out:
+  - `<arch>.context_length` from `model_info` (architecture key
+    pulled from `model_info["general.architecture"]`, e.g.
+    `llama.context_length`, `qwen2.context_length`,
+    `gemma.context_length`, `phi3.context_length`, …) → real
+    `contextWindow`.
+  - `general.parameter_count` (exact int, no longer just the
+    loose `"3.2B"` string).
+  - `capabilities` array → `tools` flips `tool_use`, `vision`
+    flips `vision`, `embedding`-only flips `streaming = false`
+    and `tool_use = false`.
+- **Variants now stay distinct.** v1.15.1's `parseOllama`
+  stripped the `:tag` suffix, collapsing `llama3.2:1b` and
+  `llama3.2:3b` into the same id. v1.15.2 keeps the full
+  `name:tag` so the catalog shows every installed variant.
+  This also matches the runtime call shape — Ollama's
+  `/v1/chat/completions` expects the full `name:tag` as `model`.
+
+### CLI surface
+
+- `--ollama-shallow` — opts back to the v1.15.1 `/api/tags`-only
+  behavior (1 round-trip, no per-model show calls). Useful for
+  remote Ollama instances on slow links.
+- Stderr footer reports the enrichment status:
+  `gen-models: ollama enriched 8 models via /api/show (0 failed)`.
+
+### Architecture
+
+Two new pure-logic surfaces in `models_fetch.zig`:
+
+- `OllamaShowDetails { context_window, parameter_count, capabilities }`
+- `parseOllamaShow(allocator, bytes) → OllamaShowDetails`
+- `enrichWithShow(*Entry, show)` — applies enrichment to a parsed
+  entry, preserving the entry's owned strings.
+
+CLI driver in `bin/gen_models.zig`:
+
+- `fetchOllamaShow(gpa, io, base, model_id)` — one-shot
+  `POST /api/show` per model.
+- Per-model failure (HTTP error, JSON parse error) keeps the
+  entry as-is and increments the `failed` counter; a single
+  failure doesn't abort the whole run.
+
+### Tests
+
++8 unit tests covering: full `name:tag` retention with multi-variant
+fixture, `/api/show` parser for llama / qwen2 / vision-bearing /
+embedding-only / arch-mismatch / missing-model_info / malformed-JSON
+cases, `enrichWithShow` overlay + zero-context preservation.
+**798 tests passing total.**
+
+## [1.15.1] — 2026-04-25 — gen-models: Ollama provider + OpenAI chat filter
+
+Two refinements after the v1.15.0 cut surfaced in real use:
+
+### OpenAI chat-completion filter
+
+`/v1/models` returns every model your key has access to — chat,
+image, audio, embedding, moderation, legacy completion. We
+hard-code `api: "openai-chat-completions"` for OpenAI entries, so
+non-chat models showed up in the output incorrectly. v1.15.1 adds
+an id-pattern denylist that drops:
+
+- Legacy completion: `babbage-*`, `davinci-*`, `*-instruct*`
+- Image / video: `dall-e*`, `gpt-image*`, `chatgpt-image*`, `sora-*`
+- Audio / TTS / realtime: `tts-*`, `whisper-*`, `gpt-audio*`,
+  `gpt-realtime*`, `*-audio*`, `*-realtime*`, `*-tts*`, `*-transcribe*`
+- Embeddings: `text-embedding-*`
+- Moderation: anything containing `moderation`
+- Specialty endpoints: `*-search-*` (search APIs), `*-deep-research`
+
+Result: a typical OpenAI key with ~120 models drops to roughly 30
+chat-completion-compatible entries (gpt-3.5/4/4o/4.1/5/5.1/5.2/5.3/5.4/5.5
++ o1/o3/o4 + chatgpt-*-latest). Use `--openai-include-all` to
+disable the filter. Filter logic + table-driven test in
+`models_fetch.isChatCompletionId`.
+
+### Ollama provider
+
+`gen-models` now polls Ollama's native `GET /api/tags` endpoint
+and adds locally-installed models to the catalog. No credential
+needed. Defaults to `http://localhost:11434`; override via
+`--ollama-url URL` or `OLLAMA_HOST` env var (the latter accepts
+`host:port` with or without scheme — same convention as Ollama's
+own client).
+
+Each entry maps to `provider: "ollama"`, `api:
+"openai-compatible-gateway"` (the api tag franky's runtime uses
+for Ollama via `--base-url http://localhost:11434/v1`). Display
+name includes the parameter size where Ollama reports it
+(`llama3.2 (3.2B)`). Connection refused → silent skip with a
+one-line stderr note (`is `ollama serve` running?`).
+
+Parser: `models_fetch.parseOllama`. URL composer:
+`bin/gen_models.composeOllamaUrl`.
+
+### Other small fixes
+
+- v1.15.0 hard-coded `GEMINI_API_KEY` for Google; v1.15.1 also
+  accepts `GOOGLE_API_KEY` (matches the runtime google_gemini
+  provider's env-var precedence).
+- Stderr footer summarizes the OpenAI filter count when it fires:
+  `gen-models: openai filtered 87 non-chat models (use
+  --openai-include-all to keep them)`.
+
+## [1.15.0] — 2026-04-25 — `zig build gen-models` (closes v2 §1.4)
+
+The §H.3 catalog was previously hand-edited and the v2 deferred-work
+catalog flagged the auto-generator as a developer-convenience
+follow-up. v1.15.0 ships it.
+
+### What's new
+
+- **`zig build gen-models`** — new build step driven by
+  `bin/gen_models.zig`. Polls each provider's models endpoint and
+  renders the result as §H.3 JSON to stdout (default) or to
+  `--out PATH` (atomic tempfile + rename).
+- Providers with a credential in env are polled; the rest are
+  silently skipped:
+  - `ANTHROPIC_API_KEY` → `GET https://api.anthropic.com/v1/models`
+    (id + display_name)
+  - `OPENAI_API_KEY` → `GET https://api.openai.com/v1/models`
+    (id only)
+  - `GEMINI_API_KEY` → `GET https://generativelanguage.googleapis.com/v1beta/models`
+    (id + display_name + inputTokenLimit + outputTokenLimit + tool_use
+    inferred from `supportedGenerationMethods`)
+- **Merge semantics** — live entries inherit `cost`, `capabilities`,
+  and `knowledge_cutoff` from the hand-curated built-in catalog (or
+  a `--base PATH` overlay). Live `display_name`, `context_window`,
+  and `max_output` win when non-zero. Built-in entries with no live
+  match are preserved.
+
+### CLI surface
+
+```
+zig build gen-models -- [options]
+
+  --out PATH           Write to PATH (default: stdout)
+  --providers LIST     Comma-separated subset (anthropic, openai, google)
+  --base PATH          Use PATH as the merge base instead of built-ins
+  --no-builtin         Drop the hand-curated catalog from the merge
+  --compact            Emit single-line JSON instead of pretty-printed
+  -h, --help
+```
+
+### Architecture
+
+Pure-logic split keeps the bulk of the code unit-testable:
+
+- **`src/coding/models_render.zig`** — `render(allocator, []const
+  Entry, RenderOptions) → []u8`. Sorts by id, JSON-string escapes,
+  pretty/compact modes. +6 tests including a `parseFromSlice`
+  round-trip against the canonical `models.zig` reader.
+- **`src/coding/models_fetch.zig`** — `parseAnthropic` /
+  `parseOpenAI` / `parseGoogleGemini` per-provider response parsers
+  taking raw bytes and producing `[]Entry`, plus `merge(base, live)
+  → []Entry` for the precedence rule. +10 tests against fixture
+  bytes for each provider's actual response shape.
+- **`src/bin/gen_models.zig`** — wires HTTP fetches +
+  parsers + merge + render + output. Uses `std.http.Client`
+  directly (no SSE/retry needed for a one-shot GET).
+
+### v2 spec migration
+
+`franky-spec-v2.md` §1.4 retires to §5 ("items shipped after the
+v1.0.0 cut").
+
+## [1.14.0] — 2026-04-25 — `/permissions` slash command
+
+The user-side missing piece of the v1.11–v1.12 permission story.
+Until now, the only way to inspect or trim the persisted
+`always_allow` / `always_deny` set was to edit
+`$FRANKY_HOME/permissions.json` by hand. v1.14.0 adds a slash
+command that does it from inside the interactive REPL.
+
+### Three subcommands
+
+```
+/permissions             — show status (gate state, all entries, persistence path)
+/permissions clear       — wipe every allow/deny/ask entry + the yes_to_all / ask_all flags
+/permissions revoke X    — drop one entry by name (e.g. `bash:git`, `write`, `read`)
+```
+
+`clear` and `revoke` auto-persist to `permissions.json` when
+the bot was started with `--remember-permissions` (otherwise
+the mutation is in-memory only for the rest of the session).
+
+### Status output shape
+
+```
+permissions overlay:
+  enabled:  yes (--prompts)
+  default:  read/ls/find/grep auto-allow; write/edit/bash ask
+  allow (tools): write
+  deny  (tools): (empty)
+  ask   (tools): (empty)
+  allow (bash): git, ls
+  deny  (bash): rm
+  ask   (bash): (empty)
+  yes_to_all: no
+  ask_all:    no
+  persisted: /Users/me/.franky/permissions.json (4 entries)
+
+use `/permissions clear` or `/permissions revoke <entry>` to mutate.
+```
+
+Per-set entries are alphabetized for stable display (matches
+the JSON storage's sorted-keys output).
+
+### Store API additions
+
+- `Store.revoke(entry: []const u8) bool` — walks the six
+  allow/deny/ask sets, drops the first matching key, returns
+  whether anything was removed. Triggers `persistIfConfigured`
+  on success.
+- `Store.clearAll()` — frees every set and resets
+  `yes_to_all` / `ask_all` to false. Triggers
+  `persistIfConfigured`.
+- `Store.entryCount() usize` — sums across all six sets, used
+  by the status renderer.
+- `Store.persistIfConfigured()` — was inlined inside
+  `waitForPrompt`; promoted to `pub` so the slash command's
+  mutations save through the same code path.
+
+### Tests (+6 → 770/770)
+
+- `revoke` drops bash-fingerprint entry, leaves siblings alone
+- `revoke` drops bare tool name from any of the three (allow /
+  deny / ask) sets it appears in
+- `revoke` returns false on unknown entry, empty string,
+  unrecognized tool prefix
+- `clearAll` wipes every set + flag and restores defaults
+- `entryCount` sums correctly across mixed sets
+- `revoke` + `persist_path` — write to disk, load from a fresh
+  Store, verify the revoked entry is gone
+
+### Files changed
+
+`src/coding/permissions.zig` (new methods + tests),
+`src/coding/modes/interactive.zig` (registration + handler +
+status renderer + sorted-output helper),
+`src/root.zig` + `build.zig.zon` (1.14.0),
+`franky-spec-v1.md` (§5.11 row + What-shipped row),
+`README.md`.
+
 ## [1.13.0] — 2026-04-25 — `--log-file` + interactive auto-divert
 
 ### What shipped

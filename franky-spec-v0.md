@@ -5,12 +5,21 @@ record of franky's v0.* development line: the implementation-status
 snapshot at the moment the v0.* line closed, the port implementation
 log, and the per-milestone roadmap of v0.1 through v0.12.*.
 
-v0.* is complete. Active design and roadmap work for v1.x lives in
-**franky-spec-v1.md** — that's the evergreen spec (architectural
-sections §1-§14, implementation reference §A-§R) plus the v1.x
-milestone plan. This file is kept for archival / audit purposes:
-it is the primary source when asking "when and how did feature X
-land?".
+The 🟡 / ❌ rows in the §0 status table below are accurate for that
+v0.12.3 snapshot. Most carried over and shipped during v1.x; a
+handful remain post-1.0 and now live in **franky-spec-v2.md**.
+This file is append-only from here.
+
+Companion documents:
+
+- **`franky-spec-v1.md`** — the spec for the v1.0.0 cut. Every row
+  in its implementation-status table is ✅. Architectural sections
+  §1-§14, implementation reference §A-§R.
+- **`franky-spec-v2.md`** — open v2.x deferred-work catalog
+  (sibling projects, toolchain-blocked items, post-1.0 ideas).
+
+This file is kept for archival / audit purposes: it is the primary
+source when asking "when and how did feature X land in v0.*?".
 
 ---
 

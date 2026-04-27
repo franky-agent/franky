@@ -44,6 +44,27 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     b.step("run", "Run the franky CLI").dependOn(&run_cmd.step);
 
+    // `zig build gen-models` — regenerate the §H.3 catalog by polling
+    // each provider's models endpoint. Pass-through args via `-- …`.
+    // Implements franky-spec-v2.md §1.4 — see `src/bin/gen_models.zig`
+    // for the CLI surface.
+    const gen_models_module = b.createModule(.{
+        .root_source_file = b.path("src/bin/gen_models.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gen_models_module.addImport("franky", franky_module);
+
+    const gen_models_exe = b.addExecutable(.{
+        .name = "franky-gen-models",
+        .root_module = gen_models_module,
+        .use_llvm = use_llvm,
+        .use_lld = use_lld,
+    });
+    const gen_models_run = b.addRunArtifact(gen_models_exe);
+    if (b.args) |args| gen_models_run.addArgs(args);
+    b.step("gen-models", "Regenerate models.json by polling provider endpoints").dependOn(&gen_models_run.step);
+
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,

@@ -12,7 +12,7 @@ edits, and §R workspace path-safety), session persistence + branching
 on disk, **four run modes** (`print` / `interactive` / `rpc` / `proxy`),
 a built-in web UI served by proxy mode, capability roles, a per-tool
 permission overlay, OAuth login for four providers, and per-phase HTTP
-timeouts. **765 tests** pass at the v1.13.0 cut.
+timeouts. **798 tests** pass at the v1.15.2 cut.
 
 ## Quick start
 
@@ -188,6 +188,20 @@ schema is sorted-key for diff-friendly dotfile checkin:
 
 Disk hiccups never abort an in-flight turn — failed writes / missing
 HOME / corrupt JSON degrade silently to in-memory-only state.
+
+**Curating the persisted set** (v1.15.2). Inside `--mode
+interactive`:
+
+```
+/permissions             — show status + every entry, alphabetized
+/permissions clear       — wipe every allow/deny/ask entry + flags
+/permissions revoke X    — drop one entry by name
+                            (e.g. `bash:git`, `write`, `read`)
+```
+
+`clear` and `revoke` auto-write back to `permissions.json` when
+the bot was started with `--remember-permissions`, so changes
+survive across sessions.
 
 **Default policy (when `--prompts` is on):** `read` / `ls` / `find` /
 `grep` auto-allow; `write` / `edit` / `bash` ask.
@@ -658,7 +672,7 @@ const grep_tool = franky.coding.tools.grep.tool();
   top; `coding` adds a particular tool/prompt set. You can use any layer
   independently.
 
-## Implementation status (v1.13.0)
+## Implementation status (v1.15.2)
 
 | Layer | Module | Status |
 |---|---|---|
@@ -669,15 +683,57 @@ const grep_tool = franky.coding.tools.grep.tool();
 | `coding` modes | print, interactive (TUI), rpc (JSON-RPC), proxy (HTTP/SSE + web UI) | ✅ |
 | `coding` features | session persistence + branching + object-store + compaction, capability roles (§5.10), permission overlay foundation (§5.11), settings/auth/models JSON, OAuth login for 4 providers, Tier-1 extensions | ✅ |
 
-**765 tests** pass at the v1.13.0 cut across one library binary and five
+**798 tests** pass at the v1.15.2 cut across one library binary and five
 integration binaries (`agent_loop`, `agent_class`, `gitignore`,
 `parallel_tools`, `kitchen_sink`).
 
+### Regenerating `models.json`
+
+```sh
+# Render the built-in catalog as §H.3 JSON to stdout
+zig build gen-models
+
+# Poll live endpoints (each provider is included only when its env
+# credential is set) and merge with the hand-curated built-ins
+ANTHROPIC_API_KEY=sk-ant-… GEMINI_API_KEY=AIza… zig build gen-models -- --out ~/.franky/models.json
+
+# Local Ollama models (no credential needed; `ollama serve` must be running)
+zig build gen-models -- --providers ollama --no-builtin
+
+# Help
+zig build gen-models -- --help
+```
+
+`gen-models` keeps `cost`/`capabilities`/`knowledge_cutoff` from the
+hand-curated built-in entries (or from `--base PATH`) and lets the
+live endpoint override `display_name`/`context_window`/`max_output`
+where it returns them. Output is sorted by id for diff-friendly
+regeneration.
+
+OpenAI's `/v1/models` returns ~120 models; gen-models filters down
+to chat-completion-compatible ids by default (drops `dall-e-*`,
+`whisper-*`, `text-embedding-*`, `*-audio*`, `*-realtime*`,
+`*-search-*`, etc.). Pass `--openai-include-all` to keep them.
+
+Ollama uses its native `GET /api/tags` endpoint (not OpenAI-compat);
+override the base URL with `--ollama-url` or `OLLAMA_HOST`. Entries
+are mapped to `api: "openai-compatible-gateway"` so franky can drive
+them via `--base-url http://localhost:11434/v1` at runtime. After
+`/api/tags`, gen-models follows up with `POST /api/show` per model
+to extract the real context window (from
+`model_info.<arch>.context_length`) and capability flags (tools,
+vision, embedding). Use `--ollama-shallow` to skip the per-model
+calls and fall back to tags-only data.
+
 ## What's deferred (post-1.0)
-- **`franky-do` Slack-bot** sibling project (§8.1, post-1.0 per §O).
+
+The complete deferred-work catalog lives in
+[`franky-spec-v2.md`](franky-spec-v2.md). Highlights:
+
+- **`franky-do` Slack-bot** sibling project (post-1.0 per §O).
   Pattern + `--role plan` posture documented in
   [`docs/sandbox.md`](docs/sandbox.md).
-- **`franky-pods` vLLM CLI** sibling project (§8.2).
+- **`franky-pods` vLLM CLI** sibling project.
 - **Extension Tier-2 / Tier-3** (`.so`/`.dylib` / Wasm). Tier-1
   static-module loading ships; Tier-2/3 need a versioned ABI + sandbox.
 - **Multi-tenant proxy auth.** `--mode proxy` is single-user, binds

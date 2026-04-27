@@ -4,11 +4,18 @@ A language-agnostic specification of the `franky` codebase, originally
 extracted from the `pi-mono` TypeScript reference implementation and
 now the authoritative design document for the Zig port. This file
 describes **what the system does**, **how its parts fit together**,
-**what invariants / contracts hold**, and the **v1.x roadmap** for
-closing the remaining gaps from the v0.12.3 shipped state.
+and **what invariants / contracts hold** for the shipped v1.0.0 cut.
 
-For the historical v0.* development log (port passes 3-13, v0.1-v0.12.\*
-roadmap, per-milestone test growth), see **franky-spec-v0.md**.
+Companion documents:
+
+- **`franky-spec-v0.md`** — frozen v0.* development log (port passes
+  3-13, v0.1-v0.12.\* roadmap, per-milestone test growth). Primary
+  source for "when and how did feature X land in v0.*?"
+- **`franky-spec-v2.md`** — open v2.x deferred-work catalog: items
+  that did **not** ship at v1.0.0 (sibling projects, post-1.0
+  ideas, toolchain-blocked items). v1 references it as
+  "see franky-spec-v2.md §X" wherever a section names a deferred
+  follow-up.
 
 The document is in two volumes:
 
@@ -27,55 +34,49 @@ The document is in two volumes:
 Status of each section against the code in `franky/src/` as of the
 v1.0.0 release (2026-04-24). Legend:
 - **✅ DONE** — implemented and tested.
-- **⏳ POST-1.0** — intentionally deferred; either explicitly
-  out-of-scope per §O, or blocked on a Zig-stdlib refactor the
-  project correctly defers. Each `⏳` row's note names the
-  blocker + planned unlock.
-- **🟡 PARTIAL** — partial or missing sub-items without a
-  post-1.0 deferral rationale. No `🟡` rows remain at the v1.0.0
-  cut; kept in the legend for future milestones.
-- **❌ MISSING** — not implemented.
 - **—** non-normative (overview / guidance / glossary /
   not-applicable to Zig native target).
+
+Sibling projects, toolchain-blocked items, and post-1.0 ideas live
+in **franky-spec-v2.md**; this table holds only what shipped.
 
 | § | Title | Status | Notes |
 |---|---|---|---|
 | 1 | What franky is | — | Overview |
-| 2 | Package topology | ⏳ | v1.0.0 ships `ai`/`agent`/`coding`/`tui` as internal Zig modules (re-exported through `franky.sdk`). Side applications (`franky-do` Slack bot §8.1, `franky-pods` vLLM CLI §8.2, `franky-web-ui` §7) are **explicitly post-1.0 per §O**: each would be a sibling Zig project that depends on `franky.sdk`, not a sub-module — this preserves the one-way `ai → agent → coding` layering. Reference architecture for chat-app bots is documented in the v1.0.0 release notes under "Slack-bot planning" |
+| 2 | Package topology | ✅ | v1.0.0 ships `ai`/`agent`/`coding`/`tui` as internal Zig modules (re-exported through `franky.sdk`). Sibling projects (`franky-do` Slack bot, `franky-pods` vLLM CLI, richer `franky-web-ui`) are intentionally separate consumers of `franky.sdk`, not sub-modules — see franky-spec-v2.md §3 |
 | 3.1 | Purpose (unified LLM API) | ✅ | All seven providers shipped: `faux`, `anthropic`, `openai_chat`, `openai_responses`, `openai_gateway`, `google_gemini`, `google_vertex`. Registry dispatch working in print + interactive modes |
 | 3.2 | Core data types | ✅ | `src/ai/types.zig` |
 | 3.3 | API registry | ✅ | `src/ai/registry.zig` |
 | 3.4 | Stream contract | ✅ | `src/ai/stream.zig` with ordering invariants |
 | 3.5 | Shared stream options | ✅ | Core options + `auth_token` (bearer) + `environ_map` (proxy) + `timeouts` + `base_url`. v1.7.2 ships `StreamOptions.hooks` (`on_payload`, `on_response`, `userdata`). Hooks fire from `ai/http.zig`'s fetch wrapper — `on_payload` before each retry attempt, `on_response` after each attempt returns. Observer-only (spec invariant: bytes-in-transcript == bytes-on-wire; hooks can't mutate either) |
 | 3.6 | Cross-provider handoff | ✅ | Neutral `Context` types plus `src/ai/transform.zig::transformForApi(messages, api_tag)` (v1.7.2). Thinking blocks → `<thinking>…</thinking>` tagged text for APIs without native thinking input; redacted thinking is dropped (no way to round-trip an opaque attestation across providers). Image-position normalization is per-provider inside each `streamFn` rather than centralized, matching the spec's "provider decides" posture. Callable via `franky.sdk.transform` |
-| 3.7 | Models catalog | ✅ | Built-in Entry[] + lookup + JSON parse in `src/coding/models.zig`. Wired into `resolveProviderIo` (v1.1.0) — `--model <id>` routes through `models.lookup` to pull context_window + max_output + full Capabilities. Auto-generator build step deferred |
-| 3.8 | Auth & OAuth | ✅ | API-key + OAuth-bearer consumption + full OAuth minting wired end-to-end: `franky login --provider {anthropic,github-copilot,google-gemini}` drives the full PKCE/device-code flow and writes auth.json; Vertex `flow_vertex.mint` handles service-account JWT + in-memory cache. §Q.5 resolver-refresh integration (checking expires_at at request time) is the remaining v1.3.\* item |
+| 3.7 | Models catalog | ✅ | Built-in Entry[] + lookup + JSON parse in `src/coding/models.zig`. Wired into `resolveProviderIo` (v1.1.0) — `--model <id>` routes through `models.lookup` to pull context_window + max_output + full Capabilities. v1.15.0 ships `zig build gen-models`: polls anthropic/openai/google models endpoints when the matching env key is set, merges live data over the built-in catalog (live `display_name`/`context_window`/`max_output` win where present; built-ins keep `cost`/`capabilities`/`knowledge_cutoff`), and renders to stdout or `--out PATH` in §H.3 shape. v1.15.1 adds **Ollama** as a fourth provider (`http://localhost:11434/api/tags`, no credential, override via `--ollama-url` / `OLLAMA_HOST`) and an **OpenAI chat-completion filter** (`models_fetch.isChatCompletionId`) that drops non-chat ids. v1.15.2 deepens the Ollama path with a per-model `POST /api/show` enrichment loop — `models_fetch.parseOllamaShow` extracts `<arch>.context_length` (architecture key from `model_info["general.architecture"]`), `general.parameter_count`, and the `capabilities` array (`tools` → `tool_use`, `vision` → `vision`, `embedding`-only → `streaming = false`); `enrichWithShow` overlays the result onto the `parseOllama` entry. Variants stay distinct (full `name:tag` is the id, e.g. `llama3.2:1b` vs `llama3.2:3b`). `--ollama-shallow` opts back to the tags-only path. Pure-logic renderer in `src/coding/models_render.zig`; per-provider response parsers in `src/coding/models_fetch.zig` |
+| 3.8 | Auth & OAuth | ✅ | API-key + OAuth-bearer consumption + full OAuth minting wired end-to-end: `franky login --provider {anthropic,github-copilot,google-gemini}` drives the full PKCE/device-code flow and writes auth.json; Vertex `flow_vertex.mint` handles service-account JWT + in-memory cache. §Q.5 resolver-refresh-before-expiry → see franky-spec-v2.md §1.6 |
 | 3.9 | Faux provider | ✅ | `src/ai/providers/faux.zig` |
 | 3.10 | Browser safety | — | Native Zig binary only |
 | 4.1 | Agent runtime purpose | ✅ | |
 | 4.2 | AgentMessage superset | ✅ | Custom role + `convertToLlm` |
-| 4.3 | Agent loop | ✅ | Sequential + parallel-homogeneous modes. `Agent.steer(text)` + `Agent.followUp(text)` queues drain through `BetweenTurnsFn` after each natural turn_end (v1.4.2). Strict mid-turn (at tool-result boundary) steering is a future refinement |
+| 4.3 | Agent loop | ✅ | Sequential + parallel-homogeneous modes. `Agent.steer(text)` + `Agent.followUp(text)` queues drain through `BetweenTurnsFn` after each natural turn_end (v1.4.2). Strict mid-turn steering → see franky-spec-v2.md §1.8 |
 | 4.4 | Parallel tool execution | ✅ | `runToolsParallel` spawns one native thread per call when every tool in the turn is `.parallel`, else sequential fallback. v1.7.3 adds **completion-order `tool_execution_end` events** via per-worker `done_flag` atomics — the main thread polls flags and emits ends in the order workers finish (§4.4). Transcript assembly stays **source-ordered** via a slot-indexed result array, honoring §9.10 "deterministic under parallel execution" |
 | 4.5 | Tools | ✅ | `execution_mode: ExecutionMode` field live on `AgentTool` and enforced by the loop dispatcher: read/grep/ls/find = `.parallel`, bash/write/edit = `.sequential` |
 | 4.6 | Agent class | ✅ | `src/agent/agent.zig` |
 | 4.7 | streamProxy | ✅ | Event-framing half (`agent.proxy.encodeEventJson` / `writeEvent`) shipped at v1.0.0; **listener-side binding shipped v1.4.0** as `src/coding/modes/proxy.zig` (`franky --mode proxy`). Three endpoints: `GET /health`, `GET /events` (SSE — register as a subscriber, receive every `AgentEvent` as `event: <kind>\ndata: <json>\n\n`), `POST /prompt` (append + run one turn under `run_mutex`). Single-session model; concurrent `/prompt` calls serialize, `/events` subscribers fan-out via `session.broadcastFrame`. Wire format reuses `agent.proxy.encodeEventJson` with zero translation, honoring the spec's "same event shape" invariant. Auth + TLS are explicitly out-of-scope — the listener binds 127.0.0.1 only; public exposure requires fronting with a TLS+auth proxy |
-| 5.1 | AgentSession orchestrator | ✅ | Auto-persistence wired with object_store-backed `$ref` extraction (v1.5.0), compaction dispatch (v1.5.1), and — as of v1.6.0 — a persistent session tree: `tree.json` loads on `--resume` and saves on every turn boundary, `--fork <name>` forks the active branch at startup, and `/branch /branches /checkout` operate on the live tree. Per-branch transcript swap on `/checkout` is explicitly deferred — §H.4 stores `transcript.json` as the active branch only, so re-materializing another branch's transcript requires per-branch transcript files (v1.7 follow-up) |
+| 5.1 | AgentSession orchestrator | ✅ | Auto-persistence wired with object_store-backed `$ref` extraction (v1.5.0), compaction dispatch (v1.5.1), persistent session tree (v1.6.0 — `tree.json` loads on `--resume`, saves on every turn boundary, `--fork <name>` forks at startup, `/branch /branches /checkout` operate on the live tree), and per-branch transcript snapshots (v1.7.0 — `transcripts/<branch>.json` written on every save; `--checkout <branch>` rehydrates a specific branch's transcript on resume) |
 | 5.2 | Built-in tools | ✅ | read/write/edit/bash/ls/find/grep all live; `ls`/`find` honor `.gitignore`; `grep` regex engine via `src/coding/regex.zig` |
 | 5.3 | Sessions on disk | ✅ | ULID + atomic round-trip + resume wired (v0.5.*); object_store `$ref` emission for oversize blobs (v1.5.0); branch tree persisted via `tree.json` on every turn, loaded on resume (v1.6.0); per-branch transcript snapshots at `transcripts/<branch>.json` written on every save (v1.7.0). `--checkout <branch>` rehydrates a specific branch's transcript on resume; `--fork <name>` snapshots the new branch immediately so checkout round-trips work |
-| 5.4 | Extension system | ⏳ | Tier-1 (compile-time static modules) shipped end-to-end in v1.1.3: `--extensions <csv>` runtime opt-in, built-in catalog in `src/coding/extensions_builtin/catalog.zig`, sample `echo` extension. **Tier-2 (`.so`/`.dylib`) and Tier-3 (Wasm) are explicitly post-1.0** — see §N.4 for the ABI design. Blocker: dynamic extension loading requires a sandbox (capability gating at load time) and a versioned ABI, both of which are substantial work; Tier-1 covers the in-practice extension surface (build-time opt-in of first-party modules) |
+| 5.4 | Extension system | ✅ | Tier-1 (compile-time static modules) shipped end-to-end in v1.1.3: `--extensions <csv>` runtime opt-in, built-in catalog in `src/coding/extensions_builtin/catalog.zig`, sample `echo` extension. Tier-2 (`.so`/`.dylib`) + Tier-3 (Wasm) → see franky-spec-v2.md §1.2 |
 | 5.5 | Run modes | ✅ | All four run modes live: print (always), interactive (v0.11.3, v1.5.5 depth pass), rpc (v1.4.3 — ping/version/abort/prompt over LSP Content-Length framing with streaming event notifications), **proxy (v1.4.0 — HTTP/SSE listener; §4.7).** Interactive ships history nav (up/down through prior prompts, bounded ring with duplicate coalescing), multi-line compose (Shift-Enter inserts `\n`, editor grows to ⅓ of terminal), and slash-command palette hint (lists matching commands above the editor; Tab completes unique prefix) |
 | 5.6 | CLI arguments | ✅ | Full flag set incl. `--continue`, `--fork`, `--export`, `--tools`, `--skills`, `--prompts-dir` (renamed from `--prompts` in v1.11.0), `--theme`, `--offline`, `--extensions`, `--base-url`, `--role`, `--proxy-port`, the v1.10.0 §G.4 phase-timeout overrides (`--connect-timeout-ms` / `--upload-timeout-ms` / `--first-byte-timeout-ms` / `--event-gap-timeout-ms`) with matching `FRANKY_*` env-var fallbacks, and the v1.11.0 permission-gate overlay (`--prompts` toggle, `--yes`/`-y`, `--allow-tools`, `--deny-tools`) |
-| 5.11 | Permission overlay | ✅ | `src/coding/permissions.zig` (v1.11.0). Off by default; `--prompts` opts in. `Store` carries allow/deny/ask lists + `yes_to_all` + `ask_all` bool; `Store.check` runs a four-step precedence ladder (deny → allow → force-ask → default policy). `fingerprintBash` is the verb-level lever ("git status" → "git"). Combined `SessionGates { role, permissions, prompter }` shares the agent loop's single `hook_userdata` pointer between gates. **v1.11.0** = foundation. **v1.11.1** = pause-and-prompt protocol (`Resolution` enum + `AgentEventKind.tool_permission_request` + `PermissionPrompter` Mutex/Condition map; `*_always` promotes into the store). **v1.11.2** = interactive-mode modal (per-turn prompter; yellow overlay + key legend; `a/A/d/D/Esc` keystrokes drive `prompter.resolve`). **v1.11.3** = RPC: new `permission/resolve` JSON-RPC method + `runPrompt` interleaves channel + stdin so a client can resolve while the worker is suspended; nested `prompt` rejected with `error.PromptInFlight`. **v1.11.4** = proxy + web UI: `POST /permission/resolve` HTTP endpoint with `Session.resolve_mutex` guarding `current_prompter` from connection threads; `web/app.js` renders an inline yellow modal in the conversation pane on the SSE `tool_permission_request` event with four buttons that POST to `/permission/resolve`. **v1.11.5** = `--ask-tools <csv>` demote-to-ask flag (sentinel `all` for "ask before every tool call, no exceptions"). **v1.12.0** = `--remember-permissions` opts in to `$FRANKY_HOME/permissions.json` round-trip (atomic write, sorted keys, schema per `permission.md` §A.6); `*_always` resolutions auto-persist inside `waitForPrompt`; corrupt or missing files degrade silently to in-memory state. Permission overlay surface complete across all four modes |
+| 5.11 | Permission overlay | ✅ | `src/coding/permissions.zig` (v1.11.0). Off by default; `--prompts` opts in. `Store` carries allow/deny/ask lists + `yes_to_all` + `ask_all` bool; `Store.check` runs a four-step precedence ladder (deny → allow → force-ask → default policy). `fingerprintBash` is the verb-level lever ("git status" → "git"). Combined `SessionGates { role, permissions, prompter }` shares the agent loop's single `hook_userdata` pointer between gates. **v1.11.0** = foundation. **v1.11.1** = pause-and-prompt protocol (`Resolution` enum + `AgentEventKind.tool_permission_request` + `PermissionPrompter` Mutex/Condition map; `*_always` promotes into the store). **v1.11.2** = interactive-mode modal (per-turn prompter; yellow overlay + key legend; `a/A/d/D/Esc` keystrokes drive `prompter.resolve`). **v1.11.3** = RPC: new `permission/resolve` JSON-RPC method + `runPrompt` interleaves channel + stdin so a client can resolve while the worker is suspended; nested `prompt` rejected with `error.PromptInFlight`. **v1.11.4** = proxy + web UI: `POST /permission/resolve` HTTP endpoint with `Session.resolve_mutex` guarding `current_prompter` from connection threads; `web/app.js` renders an inline yellow modal in the conversation pane on the SSE `tool_permission_request` event with four buttons that POST to `/permission/resolve`. **v1.11.5** = `--ask-tools <csv>` demote-to-ask flag (sentinel `all` for "ask before every tool call, no exceptions"). **v1.12.0** = `--remember-permissions` opts in to `$FRANKY_HOME/permissions.json` round-trip (atomic write, sorted keys, schema per `permission.md` §A.6); `*_always` resolutions auto-persist inside `waitForPrompt`; corrupt or missing files degrade silently to in-memory state. **v1.14.0** = `/permissions` interactive slash command (status / clear / revoke); `Store.revoke(entry)` and `Store.clearAll()` mutate the in-memory state and auto-persist when `--remember-permissions` is on, so users can curate the saved set without editing the JSON by hand. Permission overlay surface complete across all four modes |
 | 5.10 | Capability roles | ✅ | `src/coding/role.zig` + `--role <read\|plan\|code\|full>` (v1.9.0). Tool-registry filter + runtime role gate (`tool_code = "role_denied"`) + sandbox detection across print/interactive/rpc/proxy. Single-source `tool_table` drives all derivations; `role.zig::renderRoleStatusJson` is the shared wire format for `GET /role` (proxy) and `role` (rpc). `scripts/franky-zerobox` wrapper + `docs/sandbox.md` recipes (zerobox primary). Mid-session escalation explicitly out of scope |
 | 5.7 | Settings | ✅ | `loadLayered` shipped and wired through `print.zig::resolveProviderIo` (v1.1.0). Order: defaults → `$HOME/.franky/agent/settings.json` → `$PWD/.franky/settings.json` → CLI flags. `thinking_explicit` disambiguates "user set --thinking" from "default off" so `settings.thinking` participates as a fallback |
-| 5.8 | Prompt templates & skills | ✅ | `expand` + `loadTemplate` + `/template <name> [args…]` slash handler wired in interactive mode (v1.1.1). `--prompts <dir>` supplies the lookup root. Skill-bundle metadata loader still deferred |
+| 5.8 | Prompt templates & skills | ✅ | `expand` + `loadTemplate` + `/template <name> [args…]` slash handler wired in interactive mode (v1.1.1). `--prompts-dir <dir>` supplies the lookup root |
 | 5.9 | Programmatic SDK | ✅ | `franky.sdk` (v1.5.4) — façade module re-exporting the stable public surface (`Agent`, `Transcript`, `Registry`, `Channel`, `Model`, `Context`, `StreamEvent`, `drainToMessage`, tools/compaction/branching/object_store primitives) under friendly names. Deeper modules still reachable via `franky.ai` / `franky.agent` / `franky.coding` |
 | 6 | TUI library | ✅ | `src/tui/` complete; raw-terminal binding via `src/coding/terminal.zig` wired through `src/coding/modes/interactive.zig` |
 | 7 | Web UI | ✅ | MVP shipped v1.5.0 — `src/coding/modes/web/{index.html, app.js, style.css}` embedded into the binary via `@embedFile`, served by `franky --mode proxy` at `GET /`. Vanilla JS (no build pipeline); connects to `/events` via browser-native `EventSource`, POSTs to `/prompt`. Renders streaming assistant text, thinking blocks, tool start/end cards, agent errors. Auto dark/light theme via `prefers-color-scheme`. **v1.6.0** markdown subset (~150 LOC), **v1.6.1** `GET /transcript` rehydrate, **v1.6.2** live tool-arg streaming. **v1.7.0** added persistent sessions on disk + a sidebar to load past conversations: proxy mode now honors `--session-dir`/`--session`/`--resume`, auto-saves after every turn, exposes `GET /session` / `GET /sessions` / `GET /sessions/<id>/transcript` / `POST /session/new` / `POST /session/activate`, and broadcasts `session_switched` SSE on swap. Sidebar UI lists conversations newest-first, click to switch, "+ New" creates a fresh ULID. Out-of-scope: branching UI (v1.7.2 target), slash command framework (v1.7.1 target), syntax highlighting, deletion from UI |
-| 8.1 | Slack bot | ❌ | Explicitly post-1.0 per §O |
-| 8.2 | Pods CLI | ❌ | Explicitly post-1.0 per §O |
+| 8 | Side applications | — | Sibling Zig projects (Slack bot, pods CLI) — see franky-spec-v2.md §3 |
 | 9 | Cross-cutting patterns | ✅ | All 12 §9 patterns honored end-to-end: (1) registry dispatch via API tag, (2) stream-first state transitions, (3) error-as-event below the CLI boundary (§F retry/transport/tool codes flow through `ErrorDetails`), (4) plain-JSON persistence (transcript/tree/header/auth), (5) DI via explicit ctx bundles (`SessionBinding`, `StreamCtx`, `SessionState`), (6) JSON-schema-backed tool params, (7) message-transform pipeline (`convertToLlm` + v1.7.2 `transformForApi`), (8) lazy provider loading via registry register-on-demand, (9) hooks return decisions (`beforeToolCall{block, reason}`, `betweenTurns: bool`), (10) deterministic transcripts under parallel exec (§4.4, v1.7.3), (11) content-addressed session storage (v1.5.0 `$ref`), (12) no `any`-equivalent (Zig's type system enforces) |
-| 10 | Testing strategy | ✅ | 601 tests (v1.6.1). 5 integration binaries: agent_loop, agent_class, gitignore, parallel_tools, **kitchen_sink** (v1.6.1 — 15 end-to-end scenarios covering multi-turn loop, compaction round, branch-and-fork, oversize-block `$ref` extraction, tree.json round-trip, RPC framer, SDK façade, deterministic transcript order). Faux backbone ✓ |
+| 10 | Testing strategy | ✅ | 770 tests at the v1.0.0 cut. 5 integration binaries: agent_loop, agent_class, gitignore, parallel_tools, **kitchen_sink** (v1.6.1 — 15 end-to-end scenarios covering multi-turn loop, compaction round, branch-and-fork, oversize-block `$ref` extraction, tree.json round-trip, RPC framer, SDK façade, deterministic transcript order). Faux backbone ✓ |
 | 11 | Operational rules | ✅ | |
 | 12 | Implementation details | ✅ | Partial-JSON parser (v0.2.*) ✓; session migrations (v3 current) ✓; compaction summarization + pre-compact branch checkpoint (v1.5.1) ✓; ULID session ids ✓; atomic tempfile+rename writes ✓; SHA-256 hex canonicalization ✓; cancellation tokens thread through every network + tool path ✓; SSE parser with 4 MiB single-event + 1 MiB single-line caps ✓ |
 | 13 | Preserve vs reconsider | — | Guidance |
@@ -91,7 +92,7 @@ v1.0.0 release (2026-04-24). Legend:
 | C.1 | read tool | ✅ | |
 | C.2 | write tool | ✅ | |
 | C.3 | edit tool | ✅ | |
-| C.4 | bash tool | ✅ | Core shipped with cwd tracking (§R.5 trailer), workspace-scoped cwd canonicalization, env denylist, shell-trust policy, timeout, 1 MiB stdout/stderr caps. v1.7.4 adds `background: true` (nohup detach via argv-safe wrapper — returns `{pid, outputFile}` immediately; session-supervised status polling is v1.8) and chunked `on_update` emission (64 KiB `ToolUpdate` events for captures > 64 KiB, matching §C.4's chunk-size contract). True real-time incremental streaming (before command finishes) requires a non-blocking pipe-read runtime which is genuinely post-1.0 (§N.2 `io.concurrent`) |
+| C.4 | bash tool | ✅ | Core shipped with cwd tracking (§R.5 trailer), workspace-scoped cwd canonicalization, env denylist, shell-trust policy, timeout, 1 MiB stdout/stderr caps. v1.7.4 adds `background: true` (nohup detach via argv-safe wrapper — returns `{pid, outputFile}` immediately) and chunked `on_update` emission (64 KiB `ToolUpdate` events for captures > 64 KiB, matching §C.4's chunk-size contract). True real-time incremental streaming → see franky-spec-v2.md §1.3 |
 | C.5 | ls tool | ✅ | With `.gitignore` composition |
 | C.6 | find tool | ✅ | With `.gitignore` + shell glob |
 | C.7 | grep tool | ✅ | Regex or literal via `src/coding/regex.zig` |
@@ -99,30 +100,30 @@ v1.0.0 release (2026-04-24). Legend:
 | E | Compaction algorithm | ✅ | Pure-logic primitives (`estimateTokens`, `shouldTrigger`, `selectSpan`) shipped in v0.6.3; summarization dispatch + branch-checkpoint + synthetic `compaction_summary` re-injection shipped (v1.5.1) via `compaction.run`. `defaultConvertToLlm` remaps the custom role to `user` with the §E.4.3 prefix |
 | F | Error taxonomy | ✅ | `src/ai/errors.zig` |
 | F.1 | Retry policy | ✅ | `src/ai/retry.zig` algorithm + `ai/http.zig::fetchWithRetry[AndTimeouts]` wrap shipped and wired across all 5 HTTP providers (v1.3.0). Classifies 5xx/429/transient-transport as retryable; `Cancel` short-circuits; body writer reset between attempts preserves §F.1 "no retry after first byte" invariant |
-| F.2 | Tool vs agent errors | ✅ | `ErrorDetails.tool_code` / `provider_code` fields (v0.3.*). v1.7.1 wires the tool side end-to-end: every built-in tool's error-helper populates `ToolResult.tool_code` with the `§C`/`§R` sub-code (`edit_no_match`, `path_escape_workspace`, `file_not_found`, `bash_timeout`, …). `errors.fromToolResult(message, tool_code)` escalates a tool failure into an `agent_error` with `code=.tool_runtime` and `tool_code` carried through. OAuth sub-codes (§Q.6) still surface via login.zig's direct stderr path; wiring them through `ErrorDetails.provider_code` is a post-1.0 polish since OAuth flows are user-driven (not mid-turn). v1.9.1 adds the `role_denied` sub-code (capability-role gate, §5.10) — `agent.types.role_denied_code` is the single source of truth string; `tool_execution_end` event JSON includes `toolCode` so web/RPC clients render denials distinctly |
+| F.2 | Tool vs agent errors | ✅ | `ErrorDetails.tool_code` / `provider_code` fields (v0.3.*). v1.7.1 wires the tool side end-to-end: every built-in tool's error-helper populates `ToolResult.tool_code` with the `§C`/`§R` sub-code (`edit_no_match`, `path_escape_workspace`, `file_not_found`, `bash_timeout`, …). `errors.fromToolResult(message, tool_code)` escalates a tool failure into an `agent_error` with `code=.tool_runtime` and `tool_code` carried through. v1.9.1 adds the `role_denied` sub-code (capability-role gate, §5.10) — `agent.types.role_denied_code` is the single source of truth string; `tool_execution_end` event JSON includes `toolCode` so web/RPC clients render denials distinctly. OAuth sub-code (§Q.6) routing via `provider_code` → see franky-spec-v2.md §1.6 |
 | G.1 | HTTP client | ✅ | `std.http.Client` ✓; proxy env vars honored; retry + wall-clock deadline wrapping shipped in `ai/http.zig` and wired into every HTTP provider (v1.3.0/v1.3.1) |
 | G.2 | SSE parser | ✅ | |
 | G.3 | Cancellation | ✅ | `Cancel` atomic |
-| G.4 | Timeouts | ✅ | All four fields enforced. `event_gap_ms` in `driveSseFromBytes` (v0.3.0). Total-budget deadline between retry attempts (v1.3.1). **v1.8.0 — per-phase granularity**: `fetchAttemptPhased` replaces single-shot `client.fetch` with `connect → request+sendBody → receiveHead → readBody`; a watchdog thread `shutdown(.both)`s the connection's `std.Io.net.Stream` when a phase budget expires, so the blocked op returns. Phase tag (`connect`/`upload`/`first_byte`) reported via the new `*PhaseInfo` out-parameter on `fetchWithRetryAndTimeoutsAndHooksAndPhases`. **v1.10.0 — user-configurable budgets**: `--connect-timeout-ms`/`--upload-timeout-ms`/`--first-byte-timeout-ms`/`--event-gap-timeout-ms` (+ matching `FRANKY_*` env vars) plumb per-phase overrides through every mode via `resolveTimeoutsFromMap`. All five providers route through the phased fetch + new `reportTransportErrorWithPhase` so timeouts surface as `code = .timeout` with a phase-specific message ("first-byte timeout: provider didn't respond within 30000ms; raise --first-byte-timeout-ms…") instead of the legacy `code = .transport, message = "http error: Timeout"`. True streaming SSE parse during body reads stays post-1.0 (§N.2 `io.concurrent`) |
+| G.4 | Timeouts | ✅ | All four fields enforced. `event_gap_ms` in `driveSseFromBytes` (v0.3.0). Total-budget deadline between retry attempts (v1.3.1). **v1.8.0 — per-phase granularity**: `fetchAttemptPhased` replaces single-shot `client.fetch` with `connect → request+sendBody → receiveHead → readBody`; a watchdog thread `shutdown(.both)`s the connection's `std.Io.net.Stream` when a phase budget expires, so the blocked op returns. Phase tag (`connect`/`upload`/`first_byte`) reported via the new `*PhaseInfo` out-parameter on `fetchWithRetryAndTimeoutsAndHooksAndPhases`. **v1.10.0 — user-configurable budgets**: `--connect-timeout-ms`/`--upload-timeout-ms`/`--first-byte-timeout-ms`/`--event-gap-timeout-ms` (+ matching `FRANKY_*` env vars) plumb per-phase overrides through every mode via `resolveTimeoutsFromMap`. All five providers route through the phased fetch + new `reportTransportErrorWithPhase` so timeouts surface as `code = .timeout` with a phase-specific message ("first-byte timeout: provider didn't respond within 30000ms; raise --first-byte-timeout-ms…") instead of the legacy `code = .transport, message = "http error: Timeout"`. True streaming SSE parse during body reads → see franky-spec-v2.md §1.3 |
 | G.5 | Logging & tracing | ✅ | `src/ai/log.zig` — 5 levels, atomic threshold. **v1.13.0** adds `initWithFile(io, level, path)` so logs route to a file instead of stderr; new `--log-file PATH` CLI flag + `FRANKY_LOG_FILE` env var; interactive mode auto-diverts to `$FRANKY_HOME/logs/franky-<unix_ms>.log` whenever level > `warn` and no explicit file is set, with a stderr banner before raw-mode entry so users know where to tail. Solves the TUI-vs-stderr conflict where `--mode interactive --log-level trace` would garble the screen on the same TTY |
-| H.1 | auth.json | ✅ | Loader + `resolveApiKey`/`resolveAuthToken` + `save` + `providerFromToken` + `isoTimestampUtc` all shipped. Wired into print mode via `print.zig::resolveProviderIo` (v1.1.0) as the third credential tier below CLI flags and env vars. `0600` mode-check still deferred (stdlib gap) |
-| H.2 | settings.json | ✅ | Layered loader wired through `print.zig::resolveProviderIo` (v1.1.0). Same deferred items as §5.7 |
-| H.3 | models.json | ✅ | Built-in catalog + lookup wired into `resolveProviderIo` (v1.1.0); `$FRANKY_HOME/models.json` disk overlay (fallback `$HOME/.franky/models.json`) shipped (v1.5.2) — disk entries shadow built-ins on id collision. Auto-generator build step is a post-1.0 convenience, not a correctness gap |
+| H.1 | auth.json | ✅ | Loader + `resolveApiKey`/`resolveAuthToken` + `save` + `providerFromToken` + `isoTimestampUtc` all shipped. Wired into print mode via `print.zig::resolveProviderIo` (v1.1.0) as the third credential tier below CLI flags and env vars. `0600` mode-check on read → see franky-spec-v2.md §1.5 |
+| H.2 | settings.json | ✅ | Layered loader wired through `print.zig::resolveProviderIo` (v1.1.0) |
+| H.3 | models.json | ✅ | Built-in catalog + lookup wired into `resolveProviderIo` (v1.1.0); `$FRANKY_HOME/models.json` disk overlay (fallback `$HOME/.franky/models.json`) shipped (v1.5.2) — disk entries shadow built-ins on id collision. **v1.15.0** ships `zig build gen-models` (see §3.7) that regenerates the file in-place from live provider endpoints |
 | H.4 | Session format | ✅ | Round-trip ✓; object_store + branching primitives + tree.json round-trip shipped (v1.4.0). Transcript-JSON ref emission for oversize blobs (≥ 32 KiB canonical JSON) via `{"type":"ref","hash":"sha256:<hex>"}` shipped (v1.5.0); resolved transparently on load |
 | H.5 | Migrations | ✅ | `migrateSessionIfNeeded` ship with backup + reject-on-downgrade |
-| I | RPC protocol | ✅ | JSON-RPC 2.0 framer + `--mode rpc` dispatcher shipped (v1.4.3). Methods: `ping`, `version`, `abort`, `prompt({text})`. Streams agent events as `method:"event"` notifications via `agent.proxy.encodeEventJson`. Mid-flight cancel + extended method surface (tool list, session state) is v1.5+ |
+| I | RPC protocol | ✅ | JSON-RPC 2.0 framer + `--mode rpc` dispatcher shipped (v1.4.3). Methods: `ping`, `version`, `abort`, `prompt({text})`, plus v1.9.2 `role` and v1.11.3 `permission/resolve`. Streams agent events as `method:"event"` notifications via `agent.proxy.encodeEventJson`. Extended method surface (`session.create`/`list`/`get`, `branch.*`, `tool.*`) → see franky-spec-v2.md §1.7 |
 | J | Slash commands | ✅ | Parser + registry + built-in handlers shipped (v1.1.1). Full §J surface wired (v1.5.3): `/help /model /clear /quit /template /tools /tool /cost /cwd /thinking /retry /edit /export /compact /login /logout /branch /branches /checkout`. Branching trio (`/branch /branches /checkout`) surfaces a clear "persistent session tree is v1.6" message — the primitive works, the session-side wiring is the missing half |
 | K | Keybindings | ✅ | emacs + vi presets with caller-supplied overrides |
 | L | TUI rendering | ✅ | Differential renderer + raw-terminal binding + interactive dispatch all live |
 | M | Faux provider contract | ✅ | |
 | N.1 | Allocator strategy | ✅ | Explicit threading |
-| N.2 | IO / async model | ⏳ | `std.Io` threaded backend (via `std.Io.Threaded.init`) used everywhere; all blocking IO is covered. `io.concurrent` (the green-threads/fiber backend) is **unused today** — our parallel execution needs (tool batches, RPC worker) are met by `std.Thread.spawn`. **Post-1.0**: when `io.concurrent` stabilizes in Zig 0.17-stable, migrate hot paths (tool batches, provider dispatch) for lower overhead. Not a correctness concern; everything that needs concurrency already has it |
+| N.2 | IO / async model | ✅ | `std.Io` threaded backend (via `std.Io.Threaded.init`) used everywhere; all blocking IO is covered. Parallel needs (tool batches, RPC worker, proxy connections) are met by `std.Thread.spawn`. `io.concurrent` migration → see franky-spec-v2.md §1.3 |
 | N.3 | Error sets | ✅ | Single `AgentError` + `ErrorDetails` |
-| N.4 | Extension ABI | ⏳ | Tier-1 (compile-time static modules) wired end-to-end (v1.1.3) — runtime opt-in via `--extensions <csv>`, built-in catalog, sample `echo` extension, full `Host` view with `registerCommand`/`registerTool`/`subscribe`. **Tier-2 (`.so`/`.dylib` dynamic loading) and Tier-3 (Wasm sandboxed extensions) are explicitly post-1.0**. Paired with §5.4 — see there for the blocker. The Tier-1 design choices (Host view, opt-in catalog) are forward-compatible with Tier-2/3 when they land |
+| N.4 | Extension ABI | ✅ | Tier-1 (compile-time static modules) wired end-to-end (v1.1.3) — runtime opt-in via `--extensions <csv>`, built-in catalog, sample `echo` extension, full `Host` view with `registerCommand`/`registerTool`/`subscribe`. The Tier-1 design choices (Host view, opt-in catalog) are forward-compatible with Tier-2/3 when they land. Tier-2 (`.so`/`.dylib`) + Tier-3 (Wasm) → see franky-spec-v2.md §1.2 |
 | N.5 | Package layout | ✅ | Matches spec |
 | O | Port scope | — | Guidance |
 | P | Partial-JSON parser | ✅ | `src/ai/partial_json.zig`, 12 tests |
-| Q | OAuth flows | ✅ | Consumption path (§Q.7) ✓. Minting flows fully orchestrated (v1.2.\*): `franky login --provider {anthropic, github-copilot, google-gemini}` drives PKCE + device-code + writes auth.json; Vertex's `flow_vertex.mint` + `Cache` deliver in-memory short-lived tokens. Resolver-refresh wiring (§Q.5 at LLM-request time) still pending v1.3.\* |
+| Q | OAuth flows | ✅ | Consumption path (§Q.7) ✓. Minting flows fully orchestrated (v1.2.\*): `franky login --provider {anthropic, github-copilot, google-gemini}` drives PKCE + device-code + writes auth.json; Vertex's `flow_vertex.mint` + `Cache` deliver in-memory short-lived tokens. Resolver-refresh-before-expiry (§Q.5 at LLM-request time) → see franky-spec-v2.md §1.6 |
 | R | Path & command safety | ✅ | `path_safety.canonicalize` + `env_denylist.filter` shipped and wired through every path-taking tool + bash (v1.1.2). `toolWithWorkspace(*Workspace)` factories route user-supplied paths; bash's combined `BashCtx{ state, workspace }` filters env + picks the shell per `chosenShell` policy. `print.zig` + `interactive.zig` thread `PWD` as the workspace root automatically |
 
 **CLI state:** `bin/main.zig` delegates to print mode or interactive
@@ -144,131 +145,23 @@ wire-format codecs but no CLI surface (`franky login`) yet.
 
 ---
 
-## v1.x roadmap
+## v1.x line — what shipped
 
-The v0.* line closed at v0.12.3 with a **complete primitives layer**:
-every provider is a working module, every algorithm (PKCE, device
-code, JWT/RS256, compaction, retry, path-safety) has a pure-logic
-implementation with tests. What remains for **v1.0.0 — spec-complete
-native CLI** is the *orchestration* pass: wiring primitives into the
-user-facing surface so CLI flags and subcommands do what they claim.
+The v0.* line closed at v0.12.3 with a complete primitives layer.
+v1.x delivered the orchestration: CLI flags wired into primitives,
+OAuth user-facing, HTTP hardening, agent-loop depth, persistence
+tree, web UI, capability roles, permission overlay, logging
+refinements, per-phase HTTP timeouts.
 
-The v1.x milestones are grouped into four lines:
+#### v1.0.0 cut (2026-04-24)
 
-### v1.1.* — Print-mode wiring pass
+770 tests passing across two binaries (unit aggregator via
+`src/root.zig` + five integration binaries: `agent_loop`,
+`agent_class`, `gitignore`, `parallel_tools`, `kitchen_sink`). Every
+row in the implementation-status table above shows ✅. Items that
+did not ship at this cut live in **franky-spec-v2.md**.
 
-Flip seven 🟡 rows to ✅ in one coherent milestone line. All primitives
-exist; each item is 30–80 LOC of glue at the CLI / tool-site boundary.
-
-- **v1.1.0 — Auth + settings + models resolution.** `print.zig::resolveProvider`
-  consults `auth.json` via `coding.auth`, layers settings via
-  `coding.settings.loadLayered`, and routes `--model` through
-  `coding.models.lookup` with context-window + max-output honored.
-  Rows flipped: §H.1, §5.7, §H.2, §3.7, §H.3.
-- **v1.1.1 — Slash handlers + template dispatch.** `coding.slash` handler
-  bodies wired (`/help` / `/model` / `/clear` / `/quit` / `/template`).
-  `/template <name>` expands via `coding.templates.loadTemplate` +
-  `expand`. Row flipped: §J, §5.8.
-- **v1.1.2 — Path + env-safety routing.** Every path-taking tool
-  (`read`/`write`/`edit`/`ls`/`find`/`grep`) routes arguments through
-  `coding.path_safety.canonicalize`. `bash` filters its env through
-  `coding.env_denylist.filter` and refuses untrusted shells per
-  `isTrustedShell`. Needs session-level workspace threading. Row
-  flipped: §R.
-- **v1.1.3 — Extensions runtime.** `--extensions <csv>` opts in Tier-1
-  modules at runtime; extension `Host` view gets real
-  `registerCommand`/`registerTool`/`subscribe` wiring. Row flipped:
-  §5.4, §N.4 (Tier 1).
-
-**Coverage gate:** ≥ +20 tests total across the line; every newly
-plumbed primitive gets at least one end-to-end test driving the real
-CLI surface (not just the module API).
-
-### v1.2.* — OAuth transport orchestrator
-
-Make the v0.12 codecs user-facing. Ships `franky login --provider <name>`
-and wires the §Q.5 resolver into every provider request.
-
-- **v1.2.0 — Loopback listener + HTTP POST.** `coding/oauth/listener.zig`
-  binds `127.0.0.1:0`, accepts one connection, feeds bytes to
-  `parseCallback`, paints `success_html`/`error_html` back. Plus an
-  HTTP POST helper on top of `ai.http` so the token-exchange step is
-  idiomatic. Tested against a local mock server.
-- **v1.2.1 — Browser launcher + `franky login --provider anthropic`.**
-  Platform-specific launcher (`open` / `xdg-open` / `cmd /c start`).
-  `franky login --provider anthropic` drives §Q.1 end-to-end and
-  writes `auth.json` via `auth.save`.
-- **v1.2.2 — `franky login --provider github-copilot` (§Q.2).** Prints
-  user code + verification URL; polls token endpoint on a bumpable
-  interval; exchanges GitHub access-token for a Copilot token; writes
-  both to `auth.json`.
-- **v1.2.3 — `franky login --provider google-gemini` (§Q.3).** Same
-  shape as anthropic login but with Google defaults.
-- **v1.2.4 — Vertex in-memory mint + §Q.5 resolver.** Loads
-  SA JSON from `settings.providers["google-vertex"].serviceAccountPath`,
-  mints per-request JWTs via existing codecs, caches in memory with
-  `isRefreshDue` margin. Plus the resolver-side refresh-before-expiry
-  path for Anthropic/Copilot/Gemini.
-
-**Coverage gate:** ≥ +15 tests; every §Q.6 error code has a negative
-test; refresh-on-401 + refresh-failure paths tested for each OAuth
-provider.
-
-### v1.3.* — HTTP hardening
-
-Wrap every provider's fetch in the v0.3.1 retry algorithm and close
-the §G.4 timeout gaps.
-
-- **v1.3.0 — Retry wrap.** Every provider's `fetch()` call path goes
-  through `ai.retry.retryable(fn)` with provider-specific
-  `rate_limited_hard` classifiers. Cancellation short-circuits. Row
-  flipped: §F.1.
-- **v1.3.1 — Timeout enforcement.** Connect / upload / first-byte
-  deadlines enforced via either a streaming-reads migration of
-  `std.http.Client.fetch` or a worker-thread-with-deadline reconciliation
-  against `std.Io.Mutex`/`Condition`. Row flipped: §G.4, §G.1.
-
-### v1.4.* — Persistence depth + agent-loop wiring (✅ shipped pre-1.0)
-
-The v1.4.* binary line shipped pre-1.0.0 (see the "What shipped"
-table below) and closed the remaining runtime 🟡 rows:
-
-- **v1.4.0** — Transcript + branching integration (`{"$ref":"sha256:…"}` for
-  ≥ 32 KiB blobs, `tree.json` round-trip, `--fork`). §5.1, §H.4 closed.
-- **v1.4.1** — Compaction summarization (§E.4). §E closed.
-- **v1.4.2** — Agent-loop steer/followUp drain. §4.3 closed.
-- **v1.4.3** — RPC dispatcher (`--mode rpc`). §I + §5.5 (rpc half) closed.
-- **v1.4.4** — Interactive depth (history nav, multi-line compose, slash
-  palette). §5.5 (interactive half) closed.
-
-**Note on labeling:** `permission.md` reuses the labels "v1.4.0"–
-"v1.4.5" as *internal milestone IDs* for the capability-role
-roadmap. Those milestones shipped at binary versions
-v1.9.0–v1.9.5 — see the "What shipped" log row for v1.9.0 →
-v1.9.5 below and the new §5.10. The "v1.4.x" labels in
-permission.md are doc-internal step numbers, not binary
-versions.
-
----
-
-#### v1.0.0 — Spec-complete native CLI (shipped 2026-04-24)
-
-**Shipped.** Every row of the implementation-status table above
-shows ✅ or ⏳. `⏳` rows are intentionally deferred — each one
-has a named blocker (side-app scope, Zig-stdlib refactor) and a
-planned unlock rather than a missing implementation. 99%+ of spec
-`§`-referenced behavior is implemented for native (non-web)
-targets.
-
-**Coverage gate:** **615 tests** passing (> 600 target). Five
-integration binaries: `agent_loop`, `agent_class`, `gitignore`,
-`parallel_tools`, `kitchen_sink` (the last covers interactive
-event flow, parallel tools with completion-order events,
-compaction round-trip, branch-and-fork, oversize-block `$ref`
-extraction, RPC framer, SDK façade, deterministic transcript
-order).
-
-**What shipped in the v1.x line (v1.1 → v1.7.5 → v1.0.0):**
+**What shipped in the v1.x line:**
 
 | Line | Milestones | Spec rows closed |
 |---|---|---|
@@ -308,37 +201,15 @@ order).
 | v1.11.4 | **Proxy + web UI permission protocol** (post-1.0) | Completes the §5.11 mode-coverage track. New `POST /permission/resolve` HTTP route reads `{call_id, resolution}` JSON and forwards to `session.current_prompter.resolve`. `Session.resolve_mutex` guards `current_prompter` reads from connection threads (the proxy is multi-threaded — listener spawns a connection thread per request) so the runPrompt teardown can't deinit the prompter mid-call. Returns 200 with `{ok:true}`, 409 when no prompt is in flight, 404 on stale `call_id`. `web/app.js` adds a `tool_permission_request` SSE listener that renders an inline yellow modal in the conversation pane (header + args preview + four buttons: `Allow once` / `Always allow` / `Deny once` / `Always deny`); button click POSTs to `/permission/resolve`, on 200 the modal collapses to a green ✓ or red ✗ result line. New CSS classes `.permission-modal`, `.permission-args`, `.permission-buttons`, `.permission-btn-{allow,deny}`, `.permission-result-{allow,deny}` keep the modal styled in the existing yellow "needs your attention" tone. +2 integration tests (POST /permission/resolve returns 409 with no in-flight prompt; succeeds + wakes a synthetically-spawned worker thread) |
 | v1.11.5 | **Demote-to-ask overlay** (post-1.0) | New `--ask-tools <csv>` flag sits between `--allow-tools` and `--deny-tools` in precedence; entries demote the matching tool name (or bash fingerprint) from default `auto_allow` to `ask`. Reserved `all` sentinel sets `Store.ask_all = true` which flips every default-auto_allow tool to `ask` while still honoring explicit allow/deny lists — the "ask before every single tool call, no exceptions" mode users hitting `--prompts` for the first time often want. `Store` gains `ask_tools` / `ask_bash` `StringHashMap`s and an `ask_all` bool; `Store.check` consults them between the allow-list step and the default-policy step. Plumbed through every mode (`cfg.ask_tools_csv`). +6 tests (precedence sanity, ask_all sentinel, deny-still-wins-over-ask, allow-still-wins-over-ask, bash:fingerprint scoping, yes_to_all + ask_all interaction) |
 | v1.12.0 | **Persistent permissions.json** (post-1.0) | New `--remember-permissions` flag opts in to disk persistence of `*_always` decisions. Path is `$FRANKY_HOME/permissions.json` (falls back to `$HOME/.franky/permissions.json`); schema mirrors `permission.md` §A.6 with sorted-key arrays for diff-friendly storage: `{ "version": 1, "always_allow": { "tools": [...], "bash": [...] }, "always_deny": { ... } }`. New `permissions.loadFromDisk` / `saveToDisk` helpers (atomic tempfile+rename + 0600 mode + `sync` like `auth.json`); `Store.persist_path` + `Store.persist_io` fields trigger an auto-save inside `waitForPrompt` after every promotion. New `permissions.maybeAttachPersistence` shared helper threads the load+attach step into all four modes. Failures (malformed file, missing $HOME) silently degrade to in-memory state — disk hiccups never abort an in-flight turn. +7 tests (render skeleton, sorted output, round-trip, missing file, malformed JSON, defaultPath precedence, auto-persist round-trip) |
+| v1.14.0 | **`/permissions` slash command** (post-1.0) | Closes the permission-overlay user-side workflow originally scoped at `permission.md` §A.7. New `Store.revoke(entry) bool` walks the six allow/deny/ask sets (tools + bash fingerprints), drops a single matching entry, and auto-persists when `persist_path` is configured; `Store.clearAll()` wipes every set and the `yes_to_all` / `ask_all` flags, then triggers the same persist. New `Store.entryCount()` for the status renderer. New `Store.persistIfConfigured` exposed publicly so the slash command's mutations save to disk through the same code path as `waitForPrompt`'s `*_always` promotions. Slash handler `interactivePermissionsHandler`: no-args → status (gate state, default policy summary, alphabetized per-set entries, `yes_to_all`/`ask_all` flags, persistence path + entry count); `clear` → wipe + audit line; `revoke <entry>` → drop one entry by name (e.g. `bash:git`, `write`) with a "removed" / "no entry to remove" audit. +6 tests (revoke fingerprint, revoke any-set, revoke unknown returns false, clearAll wipes all, entryCount, revoke + persist round-trip via fresh Store load) |
 | v1.13.0 | **`--log-file` + interactive auto-divert** (post-1.0) | Solves the TUI-vs-stderr conflict (`--mode interactive --log-level trace` previously garbled the screen on the same TTY). New `ai.log.initWithFile(io, level, path)` opens the path truncate-on-open and routes log+body output there instead of stderr; `state_sink_file` field on the global logger state. New `--log-file PATH` CLI flag + `FRANKY_LOG_FILE` env var threaded through `print.zig::run` so RPC/proxy benefit too. Interactive mode adds an auto-divert block: when level > `warn` and no explicit file is set, mints `$FRANKY_HOME/logs/franky-<unix_ms>.log` (or `$HOME/.franky/logs/...` fallback), prints a one-line stderr banner (`📝 logs → /…`) before raw-mode entry, then re-inits the logger with that path. log/body switched from per-call `File.Writer` (which started at offset 0 and overwrote prior writes) to `Writer.fixed` + `writeStreamingAll` so successive log lines append cleanly via the kernel-tracked file position. `closeSinkFile` syncs before close so a downstream reopen sees the flushed bytes. **macOS portability fix in the v1.13.0 patch line:** initial round-trip unit tests (write log line, read file back, substring-match the content) were brittle across Zig version × OS × `std.testing.tmpDir` layout — on macOS Zig 0.16 the assumed `.zig-cache/tmp/<sub_path>/` path didn't match the dir's actual location, so the read-back saw an empty file. Replaced with a state-machine test that verifies the sink-redirect behavior via the module-private `state_sink_file` global (init flips null→file, init resets file→null, log+body during file-sink don't crash); the second test asserting `error.LogFileOpenFailed` moved from `/proc/...` (Linux-only) to `/dev/null/foo` (ENOTDIR on both). +6 tests overall after consolidation |
+| v1.15.0 | **`zig build gen-models` — §H.3 catalog regenerator** (closes v2 §1.4) | New `bin/gen_models.zig` executable + matching `gen-models` build step that polls Anthropic `/v1/models`, OpenAI `/v1/models`, and Google Gemini `/v1beta/models` (each provider only when its env credential is set) and renders the result as §H.3 JSON. Pure-logic split: `src/coding/models_render.zig` (Entry[] → JSON, sorted by id, JSON-string escaped, +6 tests including `parseFromSlice`/`render` round-trip) + `src/coding/models_fetch.zig` (per-provider response parsers + `merge` that lets live `display_name`/`context_window`/`max_output` override the base while preserving `cost`/`capabilities`/`knowledge_cutoff` from the hand-curated built-in, +10 tests with fixture bytes). CLI surface: `--out PATH`, `--providers a,b,c`, `--base PATH` (use a custom base instead of built-ins), `--no-builtin`, `--compact`, `--help`. Atomic write via tempfile + `std.Io.Dir.cwd().rename`. Closes the v2 §1.4 row — the entire deferred section now retires to the "shipped after the v1.0.0 cut" log |
+| v1.15.1 | **gen-models: Ollama provider + OpenAI chat filter** | Real-use refinement of v1.15.0. (1) New **Ollama** provider polls `GET <base>/api/tags` (Ollama's native list-installed-models endpoint); no credential; default base `http://localhost:11434`; override via `--ollama-url URL` or `OLLAMA_HOST` env var. Each entry maps to `provider="ollama", api="openai-compatible-gateway"`. Connection-refused is a soft skip with a one-line stderr note. (2) New `models_fetch.isChatCompletionId` predicate (id-pattern denylist for image/audio/embedding/moderation/legacy/specialty) filters OpenAI's response down to chat-completion-compatible entries. Roughly 30 chat models survive a typical OpenAI key (was ~120). Filter is on by default; `--openai-include-all` disables it. Stderr footer reports the drop count: `gen-models: openai filtered 87 non-chat models …`. Also adds `GOOGLE_API_KEY` as a fallback to `GEMINI_API_KEY`. +4 tests (filter table-driven keep + drop sets, `parseOllama` fixture round-trip, missing-models edge case) |
+| v1.15.2 | **gen-models: deep Ollama metadata via `/api/show`** | Follow-up to v1.15.1 closing the "every Ollama entry has `contextWindow: 0`" gap. After `/api/tags`, gen-models now POSTs `<base>/api/show` per model and merges the result. New `models_fetch.OllamaShowDetails {context_window, parameter_count, capabilities}` + `parseOllamaShow` extract `<arch>.context_length` (where arch = `model_info["general.architecture"]` — works for llama/qwen2/qwen3/gemma/phi3/deepseek2/etc.), `general.parameter_count`, and the `capabilities` array (`tools` → `tool_use`, `vision` → `vision`, `embedding`-only → `streaming = false`). New `enrichWithShow(*Entry, show)` overlays. Variants stay distinct since v1.15.1's `parseOllama` was updated to keep the full `name:tag` (e.g. `llama3.2:1b` and `llama3.2:3b` are now separate entries — matches the runtime call shape Ollama's OpenAI-compat surface expects). `--ollama-shallow` opts back to the tags-only path. Per-model `/api/show` failure → silent fallback to tags-only data; stderr footer reports `ollama enriched N models via /api/show (M failed)`. +8 tests (parseOllamaShow for llama/qwen2/vision/embedding/arch-mismatch/missing-model_info/malformed-JSON, enrichWithShow overlay + zero-context preservation, parseOllama multi-variant retention) |
+| v1.16.0 | **SSE reconnect-with-event-replay** (closes v2 §2.3) | Closes the in-flight gap that `GET /transcript` (v1.6.1) couldn't cover. Native browser `EventSource` auto-reconnects with `Last-Event-ID`; the listener now honors that header. New per-`Session` ring of 256 most-recent replay-eligible SSE frames keyed by a monotonic event id (`next_event_id` + `replay_ring: [256]?ReplayEvent`). New `broadcastEvent(allocator, frame)` stamps `id: N\n` on the frame, pushes the stamped copy into the ring (frees evicted), and fans out — replaces `broadcastFrame` at the two real-event call sites (per-turn agent events and `session_switched`); keepalive `ping` stays on `broadcastFrame` since heartbeats are stateless. `parseRequest` learns `Last-Event-ID` (case-insensitive). `runSseStream` takes a `last_event_id: u64` param and, under `events_mutex` (renamed from `subs_mutex` since it now also guards the ring), replays any frame with id > last_id BEFORE registering as a live subscriber — atomic ordering means broadcasts can't slip events through the gap between replay-end and going-live. New `replay_gap` synthetic event with `{missed_from, missed_to}` when last_id is older than the oldest entry still in the ring; client can show a "you may have missed events" banner and full-page-reload via `GET /transcript` to recover completed turns. `Session.deinit` frees retained ring frames. Internal refactors: `addSubLocked` / `fanOutLocked` extracted so the replay path doesn't double-lock. +8 tests (parseRequest header parsing × 3, broadcastEvent stamps + ring eviction, broadcastFrame keepalive doesn't touch ring, end-to-end replay of missed frames, end-to-end replay_gap on overflow). **806 tests passing total.** |
 
-**What stays `⏳` at the cut (all post-1.0 with named unlocks):**
-
-- **§2 package topology** — side apps (franky-do Slack bot §8.1,
-  franky-pods vLLM CLI §8.2) still live in sibling Zig projects
-  that consume `franky.sdk`. The §7 web UI is the exception:
-  v1.5.0 inlines a minimal vanilla-JS UI into `franky --mode
-  proxy`, so the "needs a sibling TS project" deferral no
-  longer applies to the web UI itself. Slack-bot + pods CLI
-  remain post-1.0 per §O.
-- **§5.4 / §N.4 extension Tier-2/3** — Tier-1 shipped; Tier-2
-  (`.so`/`.dylib`) + Tier-3 (Wasm) need a versioned ABI + sandbox.
-- **§G.4 per-phase timeout granularity** — total-budget deadline
-  works; per-phase requires `std.http.Client` streaming-reads
-  migration. Unlock: when we move off `fetch(opts)` to
-  `open/send/receive`.
-- **§N.2 `io.concurrent`** — `std.Io` threaded backend covers
-  everything today; migration is an optimization, not a
-  correctness concern. Unlock: when `io.concurrent` stabilizes
-  in Zig 0.17-stable.
-
----
-
-#### Post-1.0 — Side applications (optional, out-of-scope per §O)
-
-Out of scope for this roadmap unless explicitly re-prioritized. Each would be a sibling Zig project, not a sub-module, to preserve the one-way `ai → agent → coding` layering.
-
-- **`franky-do` — Slack bot (§8.1)**: thread-scoped sessions, streaming with throttled edits, bash sandbox.
-- **`franky-pods` — vLLM / GPU pod CLI (§8.2)**: pod provisioning, SSH tunneling, deploy / start / stop / logs / benchmark.
-- **`franky-web-ui` (§7)**: web-component chat UI; likely stays TypeScript-land given §3.10, with the Zig core behind `streamProxy`.
+For deferred work, sibling-project planning, and post-1.0 ideas, see
+**franky-spec-v2.md**.
 
 ---
 
@@ -635,10 +506,13 @@ Two halves:
    `AgentEvent` an in-process subscriber would see. No
    translation layer.
 
-   **Out-of-scope:** authentication, TLS, multi-session
-   multiplexing, reconnect-with-event-replay. The listener is
-   loopback-only; public exposure requires a TLS+auth fronting
-   proxy.
+   **Out-of-scope at v1.0.0:** authentication, TLS, multi-session
+   multiplexing. (Reconnect-with-event-replay was deferred at the
+   v1.0.0 cut and **shipped at v1.16.0** — `Last-Event-ID`
+   honored, ring of 256 recent frames per session, synthetic
+   `replay_gap` on overflow.) The listener is loopback-only;
+   public exposure requires a TLS+auth fronting proxy. See
+   franky-spec-v2.md §2 for the still-deferred items.
 
 ---
 
@@ -1128,18 +1002,18 @@ Adding more (tables, syntax highlighting) means swapping to a
 real CommonMark parser + DOMPurify-equivalent — the current
 subset stays small and auditable.
 
-**What's deferred (post-1.5):**
-- Session resume on page reload — currently each tab starts
-  fresh.
-- Live streaming of tool-call args (`message_update.toolcall_args`
-  is dropped by the UI; the tool card's name comes from the
-  resolved `tool_execution_start`).
-- Markdown / code-block / syntax highlighting — assistant text
-  renders as plain `textContent` (XSS-safe by construction).
-- Multi-session multiplexing — one process owns one transcript;
-  multiple tabs are multiple views of the same conversation.
-- Auth + TLS — inherits the §4.7 posture (loopback only;
-  public exposure requires a TLS+auth fronting proxy).
+**Closed in subsequent v1.x patches:** session resume on page
+reload (v1.6.1 `GET /transcript`), live tool-arg streaming (v1.6.2),
+markdown subset (v1.6.0), persistent sessions + sidebar (v1.7.0),
+slash command framework (v1.7.3), abort + watchdog recovery
+(v1.7.2/v1.7.9), `/retry` + `/edit` (v1.7.8), `/compact` (v1.7.10),
+TUI-parity polish (v1.7.7), reconnect-with-event-replay
+(v1.16.0 `Last-Event-ID` + 256-frame replay ring + synthetic
+`replay_gap` on overflow).
+
+**Still post-1.0:** multi-session multiplexing within one process,
+auth + TLS for the listener, and the richer Lit-based sibling
+project — see franky-spec-v2.md §2.
 
 **Why this design over the original Lit + Tailwind + LocalStorage
 plan:** the streamProxy listener already does the load-bearing
@@ -1157,21 +1031,14 @@ today, with no protocol change required.
 
 ## 8. Side applications
 
-### 8.1 `franky-do` — Slack bot
+The original design contemplated two side applications — a Slack bot
+(`franky-do`) and a vLLM / GPU pod CLI (`franky-pods`) — as parallel
+consumers of `franky.sdk`. Neither lives inside the franky binary at
+v1.0.0; both are intentionally separate Zig projects so the one-way
+`ai → agent → coding` layering is preserved.
 
-- Listens via Slack Socket Mode (`@slack/socket-mode`) + Web API for sends.
-- For each user message: opens (or reuses) a thread-scoped session, delegates to the coding agent via `franky-coding-agent` SDK.
-- Bash runs inside `@anthropic-ai/sandbox-runtime` — isolated filesystem, no host access — since commands are attacker-controlled from Slack's perspective.
-- Streams assistant text back into the Slack thread, updating the same message as tokens arrive (with throttling).
-- Cron jobs via `croner`.
-- Auth stored per Slack workspace.
-
-### 8.2 `franky-pods` — vLLM / GPU pod CLI
-
-- Manages vLLM deployments on GPU pod providers (RunPod, Modal, etc.).
-- SSH tunneling to pod instances for deploy/start/stop/logs/benchmark commands.
-- Hand-curated `models.json` with vLLM-compatible model specs and resource requirements.
-- Depends on `franky-agent-core` only (so it can optionally drive a local agent to debug a deployed model).
+For the reference architecture and per-project status, see
+**franky-spec-v2.md §3**.
 
 ---
 
@@ -2039,11 +1906,22 @@ File permissions must be set to `0600` on creation. A port must refuse to read `
     "read": {"maxBytes": 262144}
   },
   "extensions": ["path/to/ext.ts", "@org/franky-ext-foo"],
-  "skills": ["path/to/skill"]
+  "skills": ["path/to/skill"],
+  "profiles": {
+    "<name>": { "...named bundle of CLI-flag defaults..." }
+  }
 }
 ```
 
 Project settings override user settings field-by-field; arrays concatenate (project before user).
+
+The `profiles` map is a named-bundle-of-defaults system that lets a
+user collapse a long invocation (provider + model + base URL + role
++ thinking + env vars) into `franky --profile <name>`. Built-in
+presets ship with the binary; user entries in `profiles.<name>`
+override built-ins of the same name. Full design — schema, CLI
+surface, precedence rules, interpolation, the `--save-profile`
+flow, and the initial preset catalog — in **franky-spec-v2.md §6**.
 
 ### H.3 `models.json`
 
