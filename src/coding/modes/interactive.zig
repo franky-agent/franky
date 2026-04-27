@@ -92,6 +92,51 @@ fn runInteractive(
     stdin: std.Io.File,
     stdout: std.Io.File,
 ) !void {
+    // ── v1.13.0 — auto-divert logs to a file ───────────────────────
+    //
+    // Interactive mode owns the terminal via raw-mode stdout. The
+    // logger writes to stderr by default — same TTY → garbled TUI.
+    // Three resolution branches:
+    //   1. `--log-file PATH` (or `FRANKY_LOG_FILE`) → use it.
+    //   2. No explicit file but level > `warn` → mint a default at
+    //      `$FRANKY_HOME/logs/franky-<unix_ms>.log` (falling back to
+    //      `$HOME/.franky/logs/...`); print a one-line stderr
+    //      banner before raw mode so the user knows where to tail.
+    //   3. Level ≤ `warn` (the default) and no explicit file →
+    //      keep stderr; warnings/errors are sparse enough that
+    //      the occasional pre-TUI line is tolerable.
+    blk: {
+        const explicit = print_mode.resolveLogFileFromMap(cfg, environ_map);
+        const level = ai.log.currentLevel();
+        var auto_path: ?[]u8 = null;
+        defer if (auto_path) |p| allocator.free(p);
+
+        const target: ?[]const u8 = explicit orelse mint: {
+            if (@intFromEnum(level) <= @intFromEnum(ai.log.Level.warn)) break :mint null;
+            const home = environ_map.get("FRANKY_HOME")
+                orelse environ_map.get("HOME")
+                orelse break :mint null;
+            const ts = ai.stream.nowMillis();
+            // Use the conventional `$HOME/.franky/logs` subdir when
+            // we fell back from FRANKY_HOME; honor `FRANKY_HOME` as
+            // its own root otherwise.
+            auto_path = if (environ_map.get("FRANKY_HOME") != null)
+                std.fmt.allocPrint(allocator, "{s}/logs/franky-{d}.log", .{ home, ts }) catch break :mint null
+            else
+                std.fmt.allocPrint(allocator, "{s}/.franky/logs/franky-{d}.log", .{ home, ts }) catch break :mint null;
+            break :mint auto_path;
+        };
+
+        if (target) |path| {
+            ai.log.initWithFile(io, level, path) catch break :blk;
+            // Banner before raw-mode entry. Raw stderr is fine here.
+            var stderr_buf: [256]u8 = undefined;
+            var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
+            stderr.interface.print("📝 logs → {s}\n", .{path}) catch {};
+            stderr.interface.flush() catch {};
+        }
+    }
+
     // ── Terminal setup ─────────────────────────────────────────────
     var terminal = term_mod.Terminal.enter(stdin.handle, stdout.handle) catch |err| {
         const msg = switch (err) {

@@ -104,7 +104,7 @@ v1.0.0 release (2026-04-24). Legend:
 | G.2 | SSE parser | ✅ | |
 | G.3 | Cancellation | ✅ | `Cancel` atomic |
 | G.4 | Timeouts | ✅ | All four fields enforced. `event_gap_ms` in `driveSseFromBytes` (v0.3.0). Total-budget deadline between retry attempts (v1.3.1). **v1.8.0 — per-phase granularity**: `fetchAttemptPhased` replaces single-shot `client.fetch` with `connect → request+sendBody → receiveHead → readBody`; a watchdog thread `shutdown(.both)`s the connection's `std.Io.net.Stream` when a phase budget expires, so the blocked op returns. Phase tag (`connect`/`upload`/`first_byte`) reported via the new `*PhaseInfo` out-parameter on `fetchWithRetryAndTimeoutsAndHooksAndPhases`. **v1.10.0 — user-configurable budgets**: `--connect-timeout-ms`/`--upload-timeout-ms`/`--first-byte-timeout-ms`/`--event-gap-timeout-ms` (+ matching `FRANKY_*` env vars) plumb per-phase overrides through every mode via `resolveTimeoutsFromMap`. All five providers route through the phased fetch + new `reportTransportErrorWithPhase` so timeouts surface as `code = .timeout` with a phase-specific message ("first-byte timeout: provider didn't respond within 30000ms; raise --first-byte-timeout-ms…") instead of the legacy `code = .transport, message = "http error: Timeout"`. True streaming SSE parse during body reads stays post-1.0 (§N.2 `io.concurrent`) |
-| G.5 | Logging & tracing | ✅ | `src/ai/log.zig` — 5 levels, atomic threshold |
+| G.5 | Logging & tracing | ✅ | `src/ai/log.zig` — 5 levels, atomic threshold. **v1.13.0** adds `initWithFile(io, level, path)` so logs route to a file instead of stderr; new `--log-file PATH` CLI flag + `FRANKY_LOG_FILE` env var; interactive mode auto-diverts to `$FRANKY_HOME/logs/franky-<unix_ms>.log` whenever level > `warn` and no explicit file is set, with a stderr banner before raw-mode entry so users know where to tail. Solves the TUI-vs-stderr conflict where `--mode interactive --log-level trace` would garble the screen on the same TTY |
 | H.1 | auth.json | ✅ | Loader + `resolveApiKey`/`resolveAuthToken` + `save` + `providerFromToken` + `isoTimestampUtc` all shipped. Wired into print mode via `print.zig::resolveProviderIo` (v1.1.0) as the third credential tier below CLI flags and env vars. `0600` mode-check still deferred (stdlib gap) |
 | H.2 | settings.json | ✅ | Layered loader wired through `print.zig::resolveProviderIo` (v1.1.0). Same deferred items as §5.7 |
 | H.3 | models.json | ✅ | Built-in catalog + lookup wired into `resolveProviderIo` (v1.1.0); `$FRANKY_HOME/models.json` disk overlay (fallback `$HOME/.franky/models.json`) shipped (v1.5.2) — disk entries shadow built-ins on id collision. Auto-generator build step is a post-1.0 convenience, not a correctness gap |
@@ -308,6 +308,7 @@ order).
 | v1.11.4 | **Proxy + web UI permission protocol** (post-1.0) | Completes the §5.11 mode-coverage track. New `POST /permission/resolve` HTTP route reads `{call_id, resolution}` JSON and forwards to `session.current_prompter.resolve`. `Session.resolve_mutex` guards `current_prompter` reads from connection threads (the proxy is multi-threaded — listener spawns a connection thread per request) so the runPrompt teardown can't deinit the prompter mid-call. Returns 200 with `{ok:true}`, 409 when no prompt is in flight, 404 on stale `call_id`. `web/app.js` adds a `tool_permission_request` SSE listener that renders an inline yellow modal in the conversation pane (header + args preview + four buttons: `Allow once` / `Always allow` / `Deny once` / `Always deny`); button click POSTs to `/permission/resolve`, on 200 the modal collapses to a green ✓ or red ✗ result line. New CSS classes `.permission-modal`, `.permission-args`, `.permission-buttons`, `.permission-btn-{allow,deny}`, `.permission-result-{allow,deny}` keep the modal styled in the existing yellow "needs your attention" tone. +2 integration tests (POST /permission/resolve returns 409 with no in-flight prompt; succeeds + wakes a synthetically-spawned worker thread) |
 | v1.11.5 | **Demote-to-ask overlay** (post-1.0) | New `--ask-tools <csv>` flag sits between `--allow-tools` and `--deny-tools` in precedence; entries demote the matching tool name (or bash fingerprint) from default `auto_allow` to `ask`. Reserved `all` sentinel sets `Store.ask_all = true` which flips every default-auto_allow tool to `ask` while still honoring explicit allow/deny lists — the "ask before every single tool call, no exceptions" mode users hitting `--prompts` for the first time often want. `Store` gains `ask_tools` / `ask_bash` `StringHashMap`s and an `ask_all` bool; `Store.check` consults them between the allow-list step and the default-policy step. Plumbed through every mode (`cfg.ask_tools_csv`). +6 tests (precedence sanity, ask_all sentinel, deny-still-wins-over-ask, allow-still-wins-over-ask, bash:fingerprint scoping, yes_to_all + ask_all interaction) |
 | v1.12.0 | **Persistent permissions.json** (post-1.0) | New `--remember-permissions` flag opts in to disk persistence of `*_always` decisions. Path is `$FRANKY_HOME/permissions.json` (falls back to `$HOME/.franky/permissions.json`); schema mirrors `permission.md` §A.6 with sorted-key arrays for diff-friendly storage: `{ "version": 1, "always_allow": { "tools": [...], "bash": [...] }, "always_deny": { ... } }`. New `permissions.loadFromDisk` / `saveToDisk` helpers (atomic tempfile+rename + 0600 mode + `sync` like `auth.json`); `Store.persist_path` + `Store.persist_io` fields trigger an auto-save inside `waitForPrompt` after every promotion. New `permissions.maybeAttachPersistence` shared helper threads the load+attach step into all four modes. Failures (malformed file, missing $HOME) silently degrade to in-memory state — disk hiccups never abort an in-flight turn. +7 tests (render skeleton, sorted output, round-trip, missing file, malformed JSON, defaultPath precedence, auto-persist round-trip) |
+| v1.13.0 | **`--log-file` + interactive auto-divert** (post-1.0) | Solves the TUI-vs-stderr conflict (`--mode interactive --log-level trace` previously garbled the screen on the same TTY). New `ai.log.initWithFile(io, level, path)` opens the path truncate-on-open and routes log+body output there instead of stderr; `state_sink_file` field on the global logger state. New `--log-file PATH` CLI flag + `FRANKY_LOG_FILE` env var threaded through `print.zig::run` so RPC/proxy benefit too. Interactive mode adds an auto-divert block: when level > `warn` and no explicit file is set, mints `$FRANKY_HOME/logs/franky-<unix_ms>.log` (or `$HOME/.franky/logs/...` fallback), prints a one-line stderr banner (`📝 logs → /…`) before raw-mode entry, then re-inits the logger with that path. log/body switched from per-call `File.Writer` (which started at offset 0 and overwrote prior writes) to `Writer.fixed` + `writeStreamingAll` so successive log lines append cleanly via the kernel-tracked file position. `closeSinkFile` syncs before close so a downstream reopen sees the flushed bytes. **macOS portability fix in the v1.13.0 patch line:** initial round-trip unit tests (write log line, read file back, substring-match the content) were brittle across Zig version × OS × `std.testing.tmpDir` layout — on macOS Zig 0.16 the assumed `.zig-cache/tmp/<sub_path>/` path didn't match the dir's actual location, so the read-back saw an empty file. Replaced with a state-machine test that verifies the sink-redirect behavior via the module-private `state_sink_file` global (init flips null→file, init resets file→null, log+body during file-sink don't crash); the second test asserting `error.LogFileOpenFailed` moved from `/proc/...` (Linux-only) to `/dev/null/foo` (ENOTDIR on both). +6 tests overall after consolidation |
 
 **What stays `⏳` at the cut (all post-1.0 with named unlocks):**
 
@@ -1917,6 +1918,27 @@ driver (`coding/modes/print.zig`):
 
 An unknown value falls through rather than erroring: logging is
 diagnostic and a typo must not prevent a run.
+
+**Sink resolution (v1.13.0).** Output destination is decoupled
+from level. Default is `stderr`; override via:
+
+1. `--log-file PATH` CLI flag → use `PATH` (truncate-on-open).
+2. `FRANKY_LOG_FILE=PATH` env var → same.
+3. **Interactive mode auto-divert**: when `--mode interactive`
+   AND level > `warn` AND no explicit file is set, mint
+   `$FRANKY_HOME/logs/franky-<unix_ms>.log` (or
+   `$HOME/.franky/logs/franky-<unix_ms>.log` if `FRANKY_HOME`
+   isn't set), open it, and print a one-line stderr banner
+   (`📝 logs → /…/franky-<ts>.log`) before raw-mode entry. This
+   prevents the TUI-vs-stderr collision where verbose logs would
+   garble the same-TTY display.
+4. `stderr` (default).
+
+Sink-write failure (e.g. read-only directory) silently falls
+back to stderr so logging configuration never blocks startup.
+The `ai.log` API exposes `init(io, level)` for the stderr path
+and `initWithFile(io, level, path)` for the file path; both
+reset any previous sink. `deinit` closes the file handle.
 
 **Line format.**
 

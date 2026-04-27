@@ -12,7 +12,7 @@ edits, and §R workspace path-safety), session persistence + branching
 on disk, **four run modes** (`print` / `interactive` / `rpc` / `proxy`),
 a built-in web UI served by proxy mode, capability roles, a per-tool
 permission overlay, OAuth login for four providers, and per-phase HTTP
-timeouts. **758 tests** pass at the v1.12.0 cut.
+timeouts. **765 tests** pass at the v1.13.0 cut.
 
 ## Quick start
 
@@ -65,7 +65,7 @@ without network access.
 | **Resume / branching** | new session per run | `--continue` (most recent) or `--resume <id>`; `--fork <name>` / `--checkout <name>` | n/a |
 | **Phase timeouts** | 10 s connect / 120 s upload / 30 s first-byte / 60 s event-gap (10 min first-byte when `--base-url` points at a loopback host) | `--connect-timeout-ms` / `--upload-timeout-ms` / `--first-byte-timeout-ms` / `--event-gap-timeout-ms` (or matching `FRANKY_*_TIMEOUT_MS` env vars) | set field to `0` to disable that phase's watchdog |
 | **OAuth login** | n/a | `franky login <provider>` (anthropic / copilot / gemini / vertex) | log out by clearing `~/.franky/auth.json` |
-| **Logging** | warnings + errors | `--log-level info\|debug\|trace` or `FRANKY_LOG=…` or `FRANKY_DEBUG=1` | `--log-level error` |
+| **Logging** | warnings + errors → stderr | `--log-level info\|debug\|trace` or `FRANKY_LOG=…` or `FRANKY_DEBUG=1`; route to a file with `--log-file PATH` (or `FRANKY_LOG_FILE`); interactive mode auto-diverts above `warn` to `$FRANKY_HOME/logs/franky-<ts>.log` so the TUI stays usable | `--log-level error` |
 | **Tool subset** | every built-in tool | `--tools read,grep,…` (registry filter) | n/a — pair with `--role` for capability-tier scoping instead |
 | **Skills / templates** | n/a | `--skills <path>`, `--prompts-dir <dir>` (template root, was `--prompts` before v1.11.0) | omit |
 | **Extensions (Tier-1)** | none loaded | `--extensions <csv>` of built-in module names | omit |
@@ -272,6 +272,7 @@ Full list: `franky --help`. Highlights:
 | `--extensions LIST` | Opt-in Tier-1 extensions |
 | `--offline` | Force faux provider even when a key is set |
 | `--log-level LEVEL` / `--verbose` | `error` / `warn` / `info` / `debug` / `trace` |
+| `--log-file PATH` | Route logs to PATH instead of stderr (env: `FRANKY_LOG_FILE`). Interactive mode auto-diverts above `warn` to a default path so the TUI stays clean. |
 | `-h` / `--help`, `--version` | Help + version |
 
 ### Environment variables
@@ -286,6 +287,7 @@ Full list: `franky --help`. Highlights:
 | `GOOGLE_APPLICATION_CREDENTIALS` | Vertex AI service-account JSON path |
 | `FRANKY_HOME` | Session dir root (default: `~/.franky`) |
 | `FRANKY_LOG` | Log level: `error` / `warn` / `info` / `debug` / `trace` |
+| `FRANKY_LOG_FILE` | Override `--log-file` |
 | `FRANKY_DEBUG` | `1` or `true` → debug level |
 | `FRANKY_CONNECT_TIMEOUT_MS` / `FRANKY_UPLOAD_TIMEOUT_MS` / `FRANKY_FIRST_BYTE_TIMEOUT_MS` / `FRANKY_EVENT_GAP_TIMEOUT_MS` | Override the matching `--*-timeout-ms` flag |
 | `ZEROBOX_ACTIVE` | Set by `scripts/franky-zerobox` to silence the sandbox warning |
@@ -656,7 +658,7 @@ const grep_tool = franky.coding.tools.grep.tool();
   top; `coding` adds a particular tool/prompt set. You can use any layer
   independently.
 
-## Implementation status (v1.12.0)
+## Implementation status (v1.13.0)
 
 | Layer | Module | Status |
 |---|---|---|
@@ -667,7 +669,7 @@ const grep_tool = franky.coding.tools.grep.tool();
 | `coding` modes | print, interactive (TUI), rpc (JSON-RPC), proxy (HTTP/SSE + web UI) | ✅ |
 | `coding` features | session persistence + branching + object-store + compaction, capability roles (§5.10), permission overlay foundation (§5.11), settings/auth/models JSON, OAuth login for 4 providers, Tier-1 extensions | ✅ |
 
-**758 tests** pass at the v1.12.0 cut across one library binary and five
+**765 tests** pass at the v1.13.0 cut across one library binary and five
 integration binaries (`agent_loop`, `agent_class`, `gitignore`,
 `parallel_tools`, `kitchen_sink`).
 
@@ -717,6 +719,39 @@ On a normal filesystem (ext4, APFS, tmpfs, overlay) the wrappers are
 no-ops; plain `zig build` / `zig build test` works unchanged.
 
 Set `FRANKY_SKIP_CACHE_REDIRECT=1` to disable the redirect.
+
+### `zig build test` fails on macOS with Homebrew Zig 0.16
+
+**Symptom:** `franky-test` fails with no obvious assertion (the
+test runner's `--listen=-` framing hides the stack trace) on
+macOS where `zig version` reports `0.16.0` from
+`/opt/homebrew/Cellar/zig/0.16.0/`.
+
+**Cause:** `build.zig.zon` requires `0.17.0-dev`. Several stdlib
+shapes the test code relies on (`std.testing.tmpDir` layout,
+error-set switch exhaustiveness, `std.Io.Dir` / `std.process.Init`
+APIs) drift between 0.16 and 0.17-dev. Some tests slip through
+the build but fail at runtime with brittle assertions.
+
+**Fix:** install a 0.17-dev toolchain.
+
+```sh
+brew uninstall zig
+brew install zig --HEAD            # tracks master ≈ 0.17-dev
+zig version                        # should print 0.17.0-dev.<commit>
+```
+
+Or grab a dated 0.17-dev tarball from
+<https://ziglang.org/download/>. The repo is built and tested
+against `0.17.0-dev.87+9b177a7d2` and newer.
+
+Note for contributors writing new tests: prefer
+state-machine-style assertions over filesystem round-trips when
+the behavior under test is observable from in-process state.
+The `ai/log.zig` v1.13.0 tests are a worked example —
+`std.testing.tmpDir`'s on-disk path varies enough across
+(Zig version × OS) that read-back-and-substring-match tests
+have a long tail of platform-specific failures.
 
 ## License
 

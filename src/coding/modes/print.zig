@@ -84,7 +84,11 @@ pub fn run(
     // interactive / rpc paths was a silent no-op regardless of
     // the configured level.
     const log_level = resolveLogLevel(&cfg, environ);
-    ai.log.init(io, log_level);
+    if (resolveLogFileFromMap(&cfg, environ_map)) |path| {
+        ai.log.initWithFile(io, log_level, path) catch ai.log.init(io, log_level);
+    } else {
+        ai.log.init(io, log_level);
+    }
     defer ai.log.deinit();
 
     if (cfg.mode == .rpc) {
@@ -511,6 +515,19 @@ pub fn resolveTimeoutsFromMap(
 fn parseEnvMapU32(map: *const std.process.Environ.Map, key: []const u8) ?u32 {
     const v = map.get(key) orelse return null;
     return std.fmt.parseInt(u32, v, 10) catch null;
+}
+
+/// v1.13.0 — resolve the log-file destination for this run.
+/// Precedence: `--log-file` flag → `FRANKY_LOG_FILE` env var → null.
+/// Returned slice is borrowed from `cfg` (CLI arena) or
+/// `environ_map` (process env); both outlive the logger.
+pub fn resolveLogFileFromMap(
+    cfg: *const cli_mod.Config,
+    environ_map: *const std.process.Environ.Map,
+) ?[]const u8 {
+    if (cfg.log_file) |p| if (p.len > 0) return p;
+    if (environ_map.get("FRANKY_LOG_FILE")) |p| if (p.len > 0) return p;
+    return null;
 }
 
 /// True when `base_url` parses to a loopback host. Whole-host
@@ -1248,6 +1265,34 @@ test "resolveTimeoutsFromMap: garbage env value falls back to default" {
     try m.put("FRANKY_FIRST_BYTE_TIMEOUT_MS", "not-a-number");
     const t = resolveTimeoutsFromMap(&cfg, &m);
     try testing.expectEqual(@as(u32, 30_000), t.first_byte_ms);
+}
+
+test "resolveLogFileFromMap: --log-file wins over env" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{
+        "franky", "--log-file", "/tmp/from-cli.log",
+    });
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try m.put("FRANKY_LOG_FILE", "/tmp/from-env.log");
+    try testing.expectEqualStrings("/tmp/from-cli.log", resolveLogFileFromMap(&cfg, &m).?);
+}
+
+test "resolveLogFileFromMap: env applies when CLI flag absent" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try m.put("FRANKY_LOG_FILE", "/tmp/from-env.log");
+    try testing.expectEqualStrings("/tmp/from-env.log", resolveLogFileFromMap(&cfg, &m).?);
+}
+
+test "resolveLogFileFromMap: nothing set → null" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try testing.expect(resolveLogFileFromMap(&cfg, &m) == null);
 }
 
 test "isLoopbackBaseUrl: matches loopback hosts" {

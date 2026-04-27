@@ -50,6 +50,12 @@ pub const Config = struct {
     /// driver falls back to env vars (FRANKY_LOG, FRANKY_DEBUG) and
     /// --verbose as its resolution chain.
     log_level: ?[]const u8 = null,
+    /// `--log-file <path>` (v1.13.0). Routes the leveled logger
+    /// (`ai.log`) to a file instead of stderr — essential when
+    /// pairing `--mode interactive` with verbose log levels, as
+    /// stderr would otherwise garble the TUI on the same TTY.
+    /// Env fallback: `FRANKY_LOG_FILE`.
+    log_file: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     session_dir: ?[]const u8 = null,
     resume_id: ?[]const u8 = null,
@@ -269,6 +275,8 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.thinking_explicit = true;
         } else if (std.mem.eql(u8, name, "--log-level")) {
             cfg.log_level = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--log-file")) {
+            cfg.log_file = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--session")) {
             cfg.session_id = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--session-dir")) {
@@ -377,6 +385,9 @@ pub const usage_text: []const u8 =
     \\  --append-system-prompt TEXT  Append to the default system prompt
     \\  --thinking LEVEL             off|minimal|low|medium|high|xhigh [default: off]
     \\  --log-level LEVEL            error|warn|info|debug|trace (stderr logging)
+    \\  --log-file PATH              Route logs to PATH instead of stderr (essential
+    \\                               when pairing --mode interactive with verbose levels;
+    \\                               env: FRANKY_LOG_FILE)
     \\  --session ID                 Use a specific session id
     \\  --session-dir DIR            Parent dir (default: $FRANKY_HOME/sessions or ~/.franky/sessions)
     \\  --resume ID                  Resume a prior session (implies --session)
@@ -417,6 +428,7 @@ pub const usage_text: []const u8 =
     \\  CLAUDE_CODE_OAUTH_TOKEN      Long-lived OAuth token from `claude setup-token`
     \\  FRANKY_HOME                  Session dir root (default: ~/.franky)
     \\  FRANKY_LOG                   Log level: error|warn|info|debug|trace
+    \\  FRANKY_LOG_FILE              Override --log-file
     \\  FRANKY_DEBUG                 1/true → debug level (shortcut for --log-level debug)
     \\  FRANKY_CONNECT_TIMEOUT_MS    Override --connect-timeout-ms
     \\  FRANKY_UPLOAD_TIMEOUT_MS     Override --upload-timeout-ms
@@ -573,6 +585,12 @@ test "parse: --prompts toggle + --yes + --allow-tools / --deny-tools" {
     try testing.expect(cfg.yes);
     try testing.expectEqualStrings("read,bash:git", cfg.allow_tools_csv.?);
     try testing.expectEqualStrings("bash:rm", cfg.deny_tools_csv.?);
+}
+
+test "parse: --log-file populates cfg.log_file" {
+    var cfg = try parse(testing.allocator, &.{ "franky", "--log-file", "/tmp/franky.log" });
+    defer cfg.deinit();
+    try testing.expectEqualStrings("/tmp/franky.log", cfg.log_file.?);
 }
 
 test "parse: --ask-tools threads through to ask_tools_csv" {
