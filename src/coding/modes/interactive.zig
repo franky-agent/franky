@@ -41,6 +41,7 @@ const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
 const compaction_mod = franky.coding.compaction;
 const branching_mod = franky.coding.branching;
+const role_mod = franky.coding.role;
 const models_mod = franky.coding.models;
 const term_mod = @import("../terminal.zig");
 const print_mode = @import("print.zig");
@@ -153,11 +154,22 @@ fn runInteractive(
     try SessionBinding.init(&session, allocator, io, environ, environ_map, cfg);
     defer session.deinit();
 
+    const session_role = session.role_gate.role;
     try scrollback.appendLine(try std.fmt.allocPrint(
         allocator,
-        "franky {s} — {s} ({s})  · Ctrl-D/:quit to exit  · Ctrl-C to abort a run  · type /help",
-        .{ franky.version, session.provider.provider_name, session.provider.model_id },
+        "franky {s} — {s} ({s}) · role={s}  · Ctrl-D/:quit to exit  · Ctrl-C to abort a run  · type /help",
+        .{ franky.version, session.provider.provider_name, session.provider.model_id, session_role.toString() },
     ));
+    if (!role_mod.detectSandbox(environ) and (session_role == .code or session_role == .full)) {
+        try scrollback.appendStyledLine(
+            try std.fmt.allocPrint(
+                allocator,
+                "⚠ role={s} outside a sandbox — bash runs on the host. Try `zerobox -- franky --role {s} --mode interactive` or restart with --role plan.",
+                .{ session_role.toString(), session_role.toString() },
+            ),
+            .{ .fg = .{ .basic = .yellow }, .bold = true },
+        );
+    }
 
     // ── Slash-command registry ─────────────────────────────────────
     // Built-in /help/model/clear/quit live in `coding/slash.zig`;
@@ -177,6 +189,7 @@ fn runInteractive(
     try slash_registry.register(.{ .name = "cost", .description = "Accumulated usage", .handler = interactiveCostHandler });
     try slash_registry.register(.{ .name = "cwd", .description = "Show or set workspace cwd", .handler = interactiveCwdHandler });
     try slash_registry.register(.{ .name = "thinking", .description = "Set thinking level", .handler = interactiveThinkingHandler });
+    try slash_registry.register(.{ .name = "role", .description = "Show current capability role + permitted tools", .handler = interactiveRoleHandler });
     try slash_registry.register(.{ .name = "retry", .description = "Re-run the last user turn", .handler = interactiveRetryHandler });
     try slash_registry.register(.{ .name = "edit", .description = "Edit and resubmit the last user msg", .handler = interactiveEditHandler });
     try slash_registry.register(.{ .name = "export", .description = "Dump transcript to markdown|json", .handler = interactiveExportHandler });
@@ -892,15 +905,18 @@ fn runOneTurn(
         .config = .{
             .model = session.modelType(),
             .system_prompt = session.system_prompt,
-            .tools = session.tools[0..],
+            .tools = session.tools,
             .registry = &session.registry,
             .cancel = &cancel,
+            .hook_userdata = @ptrCast(&session.role_gate),
+            .role_denied = role_mod.RoleGate.check,
             .stream_options = .{
                 .api_key = session.provider.api_key,
                 .auth_token = session.provider.auth_token,
                 .base_url = session.provider.base_url,
                 .environ_map = session.environ_map,
                 .thinking = session.cfg.thinking,
+                .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
             },
         },
         .ch = &ch,
@@ -1359,7 +1375,10 @@ const SessionBinding = struct {
     registry: ai.registry.Registry,
     faux: ai.providers.faux.FauxProvider,
     provider: print_mode.ProviderInfo,
-    tools: [7]at.AgentTool,
+    tools: []const at.AgentTool,
+    /// Capability role + filtered ToolSet bound at session init.
+    /// Stable address for the worker thread's `hook_userdata`.
+    role_gate: role_mod.RoleGate = role_mod.RoleGate.init(.plan),
     system_prompt: []u8,
     transcript: agent.loop.Transcript,
     /// v1.6.0 — persistent branch tree. Mirrors print.zig's
@@ -1409,7 +1428,7 @@ const SessionBinding = struct {
             .workspace = if (binding.workspace) |*ws| ws else null,
         };
         // Path-taking tools get workspace routing when PWD is known.
-        binding.tools = if (binding.workspace) |*ws| .{
+        const all_tools: [7]at.AgentTool = if (binding.workspace) |*ws| .{
             tools_mod.read.toolWithWorkspace(ws),
             tools_mod.write.toolWithWorkspace(ws),
             tools_mod.edit.toolWithWorkspace(ws),
@@ -1426,6 +1445,13 @@ const SessionBinding = struct {
             tools_mod.find.tool(),
             tools_mod.grep.tool(),
         };
+
+        const active_role = if (cfg.role) |s|
+            role_mod.Role.fromString(s) catch return error.UnknownRole
+        else
+            role_mod.Role.plan;
+        binding.role_gate = role_mod.RoleGate.init(active_role);
+        binding.tools = try role_mod.filterTools(binding.arena.allocator(), &all_tools, binding.role_gate.set);
         errdefer binding.registry.deinit();
         errdefer binding.faux.deinit();
         errdefer binding.arena.deinit();
@@ -1762,6 +1788,35 @@ fn interactiveThinkingHandler(ctx: *slash_mod.Ctx, args: []const []const u8) sla
     const line = try std.fmt.allocPrint(ctx.allocator, "thinking set to: {s}", .{level.toString()});
     defer ctx.allocator.free(line);
     try ctx.output.appendSlice(ctx.allocator, line);
+}
+
+/// Read-only role inspection. Mid-session escalation is intentionally
+/// not wired (permission.md): escalation paths are reliable
+/// bug surfaces. To change role, restart franky with `--role <name>`.
+fn interactiveRoleHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
+    const bridge = bridgeFromCtx(ctx);
+    const gate = bridge.session.role_gate;
+    const names = try role_mod.allowedNames(ctx.allocator, gate.set);
+    defer ctx.allocator.free(names);
+
+    const sandboxed = role_mod.detectSandboxFromMap(bridge.session.environ_map);
+
+    const header = try std.fmt.allocPrint(
+        ctx.allocator,
+        "role: {s} — {s}\nsandbox: {s}\nallowed tools:",
+        .{ gate.role.toString(), gate.role.shortDescription(), if (sandboxed) "detected" else "none detected" },
+    );
+    defer ctx.allocator.free(header);
+    try ctx.output.appendSlice(ctx.allocator, header);
+    for (names) |n| {
+        const line = try std.fmt.allocPrint(ctx.allocator, "\n  {s}", .{n});
+        defer ctx.allocator.free(line);
+        try ctx.output.appendSlice(ctx.allocator, line);
+    }
+    try ctx.output.appendSlice(
+        ctx.allocator,
+        "\n(read-only — restart with --role <name> to change)",
+    );
 }
 
 fn interactiveRetryHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {

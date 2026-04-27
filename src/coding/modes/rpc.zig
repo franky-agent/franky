@@ -4,9 +4,10 @@
 //! stdin, dispatches to session methods, writes responses +
 //! event notifications back to stdout.
 //!
-//! Supported methods (minimal v1.4.3 surface):
+//! Supported methods:
 //!   - `ping`                  → `{"pong":true}`
-//!   - `version`               → `{"franky":"<ver>"}`
+//!   - `version`               → `{"franky":"<ver>","role":"<r>","sandbox":<bool>}`
+//!   - `role`                  → role + permitted tools + sandbox flag
 //!   - `prompt({text})`        → runs one agent turn; streams each
 //!     `AgentEvent` as a `event` notification (`method: "event"`)
 //!     with the JSON payload from `agent.proxy.encodeEventJson`.
@@ -28,6 +29,7 @@ const rpc = franky.coding.rpc;
 const cli_mod = franky.coding.cli;
 const print_mode = @import("print.zig");
 const tools_mod = franky.coding.tools;
+const role_mod = franky.coding.role;
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -89,7 +91,9 @@ const Session = struct {
     registry: ai.registry.Registry,
     faux: ai.providers.faux.FauxProvider,
     provider: print_mode.ProviderInfo,
-    tools: [7]at.AgentTool,
+    tools: []const at.AgentTool,
+    role_arena: std.heap.ArenaAllocator,
+    role_gate: role_mod.RoleGate,
     system_prompt: []u8,
     transcript: agent.loop.Transcript,
     cfg: *cli_mod.Config,
@@ -101,6 +105,7 @@ const Session = struct {
         self.allocator.free(self.system_prompt);
         self.registry.deinit();
         self.faux.deinit();
+        self.role_arena.deinit();
     }
 };
 
@@ -112,21 +117,33 @@ fn initSession(
     environ_map: *std.process.Environ.Map,
     cfg: *cli_mod.Config,
 ) !void {
+    const active_role = if (cfg.role) |s|
+        role_mod.Role.fromString(s) catch return error.UnknownRole
+    else
+        role_mod.Role.plan;
+    const role_gate = role_mod.RoleGate.init(active_role);
+    var role_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer role_arena.deinit();
+    const all_tools = [_]at.AgentTool{
+        tools_mod.read.tool(),
+        tools_mod.write.tool(),
+        tools_mod.edit.tool(),
+        tools_mod.bash.tool(),
+        tools_mod.ls.tool(),
+        tools_mod.find.tool(),
+        tools_mod.grep.tool(),
+    };
+    const filtered = try role_mod.filterTools(role_arena.allocator(), &all_tools, role_gate.set);
+
     session.* = .{
         .allocator = allocator,
         .io = io,
         .registry = ai.registry.Registry.init(allocator),
         .faux = ai.providers.faux.FauxProvider.init(allocator),
         .provider = undefined,
-        .tools = .{
-            tools_mod.read.tool(),
-            tools_mod.write.tool(),
-            tools_mod.edit.tool(),
-            tools_mod.bash.tool(),
-            tools_mod.ls.tool(),
-            tools_mod.find.tool(),
-            tools_mod.grep.tool(),
-        },
+        .tools = filtered,
+        .role_arena = role_arena,
+        .role_gate = role_gate,
         .system_prompt = undefined,
         .transcript = agent.loop.Transcript.init(allocator),
         .cfg = cfg,
@@ -185,9 +202,18 @@ fn dispatchOne(
         return;
     }
     if (std.mem.eql(u8, req.method, "version")) {
-        const payload = try std.fmt.allocPrint(allocator, "{{\"franky\":\"{s}\"}}", .{franky.version});
+        const sandboxed = role_mod.detectSandboxFromMap(session.environ_map);
+        const payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"franky\":\"{s}\",\"role\":\"{s}\",\"sandbox\":{s}}}",
+            .{ franky.version, session.role_gate.role.toString(), if (sandboxed) "true" else "false" },
+        );
         defer allocator.free(payload);
         try writeResultFrame(allocator, io, stdout, req.id, payload);
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "role")) {
+        try writeRoleResult(allocator, io, stdout, session, req.id);
         return;
     }
     if (std.mem.eql(u8, req.method, "abort")) {
@@ -261,15 +287,18 @@ fn runPrompt(
                 .capabilities = session.provider.capabilities,
             },
             .system_prompt = session.system_prompt,
-            .tools = session.tools[0..],
+            .tools = session.tools,
             .registry = &session.registry,
             .cancel = &session.cancel,
+            .hook_userdata = @ptrCast(&session.role_gate),
+            .role_denied = role_mod.RoleGate.check,
             .stream_options = .{
                 .api_key = session.provider.api_key,
                 .auth_token = session.provider.auth_token,
                 .base_url = session.provider.base_url,
                 .environ_map = session.environ_map,
                 .thinking = session.cfg.thinking,
+                .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
             },
         },
         .ch = &ch,
@@ -322,6 +351,27 @@ fn extractPromptText(params: ?[]const u8) ?[]const u8 {
 }
 
 // ─── frame writers ──────────────────────────────────────────────
+
+/// `role` JSON-RPC method — exposes the bound role + tool list +
+/// sandbox detection so RPC clients can render a status pill
+/// without inferring it from `tool_execution_end`'s `role_denied`.
+fn writeRoleResult(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout: std.Io.File,
+    session: *Session,
+    id: ?rpc.Id,
+) !void {
+    const sandboxed = role_mod.detectSandboxFromMap(session.environ_map);
+    const body = try role_mod.renderRoleStatusJson(
+        allocator,
+        session.role_gate.role,
+        session.role_gate.set,
+        sandboxed,
+    );
+    defer allocator.free(body);
+    try writeResultFrame(allocator, io, stdout, id, body);
+}
 
 fn writeResultFrame(
     allocator: std.mem.Allocator,

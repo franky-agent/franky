@@ -21,6 +21,7 @@ const ai = franky.ai;
 const agent = franky.agent;
 const at = agent.types;
 const tools_mod = franky.coding.tools;
+const role_mod = franky.coding.role;
 const session_mod = franky.coding.session;
 const cli_mod = franky.coding.cli;
 const auth_mod = franky.coding.auth;
@@ -73,9 +74,25 @@ pub fn run(
         defer allocator.free(msg);
         return writeOut(io, msg);
     }
+
+    // v1.7.5 — initialize the logger BEFORE mode dispatch so
+    // every mode (rpc / proxy / interactive / print) honors
+    // `--log-level` / `FRANKY_LOG`. Pre-1.7.5 the init lived
+    // inside `runPrint`, which is unreachable for the other
+    // modes — every `ai.log.log(...)` call in the proxy /
+    // interactive / rpc paths was a silent no-op regardless of
+    // the configured level.
+    const log_level = resolveLogLevel(&cfg, environ);
+    ai.log.init(io, log_level);
+    defer ai.log.deinit();
+
     if (cfg.mode == .rpc) {
         const rpc_mode = @import("rpc.zig");
         return rpc_mode.run(allocator, io, environ, environ_map, &cfg);
+    }
+    if (cfg.mode == .proxy) {
+        const proxy_mode = @import("proxy.zig");
+        return proxy_mode.run(allocator, io, environ, environ_map, &cfg);
     }
     if (cfg.mode == .interactive) {
         // Interactive mode doesn't require a prompt — the REPL
@@ -100,12 +117,9 @@ fn runPrint(
     var stdout_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
 
-    // ── Log threshold resolution ───────────────────────────────────
-    // Precedence (highest → lowest): --log-level, FRANKY_LOG,
-    // FRANKY_DEBUG=1, --verbose. Default is `.warn` (quiet).
-    const log_level = resolveLogLevel(cfg, environ);
-    ai.log.init(io, log_level);
-    defer ai.log.deinit();
+    // v1.7.5 — logger init moved up to `run()` so every mode
+    // (not just print) honors `--log-level`. See the parent
+    // dispatcher for the lifecycle.
 
     // ── Provider selection ────────────────────────────────────────
     // Use the io-aware resolver so `auth.json` + `settings.json`
@@ -214,6 +228,38 @@ fn runPrint(
         tools_mod.grep.tool(),
     };
 
+    const active_role = if (cfg.role) |s|
+        role_mod.Role.fromString(s) catch return exitWithMessage(
+            io,
+            "unknown --role; pick one of read, plan, code, full\n",
+            2,
+        )
+    else
+        role_mod.Role.plan;
+    var role_gate = role_mod.RoleGate.init(active_role);
+    const filtered_tools = try role_mod.filterTools(allocator, &all_tools, role_gate.set);
+    defer allocator.free(filtered_tools);
+
+    // The sandbox warning fires only when role is `code`/`full`
+    // outside a detected sandbox — host filesystem reachable from
+    // a shell is the dangerous combination.
+    {
+        const sandbox_active = role_mod.detectSandbox(environ);
+        var stderr_buf: [512]u8 = undefined;
+        var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
+        stderr.interface.print(
+            "franky · role={s} · sandbox={s}\n",
+            .{ active_role.toString(), if (sandbox_active) "yes" else "no" },
+        ) catch {};
+        if (!sandbox_active and (active_role == .code or active_role == .full)) {
+            stderr.interface.print(
+                "⚠ Running outside a sandbox with role={s}. Tool calls execute on the host filesystem.\n  Consider:  zerobox -- franky --role {s} ...   (or --role plan to disable bash)\n",
+                .{ active_role.toString(), active_role.toString() },
+            ) catch {};
+        }
+        stderr.interface.flush() catch {};
+    }
+
     // ── Session / transcript ───────────────────────────────────────
     var session_state = try SessionState.init(allocator, io, environ, cfg);
     defer session_state.deinit(allocator);
@@ -278,15 +324,18 @@ fn runPrint(
         .config = .{
             .model = model,
             .system_prompt = system_prompt,
-            .tools = &all_tools,
+            .tools = filtered_tools,
             .registry = &reg,
             .cancel = &cancel,
+            .hook_userdata = @ptrCast(&role_gate),
+            .role_denied = role_mod.RoleGate.check,
             .stream_options = .{
                 .api_key = provider_info.api_key,
                 .auth_token = provider_info.auth_token,
                 .base_url = provider_info.base_url,
                 .environ_map = environ_map,
                 .thinking = cfg.thinking,
+                .timeouts = resolveTimeoutsFromMap(cfg, environ_map),
             },
         },
         .ch = &ch,
@@ -380,7 +429,7 @@ pub fn resolveAnthropicAlias(input: []const u8) []const u8 {
 
 // ─── log level resolution ────────────────────────────────────────
 
-fn resolveLogLevel(cfg: *const cli_mod.Config, environ: std.process.Environ) ai.log.Level {
+pub fn resolveLogLevel(cfg: *const cli_mod.Config, environ: std.process.Environ) ai.log.Level {
     // 1. Explicit CLI flag wins.
     if (cfg.log_level) |s| {
         if (ai.log.Level.fromString(s)) |l| return l;
@@ -399,6 +448,34 @@ fn resolveLogLevel(cfg: *const cli_mod.Config, environ: std.process.Environ) ai.
     if (cfg.verbose) return .info;
     // 5. Default: warnings and errors only.
     return .warn;
+}
+
+/// Resolve `ai.registry.Timeouts` for this run. Precedence per
+/// field: CLI flag → env var → registry default. Each phase
+/// resolves independently, so a user can raise just the
+/// first-byte cap (slow local LLM) without affecting connect /
+/// upload / event-gap. Map-based so every mode (print stays on
+/// the live `Environ`; interactive/rpc/proxy hold a `Map`) can
+/// share the same resolver.
+pub fn resolveTimeoutsFromMap(
+    cfg: *const cli_mod.Config,
+    environ_map: *const std.process.Environ.Map,
+) ai.registry.Timeouts {
+    var t: ai.registry.Timeouts = .{};
+    if (cfg.connect_timeout_ms) |v| t.connect_ms = v
+    else if (parseEnvMapU32(environ_map, "FRANKY_CONNECT_TIMEOUT_MS")) |v| t.connect_ms = v;
+    if (cfg.upload_timeout_ms) |v| t.upload_ms = v
+    else if (parseEnvMapU32(environ_map, "FRANKY_UPLOAD_TIMEOUT_MS")) |v| t.upload_ms = v;
+    if (cfg.first_byte_timeout_ms) |v| t.first_byte_ms = v
+    else if (parseEnvMapU32(environ_map, "FRANKY_FIRST_BYTE_TIMEOUT_MS")) |v| t.first_byte_ms = v;
+    if (cfg.event_gap_timeout_ms) |v| t.event_gap_ms = v
+    else if (parseEnvMapU32(environ_map, "FRANKY_EVENT_GAP_TIMEOUT_MS")) |v| t.event_gap_ms = v;
+    return t;
+}
+
+fn parseEnvMapU32(map: *const std.process.Environ.Map, key: []const u8) ?u32 {
+    const v = map.get(key) orelse return null;
+    return std.fmt.parseInt(u32, v, 10) catch null;
 }
 
 // ─── provider selection ──────────────────────────────────────────
@@ -1054,6 +1131,67 @@ fn readWholeFileOpt(
 
 const testing = std.testing;
 const test_h = @import("../../test_helpers.zig");
+
+test "resolveLogLevel: --log-level wins over env vars + verbose" {
+    // Pin the precedence ladder for the now-`pub` resolver so a
+    // refactor that re-orders the checks gets caught.
+    var cfg = try cli_mod.parse(testing.allocator, &.{
+        "franky", "--log-level", "trace",
+    });
+    defer cfg.deinit();
+    const env: std.process.Environ = .empty;
+    try testing.expectEqual(ai.log.Level.trace, resolveLogLevel(&cfg, env));
+}
+
+test "resolveLogLevel: default is warn" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    const env: std.process.Environ = .empty;
+    try testing.expectEqual(ai.log.Level.warn, resolveLogLevel(&cfg, env));
+}
+
+test "resolveTimeoutsFromMap: defaults match registry when unset" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    const t = resolveTimeoutsFromMap(&cfg, &m);
+    try testing.expectEqual(@as(u32, 10_000), t.connect_ms);
+    try testing.expectEqual(@as(u32, 30_000), t.first_byte_ms);
+    try testing.expectEqual(@as(u32, 60_000), t.event_gap_ms);
+}
+
+test "resolveTimeoutsFromMap: --first-byte-timeout-ms wins over env" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{
+        "franky", "--first-byte-timeout-ms", "300000",
+    });
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try m.put("FRANKY_FIRST_BYTE_TIMEOUT_MS", "999");
+    const t = resolveTimeoutsFromMap(&cfg, &m);
+    try testing.expectEqual(@as(u32, 300_000), t.first_byte_ms);
+}
+
+test "resolveTimeoutsFromMap: env var applies when CLI flag absent" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try m.put("FRANKY_FIRST_BYTE_TIMEOUT_MS", "120000");
+    const t = resolveTimeoutsFromMap(&cfg, &m);
+    try testing.expectEqual(@as(u32, 120_000), t.first_byte_ms);
+}
+
+test "resolveTimeoutsFromMap: garbage env value falls back to default" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try m.put("FRANKY_FIRST_BYTE_TIMEOUT_MS", "not-a-number");
+    const t = resolveTimeoutsFromMap(&cfg, &m);
+    try testing.expectEqual(@as(u32, 30_000), t.first_byte_ms);
+}
 
 test "resolveAnthropicAlias maps short names to current ids" {
     try testing.expectEqualStrings("claude-opus-4-6", resolveAnthropicAlias("opus"));

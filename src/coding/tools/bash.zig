@@ -644,6 +644,12 @@ test "bash tool: SessionBashState propagates cwd across calls" {
     try std.Io.Dir.cwd().createDirPath(io, base);
     try std.Io.Dir.cwd().createDirPath(io, base ++ "/sub");
 
+    // Resolve `base` through the filesystem so comparisons work on
+    // targets where /tmp is a symlink (macOS: /tmp → /private/tmp).
+    // `$PWD` inside the bash wrapper reports the resolved path.
+    const resolved_sub = try resolveSubPath(gpa, io, base, "sub");
+    defer gpa.free(resolved_sub);
+
     var state = SessionBashState.init(gpa);
     defer state.deinit();
     try state.setCwd(base);
@@ -661,7 +667,7 @@ test "bash tool: SessionBashState propagates cwd across calls" {
     defer r2.deinit(gpa);
     const pwd_txt = r2.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, pwd_txt, base ++ "/sub") != null);
-    try testing.expectEqualStrings(base ++ "/sub", state.getCwd().?);
+    try testing.expectEqualStrings(resolved_sub, state.getCwd().?);
 
     // Third call (no cd): should start in the previously-captured
     // cwd, proving cwd *persists* between invocations.
@@ -711,6 +717,9 @@ test "bash tool: honors explicit cwd arg over session-tracked cwd" {
     try std.Io.Dir.cwd().createDirPath(io, base ++ "/a");
     try std.Io.Dir.cwd().createDirPath(io, base ++ "/b");
 
+    const resolved_b = try resolveSubPath(gpa, io, base, "b");
+    defer gpa.free(resolved_b);
+
     var state = SessionBashState.init(gpa);
     defer state.deinit();
     try state.setCwd(base ++ "/a");
@@ -726,7 +735,19 @@ test "bash tool: honors explicit cwd arg over session-tracked cwd" {
     try testing.expect(std.mem.indexOf(u8, r.content[0].text.text, base ++ "/b") != null);
     // Session cwd should NOT have shifted to `/a`'s explicit override;
     // the trailer in that run reports `/b`, which updates state.
-    try testing.expectEqualStrings(base ++ "/b", state.getCwd().?);
+    try testing.expectEqualStrings(resolved_b, state.getCwd().?);
+}
+
+/// v1.3.2 — resolve `<base>/<sub>` through `std.Io.Dir.realPathFile`
+/// so test comparisons survive targets where /tmp is a symlink
+/// (macOS: /tmp → /private/tmp, so `pwd` and `$PWD` report the
+/// resolved form). Returns an owned slice on `gpa`.
+fn resolveSubPath(gpa: std.mem.Allocator, io: std.Io, base: []const u8, sub: []const u8) ![]u8 {
+    var dir = try std.Io.Dir.cwd().openDir(io, base, .{});
+    defer dir.close(io);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try dir.realPathFile(io, sub, &buf);
+    return try gpa.dupe(u8, buf[0..n]);
 }
 
 test "SessionBashState.getCwd returns null when unset" {

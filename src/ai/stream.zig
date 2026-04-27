@@ -16,15 +16,36 @@ const types = @import("types.zig");
 const errors = @import("errors.zig");
 const channel_mod = @import("channel.zig");
 
-/// Wall-clock milliseconds since epoch. Zero means "not set" — the
-/// session layer overrides via its own `Io`-backed clock. Plain helper,
-/// no `std.Io` threading. Linux uses the direct syscall; other platforms
-/// fall back to the libc wrapper via `@cImport` at the higher layer.
+/// Wall-clock milliseconds since epoch. Plain helper, no `std.Io`
+/// threading.
+///
+/// Linux uses the direct syscall (`std.os.linux.clock_gettime`).
+/// Darwin / BSD / other POSIX targets call libc's `clock_gettime`
+/// via `std.c`. Any failure path returns 0 — callers treat 0 as
+/// "clock unavailable" rather than "epoch zero" since no modern
+/// system reports 1970-01-01 for its wall clock.
+///
+/// **Bug fix (v1.3.1):** the pre-v1.3.1 implementation was
+/// hardcoded to the Linux path and returned 0 everywhere else,
+/// which silently broke every timing-dependent code path on
+/// macOS — most visibly two test hangs (`parallel tools:
+/// three calls complete in ~max(individual)` busy-waits against
+/// `nowMillis`, and the SSE handler-stall timeout compares
+/// `now - last_event_ms` which stayed 0). The TUI's `(Ns ·
+/// usage)` status line also read `0s` on macOS.
 pub fn nowMillis() i64 {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var ts: linux.timespec = undefined;
         if (linux.clock_gettime(.REALTIME, &ts) == 0) {
+            return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
+        }
+        return 0;
+    }
+    // POSIX (Darwin / BSD / other) via libc.
+    if (builtin.link_libc) {
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.REALTIME, &ts) == 0) {
             return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
         }
     }
@@ -428,4 +449,22 @@ test "Cancel is observable across threads" {
     try std.testing.expect(!c.isFired());
     c.fire();
     try std.testing.expect(c.isFired());
+}
+
+test "nowMillis: returns a non-zero monotonically-advancing timestamp" {
+    // Regression gate for the macOS hang: pre-v1.3.1 this returned
+    // 0 on every non-Linux target, which looped forever in any
+    // test that busy-waited against it. A modern wall-clock is
+    // well past ~1.7e12 ms (2024+). Two consecutive reads a short
+    // busy-loop apart must advance (or at minimum not go backward).
+    const t1 = nowMillis();
+    try std.testing.expect(t1 > 1_700_000_000_000);
+    // Consume a handful of clock ticks so t2 ≥ t1 reliably even
+    // when the wall clock has 1 ms resolution on the host.
+    var acc: u64 = 0;
+    var i: usize = 0;
+    while (i < 100_000) : (i += 1) acc +%= i;
+    std.mem.doNotOptimizeAway(acc);
+    const t2 = nowMillis();
+    try std.testing.expect(t2 >= t1);
 }

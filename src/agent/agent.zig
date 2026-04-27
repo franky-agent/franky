@@ -48,6 +48,12 @@ pub const Agent = struct {
     registry: *const ai.registry.Registry,
     cancel: ai.stream.Cancel = .{},
     is_streaming: std.atomic.Value(bool) = .init(false),
+    /// Forwarded to every per-turn `agentLoop` call so providers
+    /// see the auth + transport + timeout options the bot config
+    /// supplied. Plain copy; deep ownership stays with the
+    /// caller (`stream_options.environ_map`, `stream_options.cancel`,
+    /// hooks).
+    stream_options: ai.registry.StreamOptions = .{},
 
     // ── subscribers ───────────────────────────────────────────────
     subs: std.ArrayList(Subscription) = .empty,
@@ -78,6 +84,15 @@ pub const Agent = struct {
         tools: []const at.AgentTool = &.{},
         registry: *const ai.registry.Registry,
         thinking_level: ai.types.ThinkingLevel = .off,
+        /// Auth + transport options forwarded to every provider
+        /// stream call. `api_key` / `auth_token` / `base_url` /
+        /// `environ_map` / `timeouts` / `hooks` flow through here.
+        /// Default `.{}` keeps tests on the faux provider working
+        /// (no creds needed). Real providers (Anthropic, OpenAI,
+        /// Gemini, Vertex) require at least one of `api_key` or
+        /// `auth_token` to be set, or `environ_map` populated so
+        /// the provider can pull them from env.
+        stream_options: ai.registry.StreamOptions = .{},
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) !Agent {
@@ -93,6 +108,7 @@ pub const Agent = struct {
             .thinking_level = config.thinking_level,
             .transcript = loop_mod.Transcript.init(allocator),
             .registry = config.registry,
+            .stream_options = config.stream_options,
         };
     }
 
@@ -303,7 +319,12 @@ pub const Agent = struct {
         ) catch return;
         defer ch.deinit();
 
-        var stream_opts: ai.registry.StreamOptions = .{};
+        // Start from the caller-supplied stream_options (auth +
+        // transport + timeouts) and overlay per-turn fields like
+        // thinking level. The Agent's own `cancel` is what the
+        // loop wires up; if the caller passed a cancel of their
+        // own it would be ignored — the Agent owns cancellation.
+        var stream_opts: ai.registry.StreamOptions = self.stream_options;
         stream_opts.thinking = self.thinking_level;
 
         loop_mod.agentLoop(self.allocator, self.io, &self.transcript, .{

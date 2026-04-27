@@ -33,6 +33,11 @@ pub const ToolResult = struct {
 
 pub const ExecutionMode = enum { sequential, parallel };
 
+/// Stable wire-format constant for the `tool_code` value the
+/// runtime role gate emits. Web UI / RPC clients key off this
+/// string to render denials distinctly from generic tool errors.
+pub const role_denied_code = "role_denied";
+
 /// Update streamed from tool execution into the event stream.
 pub const ToolUpdate = struct {
     /// Free-form JSON blob the tool wants the UI to render as progress.

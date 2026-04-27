@@ -17,6 +17,7 @@ pub const modes = struct {
     pub const interactive = @import("modes/interactive.zig");
     pub const login = @import("modes/login.zig");
     pub const rpc = @import("modes/rpc.zig");
+    pub const proxy = @import("modes/proxy.zig");
 };
 
 pub const terminal = @import("terminal.zig");
@@ -30,6 +31,7 @@ pub const env_denylist = @import("env_denylist.zig");
 pub const object_store = @import("object_store.zig");
 pub const branching = @import("branching.zig");
 pub const compaction = @import("compaction.zig");
+pub const role = @import("role.zig");
 pub const settings = @import("settings.zig");
 pub const auth = @import("auth.zig");
 pub const oauth = @import("oauth/mod.zig");
@@ -57,6 +59,7 @@ test {
     _ = modes.interactive;
     _ = modes.login;
     _ = modes.rpc;
+    _ = modes.proxy;
     _ = terminal;
     _ = session;
     _ = cli;
@@ -67,6 +70,7 @@ test {
     _ = object_store;
     _ = branching;
     _ = compaction;
+    _ = role;
     _ = settings;
     _ = auth;
     _ = oauth;

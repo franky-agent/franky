@@ -24,7 +24,7 @@
 const std = @import("std");
 const types = @import("../ai/types.zig");
 
-pub const Mode = enum { print, interactive, rpc };
+pub const Mode = enum { print, interactive, rpc, proxy };
 
 pub const Config = struct {
     provider: ?[]const u8 = null,
@@ -72,6 +72,11 @@ pub const Config = struct {
     /// `<session_dir>/transcripts/<name>.json` on top of the tree
     /// metadata; pairs naturally with `--resume <id>`.
     checkout_branch: ?[]const u8 = null,
+    /// `--role <name>` — capability tier (`read`/`plan`/`code`/
+    /// `full`). Filters which built-in tools the agent registry
+    /// contains + drives the runtime role gate. Default `plan`
+    /// (workspace-scoped read+write, no shell). See `permission.md`.
+    role: ?[]const u8 = null,
     /// `--export <format>` — dump the active transcript and exit.
     /// Accepted values: `markdown`, `json`.
     export_format: ?[]const u8 = null,
@@ -91,6 +96,26 @@ pub const Config = struct {
     /// `--extensions <list>` — comma-separated extension names
     /// opt-in once the Tier-1 loader ships (v0.10.4).
     extensions: ?[]const u8 = null,
+    /// `--proxy-port N` — TCP port for `--mode proxy` (§4.7
+    /// streamProxy listener). Defaults to 8787 when omitted.
+    proxy_port: ?u16 = null,
+
+    // ── §G.4 phase-timeout overrides ──────────────────────────────
+    /// `--connect-timeout-ms N` — TCP/TLS connect deadline. 0 disables.
+    /// Env fallback: `FRANKY_CONNECT_TIMEOUT_MS`. Default 10_000.
+    connect_timeout_ms: ?u32 = null,
+    /// `--upload-timeout-ms N` — request-body upload deadline.
+    /// Env: `FRANKY_UPLOAD_TIMEOUT_MS`. Default 120_000.
+    upload_timeout_ms: ?u32 = null,
+    /// `--first-byte-timeout-ms N` — max wait between request send
+    /// and first response byte. The knob users running slow local
+    /// LLMs (Ollama on CPU, vLLM with cold cache) most often need
+    /// to raise from the 30 s default. Env: `FRANKY_FIRST_BYTE_TIMEOUT_MS`.
+    first_byte_timeout_ms: ?u32 = null,
+    /// `--event-gap-timeout-ms N` — max gap between successive SSE
+    /// events while streaming. Env: `FRANKY_EVENT_GAP_TIMEOUT_MS`.
+    /// Default 60_000.
+    event_gap_timeout_ms: ?u32 = null,
 
     /// Concatenated positional args — the user's prompt.
     prompt: []const u8 = "",
@@ -213,6 +238,8 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.fork_branch = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--checkout")) {
             cfg.checkout_branch = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--role")) {
+            cfg.role = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--export")) {
             cfg.export_format = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--tools")) {
@@ -227,11 +254,27 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.offline = true;
         } else if (std.mem.eql(u8, name, "--extensions")) {
             cfg.extensions = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--proxy-port")) {
+            const v = try take_value(argv, &i, inline_value);
+            cfg.proxy_port = std.fmt.parseInt(u16, v, 10) catch return error.UnknownMode;
+        } else if (std.mem.eql(u8, name, "--connect-timeout-ms")) {
+            const v = try take_value(argv, &i, inline_value);
+            cfg.connect_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+        } else if (std.mem.eql(u8, name, "--upload-timeout-ms")) {
+            const v = try take_value(argv, &i, inline_value);
+            cfg.upload_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+        } else if (std.mem.eql(u8, name, "--first-byte-timeout-ms")) {
+            const v = try take_value(argv, &i, inline_value);
+            cfg.first_byte_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+        } else if (std.mem.eql(u8, name, "--event-gap-timeout-ms")) {
+            const v = try take_value(argv, &i, inline_value);
+            cfg.event_gap_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
         } else if (std.mem.eql(u8, name, "--mode")) {
             const v = try take_value(argv, &i, inline_value);
             if (std.mem.eql(u8, v, "print")) cfg.mode = .print
             else if (std.mem.eql(u8, v, "interactive")) cfg.mode = .interactive
             else if (std.mem.eql(u8, v, "rpc")) cfg.mode = .rpc
+            else if (std.mem.eql(u8, v, "proxy")) cfg.mode = .proxy
             else return error.UnknownMode;
         } else {
             // Unknown flag — treat as positional for now (no extensions yet).
@@ -289,10 +332,12 @@ pub const usage_text: []const u8 =
     \\  --session-dir DIR            Parent dir (default: $FRANKY_HOME/sessions or ~/.franky/sessions)
     \\  --resume ID                  Resume a prior session (implies --session)
     \\  --no-session                 Do not persist this run
-    \\  --mode MODE                  print [interactive,rpc deferred]
+    \\  --mode MODE                  print | interactive | rpc | proxy
+    \\  --proxy-port N               TCP port for --mode proxy (§4.7) [default: 8787]
     \\  --continue                   Resume the most-recent session in session-dir
     \\  --fork NAME                  Fork a new branch at the current head (§5.1)
     \\  --checkout NAME              Resume the named branch (v1.7.0); pairs with --resume
+    \\  --role NAME                  Capability tier: read|plan|code|full (default plan)
     \\  --export FORMAT              Dump transcript (markdown|json) and exit
     \\  --tools LIST                 Comma-separated tool subset for this run
     \\  --skills PATH                Load a skill bundle (§5.8)
@@ -300,6 +345,11 @@ pub const usage_text: []const u8 =
     \\  --theme NAME                 TUI theme (no-op until TUI ships)
     \\  --offline                    Force faux provider even when a key is set
     \\  --extensions LIST            Opt in Tier-1 extensions (§5.4/§N.4)
+    \\  --connect-timeout-ms N       TCP/TLS connect deadline (default 10000; 0 disables)
+    \\  --upload-timeout-ms N        Request-body upload deadline (default 120000)
+    \\  --first-byte-timeout-ms N    Max wait for first response byte (default 30000;
+    \\                               raise for slow local LLMs e.g. Ollama on CPU)
+    \\  --event-gap-timeout-ms N     Max gap between SSE events (default 60000)
     \\  --verbose                    Extra logging to stderr
     \\  -h, --help                   Show this help
     \\      --version                Print version and exit
@@ -311,6 +361,10 @@ pub const usage_text: []const u8 =
     \\  FRANKY_HOME                  Session dir root (default: ~/.franky)
     \\  FRANKY_LOG                   Log level: error|warn|info|debug|trace
     \\  FRANKY_DEBUG                 1/true → debug level (shortcut for --log-level debug)
+    \\  FRANKY_CONNECT_TIMEOUT_MS    Override --connect-timeout-ms
+    \\  FRANKY_UPLOAD_TIMEOUT_MS     Override --upload-timeout-ms
+    \\  FRANKY_FIRST_BYTE_TIMEOUT_MS Override --first-byte-timeout-ms
+    \\  FRANKY_EVENT_GAP_TIMEOUT_MS  Override --event-gap-timeout-ms
     \\
 ;
 

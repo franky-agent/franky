@@ -115,6 +115,26 @@ pub const HookDecision = struct {
     reason_text: ?[]const u8 = null,
 };
 
+/// Decision from the runtime role gate. The mode-level driver
+/// provides a callback that returns non-null when a tool name
+/// (not present in this session's registered tools) is a known
+/// built-in disabled by the active role. The loop then emits a
+/// structured `role_denied` `tool_execution_end` instead of the
+/// generic "unknown tool" path — catches the case where the
+/// model emits a `tool_call` from prior-conversation memory or
+/// training data for a tool that exists only in higher roles.
+pub const RoleDenial = struct {
+    current_role: []const u8,
+    /// Lowest role that would re-enable this tool, when known.
+    /// E.g. `bash` → `code`. Surfaces as a remedy hint.
+    min_role: ?[]const u8 = null,
+};
+
+pub const RoleDeniedFn = *const fn (
+    userdata: ?*anyopaque,
+    tool_name: []const u8,
+) ?RoleDenial;
+
 pub const BeforeToolCallFn = *const fn (
     userdata: ?*anyopaque,
     tool: *const at.AgentTool,
@@ -149,6 +169,7 @@ pub const Config = struct {
     cancel: *ai.stream.Cancel,
     hook_userdata: ?*anyopaque = null,
     before_tool_call: ?BeforeToolCallFn = null,
+    role_denied: ?RoleDeniedFn = null,
     after_tool_call: ?AfterToolCallFn = null,
     /// §4.3 steer/followUp drain hooks. Called between turns —
     /// after a turn naturally ends, before the next turn's LLM
@@ -381,7 +402,14 @@ fn runTurn(
     } else for (tool_calls.items) |tc| {
         const maybe_tool = findTool(config.tools, tc.name);
         if (maybe_tool == null) {
-            const r = try makeErrorResult(allocator, "unknown tool");
+            const r = blk: {
+                if (config.role_denied) |fn_| {
+                    if (fn_(config.hook_userdata, tc.name)) |denial| {
+                        break :blk try makeRoleDeniedResult(allocator, tc.name, denial);
+                    }
+                }
+                break :blk try makeErrorResult(allocator, "unknown tool");
+            };
             try pushToolStart(out, io, allocator, tc.id, tc.name);
             try pushToolEnd(out, io, allocator, tc.id, null, r);
             try results.append(allocator, .{ .call_id = tc.id, .result = r, .terminate = false });
@@ -665,6 +693,7 @@ fn pushToolEnd(
     }
     for (result.content) |cb| try copied_content.append(allocator, try cb.dupe(allocator));
     const owned_details = if (result.details_json) |d| try allocator.dupe(u8, d) else null;
+    const owned_tool_code = if (result.tool_code) |t| try allocator.dupe(u8, t) else null;
     try out.push(io, .{ .tool_execution_end = .{
         .call_id = try allocator.dupe(u8, call_id),
         .result = .{
@@ -672,6 +701,7 @@ fn pushToolEnd(
             .details_json = owned_details,
             .is_error = result.is_error,
             .terminate = result.terminate,
+            .tool_code = owned_tool_code,
         },
     } });
 }
@@ -700,6 +730,32 @@ fn makeErrorResult(allocator: std.mem.Allocator, text: []const u8) !at.ToolResul
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = cb;
     return .{ .content = arr, .is_error = true };
+}
+
+fn makeRoleDeniedResult(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    denial: RoleDenial,
+) !at.ToolResult {
+    const text = if (denial.min_role) |min|
+        try std.fmt.allocPrint(
+            allocator,
+            "tool '{s}' is not available under role '{s}'. Restart with --role {s} (and ensure a sandbox is in place for risky roles) to enable it.",
+            .{ tool_name, denial.current_role, min },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "tool '{s}' is not available under role '{s}'.",
+            .{ tool_name, denial.current_role },
+        );
+    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
+    arr[0] = .{ .text = .{ .text = text } };
+    return .{
+        .content = arr,
+        .is_error = true,
+        .tool_code = try allocator.dupe(u8, at.role_denied_code),
+    };
 }
 
 /// Dump one message to the trace log. Text and tool-call args are

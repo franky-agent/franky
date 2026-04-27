@@ -1,22 +1,19 @@
-//! streamProxy — §4.7.
+//! streamProxy — §4.7 event-framing primitives.
 //!
-//! Transport-agnostic primitives for exposing the agent loop to a
-//! remote front-end over SSE. A full HTTP listener wiring is
-//! deferred until `std.Io.net` stabilizes in Zig 0.17-dev; this
-//! module ships the serialization layer that a future TCP/HTTP
-//! binding will call into:
+//! Transport-agnostic serialization for exposing the agent loop
+//! to a remote front-end over SSE:
 //!
 //!   - `writeEvent(writer, ev)` — render one `AgentEvent` as an SSE
 //!     frame (`event: <kind>\ndata: <json>\n\n`).
 //!   - `encodeEventJson(allocator, ev)` — pure function that
 //!     produces the JSON payload for an event (no SSE framing).
 //!
-//! Once a listener lands, the binding loop is:
-//!
-//!     while (ch.next(io)) |ev| {
-//!         try proxy.writeEvent(sse_writer, ev);
-//!     }
-//!     sse_writer.writeAll("event: close\ndata: {}\n\n");
+//! The HTTP/SSE listener that calls these primitives lives at
+//! `coding/modes/proxy.zig` (`franky --mode proxy`, shipped
+//! v1.4.0). The split keeps this module pure (no `std.Io.net`
+//! dependency) so it stays testable in isolation and re-usable
+//! by alternative transports (Slack-bot bridges, custom RPC
+//! frames).
 //!
 //! Events are the same `at.AgentEvent` shapes the in-process loop
 //! emits, so a remote client can drive the agent with zero
@@ -109,6 +106,10 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
             try appendJsonStr(&buf, allocator, e.call_id);
             try buf.appendSlice(allocator, ",\"isError\":");
             try buf.appendSlice(allocator, if (e.result.is_error) "true" else "false");
+            if (e.result.tool_code) |code| {
+                try buf.appendSlice(allocator, ",\"toolCode\":");
+                try appendJsonStr(&buf, allocator, code);
+            }
         },
         .agent_error => |d| {
             try buf.appendSlice(allocator, "\"kind\":\"agent_error\",\"code\":");

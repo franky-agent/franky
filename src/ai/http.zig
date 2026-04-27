@@ -11,26 +11,35 @@
 //!     production providers inline their own fetch so they can inspect
 //!     status/headers before parsing.
 //!
-//! ### Timeout strategy (v0.3.0)
+//! ### Timeout strategy
 //!
 //! The four §G.4 fields (`connect_ms`, `upload_ms`, `first_byte_ms`,
-//! `event_gap_ms`) are all plumbed through `StreamOptions.timeouts`:
+//! `event_gap_ms`) are all plumbed through `StreamOptions.timeouts`.
 //!
-//! - `event_gap_ms` is enforced here in `driveSseFromBytes` between
-//!   successful `on_event` callbacks. Currently this mostly catches slow
-//!   handlers (since `fetch()` buffers the full body); once we switch to
-//!   streaming reads it will also catch server-side mid-stream stalls.
-//! - `connect_ms`, `upload_ms`, and `first_byte_ms` are **plumbed through
-//!   the API surface but not yet enforced by the underlying fetch**.
-//!   `std.http.Client.fetch` is a blocking primitive with no per-phase
-//!   hooks or cancellation path in 0.17-dev; enforcing these needs
-//!   either a streaming-reads migration or a worker-thread-with-deadline
-//!   pattern that reconciles with `std.Io.Mutex`/`Condition`. Tracked as
-//!   the next tightening pass.
+//! - **v0.3.0**: shapes + `event_gap_ms` enforcement in
+//!   `driveSseFromBytes`.
+//! - **v1.3.1**: total wall-clock budget = `connect + upload +
+//!   first_byte` enforced between retry attempts via `fetchDeadlineMs()`.
+//! - **v1.8.0** (this pass): per-phase enforcement via
+//!   `fetchAttemptPhased`. Each request goes through the lower-level
+//!   `client.connect → request → sendBody → receiveHead → readBody`
+//!   sequence (instead of one-shot `client.fetch`), and a watchdog
+//!   thread closes the connection's underlying stream when the
+//!   current phase budget expires. The blocked phase op then returns
+//!   `error.ConnectionResetByPeer` / `error.BrokenPipe`, which we
+//!   classify as `error.Timeout`. The phase tag (`connect`, `upload`,
+//!   `first_byte`) is reported via the optional `*PhaseInfo`
+//!   out-parameter on `fetchWithRetryAndTimeoutsAndHooksAndPhases`.
 //!
-//! The fields' arithmetic and API surface are fully tested so callers
-//! can depend on them today; future enforcement is a code change that
-//! will not alter call sites.
+//! The connect-phase watchdog can only **tag** post-fact (not
+//! interrupt) — `client.request()` does CA-bundle setup before
+//! exposing a connection to close, and we don't have a hook between
+//! those two. Practically this is rarely a problem because the
+//! TCP+TLS connect itself is what's hanging, and the OS-level connect
+//! timeout (~60s on Linux) bounds it long before user-facing impact.
+//!
+//! Body reading still buffers the full response before SSE parsing —
+//! true streaming reads are post-1.0 (§N.2 `io.concurrent`).
 
 const std = @import("std");
 const sse_mod = @import("sse.zig");
@@ -39,6 +48,137 @@ const errors_mod = @import("errors.zig");
 const registry_mod = @import("registry.zig");
 
 pub const Timeouts = registry_mod.Timeouts;
+
+// ─── §G.4 per-phase timeout primitives (v1.8.0) ──────────────────
+
+/// On-success this is `none`; on `error.Timeout` it identifies which
+/// phase the watchdog killed. `event_gap_ms` timeouts come from
+/// `driveSseFromBytes` and are reported separately at the SSE layer.
+pub const PhaseTag = enum {
+    none,
+    connect,
+    upload,
+    first_byte,
+
+    pub fn label(self: PhaseTag) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .connect => "connect",
+            .upload => "upload",
+            .first_byte => "first_byte",
+        };
+    }
+};
+
+/// Out-parameter passed by callers that want to know which phase
+/// timed out. `null` is fine — the per-phase enforcement still
+/// happens; only the diagnostic tag is dropped on the floor.
+pub const PhaseInfo = struct {
+    timed_out_phase: PhaseTag = .none,
+};
+
+/// Shared state between the request thread and its watchdog. Owned
+/// by the request thread; the watchdog reads/writes via `mutex`.
+///
+/// The watchdog is a single thread per request attempt. It polls
+/// the deadline every `poll_ms` and, when armed and expired, closes
+/// the connection's underlying `std.Io.net.Stream` so the blocked
+/// phase op returns. This gives us interrupt semantics without
+/// needing async/coroutines.
+const PhaseGuard = struct {
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    /// Connection whose stream we close when the deadline fires.
+    /// Null while no connection exists yet (i.e. during `connect`).
+    connection: ?*std.http.Client.Connection = null,
+    /// Absolute deadline in ms-since-epoch for the active phase.
+    /// 0 = no active deadline (between phases or done).
+    deadline_ms: i64 = 0,
+    /// Phase tag for the active deadline.
+    current_phase: PhaseTag = .none,
+    /// Phase whose deadline the watchdog fired (if any). Read by
+    /// the request thread after a phase op fails to disambiguate
+    /// "real" connection error from "we killed it".
+    fired_phase: PhaseTag = .none,
+    /// Set by the request thread when the request completes (one
+    /// way or another). The watchdog observes and exits.
+    stop: std.atomic.Value(bool) = .init(false),
+    /// Sleep granularity. Tests can tighten this. Production keeps
+    /// 50 ms (snappy phase-end shutdown, negligible CPU).
+    poll_ms: u64 = 50,
+};
+
+fn watchdogLoop(g: *PhaseGuard) void {
+    while (!g.stop.load(.acquire)) {
+        nanoSleepMs(g.poll_ms);
+        if (g.stop.load(.acquire)) return;
+        g.mutex.lockUncancelable(g.io);
+        const now = stream_mod.nowMillis();
+        if (g.deadline_ms > 0 and now >= g.deadline_ms) {
+            // Fire — record which phase, then `shutdown(.both)`
+            // the connection stream so the blocked phase op
+            // returns. Disarm in the same critical section so we
+            // don't re-fire if the request thread is slow to react.
+            // shutdown is preferred over close because the request
+            // thread still holds Reader/Writer state on the socket;
+            // closing the fd from another thread races with that
+            // state and crashes. shutdown signals EOF to in-flight
+            // reads/writes without freeing the fd.
+            g.fired_phase = g.current_phase;
+            const conn = g.connection;
+            g.deadline_ms = 0;
+            g.mutex.unlock(g.io);
+            if (conn) |c| c.stream_reader.stream.shutdown(g.io, .both) catch {};
+            continue;
+        }
+        g.mutex.unlock(g.io);
+    }
+}
+
+/// Arm `g` for a new phase. Caller-side: the request thread calls
+/// this immediately before the IO op and `disarmPhase` immediately
+/// after it returns.
+fn armPhase(g: *PhaseGuard, phase: PhaseTag, conn: ?*std.http.Client.Connection, budget_ms: u32) void {
+    if (budget_ms == 0) return; // disabled — leave deadline=0
+    g.mutex.lockUncancelable(g.io);
+    defer g.mutex.unlock(g.io);
+    g.current_phase = phase;
+    g.connection = conn;
+    g.deadline_ms = stream_mod.nowMillis() + @as(i64, @intCast(budget_ms));
+}
+
+/// Disarm — clears the active deadline so the watchdog can't fire.
+/// Returns whether the watchdog already fired (caller maps that to
+/// `error.Timeout`).
+fn disarmPhase(g: *PhaseGuard) bool {
+    g.mutex.lockUncancelable(g.io);
+    defer g.mutex.unlock(g.io);
+    g.current_phase = .none;
+    g.connection = null;
+    g.deadline_ms = 0;
+    return g.fired_phase != .none;
+}
+
+/// Sleep for `ms` milliseconds. Best-effort — signals can wake it
+/// early, harmless here. Production binaries link libc and use
+/// `nanosleep`; tests (which don't link libc in this project) fall
+/// back to a wall-clock busy-spin so the function actually delays.
+/// The mirror in `coding/modes/proxy.zig` only runs in production
+/// where libc is always present.
+fn nanoSleepMs(ms: u64) void {
+    if (@import("builtin").link_libc) {
+        const sec: i64 = @intCast(ms / 1000);
+        const nsec: i64 = @intCast((ms % 1000) * std.time.ns_per_ms);
+        const ts = std.c.timespec{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
+        _ = std.c.nanosleep(&ts, null);
+        return;
+    }
+    // No libc — busy-spin against the wall clock. CPU-hot but
+    // correct; only the test binary takes this path.
+    const start = stream_mod.nowMillis();
+    const deadline = start + @as(i64, @intCast(ms));
+    while (stream_mod.nowMillis() < deadline) {}
+}
 
 pub const Header = struct {
     name: []const u8,
@@ -208,6 +348,14 @@ pub const FetchRetryCtx = struct {
     hook_userdata: ?*anyopaque = null,
     on_payload: ?*const fn (userdata: ?*anyopaque, payload: []const u8) void = null,
     on_response: ?*const fn (userdata: ?*anyopaque, status: u16) void = null,
+    /// v1.8.0 — full §G.4 phase budgets used by `fetchAttemptPhased`.
+    /// `fetchAttempt` (the legacy single-shot path) only uses
+    /// `deadline_ms` (= sum of phase budgets) for total-budget cuts.
+    timeouts: Timeouts = .{},
+    /// v1.8.0 — out-parameter for the per-phase tag on
+    /// `error.Timeout`. `fetchAttemptPhased` writes this; the legacy
+    /// `fetchAttempt` leaves it as-is.
+    phase_info: ?*PhaseInfo = null,
 };
 
 /// Shared attempt callback used by `fetchWithRetry`. Classifies
@@ -280,6 +428,196 @@ fn classifyTransport(e: anyerror) retry_mod.Outcome {
     };
 }
 
+/// v1.8.0 — phased attempt callback. Replaces `fetchAttempt`'s
+/// single-shot `client.fetch(...)` with the three-phase
+/// `connect → request+sendBody → receiveHead → readBody` flow,
+/// each guarded by its own watchdog so a hung phase returns
+/// promptly. Body reading still buffers (no streaming SSE parse
+/// yet — post-1.0).
+///
+/// Per-phase timeouts come from `ctx.timeouts`. Setting any field
+/// to 0 disables enforcement for that phase. The watchdog tags
+/// `ctx.phase_info.?.timed_out_phase` on the way out.
+pub fn fetchAttemptPhased(userdata: ?*anyopaque, attempt: u32) retry_mod.AttemptResult {
+    _ = attempt;
+    const ctx: *FetchRetryCtx = @ptrCast(@alignCast(userdata.?));
+
+    // §G.4 wall-clock total-budget check — same short-circuit as
+    // `fetchAttempt` so a request already over budget doesn't
+    // start a new phase round.
+    if (ctx.deadline_ms > 0 and deadlineExpired(stream_mod.nowMillis(), ctx.start_ms, ctx.deadline_ms)) {
+        ctx.last_err = error.Timeout;
+        return .{ .outcome = .terminal };
+    }
+
+    ctx.body_writer.clearRetainingCapacity();
+
+    if (ctx.on_payload) |hook| {
+        const payload = ctx.options.payload orelse "";
+        hook(ctx.hook_userdata, payload);
+    }
+
+    // Spawn the watchdog up-front; it serves all three phases. We
+    // hand it `io` from the client so closing the connection is
+    // io-aware. `stop` flips at function exit (deferred) so the
+    // thread joins cleanly on every return path.
+    var guard: PhaseGuard = .{ .io = ctx.client.io };
+    const wd_thread = std.Thread.spawn(.{}, watchdogLoop, .{&guard}) catch |e| {
+        ctx.last_err = e;
+        return .{ .outcome = .terminal };
+    };
+    defer {
+        guard.stop.store(true, .release);
+        wd_thread.join();
+    }
+
+    const result = fetchPhased(ctx, &guard) catch |e| {
+        ctx.last_err = e;
+        // If the watchdog killed a phase, surface the tag and
+        // upgrade to `error.Timeout` (which `classifyTransport`
+        // routes to `terminal`, stopping retries — connect-phase
+        // timeouts ARE retryable in principle, but for v1.8.0 we
+        // keep the conservative behavior: total-budget retry
+        // already covers the "transient slow" case).
+        if (guard.fired_phase != .none) {
+            if (ctx.phase_info) |pi| pi.timed_out_phase = guard.fired_phase;
+            ctx.last_err = error.Timeout;
+            return .{ .outcome = .terminal };
+        }
+        return .{ .outcome = classifyTransport(e) };
+    };
+    ctx.last_status = result.status;
+    ctx.last_err = null;
+
+    if (ctx.on_response) |hook| {
+        hook(ctx.hook_userdata, @intFromEnum(result.status));
+    }
+
+    const status_code = @intFromEnum(result.status);
+    if (status_code < 400) {
+        ctx.bytes_flowed.* = true;
+        return .{ .outcome = .success };
+    }
+    if (status_code >= 500 or status_code == 429) {
+        return .{ .outcome = .retryable };
+    }
+    return .{ .outcome = .terminal };
+}
+
+/// Inner phased flow used by `fetchAttemptPhased`. Returns the
+/// HTTP result on success, propagates whatever error the std.http
+/// client surfaced on failure (the watchdog flag distinguishes
+/// "we killed it" from "real network error" at the caller).
+fn fetchPhased(
+    ctx: *FetchRetryCtx,
+    guard: *PhaseGuard,
+) !std.http.Client.FetchResult {
+    const opts = ctx.options.*;
+    const uri = switch (opts.location) {
+        .url => |u| try std.Uri.parse(u),
+        .uri => |u| u,
+    };
+    const method: std.http.Method = opts.method orelse
+        if (opts.payload != null) .POST else .GET;
+
+    // ── Phase 1: connect ──
+    // Connect through `client.request` (it does CA-bundle setup +
+    // `client.connect`). The watchdog tags but can't interrupt
+    // (no connection handle exists yet); the OS-level connect
+    // timeout still bounds it. Once `request` returns, we own a
+    // connection and the next two phases get full interrupt.
+    armPhase(guard, .connect, null, ctx.timeouts.connect_ms);
+    var req = std.http.Client.request(ctx.client, method, uri, .{
+        .redirect_behavior = opts.redirect_behavior orelse
+            if (opts.payload == null) @enumFromInt(3) else .unhandled,
+        .headers = opts.headers,
+        .extra_headers = opts.extra_headers,
+        .privileged_headers = opts.privileged_headers,
+        // v1.8.0: force-close per request — a watchdog-killed
+        // connection MUST NOT go back in the pool. Re-handshake
+        // cost is acceptable; correctness wins.
+        .keep_alive = false,
+    }) catch |e| {
+        if (disarmPhase(guard)) return error.Timeout;
+        return e;
+    };
+    defer req.deinit();
+    if (disarmPhase(guard)) return error.Timeout;
+
+    // ── Phase 2: upload ──
+    armPhase(guard, .upload, req.connection, ctx.timeouts.upload_ms);
+    if (opts.payload) |payload| {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var body = req.sendBodyUnflushed(&.{}) catch |e| {
+            if (disarmPhase(guard)) return error.Timeout;
+            return e;
+        };
+        body.writer.writeAll(payload) catch |e| {
+            if (disarmPhase(guard)) return error.Timeout;
+            return e;
+        };
+        body.end() catch |e| {
+            if (disarmPhase(guard)) return error.Timeout;
+            return e;
+        };
+        req.connection.?.flush() catch |e| {
+            if (disarmPhase(guard)) return error.Timeout;
+            return e;
+        };
+    } else {
+        req.sendBodiless() catch |e| {
+            if (disarmPhase(guard)) return error.Timeout;
+            return e;
+        };
+    }
+    if (disarmPhase(guard)) return error.Timeout;
+
+    // ── Phase 3: first byte (response head) ──
+    const redirect_buffer: []u8 = if (opts.redirect_behavior == .unhandled) &.{} else opts.redirect_buffer orelse
+        ctx.client.allocator.alloc(u8, 8 * 1024) catch |e| return e;
+    defer if (opts.redirect_buffer == null and opts.redirect_behavior != .unhandled) ctx.client.allocator.free(redirect_buffer);
+
+    armPhase(guard, .first_byte, req.connection, ctx.timeouts.first_byte_ms);
+    var response = req.receiveHead(redirect_buffer) catch |e| {
+        if (disarmPhase(guard)) return error.Timeout;
+        return e;
+    };
+    if (disarmPhase(guard)) return error.Timeout;
+
+    // ── Phase 4: body ──
+    // No watchdog here — body reads are bounded by `event_gap_ms`
+    // at the SSE layer (`driveSseFromBytes`). For non-SSE
+    // responses, the response_writer's own pacing applies. True
+    // streaming SSE parse is post-1.0 (§N.2 `io.concurrent`).
+    const response_writer = opts.response_writer orelse {
+        const reader = response.reader(&.{});
+        _ = reader.discardRemaining() catch return response.bodyErr().?;
+        return .{ .status = response.head.status };
+    };
+
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => opts.decompress_buffer orelse ctx.client.allocator.alloc(u8, std.compress.zstd.default_window_len) catch |e| return e,
+        .deflate, .gzip => opts.decompress_buffer orelse ctx.client.allocator.alloc(u8, std.compress.flate.max_window_len) catch |e| return e,
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (opts.decompress_buffer == null) switch (response.head.content_encoding) {
+        .identity => {},
+        .zstd, .deflate, .gzip => ctx.client.allocator.free(decompress_buffer),
+        .compress => unreachable,
+    };
+
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = reader.streamRemaining(response_writer) catch |e| switch (e) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => return e,
+    };
+
+    return .{ .status = response.head.status };
+}
+
 /// Drop-in replacement for `client.fetch` with §F.1 retry policy
 /// baked in. Writes the response body into `body_writer`; returns
 /// the final `FetchResult` on success, or propagates the last
@@ -336,22 +674,85 @@ pub fn hooksFromOptions(opts: anytype) Hooks {
     };
 }
 
-/// v1.3.0 R5 — push the canonical `.start` → `error_ev(transport)`
-/// → close-channel sequence when a provider's HTTP fetch fails
-/// with a transport-level error (connection refused, DNS failure,
-/// deadline exceeded, etc.). 5 provider `streamFn`s had this
-/// 5-line catch block verbatim — this is the shared form.
+/// v1.3.0 R5 — push the canonical `.start` → `error_ev(...)` →
+/// close-channel sequence when a provider's HTTP fetch fails.
+///
+/// Branches on `err`:
+///   - `error.Timeout` → `code = .timeout`, message names the
+///     phase (when `phase_info` is provided) and includes the
+///     budget that was exceeded so the user can tune the
+///     matching `--<phase>-timeout-ms` flag. This is the typical
+///     symptom when running against slow local LLMs (Ollama on
+///     CPU, vLLM cold cache).
+///   - everything else → `code = .transport`, `http error: <name>`.
 pub fn reportTransportError(
     out: *stream_mod.Channel,
     io: std.Io,
     allocator: std.mem.Allocator,
     err: anyerror,
 ) !void {
+    return reportTransportErrorWithPhase(out, io, allocator, err, null, null);
+}
+
+/// Variant that surfaces phase + budget. Pass `null` for either
+/// parameter you don't have access to — callers from the legacy
+/// (non-phased) fetch path hit the wrapper above.
+pub fn reportTransportErrorWithPhase(
+    out: *stream_mod.Channel,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    err: anyerror,
+    phase: ?PhaseTag,
+    timeouts: ?Timeouts,
+) !void {
     try out.push(io, .start);
+    const Code = @import("errors.zig").Code;
+    if (err == error.Timeout) {
+        const message = try formatTimeoutMessage(allocator, phase, timeouts);
+        out.closeWithFinal(io, .{ .error_ev = .{ .code = Code.timeout, .message = message } });
+        return;
+    }
     out.closeWithFinal(io, .{ .error_ev = .{
-        .code = @import("errors.zig").Code.transport,
+        .code = Code.transport,
         .message = try std.fmt.allocPrint(allocator, "http error: {s}", .{@errorName(err)}),
     } });
+}
+
+fn formatTimeoutMessage(
+    allocator: std.mem.Allocator,
+    phase: ?PhaseTag,
+    timeouts: ?Timeouts,
+) ![]u8 {
+    const phase_name: []const u8 = if (phase) |p| switch (p) {
+        .connect => "connect",
+        .upload => "upload",
+        .first_byte => "first-byte",
+        .none => "request",
+    } else "request";
+    const flag_name: []const u8 = if (phase) |p| switch (p) {
+        .connect => "--connect-timeout-ms",
+        .upload => "--upload-timeout-ms",
+        .first_byte => "--first-byte-timeout-ms",
+        .none => "--first-byte-timeout-ms",
+    } else "--first-byte-timeout-ms";
+    const budget_ms: ?u32 = if (timeouts) |t| switch (phase orelse .none) {
+        .connect => t.connect_ms,
+        .upload => t.upload_ms,
+        .first_byte => t.first_byte_ms,
+        .none => null,
+    } else null;
+    if (budget_ms) |ms| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s} timeout: provider didn't respond within {d}ms; raise {s} (or set FRANKY_FIRST_BYTE_TIMEOUT_MS) for slow models",
+            .{ phase_name, ms, flag_name },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{s} timeout: provider didn't respond in time; raise {s} (or set FRANKY_FIRST_BYTE_TIMEOUT_MS) for slow models",
+        .{ phase_name, flag_name },
+    );
 }
 
 pub fn fetchWithRetryAndTimeoutsAndHooks(
@@ -363,8 +764,34 @@ pub fn fetchWithRetryAndTimeoutsAndHooks(
     timeouts: Timeouts,
     hooks: Hooks,
 ) !std.http.Client.FetchResult {
+    return fetchWithRetryAndTimeoutsAndHooksAndPhases(
+        client,
+        options,
+        body_writer,
+        cancel,
+        policy,
+        timeouts,
+        hooks,
+        null,
+    );
+}
+
+/// v1.8.0 — adds the optional `*PhaseInfo` out-parameter so callers
+/// can read which §G.4 phase fired on `error.Timeout`. Routes
+/// through `fetchAttemptPhased`; legacy `fetchAttempt` (single-shot
+/// `client.fetch`) remains for backward compat but is no longer
+/// reachable through any of the public entry points.
+pub fn fetchWithRetryAndTimeoutsAndHooksAndPhases(
+    client: *std.http.Client,
+    options: std.http.Client.FetchOptions,
+    body_writer: *std.Io.Writer.Allocating,
+    cancel: *stream_mod.Cancel,
+    policy: retry_mod.Policy,
+    timeouts: Timeouts,
+    hooks: Hooks,
+    phase_info: ?*PhaseInfo,
+) !std.http.Client.FetchResult {
     var opts_copy = options;
-    // Inject our body writer into the fetch options.
     opts_copy.response_writer = &body_writer.writer;
 
     const deadline_ms: u64 = timeouts.fetchDeadlineMs();
@@ -381,6 +808,8 @@ pub fn fetchWithRetryAndTimeoutsAndHooks(
         .hook_userdata = hooks.userdata,
         .on_payload = hooks.on_payload,
         .on_response = hooks.on_response,
+        .timeouts = timeouts,
+        .phase_info = phase_info,
     };
 
     const result = retry_mod.run(
@@ -388,7 +817,7 @@ pub fn fetchWithRetryAndTimeoutsAndHooks(
         cancel,
         defaultSleep,
         null,
-        fetchAttempt,
+        fetchAttemptPhased,
         @ptrCast(&ctx),
     );
 
@@ -511,6 +940,88 @@ test "Timeouts defaults match §G.4 (10s / 120s / 30s / 60s)" {
     try testing.expectEqual(@as(u32, 60_000), t.event_gap_ms);
 }
 
+test "formatTimeoutMessage: first_byte phase names the right flag + budget" {
+    const gpa = testing.allocator;
+    const msg = try formatTimeoutMessage(gpa, .first_byte, .{ .first_byte_ms = 30_000 });
+    defer gpa.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "first-byte timeout") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "30000ms") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "--first-byte-timeout-ms") != null);
+}
+
+test "formatTimeoutMessage: connect phase names connect flag" {
+    const gpa = testing.allocator;
+    const msg = try formatTimeoutMessage(gpa, .connect, .{ .connect_ms = 5_000 });
+    defer gpa.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "connect timeout") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "--connect-timeout-ms") != null);
+}
+
+test "formatTimeoutMessage: null phase falls back to generic request wording" {
+    const gpa = testing.allocator;
+    const msg = try formatTimeoutMessage(gpa, null, null);
+    defer gpa.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "request timeout") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "FRANKY_FIRST_BYTE_TIMEOUT_MS") != null);
+}
+
+test "reportTransportErrorWithPhase: error.Timeout produces code=.timeout" {
+    const gpa = testing.allocator;
+    var ch = try stream_mod.Channel.init(gpa, 8);
+    defer ch.deinit();
+    var threaded = @import("../test_helpers.zig").threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try reportTransportErrorWithPhase(
+        &ch,
+        io,
+        gpa,
+        error.Timeout,
+        .first_byte,
+        .{ .first_byte_ms = 42_000 },
+    );
+
+    var saw_timeout = false;
+    var saw_message = false;
+    while (ch.next(io)) |ev| {
+        switch (ev) {
+            .error_ev => |d| {
+                if (d.code == .timeout) saw_timeout = true;
+                if (std.mem.indexOf(u8, d.message, "42000ms") != null) saw_message = true;
+            },
+            else => {},
+        }
+        ev.deinit(gpa);
+    }
+    try testing.expect(saw_timeout);
+    try testing.expect(saw_message);
+}
+
+test "reportTransportErrorWithPhase: non-timeout keeps legacy transport code" {
+    const gpa = testing.allocator;
+    var ch = try stream_mod.Channel.init(gpa, 8);
+    defer ch.deinit();
+    var threaded = @import("../test_helpers.zig").threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try reportTransportErrorWithPhase(&ch, io, gpa, error.ConnectionRefused, null, null);
+
+    var saw_transport = false;
+    while (ch.next(io)) |ev| {
+        switch (ev) {
+            .error_ev => |d| if (d.code == .transport) {
+                saw_transport = true;
+                try testing.expect(std.mem.indexOf(u8, d.message, "http error: ConnectionRefused") != null);
+            },
+            else => {},
+        }
+        ev.deinit(gpa);
+    }
+    try testing.expect(saw_transport);
+}
+
 test "driveSseFromBytes parses synthetic Anthropic-shaped events" {
     const gpa = testing.allocator;
     var cancel = stream_mod.Cancel{};
@@ -596,9 +1107,181 @@ test "driveSseFromBytesWithTimeouts fires Timeout when handler stalls past event
     try testing.expectError(EventHandlerError.Timeout, r);
 }
 
-// NOTE(coverage-v0.3.0): live-network integration tests for the three
-// fetch-phase timeouts (connect/upload/first_byte) are deferred until
-// we switch to streaming reads. See the module doc comment. The arithmetic
-// gates above verify each field is plumbed through and contributes to the
-// effective deadline; behavioral enforcement will land when the streaming
-// refactor goes in.
+// ─── §G.4 per-phase enforcement tests (v1.8.0) ──────────────────
+//
+// Each test stands up a tiny HTTP-ish server on a loopback port
+// that's deliberately slow (or completely silent) at one phase
+// boundary. The client is configured with a tight phase budget;
+// we expect `error.Timeout` and the matching `PhaseTag` in the
+// out-parameter `PhaseInfo`.
+
+const test_h = @import("../test_helpers.zig");
+
+const StallPhase = enum { none, first_byte };
+
+const StallServer = struct {
+    server: std.Io.net.Server,
+    port: u16,
+    /// Phase the server stalls at: any read past this point hangs.
+    stall_at: StallPhase,
+    /// How long the server thread sleeps before responding (only
+    /// relevant for stall_at != .none).
+    stall_ms: u64,
+    /// Stop signal — flipped by the test before deinit so the
+    /// server thread exits its accept loop cleanly.
+    stop: std.atomic.Value(bool) = .init(false),
+    io: std.Io,
+};
+
+fn stallServerLoop(s: *StallServer) void {
+    var stream = s.server.accept(s.io) catch return;
+    defer stream.close(s.io);
+
+    // Drain the request bytes. Real HTTP request ends with
+    // `\r\n\r\n`. We don't bother parsing — just read until the
+    // peer indicates EOF or until we've seen the header
+    // terminator. This unblocks the client's upload phase.
+    var sink: [4096]u8 = undefined;
+    var r = stream.reader(s.io, &.{});
+    var saw_term = false;
+    var seen: usize = 0;
+    while (!saw_term) {
+        var vecs: [1][]u8 = .{&sink};
+        const n = r.interface.readVec(&vecs) catch break;
+        if (n == 0) break;
+        seen += n;
+        // Look for "\r\n\r\n" anywhere — close enough for a
+        // well-formed POST since headers come before body for
+        // small bodies.
+        if (std.mem.indexOf(u8, sink[0..@min(n, sink.len)], "\r\n\r\n") != null) saw_term = true;
+        if (seen > 16 * 1024) break;
+    }
+
+    switch (s.stall_at) {
+        .first_byte => {
+            nanoSleepMs(s.stall_ms);
+            const reply =
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            var wbuf: [256]u8 = undefined;
+            var w = stream.writer(s.io, &wbuf);
+            w.interface.writeAll(reply) catch {};
+            w.interface.flush() catch {};
+        },
+        .none => {
+            const reply =
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+            var wbuf: [256]u8 = undefined;
+            var w = stream.writer(s.io, &wbuf);
+            w.interface.writeAll(reply) catch {};
+            w.interface.flush() catch {};
+        },
+    }
+}
+
+fn bindStallServer(io: std.Io, stall_at: StallPhase, stall_ms: u64) ?StallServer {
+    const from: u16 = 18950;
+    const to: u16 = 18999;
+    var p = from;
+    while (p < to) : (p += 1) {
+        var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch continue;
+        const server = std.Io.net.IpAddress.listen(&addr, io, .{
+            .kernel_backlog = 4,
+            .reuse_address = true,
+        }) catch continue;
+        return .{
+            .server = server,
+            .port = p,
+            .stall_at = stall_at,
+            .stall_ms = stall_ms,
+            .io = io,
+        };
+    }
+    return null;
+}
+
+test "fetchPhased: happy path keeps PhaseInfo at .none" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var s = bindStallServer(io, .none, 0) orelse return;
+    defer s.server.deinit(io);
+    const server_thread = try std.Thread.spawn(.{}, stallServerLoop, .{&s});
+    defer server_thread.join();
+
+    var client = std.http.Client{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    var bw = std.Io.Writer.Allocating.init(gpa);
+    defer bw.deinit();
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/", .{s.port});
+    defer gpa.free(url);
+
+    var cancel: stream_mod.Cancel = .{};
+    var pi: PhaseInfo = .{};
+    const result = try fetchWithRetryAndTimeoutsAndHooksAndPhases(
+        &client,
+        .{ .location = .{ .url = url }, .method = .GET },
+        &bw,
+        &cancel,
+        .{ .max_retries = 0 },
+        .{ .connect_ms = 5_000, .upload_ms = 5_000, .first_byte_ms = 5_000 },
+        .{},
+        &pi,
+    );
+    try testing.expectEqual(@as(u16, 200), @intFromEnum(result.status));
+    try testing.expectEqual(PhaseTag.none, pi.timed_out_phase);
+}
+
+test "fetchPhased: first_byte phase fires when server stalls past budget" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    // Server reads the request then sleeps 1500 ms. Client's
+    // first_byte budget is 200 ms — watchdog should fire well
+    // before the server replies.
+    var s = bindStallServer(io, .first_byte, 1500) orelse return;
+    defer s.server.deinit(io);
+    const server_thread = try std.Thread.spawn(.{}, stallServerLoop, .{&s});
+    defer server_thread.join();
+
+    var client = std.http.Client{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    var bw = std.Io.Writer.Allocating.init(gpa);
+    defer bw.deinit();
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/", .{s.port});
+    defer gpa.free(url);
+
+    var cancel: stream_mod.Cancel = .{};
+    var pi: PhaseInfo = .{};
+    const t0 = stream_mod.nowMillis();
+    const r = fetchWithRetryAndTimeoutsAndHooksAndPhases(
+        &client,
+        .{ .location = .{ .url = url }, .method = .GET },
+        &bw,
+        &cancel,
+        .{ .max_retries = 0 },
+        .{ .connect_ms = 5_000, .upload_ms = 5_000, .first_byte_ms = 200 },
+        .{},
+        &pi,
+    );
+    const elapsed = stream_mod.nowMillis() - t0;
+    try testing.expectError(error.Timeout, r);
+    try testing.expectEqual(PhaseTag.first_byte, pi.timed_out_phase);
+    // Watchdog poll is 50ms, budget is 200ms — must fire well
+    // before the server's 1500ms reply. Allow generous slack.
+    try testing.expect(elapsed < 1200);
+}
+
+test "fetchPhased: PhaseTag.label returns canonical phase names" {
+    try testing.expectEqualStrings("none", PhaseTag.none.label());
+    try testing.expectEqualStrings("connect", PhaseTag.connect.label());
+    try testing.expectEqualStrings("upload", PhaseTag.upload.label());
+    try testing.expectEqualStrings("first_byte", PhaseTag.first_byte.label());
+}

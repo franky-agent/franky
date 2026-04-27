@@ -281,3 +281,82 @@ test "agent loop: before_tool_call can block a call" {
     }
     try testing.expect(saw_error_result);
 }
+
+// ─── v1.4.1 — runtime role gate ───────────────────────────────────
+
+test "runtime role gate: tool_call for role-disabled built-in emits role_denied" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    // Faux script: emit ONE tool_call for `bash` (which is not in
+    // the registered tools below — under role=plan), then `done`.
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+    try faux.push(.{ .events = &.{
+        .{ .tool_call = .{ .id = "c-1", .name = "bash", .args_json = "{\"command\":\"ls\"}" } },
+        .{ .done = .{ .stop_reason = .tool_use } },
+    } });
+    // Second turn: model just stops (after seeing the role_denied result).
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "ack", .chunk_size = 4 } },
+        .{ .done = .{ .stop_reason = .stop } },
+    } });
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    const user_content = try gpa.alloc(ai.types.ContentBlock, 1);
+    user_content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "run something") } };
+    try transcript.append(.{ .role = .user, .content = user_content, .timestamp = 0 });
+
+    var ch = try loop.AgentChannel.initWithDrop(gpa, 256, at.AgentEvent.deinit, gpa);
+    defer ch.deinit();
+
+    // Mimic what `coding.role.RoleGate` does without importing it
+    // here (this file lives under `test/`; the loop's interface is
+    // generic).
+    const Gate = struct {
+        fn check(_: ?*anyopaque, tool_name: []const u8) ?loop.RoleDenial {
+            if (std.mem.eql(u8, tool_name, "bash")) {
+                return .{ .current_role = "plan", .min_role = "code" };
+            }
+            return null;
+        }
+    };
+
+    var cancel: ai.stream.Cancel = .{};
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &[_]at.AgentTool{}, // no tools registered → bash is "unknown"
+        .registry = &reg,
+        .cancel = &cancel,
+        .role_denied = Gate.check,
+    }, &ch);
+
+    // We expect a tool_execution_end carrying tool_code = "role_denied".
+    var saw_role_denied = false;
+    while (ch.next(io)) |ev| {
+        switch (ev) {
+            .tool_execution_end => |e| {
+                if (e.result.is_error) {
+                    if (e.result.tool_code) |tc| {
+                        if (std.mem.eql(u8, tc, "role_denied")) saw_role_denied = true;
+                    }
+                }
+            },
+            else => {},
+        }
+        ev.deinit(gpa);
+    }
+    try testing.expect(saw_role_denied);
+}

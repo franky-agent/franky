@@ -14,7 +14,11 @@ pub fn build(b: *std.Build) void {
     else
         use_lld_opt;
 
-    const franky_module = b.createModule(.{
+    // Public module — exposed to dependents via `b.dependency("franky").module("franky")`.
+    // The internal binary still imports through the same `franky_module`
+    // so there's only one definition. This is what makes franky-do (and
+    // any future sibling project) able to consume `franky.sdk`.
+    const franky_module = b.addModule("franky", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
