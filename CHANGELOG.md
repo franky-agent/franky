@@ -7,6 +7,98 @@ versions correspond to the roadmap milestones in `franky-spec-v1.md`
 `franky-spec-v0.md` under "Port implementation log" and the v0.\*
 roadmap section — this file starts from v1.x.
 
+## [1.21.0] — 2026-04-28 — `Agent.workerFn` deadlock fix (concurrent drain)
+
+Fixes a hard hang in the high-level `Agent` class when a turn
+emits more than ~128 events. Surfaced by franky-do v0.2.x running
+gemma4 on Ollama: tool-using turns with thinking deltas would
+emit 150-200+ events per turn, the worker would hang on
+`out.push` mid-turn, and the Slack reply for the second turn
+never reached the user.
+
+### Root cause
+
+`Agent.workerFn` ran `agentLoop` and the event-drain in the
+**same thread, sequentially**:
+
+```zig
+var ch = AgentChannel.initWithDrop(.. capacity: 128 ..);
+loop_mod.agentLoop(.., &ch);   // pushes events
+while (ch.next(io)) |ev| {     // drains AFTER agentLoop returns
+    self.broadcast(ev);
+}
+```
+
+`AgentChannel.push` is **blocking** — it waits on `not_full`
+when the channel is at capacity. With agentLoop and the drain
+on the same thread, the push that hits the cap never unblocks
+because the drain doesn't run until agentLoop returns. Classic
+single-threaded producer/consumer deadlock.
+
+For light turns (< 128 events) the bug was invisible: the whole
+run fits in the buffer, agentLoop returns, drain runs, all good.
+But any tool-heavy turn or a turn with thinking deltas would push
+past 128 — gemma4 alone produced ~95 events for a single
+"call find" turn (thinking + tool_use), and adding a follow-up
+turn with text deltas pushed total > 128.
+
+Print mode had been working around this since day one — see the
+4096-cap channel + dedicated worker thread in
+`coding/modes/print.zig`. The Agent class never got the same
+treatment because the test suite only exercised faux-provider
+turns with tiny event counts.
+
+### Fix
+
+Two changes in `Agent.workerFn`:
+
+1. **Channel capacity 128 → 4096.** Matches print mode. With
+   thinking + text + tool deltas at ~5 events/token, this gives
+   ~800-token turns of headroom per run before backpressure
+   kicks in.
+2. **`agentLoop` runs on a dedicated thread.** A new
+   `LoopWorkerArgs` struct + `loopWorkerMain` wrapper carries the
+   loop config; the existing worker thread now drains the channel
+   concurrently and joins the loop thread when the channel
+   closes.
+
+The Agent's public surface is unchanged — `prompt` /
+`waitForIdle` / `abort` / `subscribe` all work as before. The
+only observable difference: tool-heavy and thinking-heavy turns
+now actually finish.
+
+### Tests (+1 → 879)
+
+`Agent: does NOT deadlock when a turn produces > 128 events
+(v1.21.0 regression)` — pushes a faux-provider text event with
+`chunk_size = 1` and a 200-char body, producing 200
+`text_delta` events plus framing events. Asserts `waitForIdle`
+returns (would hang forever pre-v1.21.0) and that the
+subscriber received exactly 200 text deltas + 1 turn_end.
+
+### Files changed
+
+- `src/agent/agent.zig` — `LoopWorkerArgs` + `loopWorkerMain`
+  introduced; `workerFn` rewritten to spawn agentLoop on a
+  dedicated thread and drain concurrently. Capacity bumped
+  128 → 4096. Inline comment block documenting the deadlock
+  + fix retained for future readers.
+- `test/agent_class_test.zig` — `TextDeltaCounter` helper +
+  the regression test described above.
+- `src/root.zig`, `build.zig.zon` — 1.20.0 → 1.21.0.
+
+### Why a minor bump
+
+This is a real bug fix that changes runtime behavior — turns
+that previously hung now succeed. Earlier v1.20.x worked for
+typical print-mode usage because print mode had its own
+workaround; downstream consumers (Agent class users like
+franky-do) silently couldn't run tool-using sessions. The fix
+warrants a separate version line.
+
+The §1.5 + §7.1 work originally queued for v1.21.0 in
+`v1.21-design.md` slides to v1.22.0.
+
 ## [1.20.0] — 2026-04-28 — proxy.zig diet (Option C, partial)
 
 `refactoring.md` Option C — focused proxy.zig diet, no architectural

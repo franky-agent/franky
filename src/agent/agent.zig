@@ -308,12 +308,44 @@ pub const Agent = struct {
         self.worker = try std.Thread.spawn(.{}, workerFn, .{self});
     }
 
+    /// v1.21.0 — args struct for the agent-loop worker thread.
+    /// The agentLoop runs on a separate thread so this Agent's
+    /// drain loop can pull events concurrently. Single-thread
+    /// agentLoop+drain previously deadlocked on the bounded
+    /// channel (see `workerFn` for the full diagnosis).
+    const LoopWorkerArgs = struct {
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        transcript: *loop_mod.Transcript,
+        config: loop_mod.Config,
+        ch: *loop_mod.AgentChannel,
+    };
+
+    fn loopWorkerMain(args: LoopWorkerArgs) void {
+        loop_mod.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
+    }
+
     fn workerFn(self: *Agent) void {
         defer self.is_streaming.store(false, .release);
 
+        // v1.21.0 — channel capacity bumped 128 → 4096 AND `agentLoop`
+        // moved to a dedicated thread so this worker can drain
+        // concurrently. The previous shape — `agentLoop` and the
+        // drain loop running sequentially in this same thread — would
+        // deadlock on tool-heavy turns: `agentLoop` calls
+        // `out.push(...)` inline for every event (turn_start /
+        // message_start / message_update × N / tool_execution_start /
+        // tool_execution_end / message_end / turn_end), and once the
+        // channel hit capacity the blocking `push` waited for a
+        // consumer that wouldn't run until `agentLoop` returned —
+        // which it couldn't until `push` unblocked. With models that
+        // emit thinking deltas alongside text, even a 2-turn
+        // conversation can blow past 128 events. Match print mode's
+        // 4096 buffer + concurrent-drain pattern (see
+        // `coding/modes/print.zig` §"agent-loop worker thread").
         var ch = loop_mod.AgentChannel.initWithDrop(
             self.allocator,
-            128,
+            4096,
             at.AgentEvent.deinit,
             self.allocator,
         ) catch return;
@@ -327,7 +359,7 @@ pub const Agent = struct {
         var stream_opts: ai.registry.StreamOptions = self.stream_options;
         stream_opts.thinking = self.thinking_level;
 
-        loop_mod.agentLoop(self.allocator, self.io, &self.transcript, .{
+        const cfg: loop_mod.Config = .{
             .model = self.model,
             .system_prompt = self.system_prompt,
             .tools = self.tools,
@@ -336,9 +368,33 @@ pub const Agent = struct {
             .stream_options = stream_opts,
             .hook_userdata = @ptrCast(self),
             .between_turns = betweenTurnsHook,
-        }, &ch);
+        };
 
-        // Drain events, broadcast, capture any agent_error.
+        const loop_args: LoopWorkerArgs = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .transcript = &self.transcript,
+            .config = cfg,
+            .ch = &ch,
+        };
+        const loop_thread = std.Thread.spawn(.{}, loopWorkerMain, .{loop_args}) catch {
+            // Spawn failure: synthesize an agent_error and broadcast
+            // synchronously so subscribers see *something* before we
+            // return. No drain to do — channel is empty.
+            const err_msg = self.allocator.dupe(u8, "failed to spawn agent loop thread") catch return;
+            const details: ai.errors.ErrorDetails = .{
+                .code = .internal,
+                .message = err_msg,
+            };
+            self.broadcast(.{ .agent_error = details });
+            self.allocator.free(err_msg);
+            return;
+        };
+
+        // Drain events concurrently with `agentLoop`. `ch.next`
+        // blocks on `not_empty`; `agentLoop` closes the channel
+        // when it returns, which unblocks the final `next` call
+        // with `null`.
         while (ch.next(self.io)) |ev| {
             switch (ev) {
                 .agent_error => |details| {
@@ -351,6 +407,11 @@ pub const Agent = struct {
             self.broadcast(ev);
             ev.deinit(self.allocator);
         }
+
+        // Join the agentLoop thread. By construction it has already
+        // returned (its final action is `out.close(io)`), but join
+        // is required to free the thread handle.
+        loop_thread.join();
     }
 
     /// §4.3 between-turns hook: drain both queues into the

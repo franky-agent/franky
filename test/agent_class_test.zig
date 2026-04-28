@@ -243,3 +243,74 @@ test "Agent: deinit frees queued-but-not-drained messages" {
     try agent.followUp("leak-check-b");
     agent.deinit();
 }
+
+const TextDeltaCounter = struct {
+    text_deltas: std.atomic.Value(u32) = .init(0),
+    turn_ends: std.atomic.Value(u32) = .init(0),
+
+    fn onEvent(ud: ?*anyopaque, ev: at.AgentEvent) void {
+        const self: *TextDeltaCounter = @ptrCast(@alignCast(ud.?));
+        switch (ev) {
+            .message_update => |u| switch (u) {
+                .text => _ = self.text_deltas.fetchAdd(1, .monotonic),
+                else => {},
+            },
+            .turn_end => _ = self.turn_ends.fetchAdd(1, .monotonic),
+            else => {},
+        }
+    }
+};
+
+test "Agent: does NOT deadlock when a turn produces > 128 events (v1.21.0 regression)" {
+    // Before v1.21.0, `Agent.workerFn` ran `agentLoop` and the
+    // event-drain in the same thread sequentially — agentLoop pushed
+    // events into a 128-cap channel and only THEN did the worker
+    // drain. A turn that emitted > 128 events would block on
+    // `out.push` waiting for a consumer that wouldn't run until
+    // agentLoop returned, which it couldn't because push was
+    // blocked. Symptom: tool-using turns with thinking deltas (e.g.
+    // gemma4 via Ollama, observed in franky-do v0.2.x) produced no
+    // Slack reply for the second turn — the worker thread was hung
+    // mid-push. v1.21.0 moved agentLoop to a dedicated thread + bumped
+    // capacity to 4096; this test forces > 128 deltas to prove the
+    // fix holds.
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var faux = ai.providers.faux.FauxProvider.init(gpa);
+    defer faux.deinit();
+    // chunk_size=1 + a 200-char text → 200 text_delta events on top
+    // of turn_start / message_start / message_end / turn_end. Old
+    // 128-cap channel would deadlock; 4096-cap handles this with
+    // ample headroom.
+    const long_text = "x" ** 200;
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = long_text, .chunk_size = 1 } },
+    } });
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var agent = try agent_mod.Agent.init(gpa, io, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .registry = &reg,
+    });
+    defer agent.deinit();
+
+    var counter: TextDeltaCounter = .{};
+    _ = try agent.subscribe(TextDeltaCounter.onEvent, @ptrCast(&counter));
+
+    try agent.prompt("emit a lot");
+    agent.waitForIdle(); // would hang forever pre-v1.21.0
+
+    try testing.expectEqual(@as(u32, 200), counter.text_deltas.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), counter.turn_ends.load(.monotonic));
+}
