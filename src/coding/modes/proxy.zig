@@ -96,6 +96,10 @@ pub fn run(
     try initSession(&session, allocator, io, environ, environ_map, cfg);
     defer session.deinit();
 
+    // v1.18.0 — re-init the logger to a per-session path now that
+    // we know the session id. Best-effort; falls through on failure.
+    print_mode.maybeReinitLoggerForSession(allocator, io, cfg, environ_map, session.session_id);
+
     const port = cfg.proxy_port orelse default_port;
     var addr = std.Io.net.IpAddress.parseIp4(default_host, port) catch return error.BindFailed;
     var server = std.Io.net.IpAddress.listen(&addr, io, .{
@@ -199,6 +203,9 @@ const Session = struct {
     cfg: *cli_mod.Config,
     environ_map: *std.process.Environ.Map,
     cancel: ai.stream.Cancel = .{},
+    /// v1.19.0 — resolved per-tool-prompt toggle. CLI `--prompts`
+    /// wins; otherwise honors settings.json `prompts: bool`.
+    prompts_enabled: bool = false,
 
     // ── v1.7.0 — session persistence on disk ──────────────────
     //
@@ -434,7 +441,15 @@ fn initSession(
 
     var permission_store = permissions_mod.Store.init(allocator);
     errdefer permission_store.deinit();
-    permission_store.yes_to_all = cfg.yes;
+    var prompts_enabled: bool = cfg.prompts;
+    // v1.19.0 — settings-layer overlay first; CLI overlay below.
+    {
+        var settings = try print_mode.loadSettingsForOverlay(allocator, io, environ);
+        defer settings.deinit();
+        try print_mode.applyPermissionsSettingsOverlay(&permission_store, &settings);
+        prompts_enabled = print_mode.resolvePromptsDefault(cfg, &settings);
+    }
+    if (cfg.yes) permission_store.yes_to_all = true;
     if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
     if (cfg.deny_tools_csv) |s| try permission_store.addDenyList(s);
     if (cfg.ask_tools_csv) |s| try permission_store.addAskList(s);
@@ -463,10 +478,11 @@ fn initSession(
         .session_id = session_id,
         .parent_dir = parent_dir,
         .created_at_ms = created_at_ms,
+        .prompts_enabled = prompts_enabled,
     };
     session.session_gates = .{
         .role = &session.role_gate,
-        .permissions = if (cfg.prompts) &session.permission_store else null,
+        .permissions = if (session.prompts_enabled) &session.permission_store else null,
     };
     if (resume_loaded) |loaded| {
         // Header strings are arena-owned by the loader; free them
@@ -1538,7 +1554,7 @@ fn runOneTurnInternal(
     // before deinit guarantees no use-after-free.
     var prompter = permissions_mod.PermissionPrompter.init(allocator, io, &ch);
     defer prompter.deinit();
-    if (session.cfg.prompts) {
+    if (session.prompts_enabled) {
         session.session_gates.prompter = &prompter;
     }
     defer session.session_gates.prompter = null;
@@ -2650,6 +2666,108 @@ fn bindLoopback(io: std.Io) ?ListenSetup {
     return null;
 }
 
+// ─── v1.20.0 test fixture ──────────────────────────────────────
+//
+// Extracted from 11+ duplicated `Client = struct { fn run … }`
+// blocks across HTTP-driven tests. Each one used to spawn a
+// thread that connected to the loopback port, sent a fixed
+// request string, and read bytes-until-close into an
+// `ArrayList(u8)`. Same pattern, ~25 LOC each. The helper
+// collapses each call site to a single line + the request
+// string. SSE / keepalive / multi-stage tests still roll
+// their own client threads — those have non-trivial timing
+// or multi-request behavior that doesn't fit the generic
+// shape and isn't worth forcing.
+
+const ProxyHttpClientArgs = struct {
+    port: u16,
+    io: std.Io,
+    request: []const u8,
+    captured: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+};
+
+fn proxyHttpClient(args: ProxyHttpClientArgs) void {
+    var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", args.port) catch return;
+    var stream = std.Io.net.IpAddress.connect(&addr, args.io, .{ .mode = .stream }) catch return;
+    defer stream.close(args.io);
+    var wb: [256]u8 = undefined;
+    var w = stream.writer(args.io, &wb);
+    w.interface.writeAll(args.request) catch return;
+    w.interface.flush() catch return;
+    var buf: [16 * 1024]u8 = undefined;
+    var r = stream.reader(args.io, &.{});
+    while (true) {
+        var vecs: [1][]u8 = .{&buf};
+        const n = r.interface.readVec(&vecs) catch break;
+        if (n == 0) break;
+        args.captured.appendSlice(args.alloc, buf[0..n]) catch break;
+    }
+}
+
+/// v1.20.0 — bundles the `cfg + environ_map + session` triplet
+/// so an HTTP test gets a session in two lines instead of seven.
+/// Lifetime: each field is owned (cfg + environ_map by their
+/// respective `init`/`parse`, session by `initSessionForTest`);
+/// `deinit` runs in reverse-init order. The session struct
+/// holds borrowed pointers to `cfg` and `environ_map`, so
+/// `ProxyTestSession` must not move after `initFor` returns —
+/// the test fixture is stack-allocated by callers and
+/// referenced by `&ts.session`.
+const ProxyTestSession = struct {
+    cfg: cli_mod.Config,
+    environ_map: std.process.Environ.Map,
+    session: Session,
+
+    fn initFor(
+        self: *ProxyTestSession,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cli_args: []const []const u8,
+    ) !void {
+        self.cfg = try cli_mod.parse(gpa, cli_args);
+        errdefer self.cfg.deinit();
+        self.environ_map = std.process.Environ.Map.init(gpa);
+        errdefer self.environ_map.deinit();
+        try initSessionForTest(&self.session, gpa, io, &self.cfg, &self.environ_map);
+    }
+
+    fn deinit(self: *ProxyTestSession) void {
+        self.session.deinit();
+        self.environ_map.deinit();
+        self.cfg.deinit();
+    }
+};
+
+/// Spawn a client thread that fires `request_text` at
+/// `setup.port`, accept the connection on `setup.server`,
+/// dispatch to `handleConnection`, and join. `captured`
+/// receives the verbatim response (status line + headers
+/// + body). For tests that need streaming or multi-request
+/// patterns (SSE, keepalive, prompt-with-body), keep your
+/// own client thread.
+fn runProxyHttpRequest(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    setup: *ListenSetup,
+    session: *Session,
+    request_text: []const u8,
+    captured: *std.ArrayList(u8),
+) !void {
+    const cli = try std.Thread.spawn(.{}, proxyHttpClient, .{
+        ProxyHttpClientArgs{
+            .port = setup.port,
+            .io = io,
+            .request = request_text,
+            .captured = captured,
+            .alloc = gpa,
+        },
+    });
+    const stream = try setup.server.accept(io);
+    handleConnection(.{ .session = session, .stream = stream, .io = io, .allocator = gpa });
+    cli.join();
+}
+
 test "proxy: GET /health returns 200" {
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
@@ -2659,44 +2777,13 @@ test "proxy: GET /health returns 200" {
     var setup = bindLoopback(io) orelse return; // sandbox can't bind
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
-
-    // Client thread: GET /health, capture response.
-    const Client = struct {
-        fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
-            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
-            var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
-            defer stream.close(client_io);
-            const req = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-            var wb: [256]u8 = undefined;
-            var w = stream.writer(client_io, &wb);
-            w.interface.writeAll(req) catch return;
-            w.interface.flush() catch return;
-            var buf: [1024]u8 = undefined;
-            var r = stream.reader(client_io, &.{});
-            while (true) {
-                var vecs: [1][]u8 = .{&buf};
-                const n = r.interface.readVec(&vecs) catch break;
-                if (n == 0) break;
-                captured.appendSlice(alloc, buf[0..n]) catch break;
-            }
-        }
-    };
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(gpa);
-
-    const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &resp, gpa });
-
-    const stream = try setup.server.accept(io);
-    handleConnection(.{ .session = &session, .stream = stream, .io = io, .allocator = gpa });
-    cli.join();
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", &resp);
 
     try testing.expect(std.mem.indexOf(u8, resp.items, "200") != null);
     try testing.expect(std.mem.indexOf(u8, resp.items, "{\"ok\":true}") != null);
@@ -2711,43 +2798,13 @@ test "proxy: GET /role exposes role + permitted tools" {
     var setup = bindLoopback(io) orelse return;
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{ "franky", "--role", "plan" });
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--role", "plan" });
+    defer ts.deinit();
 
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
-
-    const Client = struct {
-        fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
-            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
-            var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
-            defer stream.close(client_io);
-            const req = "GET /role HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-            var wb: [256]u8 = undefined;
-            var w = stream.writer(client_io, &wb);
-            w.interface.writeAll(req) catch return;
-            w.interface.flush() catch return;
-            var buf: [4096]u8 = undefined;
-            var r = stream.reader(client_io, &.{});
-            while (true) {
-                var vecs: [1][]u8 = .{&buf};
-                const n = r.interface.readVec(&vecs) catch break;
-                if (n == 0) break;
-                captured.appendSlice(alloc, buf[0..n]) catch break;
-            }
-        }
-    };
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(gpa);
-
-    const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &resp, gpa });
-
-    const stream = try setup.server.accept(io);
-    handleConnection(.{ .session = &session, .stream = stream, .io = io, .allocator = gpa });
-    cli.join();
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, "GET /role HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", &resp);
 
     try testing.expect(std.mem.indexOf(u8, resp.items, "200") != null);
     try testing.expect(std.mem.indexOf(u8, resp.items, "\"role\":\"plan\"") != null);
@@ -2774,47 +2831,16 @@ fn runStaticAssetCase(case: StaticAssetCase) !void {
     var setup = bindLoopback(io) orelse return;
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
-
-    const Client = struct {
-        fn run(p: u16, path: []const u8, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
-            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
-            var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
-            defer stream.close(client_io);
-            const req = std.fmt.allocPrint(alloc,
-                "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-                .{path},
-            ) catch return;
-            defer alloc.free(req);
-            var wb: [256]u8 = undefined;
-            var w = stream.writer(client_io, &wb);
-            w.interface.writeAll(req) catch return;
-            w.interface.flush() catch return;
-            var buf: [16 * 1024]u8 = undefined;
-            var r = stream.reader(client_io, &.{});
-            while (true) {
-                var vecs: [1][]u8 = .{&buf};
-                const n = r.interface.readVec(&vecs) catch break;
-                if (n == 0) break;
-                captured.appendSlice(alloc, buf[0..n]) catch break;
-            }
-        }
-    };
+    const req = try std.fmt.allocPrint(gpa, "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", .{case.request_path});
+    defer gpa.free(req);
 
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(gpa);
-    const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, case.request_path, io, &resp, gpa });
-
-    const stream = try setup.server.accept(io);
-    handleConnection(.{ .session = &session, .stream = stream, .io = io, .allocator = gpa });
-    cli.join();
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, req, &resp);
 
     try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
     try testing.expect(std.mem.indexOf(u8, resp.items, case.expect_content_type) != null);
@@ -3072,42 +3098,13 @@ test "respondSessionList: empty parent_dir returns persisted=false" {
     var setup = bindLoopback(io) orelse return;
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
-
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map); // null parent_dir
-    defer session.deinit();
-
-    const Client = struct {
-        fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
-            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
-            var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
-            defer stream.close(client_io);
-            const req = "GET /sessions HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-            var wb: [256]u8 = undefined;
-            var w = stream.writer(client_io, &wb);
-            w.interface.writeAll(req) catch return;
-            w.interface.flush() catch return;
-            var buf: [1024]u8 = undefined;
-            var r = stream.reader(client_io, &.{});
-            while (true) {
-                var vecs: [1][]u8 = .{&buf};
-                const n = r.interface.readVec(&vecs) catch break;
-                if (n == 0) break;
-                captured.appendSlice(alloc, buf[0..n]) catch break;
-            }
-        }
-    };
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"}); // null parent_dir
+    defer ts.deinit();
 
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(gpa);
-    const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &resp, gpa });
-    const stream = try setup.server.accept(io);
-    handleConnection(.{ .session = &session, .stream = stream, .io = io, .allocator = gpa });
-    cli.join();
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, "GET /sessions HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", &resp);
 
     try testing.expect(std.mem.indexOf(u8, resp.items, "\"sessions\":[]") != null);
     try testing.expect(std.mem.indexOf(u8, resp.items, "\"persisted\":false") != null);
@@ -3761,47 +3758,20 @@ test "proxy: POST /command end-to-end via HTTP" {
     var setup = bindLoopback(io) orelse return;
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
-
-    const Client = struct {
-        fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
-            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
-            var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
-            defer stream.close(client_io);
-            const body = "/help";
-            const req = std.fmt.allocPrint(alloc,
-                "POST /command HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
-                .{ body.len, body },
-            ) catch return;
-            defer alloc.free(req);
-            var wb: [256]u8 = undefined;
-            var w = stream.writer(client_io, &wb);
-            w.interface.writeAll(req) catch return;
-            w.interface.flush() catch return;
-            var buf: [4096]u8 = undefined;
-            var r = stream.reader(client_io, &.{});
-            while (true) {
-                var vecs: [1][]u8 = .{&buf};
-                const n = r.interface.readVec(&vecs) catch break;
-                if (n == 0) break;
-                captured.appendSlice(alloc, buf[0..n]) catch break;
-            }
-        }
-    };
+    const body = "/help";
+    const req = try std.fmt.allocPrint(gpa,
+        "POST /command HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer gpa.free(req);
 
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(gpa);
-    const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &resp, gpa });
-    const stream = try setup.server.accept(io);
-    handleConnection(.{ .session = &session, .stream = stream, .io = io, .allocator = gpa });
-    cli.join();
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, req, &resp);
 
     try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
     try testing.expect(std.mem.indexOf(u8, resp.items, "\"ok\":true") != null);
@@ -3814,14 +3784,9 @@ test "proxy: keepalive thread broadcasts ping frames to subscribers" {
     const io = threaded.io();
     const gpa = testing.allocator;
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
-
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
     // Bind a loopback socket pair. The "client" side reads what
     // the keepalive broadcasts; the "server" side is wired into
@@ -3855,13 +3820,13 @@ test "proxy: keepalive thread broadcasts ping frames to subscribers" {
     // Register the accepted stream as an SSE subscriber so the
     // keepalive's broadcastFrame writes hit the client socket.
     var sub = SseSubscriber{ .stream = stream, .io = io };
-    _ = session.addSub(&sub);
-    defer session.removeSub(&sub);
+    _ = ts.session.addSub(&sub);
+    defer ts.session.removeSub(&sub);
 
     // Drive the keepalive at 200 ms intervals (vs. the
     // production 15 s) so the test stays under a second.
     var ka = KeepaliveCtx{
-        .session = &session,
+        .session = &ts.session,
         .interval_ms = 200,
         .poll_ms = 50,
     };
@@ -3886,46 +3851,20 @@ test "proxy: POST /abort fires session.cancel" {
     var setup = bindLoopback(io) orelse return;
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
-
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
     // Cancel starts un-fired.
-    try testing.expect(!session.cancel.isFired());
-
-    const Client = struct {
-        fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
-            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
-            var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
-            defer stream.close(client_io);
-            const req = "POST /abort HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
-            var wb: [256]u8 = undefined;
-            var w = stream.writer(client_io, &wb);
-            w.interface.writeAll(req) catch return;
-            w.interface.flush() catch return;
-            var buf: [512]u8 = undefined;
-            var r = stream.reader(client_io, &.{});
-            var vecs: [1][]u8 = .{&buf};
-            const n = r.interface.readVec(&vecs) catch return;
-            if (n > 0) captured.appendSlice(alloc, buf[0..n]) catch {};
-        }
-    };
+    try testing.expect(!ts.session.cancel.isFired());
 
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(gpa);
-    const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &resp, gpa });
-    const stream = try setup.server.accept(io);
-    handleConnection(.{ .session = &session, .stream = stream, .io = io, .allocator = gpa });
-    cli.join();
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, "POST /abort HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n", &resp);
 
     try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
     try testing.expect(std.mem.indexOf(u8, resp.items, "\"aborted\":true") != null);
-    try testing.expect(session.cancel.isFired());
+    try testing.expect(ts.session.cancel.isFired());
 }
 
 test "proxy: POST /permission/resolve without an in-flight prompt returns 409" {
@@ -3937,45 +3876,21 @@ test "proxy: POST /permission/resolve without an in-flight prompt returns 409" {
     var setup = bindLoopback(io) orelse return;
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
-
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
     // current_prompter is null by default — no runPrompt active.
 
-    const Client = struct {
-        fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
-            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
-            var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
-            defer stream.close(client_io);
-            const body = "{\"call_id\":\"c1\",\"resolution\":\"allow_once\"}";
-            const req = std.fmt.allocPrint(alloc,
-                "POST /permission/resolve HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
-                .{ body.len, body },
-            ) catch return;
-            defer alloc.free(req);
-            var wb: [256]u8 = undefined;
-            var w = stream.writer(client_io, &wb);
-            w.interface.writeAll(req) catch return;
-            w.interface.flush() catch return;
-            var buf: [512]u8 = undefined;
-            var r = stream.reader(client_io, &.{});
-            var vecs: [1][]u8 = .{&buf};
-            const n = r.interface.readVec(&vecs) catch return;
-            if (n > 0) captured.appendSlice(alloc, buf[0..n]) catch {};
-        }
-    };
+    const body = "{\"call_id\":\"c1\",\"resolution\":\"allow_once\"}";
+    const req = try std.fmt.allocPrint(gpa,
+        "POST /permission/resolve HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer gpa.free(req);
 
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(gpa);
-    const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &resp, gpa });
-    const stream = try setup.server.accept(io);
-    handleConnection(.{ .session = &session, .stream = stream, .io = io, .allocator = gpa });
-    cli.join();
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, req, &resp);
 
     try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 409") != null);
 }
@@ -3989,14 +3904,9 @@ test "proxy: POST /permission/resolve with a wired prompter succeeds + wakes the
     var setup = bindLoopback(io) orelse return;
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
-
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
     // Hand-build a prompter + a worker thread suspended on
     // requestAndWait so the resolve has something to wake.
@@ -4004,8 +3914,8 @@ test "proxy: POST /permission/resolve with a wired prompter succeeds + wakes the
     defer ch.deinit();
     var prompter = permissions_mod.PermissionPrompter.init(gpa, io, &ch);
     defer prompter.deinit();
-    session.current_prompter = &prompter;
-    defer session.current_prompter = null;
+    ts.session.current_prompter = &prompter;
+    defer ts.session.current_prompter = null;
 
     const Worker = struct {
         result: ?permissions_mod.Resolution = null,
@@ -4024,34 +3934,16 @@ test "proxy: POST /permission/resolve with a wired prompter succeeds + wakes the
     try testing.expect(ev == .tool_permission_request);
     ev.deinit(gpa);
 
-    const Client = struct {
-        fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
-            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
-            var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
-            defer stream.close(client_io);
-            const body = "{\"call_id\":\"c1\",\"resolution\":\"allow_once\"}";
-            const req = std.fmt.allocPrint(alloc,
-                "POST /permission/resolve HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
-                .{ body.len, body },
-            ) catch return;
-            defer alloc.free(req);
-            var wb: [256]u8 = undefined;
-            var w = stream.writer(client_io, &wb);
-            w.interface.writeAll(req) catch return;
-            w.interface.flush() catch return;
-            var buf: [512]u8 = undefined;
-            var r = stream.reader(client_io, &.{});
-            var vecs: [1][]u8 = .{&buf};
-            const n = r.interface.readVec(&vecs) catch return;
-            if (n > 0) captured.appendSlice(alloc, buf[0..n]) catch {};
-        }
-    };
+    const body = "{\"call_id\":\"c1\",\"resolution\":\"allow_once\"}";
+    const req = try std.fmt.allocPrint(gpa,
+        "POST /permission/resolve HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer gpa.free(req);
+
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(gpa);
-    const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &resp, gpa });
-    const stream = try setup.server.accept(io);
-    handleConnection(.{ .session = &session, .stream = stream, .io = io, .allocator = gpa });
-    cli.join();
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, req, &resp);
     wt.join();
 
     try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
@@ -4068,50 +3960,21 @@ test "proxy: GET /transcript returns the live transcript" {
     var setup = bindLoopback(io) orelse return;
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
-
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
     // Seed one user message into the transcript so the response
     // body has something to inspect.
     {
         const blocks = try gpa.alloc(ai.types.ContentBlock, 1);
         blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "seeded") } };
-        try session.transcript.append(.{ .role = .user, .content = blocks, .timestamp = 0 });
+        try ts.session.transcript.append(.{ .role = .user, .content = blocks, .timestamp = 0 });
     }
-
-    const Client = struct {
-        fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
-            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
-            var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
-            defer stream.close(client_io);
-            const req = "GET /transcript HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-            var wb: [256]u8 = undefined;
-            var w = stream.writer(client_io, &wb);
-            w.interface.writeAll(req) catch return;
-            w.interface.flush() catch return;
-            var buf: [4096]u8 = undefined;
-            var r = stream.reader(client_io, &.{});
-            while (true) {
-                var vecs: [1][]u8 = .{&buf};
-                const n = r.interface.readVec(&vecs) catch break;
-                if (n == 0) break;
-                captured.appendSlice(alloc, buf[0..n]) catch break;
-            }
-        }
-    };
 
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(gpa);
-    const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &resp, gpa });
-    const stream = try setup.server.accept(io);
-    handleConnection(.{ .session = &session, .stream = stream, .io = io, .allocator = gpa });
-    cli.join();
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, "GET /transcript HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", &resp);
 
     try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
     try testing.expect(std.mem.indexOf(u8, resp.items, "application/json") != null);
@@ -4136,15 +3999,13 @@ test "proxy: GET /events writes SSE preamble" {
     var setup = bindLoopback(io) orelse return;
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
-
+    // SSE-streaming endpoint: read just one chunk and drop the
+    // connection so handleConnection's read loop exits. Generic
+    // `runProxyHttpRequest` would block on the open SSE stream.
     const Client = struct {
         fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
             var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", p) catch return;
@@ -4155,8 +4016,6 @@ test "proxy: GET /events writes SSE preamble" {
             var w = stream.writer(client_io, &wb);
             w.interface.writeAll(req) catch return;
             w.interface.flush() catch return;
-            // Read just enough to capture the preamble + ":connected" comment,
-            // then drop the connection so handleConnection's read loop exits.
             var buf: [512]u8 = undefined;
             var r = stream.reader(client_io, &.{});
             var vecs: [1][]u8 = .{&buf};
@@ -4166,10 +4025,9 @@ test "proxy: GET /events writes SSE preamble" {
     };
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(gpa);
-
     const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &resp, gpa });
     const stream = try setup.server.accept(io);
-    handleConnection(.{ .session = &session, .stream = stream, .io = io, .allocator = gpa });
+    handleConnection(.{ .session = &ts.session, .stream = stream, .io = io, .allocator = gpa });
     cli.join();
 
     try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
@@ -4186,14 +4044,9 @@ test "proxy: POST /prompt fans assistant events to /events subscribers" {
     var setup = bindLoopback(io) orelse return;
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
-
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
     // /events client: connect, receive bytes, stop reading once we
     // see `turn_end` in the SSE stream so the test terminates.
@@ -4257,7 +4110,7 @@ test "proxy: POST /prompt fans assistant events to /events subscribers" {
     const sse_cli = try std.Thread.spawn(.{}, SseClient.run, .{ setup.port, io, &sse_bytes, gpa });
     const ev_stream = try setup.server.accept(io);
     const ev_arg = ConnArg{
-        .session = &session,
+        .session = &ts.session,
         .stream = ev_stream,
         .io = io,
         .allocator = gpa,
@@ -4270,7 +4123,7 @@ test "proxy: POST /prompt fans assistant events to /events subscribers" {
     const prompt_cli = try std.Thread.spawn(.{}, PromptClient.run, .{ setup.port, io, &prompt_resp, gpa });
     const prompt_stream = try setup.server.accept(io);
     handleConnection(.{
-        .session = &session,
+        .session = &ts.session,
         .stream = prompt_stream,
         .io = io,
         .allocator = gpa,
@@ -4322,28 +4175,23 @@ test "broadcastEvent: stamps frame with monotonic id and stores in ring" {
     const io = threaded.io();
     const gpa = testing.allocator;
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
+    ts.session.broadcastEvent(gpa, "event: turn_start\ndata: {}\n\n");
+    ts.session.broadcastEvent(gpa, "event: turn_end\ndata: {}\n\n");
 
-    session.broadcastEvent(gpa, "event: turn_start\ndata: {}\n\n");
-    session.broadcastEvent(gpa, "event: turn_end\ndata: {}\n\n");
+    try testing.expectEqual(@as(u64, 3), ts.session.next_event_id);
 
-    try testing.expectEqual(@as(u64, 3), session.next_event_id);
-
-    const slot1 = session.replay_ring[1 % replay_ring_capacity].?;
+    const slot1 = ts.session.replay_ring[1 % replay_ring_capacity].?;
     try testing.expectEqual(@as(u64, 1), slot1.id);
     try testing.expectEqualStrings(
         "id: 1\nevent: turn_start\ndata: {}\n\n",
         slot1.frame,
     );
 
-    const slot2 = session.replay_ring[2 % replay_ring_capacity].?;
+    const slot2 = ts.session.replay_ring[2 % replay_ring_capacity].?;
     try testing.expectEqual(@as(u64, 2), slot2.id);
     try testing.expectEqualStrings(
         "id: 2\nevent: turn_end\ndata: {}\n\n",
@@ -4357,26 +4205,21 @@ test "broadcastEvent: ring eviction frees evicted frame" {
     const io = threaded.io();
     const gpa = testing.allocator;
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
-
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
     // Push capacity+5 events. testing.allocator catches leaks if an
     // evicted frame fails to free.
     var i: u64 = 0;
     while (i < replay_ring_capacity + 5) : (i += 1) {
-        session.broadcastEvent(gpa, "event: stub\ndata: {}\n\n");
+        ts.session.broadcastEvent(gpa, "event: stub\ndata: {}\n\n");
     }
 
-    try testing.expectEqual(@as(u64, replay_ring_capacity + 6), session.next_event_id);
+    try testing.expectEqual(@as(u64, replay_ring_capacity + 6), ts.session.next_event_id);
 
     // Slot 1 should now hold id (capacity + 1), not the original id 1.
-    const slot1 = session.replay_ring[1 % replay_ring_capacity].?;
+    const slot1 = ts.session.replay_ring[1 % replay_ring_capacity].?;
     try testing.expectEqual(@as(u64, replay_ring_capacity + 1), slot1.id);
 }
 
@@ -4386,22 +4229,17 @@ test "broadcastFrame (keepalive): does NOT advance event id or touch ring" {
     const io = threaded.io();
     const gpa = testing.allocator;
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
-
-    session.broadcastFrame("event: ping\ndata: {}\n\n");
-    session.broadcastFrame("event: ping\ndata: {}\n\n");
+    ts.session.broadcastFrame("event: ping\ndata: {}\n\n");
+    ts.session.broadcastFrame("event: ping\ndata: {}\n\n");
 
     // Keepalive is intentionally stateless — heartbeat frames don't
     // belong in the ring (replaying old pings is meaningless).
-    try testing.expectEqual(@as(u64, 1), session.next_event_id);
-    try testing.expect(session.replay_ring[1] == null);
+    try testing.expectEqual(@as(u64, 1), ts.session.next_event_id);
+    try testing.expect(ts.session.replay_ring[1] == null);
 }
 
 test "proxy: GET /events with Last-Event-ID replays missed frames" {
@@ -4413,22 +4251,17 @@ test "proxy: GET /events with Last-Event-ID replays missed frames" {
     var setup = bindLoopback(io) orelse return; // sandbox can't bind
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
-
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
     // Pre-populate the ring with five events. No live subscriber is
     // attached, so the fan-out is a no-op; only the ring grows.
-    session.broadcastEvent(gpa, "event: ev1\ndata: {}\n\n");
-    session.broadcastEvent(gpa, "event: ev2\ndata: {}\n\n");
-    session.broadcastEvent(gpa, "event: ev3\ndata: {}\n\n");
-    session.broadcastEvent(gpa, "event: ev4\ndata: {}\n\n");
-    session.broadcastEvent(gpa, "event: ev5\ndata: {}\n\n");
+    ts.session.broadcastEvent(gpa, "event: ev1\ndata: {}\n\n");
+    ts.session.broadcastEvent(gpa, "event: ev2\ndata: {}\n\n");
+    ts.session.broadcastEvent(gpa, "event: ev3\ndata: {}\n\n");
+    ts.session.broadcastEvent(gpa, "event: ev4\ndata: {}\n\n");
+    ts.session.broadcastEvent(gpa, "event: ev5\ndata: {}\n\n");
 
     const Client = struct {
         fn run(p: u16, client_io: std.Io, captured: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
@@ -4463,7 +4296,7 @@ test "proxy: GET /events with Last-Event-ID replays missed frames" {
     const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &captured, gpa });
     const stream = try setup.server.accept(io);
     const handler = try std.Thread.spawn(.{}, handleConnection, .{ConnArg{
-        .session = &session,
+        .session = &ts.session,
         .stream = stream,
         .io = io,
         .allocator = gpa,
@@ -4493,20 +4326,15 @@ test "proxy: GET /events with too-old Last-Event-ID emits replay_gap" {
     var setup = bindLoopback(io) orelse return; // sandbox can't bind
     defer setup.server.deinit(io);
 
-    var cfg = try cli_mod.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-    var environ_map = std.process.Environ.Map.init(gpa);
-    defer environ_map.deinit();
-
-    var session: Session = undefined;
-    try initSessionForTest(&session, gpa, io, &cfg, &environ_map);
-    defer session.deinit();
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
 
     // Push capacity+10 events so the oldest 10 are evicted; a client
     // claiming Last-Event-ID: 1 is past the gap horizon.
     var i: u64 = 0;
     while (i < replay_ring_capacity + 10) : (i += 1) {
-        session.broadcastEvent(gpa, "event: stub\ndata: {}\n\n");
+        ts.session.broadcastEvent(gpa, "event: stub\ndata: {}\n\n");
     }
 
     const Client = struct {
@@ -4546,7 +4374,7 @@ test "proxy: GET /events with too-old Last-Event-ID emits replay_gap" {
     const cli = try std.Thread.spawn(.{}, Client.run, .{ setup.port, io, &captured, gpa });
     const stream = try setup.server.accept(io);
     const handler = try std.Thread.spawn(.{}, handleConnection, .{ConnArg{
-        .session = &session,
+        .session = &ts.session,
         .stream = stream,
         .io = io,
         .allocator = gpa,

@@ -56,6 +56,14 @@ pub const Config = struct {
     /// stderr would otherwise garble the TUI on the same TTY.
     /// Env fallback: `FRANKY_LOG_FILE`.
     log_file: ?[]const u8 = null,
+    /// `--log-per-session` (v1.18.0). When set AND `--log-file`
+    /// is not, each mode re-inits the logger with
+    /// `$FRANKY_HOME/logs/<session-id>.log` (or
+    /// `$HOME/.franky/logs/<session-id>.log`) right after the
+    /// session id is known. Lets the user diff debug runs without
+    /// manually segmenting a single shared log file. Env fallback:
+    /// `FRANKY_LOG_PER_SESSION` (any non-empty value).
+    log_per_session: bool = false,
     /// `--http-trace-dir <path>` (v1.16.1). When set, every
     /// successful provider HTTP fetch writes a full request +
     /// response trace file into this directory, named
@@ -309,6 +317,8 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.log_level = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--log-file")) {
             cfg.log_file = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--log-per-session")) {
+            cfg.log_per_session = true;
         } else if (std.mem.eql(u8, name, "--http-trace-dir")) {
             cfg.http_trace_dir = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--text-tool-call-fallback")) {
@@ -430,6 +440,10 @@ pub const usage_text: []const u8 =
     \\  --log-file PATH              Route logs to PATH instead of stderr (essential
     \\                               when pairing --mode interactive with verbose levels;
     \\                               env: FRANKY_LOG_FILE)
+    \\  --log-per-session            After session id is known, route logs to
+    \\                               $FRANKY_HOME/logs/<session-id>.log so each run
+    \\                               has its own file. --log-file overrides.
+    \\                               env: FRANKY_LOG_PER_SESSION
     \\  --http-trace-dir DIR         Diagnostic: dump full request + response of every
     \\                               provider HTTP fetch into <DIR>/<unix_ms>-<seq>-<provider>.txt.
     \\                               Diagnostic only; no rotation or size cap.

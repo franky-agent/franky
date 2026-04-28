@@ -51,6 +51,11 @@ pub fn run(
     try initSession(&session, allocator, io, environ, environ_map, cfg);
     defer session.deinit();
 
+    // Note: `--log-per-session` is a no-op in rpc mode. RPC mode
+    // multiplexes virtual sessions through JSON-RPC `session.create`
+    // — there is no single outer session id to route the log file
+    // to. Use `--log-file <path>` to capture rpc logs.
+
     // Read frames in a loop.
     var read_buf: std.ArrayList(u8) = .empty;
     defer read_buf.deinit(allocator);
@@ -112,6 +117,9 @@ const Session = struct {
     cfg: *cli_mod.Config,
     environ_map: *std.process.Environ.Map,
     cancel: ai.stream.Cancel = .{},
+    /// v1.19.0 — resolved per-tool-prompt toggle. CLI `--prompts`
+    /// wins; otherwise honors settings.json `prompts: bool`.
+    prompts_enabled: bool = false,
 
     fn deinit(self: *Session) void {
         self.transcript.deinit();
@@ -151,7 +159,15 @@ fn initSession(
 
     var permission_store = permissions_mod.Store.init(allocator);
     errdefer permission_store.deinit();
-    permission_store.yes_to_all = cfg.yes;
+    var prompts_enabled: bool = cfg.prompts;
+    // v1.19.0 — settings-layer overlay first; CLI overlay below.
+    {
+        var settings = try print_mode.loadSettingsForOverlay(allocator, io, environ);
+        defer settings.deinit();
+        try print_mode.applyPermissionsSettingsOverlay(&permission_store, &settings);
+        prompts_enabled = print_mode.resolvePromptsDefault(cfg, &settings);
+    }
+    if (cfg.yes) permission_store.yes_to_all = true;
     if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
     if (cfg.deny_tools_csv) |s| try permission_store.addDenyList(s);
     if (cfg.ask_tools_csv) |s| try permission_store.addAskList(s);
@@ -177,10 +193,11 @@ fn initSession(
         .transcript = agent.loop.Transcript.init(allocator),
         .cfg = cfg,
         .environ_map = environ_map,
+        .prompts_enabled = prompts_enabled,
     };
     session.session_gates = .{
         .role = &session.role_gate,
-        .permissions = if (cfg.prompts) &session.permission_store else null,
+        .permissions = if (session.prompts_enabled) &session.permission_store else null,
     };
     errdefer session.registry.deinit();
     errdefer session.faux.deinit();
@@ -429,7 +446,7 @@ fn runPrompt(
     // `session.current_prompter` to wake it.
     var prompter = permissions_mod.PermissionPrompter.init(allocator, io, &ch);
     defer prompter.deinit();
-    if (session.cfg.prompts) {
+    if (session.prompts_enabled) {
         session.session_gates.prompter = &prompter;
     }
     defer session.session_gates.prompter = null;

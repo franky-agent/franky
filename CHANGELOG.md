@@ -7,6 +7,372 @@ versions correspond to the roadmap milestones in `franky-spec-v1.md`
 `franky-spec-v0.md` under "Port implementation log" and the v0.\*
 roadmap section — this file starts from v1.x.
 
+## [1.20.0] — 2026-04-28 — proxy.zig diet (Option C, partial)
+
+`refactoring.md` Option C — focused proxy.zig diet, no architectural
+change. Two highest-leverage extractions; ~−188 net LOC. Original
+estimate was 500-950 LOC, but the rest of the cleanups (slash-handler
+unification with interactive.zig, endpoint-dispatcher, transcript-
+renderer merge) are medium risk for diminishing returns and stay
+deferred. proxy.zig is a hot-bug zone — every extraction had to leave
+all 878 tests passing at every step, so the conservative cut is the
+honest cut.
+
+### What shipped
+
+**`proxyHttpClient` + `runProxyHttpRequest` test fixture.** 11 tests
+duplicated the same `Client = struct { fn run … }` block: spawn a
+thread, connect to loopback, send a fixed HTTP request, read bytes
+until close. Each block was ~20-25 LOC. Extracted into a single
+`runProxyHttpRequest(gpa, io, &setup, &session, request, captured)`
+helper. SSE-streaming tests (the GET /events preamble + replay-gap
+tests + multi-stage POST /prompt fan-out) keep their custom client
+threads — those have non-trivial timing or multi-request behavior
+that doesn't fit the generic shape and isn't worth forcing.
+
+**`ProxyTestSession` bundle.** The `cfg + environ_map + Session`
+triplet repeated across ~12 HTTP-driven tests as 7 lines of
+`var cfg = …; defer cfg.deinit(); var environ_map = …; defer
+environ_map.deinit(); var session: Session = undefined; try
+initSessionForTest(…); defer session.deinit();`. New
+`ProxyTestSession.initFor(&ts, gpa, io, &.{"franky"})` collapses
+that to 3 lines. Lifetime: each field deinits in reverse-init
+order; the session struct holds borrowed pointers to cfg +
+environ_map within the bundle, so the bundle itself must not move
+after `initFor`. Slash-handler tests (which heap-allocate Session
+via `gpa.create(Session)` to pass `*Session` into the dispatcher)
+keep their existing pattern — that's a different shape.
+
+### What's deliberately not in this cut
+
+- **Slash-handler unification** with `interactive.zig` — medium-
+  risk multi-mode refactor, ~150-250 LOC. Would require redesigning
+  every handler to return data + having modes adapt to text/JSON.
+  Stays deferred.
+- **Endpoint dispatcher** — extracting "header sniff → route →
+  respond" boilerplate from each `respond*` handler. ~50-100 LOC.
+  Worth doing if the dispatcher count grows.
+- **Transcript-renderer merge** (`renderTranscriptMarkdown` ↔
+  `renderTranscriptForUi`) — the two formats diverge enough
+  (markdown vs JSON with `usage`/`toolCallId`/`isError` fields)
+  that abstracting them likely costs more than it saves.
+- **JSON-helper extraction** — `appendUiJsonStr` is local; not
+  worth its own module yet.
+
+### Tests (878/878 still green)
+
+No new tests; this is pure refactor. Every existing test was
+re-run after each migration step. No behavioral change.
+
+### Files changed
+
+- `src/coding/modes/proxy.zig` — added `ProxyHttpClientArgs`,
+  `proxyHttpClient`, `runProxyHttpRequest`, and
+  `ProxyTestSession` near `bindLoopback`. Migrated 12 HTTP tests
+  to the new fixtures. SSE / multi-stage tests kept their inline
+  Client structs with explanatory comments. 4579 → 4391 LOC.
+- `src/root.zig`, `build.zig.zon` — 1.19.0 → 1.20.0.
+
+### Why this is enough for the v1.x line
+
+The strategic cleanups (Option A's `AgentService` extraction or
+Option B's §I.1 RPC method-surface depth) require architectural
+work that should land as a v2.x milestone, not in a cosmetic
+diet. The diet's job was to make proxy.zig less of a chore to
+edit; the new fixtures cut a future "add an HTTP test" from
+~30 LOC of boilerplate to ~3 lines. That's the bar a velocity-
+oriented refactor needs to clear.
+
+## [1.19.0] — 2026-04-28 — Settings-layer overlay (§4.5 + §4.10 + §4.12 closed)
+
+Closes the v2 §4.5 (per-tool overrides), §4.10 (permission
+overlay defaults), and §4.12 (`prompts: bool`) follow-ups in
+one cut. Settings.json fields that have been *defined* in §H.2
+since v1.0 but never read at runtime now actually flow into the
+runtime, with the established `defaults < env < settings.json
+< profile < CLI` precedence.
+
+### What shipped
+
+`Settings` (in `coding/settings.zig`) gains seven fields:
+
+- `bash_timeout_ms: ?u64` ← `tools.bash.timeoutMs`
+- `read_max_bytes: ?usize` ← `tools.read.maxBytes`
+- `permissions_ask_all: ?bool` ← `permissions.ask_all`
+- `permissions_yes_to_all: ?bool` ← `permissions.yes_to_all`
+- `permissions_always_allow_{tools,bash}: [][]const u8` ←
+  `permissions.always_allow.{tools,bash}`
+- `permissions_always_deny_{tools,bash}: [][]const u8` ←
+  `permissions.always_deny.{tools,bash}`
+- `prompts_default: ?bool` ← `prompts: bool`
+
+Each `null`/empty means "no setting present at any layer; built-
+in default applies." Arrays concatenate across user → project
+layers; ill-typed values (string for an int field, etc.) are
+silently dropped — settings.json is permissive at the edges, in
+line with every other field's parsing in this loader.
+
+The bash + read tools gained per-session ctx that carries the
+override:
+
+- `SessionBashState.default_timeout_ms_override: ?u64` —
+  resolves via `defaultTimeoutMs()` / `resolveDefaultTimeoutMs`;
+  per-call `timeoutMs` arg always wins.
+- `tools/read.zig::ReadCtx { workspace, max_bytes_without_limit_override }`
+  + `toolWithCtx(ctx)` factory — replaces the `toolWithWorkspace`
+  factory in print/interactive (the modes that wire workspace).
+  Per-call `limit` arg always wins.
+
+The permissions `Store` gained a public `addBareEntry(name,
+kind, is_bash_fingerprint)` so already-parsed string arrays can
+seed the four allow/deny sets without round-tripping through the
+CSV parser.
+
+Mode wiring (print + interactive + rpc + proxy) now does:
+
+1. `Store.init` / `SessionBashState.init` / `ReadCtx{}`.
+2. **Settings-layer overlay** — `loadSettingsForOverlay` then
+   `applyBashSettingsOverlay` / `applyReadSettingsOverlay` /
+   `applyPermissionsSettingsOverlay`; resolves
+   `prompts_enabled` via `resolvePromptsDefault`.
+3. **CLI overlay** (additive) — `if (cfg.yes) yes_to_all = true`,
+   CSV add* methods. CLI flags only *lift* (never clear what
+   settings set), preserving the `settings < CLI` precedence
+   without needing per-flag negation.
+
+The `--prompts` toggle is now session-scoped: each mode resolves
+it once at session init via `resolvePromptsDefault(cfg, settings)`
+and stores the result on the session struct (`prompts_enabled`),
+so subsequent per-turn checks read the resolved value rather than
+re-evaluating CLI flags.
+
+### What's deliberately not in this cut
+
+- **`tools.bash.allowList`** — listed in §4.5 of v2 but skipped
+  here. The bash tool has no allowlist concept today; adding one
+  is a separate feature (regex/prefix matching on the command),
+  not just plumbing. Stays as a v2 §4.5 sub-row.
+- **Bash timeout overlay in rpc / proxy modes** — these modes
+  use the bare `bash.tool()` factory (no `SessionBashState`),
+  so the timeout override doesn't reach them. This is a pre-
+  existing limitation, not introduced by v1.19.0.
+- **Profile-layer expression of these fields** — profiles
+  currently don't expose `tools.*` / `permissions.*` /
+  `prompts`. settings.json is the only way to set them today.
+  Profiles can opt in later.
+
+### Tests (+12 → 873; another +5 from helper coverage = 878)
+
+`coding/settings.zig` (+6): tools overlay, defaults-stay-null,
+permissions scalars + arrays, arrays concatenate user + project,
+prompts: bool, ill-typed silently-dropped.
+
+`coding/tools/bash.zig` (+1):
+`SessionBashState.defaultTimeoutMs honors override`.
+
+`coding/tools/read.zig` (+3): `ReadCtx.effectiveMaxBytes`,
+override caps `without-explicit-limit` reads tighter than module
+default, null override falls back to module default.
+
+`coding/permissions.zig` (+2): `addBareEntry` tool + bash;
+empty name silently skipped.
+
+`coding/modes/print.zig` (+5): `applyBashSettingsOverlay`
+copies / null is no-op; `applyReadSettingsOverlay` copies;
+`applyPermissionsSettingsOverlay` pre-seeds Store from arrays
++ scalars; `resolvePromptsDefault` CLI > settings precedence.
+
+### Files changed
+
+- `src/coding/settings.zig` — seven new `Settings` fields +
+  parser arms + `appendStringArray` helper + `deinitStringArray`
+  helper.
+- `src/coding/tools/bash.zig` — `SessionBashState`
+  `default_timeout_ms_override` + `defaultTimeoutMs` +
+  `resolveDefaultTimeoutMs`; both execute paths use the
+  resolver.
+- `src/coding/tools/read.zig` — `ReadCtx` struct + `toolWithCtx`
+  factory + `executeWithCtx` + `readFileWithCap` accepting an
+  explicit cap.
+- `src/coding/permissions.zig` — `Store.addBareEntry` for
+  pre-seeding sets from already-parsed arrays.
+- `src/coding/modes/print.zig` — `loadSettingsForOverlay`,
+  `applyBashSettingsOverlay`, `applyReadSettingsOverlay`,
+  `applyPermissionsSettingsOverlay`, `resolvePromptsDefault`
+  helpers; `runPrint` wires all four overlays.
+- `src/coding/modes/interactive.zig` — `read_ctx` +
+  `prompts_enabled` fields on `SessionBinding`; settings
+  overlay applied at session init.
+- `src/coding/modes/rpc.zig` — `prompts_enabled` field on
+  `Session`; settings overlay applied in `initSession`.
+- `src/coding/modes/proxy.zig` — `prompts_enabled` field on
+  `Session`; settings overlay applied in `initSession`.
+- `src/root.zig`, `build.zig.zon` — 1.18.0 → 1.19.0.
+
+### Try it
+
+```jsonc
+// ~/.franky/settings.json
+{
+  "tools": {
+    "bash": { "timeoutMs": 30000 },
+    "read": { "maxBytes": 524288 }
+  },
+  "permissions": {
+    "always_allow": { "tools": ["read", "ls", "find", "grep"] },
+    "always_deny":  { "bash": ["rm"] }
+  },
+  "prompts": true
+}
+```
+
+Now `franky` runs with a 30s default bash timeout, allows
+512 KiB read-without-limit, auto-allows the four read-family
+tools, blocks `rm` outright, and prompts on every other tool call
+— without typing a single CLI flag.
+
+## [1.18.0] — 2026-04-27 — Per-session log files (§4.3 closed)
+
+Closes the long-standing v2 §4.3 follow-up: a single shared
+`--log-file` is fine for one-shot `--mode print` runs, but as
+soon as you run `--mode interactive`/`rpc`/`proxy` with multiple
+sessions (or restart a session under the same process), trace
+output collides into one file and you lose per-session context.
+
+### What shipped
+
+A new `--log-per-session` flag (env fallback
+`FRANKY_LOG_PER_SESSION=1`) that, after the session id is known,
+re-points the logger at `<franky-home>/logs/<session-id>.log`.
+Resolution:
+
+- `FRANKY_HOME/logs/<session-id>.log` if `FRANKY_HOME` is set;
+- otherwise `$HOME/.franky/logs/<session-id>.log`;
+- otherwise the flag is a no-op (no place to put the file).
+
+Precedence: an explicit `--log-file` always wins — if you point
+the logger somewhere by name, we don't second-guess you. The
+per-session reroute only kicks in when no explicit log-file was
+given.
+
+The reinit path uses the existing `ai.log.initWithFile`, which
+already closes the previous sink before opening a new one, so
+flipping mid-process is safe. Wired in **`print`** and
+**`proxy`** — the two modes that own a real session id at the
+outer process boundary. `interactive` holds an in-memory
+transcript that is never assigned a persisted session id, and
+`rpc` multiplexes virtual sessions inside JSON-RPC
+`session.create`; in both, `--log-per-session` is a documented
+no-op (use `--log-file <path>` instead). Routing the rpc reinit
+inside per-session dispatch is a possible follow-up but not in
+scope for v1.18.0.
+
+### Tests (+6 → 861)
+
+- `resolveLogPerSessionFromMap: --log-per-session flag wins`
+- `resolveLogPerSessionFromMap: env FRANKY_LOG_PER_SESSION=1`
+- `resolveLogPerSessionFromMap: env empty → false`
+- `buildPerSessionLogPath: FRANKY_HOME wins over HOME`
+- `buildPerSessionLogPath: falls back to $HOME/.franky/logs`
+- `buildPerSessionLogPath: returns null when neither is set`
+
+### Files changed
+
+- `src/coding/cli.zig` — `log_per_session: bool` field +
+  `--log-per-session` parser + help text.
+- `src/coding/modes/print.zig` — three new helpers
+  (`resolveLogPerSessionFromMap`, `buildPerSessionLogPath`,
+  `maybeReinitLoggerForSession`) + 6 tests; reinit hook after
+  `SessionState.init`.
+- `src/coding/modes/proxy.zig` — calls
+  `print_mode.maybeReinitLoggerForSession` after the per-HTTP
+  session id becomes available.
+- `src/coding/modes/interactive.zig`,
+  `src/coding/modes/rpc.zig` — short comment documenting that
+  `--log-per-session` is a no-op in these modes (no outer
+  session id to route to) and pointing at `--log-file` instead.
+- `src/root.zig`, `build.zig.zon` — 1.17.5 → 1.18.0.
+
+### Try it
+
+```sh
+franky --mode interactive --log-per-session --log-level debug
+# logs land in $HOME/.franky/logs/<session-id>.log
+```
+
+Each `/new` (or RPC `session.create`, or proxy session) opens a
+fresh file under that session's id; explicit `--log-file <path>`
+still overrides if you'd rather pin to one location.
+
+## [1.17.5] — 2026-04-27 — `delta.reasoning_content` → `thinking_delta`
+
+The "5 MB body, nothing rendered" failure mode that v1.16.1's
+`--http-trace-dir` flag was originally built to diagnose finally
+got caught with a model that actually exhibits it. Cloudflare-
+hosted Kimi-K2.6 emits its thinking output as
+`delta.reasoning_content` chunks rather than `delta.content`,
+and the v1.16.0 `openai_chat` driver only knew about `content`
++ `tool_calls`. Result: the model thinks for thousands of tokens,
+6+ MB of `data: {...}\n\n` lines come down the wire, the parser
+silently drops every single one, and the UI shows nothing.
+
+### What shipped
+
+`openai_chat.zig::handleDelta` now also handles two additional
+delta fields, both translated to the existing `thinking_delta`
+event channel that Anthropic's reasoning already feeds:
+
+- **`delta.reasoning_content`** — Kimi (Moonshot AI), DeepSeek
+  reasoner variants, several other open-source reasoning models
+  served via openai-compat shims.
+- **`delta.reasoning`** — bare-name variant some models emit.
+
+Both are flexible: a turn that mixes thinking + content + tool
+calls now routes each kind to its own block, the way Anthropic
+already does. Anything we don't recognize still gets ignored
+silently — the change is purely additive.
+
+### Why this hypothesis took a while to confirm
+
+In the original Cloudflare-Gemma debugging session, I floated
+`delta.reasoning_content` as the most likely cause of the 5 MB
+hang. We then disproved it for that specific model — Gemma's
+trace emitted clean `tool_calls[]` and the bug was actually
+malformed escapes in tool args (fixed in v1.16.2). I closed the
+hypothesis as "wrong for that model"; the user took it as
+permanently dismissed.
+
+The shape of the bug was right; we'd just been pointing it at
+the wrong model. Kimi-K2.6 is the model that actually triggers
+it, and the trace this time made it unmistakable. **The
+diagnostic flag pulled its weight twice.**
+
+### Tests (+2 → 855)
+
+- `runFromSse: reasoning_content delta becomes thinking_delta` —
+  feeds a synthetic SSE stream that mirrors the Kimi-K2.6 shape
+  (mixed `reasoning_content` + `content`); asserts thinking
+  bytes and content bytes are accounted for in their respective
+  channels.
+- `runFromSse: bare reasoning field is also accepted` — covers
+  the alternate field name some other models emit.
+
+### Files changed
+
+- `src/ai/providers/openai_chat.zig` — `handleDelta` adds
+  `reasoning_content` + `reasoning` arms; +2 fixture tests.
+- `src/root.zig`, `build.zig.zon` — 1.17.4 → 1.17.5.
+
+### Try it
+
+```sh
+franky --profile cloudflare-gemma  # if you've edited model to kimi-k2.6
+```
+
+You should now see thinking content stream into the UI's
+reasoning area instead of vanishing into the void. The 6 MB body
+issue dissolves into a normal long-thinking turn.
+
 ## [1.17.4] — 2026-04-27 — 32-bit Linux portability fixes
 
 CI build for `x86-linux-gnu` (32-bit Linux) failed in ReleaseSafe

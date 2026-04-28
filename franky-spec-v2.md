@@ -35,6 +35,11 @@ with a "shipped at vN.M.K" pointer).
 
 No v2 milestone has been opened yet. The v1.0.0 cut closed
 2026-04-24 at **770/770 tests**, with all v1.x line work merged.
+The v1.x line is still active; binary version as of 2026-04-28 is
+**v1.20.0 at 878 tests**. v2 catalog items closed during the v1.x
+line so far: §1.4, §2.3, §4.3, §4.5 (partial), §4.10, §4.12, §5
+(see §6 for details).
+
 Items below are eligible to be picked up but unscheduled. When
 we open a v2.0 line we will land:
 
@@ -373,17 +378,17 @@ is a separate orchestration.
 **Deferred.** Pick up if interop with running Claude Code becomes
 a real ask.
 
-### 4.3 Per-session `$FRANKY_HOME/logs/<session-id>.jsonl`
+### 4.3 Per-session `$FRANKY_HOME/logs/<session-id>.log` (✅ shipped v1.18.0)
 
 **From v1 §G.5 "Non-goals for this revision".** Today logs route
 to stderr or to a single file (`--log-file PATH`, v1.13.0); a
 per-session log file would let users diff debug runs without
 manually segmenting.
 
-**Deferred.** Easy to add on top of the v1.13.0 sink-resolution
-machinery. Includes: log rotation, structured-JSON output, log
-shipping, per-module level overrides — all listed as non-goals
-for the v1 logging revision.
+**Shipped v1.18.0** as `--log-per-session` (env fallback
+`FRANKY_LOG_PER_SESSION=1`). See §6 for details. Log rotation,
+structured-JSON output, log shipping, and per-module level
+overrides remain explicit non-goals for v1.
 
 ### 4.4 Settings-layer `tools.bash.envDenylist` extension
 
@@ -394,15 +399,21 @@ as a user override slot.
 **Deferred.** Pick up if a specific user case needs additional
 secrets denied. The hook into `loadLayered` is straightforward.
 
-### 4.5 Settings-layer per-tool overrides
+### 4.5 Settings-layer per-tool overrides (✅ partially shipped v1.19.0)
 
 **From §H.2 settings shape.** Settings JSON defines per-tool fields
 (`tools.bash.timeoutMs`, `tools.bash.allowList`, `tools.read.maxBytes`)
 that are not yet honored at runtime — tools use their hardcoded
 defaults from §C.4 etc.
 
-**Deferred.** Wire-up work, ~50 LOC. Pick up if a deploy needs a
-specific override.
+**Shipped v1.19.0** for `tools.bash.timeoutMs` (in print +
+interactive; rpc/proxy use the stateless bash factory and don't
+get the overlay yet) and `tools.read.maxBytes`. See §6 for
+details.
+
+**Still deferred:** `tools.bash.allowList`. The bash tool has no
+allowlist concept today — adding one is a separate feature
+(regex/prefix matching on the command), not just plumbing.
 
 ### 4.6 Garbage collection for `objects/` blob store
 
@@ -447,7 +458,7 @@ without per-run flags.
 trips the default. The CLI flags + env vars already cover the
 escape hatch today.
 
-### 4.10 Permission overlay — settings-layer defaults
+### 4.10 Permission overlay — settings-layer defaults (✅ shipped v1.19.0)
 
 **Concept.** v1.12.0 ships `--remember-permissions` →
 `$FRANKY_HOME/permissions.json` round-trip for `*_always`
@@ -458,9 +469,14 @@ default allow/deny list (e.g., a repo says "always allow
 slash command surfaces the runtime state but doesn't read from
 settings.
 
-**Deferred.** Pick up if a project-level permission policy
-becomes a real ask. The store + permissions.json schema already
-support the data shape; the missing piece is the layered loader.
+**Shipped v1.19.0.** `permissions.always_allow.{tools,bash}` /
+`permissions.always_deny.{tools,bash}` arrays + `ask_all` /
+`yes_to_all` scalars now seed the `Store` at session init via
+`applyPermissionsSettingsOverlay`. Wired in all four modes;
+new `Store.addBareEntry` lets already-parsed arrays bypass the
+CSV parser. CLI flags become *lift-only* (additive) so they
+augment the settings layer rather than clearing it. See §6 for
+details.
 
 ### 4.11 Network firewall config for franky-do
 
@@ -472,7 +488,7 @@ recipes per v1 §5.10 and `docs/sandbox.md`); no in-process firewall.
 **Deferred.** A franky-do concern. Recorded here so it isn't
 re-discovered.
 
-### 4.12 Approach A `--prompts` overlay (alternate vision)
+### 4.12 Approach A `--prompts` overlay (✅ shipped v1.19.0)
 
 **Historical note.** The original `permission.md` design contemplated
 two approaches: (A) per-tool prompt overlay, (B) capability-role
@@ -486,8 +502,12 @@ was a *settings-driven default policy override* — a project's
 default, ask before `bash`/`write`/`edit`". Today the user must
 pass `--prompts` explicitly per run.
 
-**Deferred.** Composes with §4.10 (settings-layer permission
-defaults) — likely a single combined milestone.
+**Shipped v1.19.0.** Combined milestone with §4.10. Settings.json
+top-level `prompts: bool` is now resolved once at session init
+via `resolvePromptsDefault(cfg, settings)` and cached on the
+session struct as `prompts_enabled`. CLI `--prompts` always
+wins; settings only flips the default for runs that didn't pass
+the flag. See §6 for details.
 
 ---
 
@@ -765,7 +785,180 @@ v2.x readers can see what's been retired without diffing v1's
   openrouter, ollama, lm-studio) + `--list-profiles` +
   `--save-profile <name>`. Closes the user-pain ten-flag-command
   problem: `franky --profile cloudflare-llama` now replaces a
-  full Cloudflare invocation. +16 tests; 833 → 849.
+  full Cloudflare invocation. +16 tests; 833 → 849. Refinements
+  in v1.17.1 (parser accepts kebab-case + snake_case keys),
+  v1.17.2 (loader/saver path consistency + debug-level
+  source-path log), v1.17.3 (drop legacy
+  `~/.franky/agent/settings.json` path).
+
+- **§4.5 + §4.10 + §4.12 — settings-layer overlay** → shipped
+  v1.19.0. Settings.json fields defined in §H.2 since v1.0 but
+  never read at runtime now flow through the
+  `defaults < env < settings.json < profile < CLI` overlay
+  chain. Seven new `Settings` fields: `bash_timeout_ms`,
+  `read_max_bytes`, `permissions_ask_all` /
+  `permissions_yes_to_all`, four `permissions_always_*` arrays
+  (concat user → project), and `prompts_default`. Tool wiring:
+  `SessionBashState.default_timeout_ms_override` (per-call
+  `timeoutMs` arg still wins) + new
+  `tools/read.zig::ReadCtx { workspace, max_bytes_without_limit_override }`
+  + `toolWithCtx(ctx)` factory replacing `toolWithWorkspace` in
+  print + interactive (per-call `limit` arg still wins). New
+  `Store.addBareEntry` lets parsed arrays seed allow/deny sets
+  without CSV round-trip. CLI flags became *lift-only*
+  (`if (cfg.yes) yes_to_all = true`) so they no longer clear
+  settings-set values when off. Prompts toggle is resolved once
+  at session init and cached on the session struct. Five new
+  helpers in `print.zig`. Wired in all four modes.
+  +12 settings/tools/permissions tests + 5 helper tests; 861 →
+  878.
+
+  Deliberately deferred: `tools.bash.allowList` (no allowlist
+  concept in bash today; would be a separate feature, stays as
+  a v2 §4.5 sub-row); rpc + proxy bash-timeout overlay (those
+  modes use the stateless `bash.tool()` factory — pre-existing
+  limitation); profile-layer expression of these fields.
+- **§4.3 — per-session log files** → shipped v1.18.0. New
+  `--log-per-session` flag (env fallback
+  `FRANKY_LOG_PER_SESSION=1`); once the session id is known the
+  logger is re-pointed at
+  `<franky-home>/logs/<session-id>.log` (resolves
+  `FRANKY_HOME/logs/...` → `$HOME/.franky/logs/...` → no-op).
+  Explicit `--log-file <path>` always wins; the per-session
+  reroute only kicks in otherwise. Wired in **print** and
+  **proxy** (the two modes that own a real session id at the
+  outer process boundary); reuses `ai.log.initWithFile` which
+  closes the previous sink before opening a new one. In
+  **interactive** (in-memory transcript, no persisted id) and
+  **rpc** (virtual sessions inside `session.create`) the flag
+  is a documented no-op — use `--log-file <path>` instead. +6
+  tests; 855 → 861. Routing the rpc reinit inside per-session
+  dispatch is a possible follow-up but not on the v1 line. Log
+  rotation, structured-JSON, log shipping, per-module level
+  overrides remain explicit non-goals.
+
+### Defensive features for sloppy gateways (v1.16.1–v1.16.3, v1.17.5)
+
+Not v2 catalog rows — these were universal-defensive features
+that fell out of real Cloudflare Workers AI debugging. Logged
+here so the rationale isn't re-discovered.
+
+- **v1.16.1** — `--http-trace-dir <path>` diagnostic flag. Dumps
+  every provider HTTP fetch's full request + response into one
+  file per call. Built specifically to diagnose "5 MB response
+  body, nothing rendered" failure modes; paid for itself twice
+  in the same session (caught the v1.16.2 escape bug, then the
+  v1.17.5 reasoning_content bug).
+- **v1.16.2** — `utils.sanitizeJsonString`. Repairs invalid
+  JSON-escape sequences in `tool_call.arguments_json` before
+  re-emission so strict openai-compat gateways (Cloudflare,
+  whose layer reparses `arguments` as JSON unlike OpenAI proper)
+  don't 400 on model-emitted `\c`-style malformed escapes.
+- **v1.16.3** — Better tool error messages
+  (`formatToolExecutionError`) + `--text-tool-call-fallback`.
+  The first replaces bare `@errorName(e)` ("SyntaxError") with
+  tool-name + hint + args preview so the model can self-correct
+  on retry. The second handles gateways that deliver tool calls
+  as `delta.content` text instead of structured `tool_calls[]`
+  (Cloudflare's openai-compat shim with Llama-3.3-70b is the
+  observed case; the native CF `/run` endpoint with any model
+  also). Recognizes Cloudflare-style, Llama-style, OpenAI-style,
+  and `<tool_call>` / `<|python_tag|>` wrappers; only applies
+  when the named tool is in the live registry.
+- **v1.17.5** — `delta.reasoning_content` → `thinking_delta`.
+  Closes the original "5 MB body, nothing rendered" hypothesis
+  for real this time — Kimi-K2.6 (and DeepSeek-style reasoning
+  models on openai-compat shims) emit thinking content via
+  `reasoning_content` chunks rather than `content`. The
+  v1.16.0 driver silently dropped every chunk. Now translates
+  to the existing `thinking_delta` event channel Anthropic's
+  reasoning takes. Bare `reasoning` field also accepted.
+
+### Other v1.17.x patches
+
+- **v1.17.4** — 32-bit Linux portability fixes. v1.16.1's
+  `trace_seq` and v1.16.3's `synth_tool_id_seq` were
+  `std.atomic.Value(u64)`; on i386 the atomic-RMW asserts
+  ≤32-bit so both moved to `Value(u32)` (4 B per process is
+  plenty). Two `replay_ring[u64_expr]` indices got narrow-cast
+  to `usize`. Goreleaser CI for `x86-linux-gnu` ReleaseSafe
+  builds clean.
+
+### Refactors (no v2 row; logged for future readers)
+
+- **v1.20.0 — proxy.zig diet (Option C, partial)**. From
+  `refactoring.md` Option C. Two highest-leverage extractions:
+  `proxyHttpClient` + `runProxyHttpRequest` test fixture
+  (replaces 11 duplicated client-thread blocks) and
+  `ProxyTestSession.initFor` bundle (collapses
+  `cfg + environ_map + Session` boilerplate across 12 HTTP
+  tests). Net **−188 LOC** (4579 → 4391) in `proxy.zig`;
+  pure refactor, no behavioral change, 878/878 tests still
+  green. Below the optimistic 500-950 estimate — slash-handler
+  unification with interactive.zig, endpoint dispatcher,
+  transcript-renderer merge, and JSON-helper extraction stay
+  deferred (medium risk for diminishing returns; proxy.zig is
+  a hot-bug zone). The strategic cleanups (`AgentService`
+  extraction or §I.1 method-surface depth) belong in a v2.x
+  architectural milestone, not a cosmetic diet.
+
+---
+
+## 7. Open ideas (not yet on the catalog)
+
+### 7.1 `agent` tool — spawn a child franky locked to `--role plan`
+
+**Concept.** Add an eighth `coding` tool, `agent`, that spawns a
+child franky process to delegate work. The child is
+*always* started with `--role plan` (read/ls/find/grep + write
++ edit, no bash) — the parent can't pass through any other
+role. This gives the parent agent a way to fan out research /
+analysis tasks without exposing host-shell capabilities to the
+child.
+
+**Why this shape.**
+
+- **Process isolation, not in-process Agent.** The parent runs
+  whatever role; the child's role is structurally bounded. A
+  malicious parent can't escalate the child by passing
+  `--role full`.
+- **Reuses the existing `--mode print` surface.** The child
+  receives a prompt, runs to completion, prints its final
+  reply. No new transport, no IPC, no service tier.
+- **Composes with the v1.19.0 settings overlay.** A project's
+  settings.json can pre-seed the child's permission store
+  (e.g., always-allow `read`/`ls`/`grep`) so the child runs
+  unattended without prompts.
+
+**Open design questions.**
+
+1. **Argument surface.** What can the parent pass besides the
+   prompt? Likely-allowed: `--system-prompt`, `--profile`,
+   `--thinking`, `--no-session`. Likely-blocked: `--role`,
+   `--prompts`, `--yes`, `--allow-tools`, `--deny-tools`,
+   `--remember-permissions`.
+2. **Output handling.** Child's stdout becomes the tool result.
+   Capture stderr to the parent's log? Or to a per-call file?
+3. **Cancellation.** Parent's abort needs to kill the child
+   process group. Reuse the bash tool's nohup pattern, or
+   plain `kill(-pgid, SIGTERM)`?
+4. **Cost & timeouts.** Parent should be able to bound total
+   wall time (`timeoutMs`?) and possibly token budget. The
+   former composes with bash's existing timeout mechanism;
+   the latter would need a new flag on the child.
+5. **Authentication.** Child inherits parent's env (auth.json,
+   API keys). Should it inherit the same `--profile`, or be
+   forced to faux for testing? Probably "inherits unless
+   overridden."
+6. **Recursion.** If the child also has the `agent` tool, can
+   it spawn its own children? Default: yes (the role-plan gate
+   applies recursively); add a depth cap to prevent runaway
+   chains.
+
+**Status.** Discussed at end of v1.20.0 session. Not yet
+designed in detail; spec entry to be expanded into a full §
+when implementation begins. Roughly 200-400 LOC of new code
+(tool plus tests) once the design questions are answered.
 
 ---
 

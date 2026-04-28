@@ -180,6 +180,30 @@ pub const Store = struct {
         try addCsv(self, csv, .ask);
     }
 
+    /// v1.19.0 — pre-seed the Store from already-parsed string
+    /// arrays (e.g. settings.json `permissions.always_allow.tools`).
+    /// `name` is a bare tool name (`read`) or a bare bash
+    /// fingerprint (`git`); the caller decides which set via the
+    /// `is_bash_fingerprint` flag. Empty names are silently skipped.
+    pub fn addBareEntry(
+        self: *Store,
+        name: []const u8,
+        kind: Kind,
+        is_bash_fingerprint: bool,
+    ) !void {
+        if (name.len == 0) return;
+        const set: *std.StringHashMapUnmanaged(void) = if (is_bash_fingerprint) switch (kind) {
+            .allow => &self.allow_bash,
+            .deny => &self.deny_bash,
+            .ask => &self.ask_bash,
+        } else switch (kind) {
+            .allow => &self.allow_tools,
+            .deny => &self.deny_tools,
+            .ask => &self.ask_tools,
+        };
+        try addToSet(self.allocator, set, name);
+    }
+
     fn addCsv(self: *Store, csv: []const u8, kind: Kind) !void {
         var it = std.mem.tokenizeScalar(u8, csv, ',');
         while (it.next()) |raw| {
@@ -1230,6 +1254,29 @@ test "Store.revoke + persist_path: rewrite is observable from a fresh store" {
     try testing.expectEqual(@as(usize, 1), after.entryCount());
     try testing.expectEqual(Decision.auto_allow, after.check("bash", "{\"command\":\"ls -la\"}"));
     try testing.expectEqual(Decision.ask, after.check("bash", "{\"command\":\"git status\"}"));
+}
+
+test "Store.addBareEntry: tool-name allow + bash fingerprint deny" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try s.addBareEntry("read", .allow, false);
+    try s.addBareEntry("write", .deny, false);
+    try s.addBareEntry("git", .allow, true);
+    try s.addBareEntry("rm", .deny, true);
+    // Tool-level allow → auto_allow; tool-level deny → auto_deny.
+    try testing.expectEqual(Decision.auto_allow, s.check("read", "{}"));
+    try testing.expectEqual(Decision.auto_deny, s.check("write", "{}"));
+    // Bash fingerprint allow/deny.
+    try testing.expectEqual(Decision.auto_allow, s.check("bash", "{\"command\":\"git status\"}"));
+    try testing.expectEqual(Decision.auto_deny, s.check("bash", "{\"command\":\"rm -rf /\"}"));
+}
+
+test "Store.addBareEntry: empty name silently skipped" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try s.addBareEntry("", .allow, false);
+    try s.addBareEntry("", .deny, true);
+    try testing.expectEqual(@as(usize, 0), s.entryCount());
 }
 
 test "Store.check: yes_to_all + ask_all → auto_allow (CI gate-active mode)" {

@@ -200,6 +200,11 @@ fn runInteractive(
     try SessionBinding.init(&session, allocator, io, environ, environ_map, cfg);
     defer session.deinit();
 
+    // Note: `--log-per-session` is a no-op in interactive mode.
+    // The transcript is held in memory and never assigned a
+    // persisted session id, so there's no name to route the log
+    // file to. Use `--log-file <path>` to capture interactive logs.
+
     const session_role = session.role_gate.role;
     try scrollback.appendLine(try std.fmt.allocPrint(
         allocator,
@@ -1044,7 +1049,7 @@ fn runOneTurn(
     // prompter between turns.
     var prompter = permissions_mod.PermissionPrompter.init(allocator, io, &ch);
     defer prompter.deinit();
-    if (session.cfg.prompts) {
+    if (session.prompts_enabled) {
         session.session_gates.prompter = &prompter;
     }
     defer session.session_gates.prompter = null;
@@ -1586,6 +1591,9 @@ const SessionBinding = struct {
     /// v1.11.0 — per-tool permission gate. Disabled by default;
     /// `--prompts` opts in. Stable address (worker thread reads).
     permission_store: permissions_mod.Store = undefined,
+    /// v1.19.0 — resolved per-tool-prompt toggle. CLI `--prompts`
+    /// wins; otherwise honors settings.json `prompts: bool`.
+    prompts_enabled: bool = false,
     /// Combined gates struct passed as `hook_userdata`.
     session_gates: permissions_mod.SessionGates = .{},
     system_prompt: []u8,
@@ -1599,6 +1607,9 @@ const SessionBinding = struct {
     workspace: ?tools_mod.workspace.Workspace = null,
     bash_state: tools_mod.bash.SessionBashState = undefined,
     bash_ctx: tools_mod.bash.BashCtx = .{},
+    /// v1.19.0 — ReadCtx for the read tool (workspace + settings
+    /// overlay). Stable address: tool ctx pointers reference it.
+    read_ctx: tools_mod.read.ReadCtx = .{},
 
     /// Fills `binding` in place. Taking the destination pointer is
     /// required: the `FauxProvider`'s address gets registered with
@@ -1632,13 +1643,25 @@ const SessionBinding = struct {
             else
                 null,
         };
+        binding.read_ctx = .{
+            .workspace = if (binding.workspace) |*ws| ws else null,
+        };
+        // v1.19.0 — apply settings-layer overlay
+        // (tools.bash.timeoutMs + tools.read.maxBytes).
+        {
+            var settings = try print_mode.loadSettingsForOverlay(allocator, io, environ);
+            defer settings.deinit();
+            print_mode.applyBashSettingsOverlay(&binding.bash_state, &settings);
+            print_mode.applyReadSettingsOverlay(&binding.read_ctx, &settings);
+        }
         binding.bash_ctx = .{
             .state = &binding.bash_state,
             .workspace = if (binding.workspace) |*ws| ws else null,
         };
-        // Path-taking tools get workspace routing when PWD is known.
+        // Path-taking tools get workspace routing when PWD is known;
+        // read additionally carries the settings-layer ReadCtx.
         const all_tools: [7]at.AgentTool = if (binding.workspace) |*ws| .{
-            tools_mod.read.toolWithWorkspace(ws),
+            tools_mod.read.toolWithCtx(&binding.read_ctx),
             tools_mod.write.toolWithWorkspace(ws),
             tools_mod.edit.toolWithWorkspace(ws),
             tools_mod.bash.toolWithStateAndWorkspace(&binding.bash_ctx),
@@ -1663,7 +1686,14 @@ const SessionBinding = struct {
         binding.tools = try role_mod.filterTools(binding.arena.allocator(), &all_tools, binding.role_gate.set);
 
         binding.permission_store = permissions_mod.Store.init(allocator);
-        binding.permission_store.yes_to_all = cfg.yes;
+        // v1.19.0 — settings-layer overlay first; CLI overlay below.
+        {
+            var settings = try print_mode.loadSettingsForOverlay(allocator, io, environ);
+            defer settings.deinit();
+            try print_mode.applyPermissionsSettingsOverlay(&binding.permission_store, &settings);
+            binding.prompts_enabled = print_mode.resolvePromptsDefault(cfg, &settings);
+        }
+        if (cfg.yes) binding.permission_store.yes_to_all = true;
         if (cfg.allow_tools_csv) |s| try binding.permission_store.addAllowList(s);
         if (cfg.deny_tools_csv) |s| try binding.permission_store.addDenyList(s);
         if (cfg.ask_tools_csv) |s| try binding.permission_store.addAskList(s);
@@ -1676,7 +1706,7 @@ const SessionBinding = struct {
         );
         binding.session_gates = .{
             .role = &binding.role_gate,
-            .permissions = if (cfg.prompts) &binding.permission_store else null,
+            .permissions = if (binding.prompts_enabled) &binding.permission_store else null,
         };
         errdefer binding.registry.deinit();
         errdefer binding.faux.deinit();

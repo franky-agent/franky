@@ -68,6 +68,10 @@ pub const trailer_marker: []const u8 = "<<<FRANKY_TRAILER>>>cwd=";
 pub const SessionBashState = struct {
     allocator: std.mem.Allocator,
     cwd_buf: std.ArrayList(u8) = .empty,
+    /// v1.19.0 — settings-layer override for the per-call default
+    /// timeout. Null = use module-level `default_timeout_ms`. The
+    /// per-call `timeoutMs` arg always wins regardless.
+    default_timeout_ms_override: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator) SessionBashState {
         return .{ .allocator = allocator };
@@ -86,7 +90,19 @@ pub const SessionBashState = struct {
         if (self.cwd_buf.items.len == 0) return null;
         return self.cwd_buf.items;
     }
+
+    pub fn defaultTimeoutMs(self: *const SessionBashState) u64 {
+        return self.default_timeout_ms_override orelse default_timeout_ms;
+    }
 };
+
+/// Resolves the effective per-call default timeout for both the
+/// state-only and ctx-bearing execution paths. Used in places where
+/// only `BashCtx` is in hand.
+pub fn resolveDefaultTimeoutMs(state: ?*SessionBashState) u64 {
+    if (state) |s| return s.defaultTimeoutMs();
+    return default_timeout_ms;
+}
 
 pub fn tool() at.AgentTool {
     return .{
@@ -245,10 +261,11 @@ fn execute(
         false;
     if (background) return try runBackground(allocator, io, command, cwd_opt);
 
+    const eff_default_ms: u64 = resolveDefaultTimeoutMs(state);
     const timeout_ms: u64 = if (root.object.get("timeoutMs")) |v| blk: {
         if (v == .integer and v.integer >= 1) break :blk @intCast(v.integer);
-        break :blk default_timeout_ms;
-    } else default_timeout_ms;
+        break :blk eff_default_ms;
+    } else eff_default_ms;
 
     const timeout: std.Io.Timeout = .{ .duration = .{
         .raw = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
@@ -364,10 +381,11 @@ fn executeWithCtx(
         false;
     if (background) return try runBackground(allocator, io, command, cwd_opt);
 
+    const eff_default_ms: u64 = resolveDefaultTimeoutMs(state);
     const timeout_ms: u64 = if (root.object.get("timeoutMs")) |v| blk: {
         if (v == .integer and v.integer >= 1) break :blk @intCast(v.integer);
-        break :blk default_timeout_ms;
-    } else default_timeout_ms;
+        break :blk eff_default_ms;
+    } else eff_default_ms;
 
     const timeout: std.Io.Timeout = .{ .duration = .{
         .raw = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
@@ -756,6 +774,20 @@ test "SessionBashState.getCwd returns null when unset" {
     try testing.expect(state.getCwd() == null);
     try state.setCwd("/tmp/x");
     try testing.expectEqualStrings("/tmp/x", state.getCwd().?);
+}
+
+test "SessionBashState.defaultTimeoutMs honors override" {
+    var state = SessionBashState.init(testing.allocator);
+    defer state.deinit();
+    // Default = module-level constant when override unset.
+    try testing.expectEqual(default_timeout_ms, state.defaultTimeoutMs());
+    try testing.expectEqual(default_timeout_ms, resolveDefaultTimeoutMs(&state));
+    // Set the settings-layer override; resolver picks it up.
+    state.default_timeout_ms_override = 30_000;
+    try testing.expectEqual(@as(u64, 30_000), state.defaultTimeoutMs());
+    try testing.expectEqual(@as(u64, 30_000), resolveDefaultTimeoutMs(&state));
+    // Null state → module default.
+    try testing.expectEqual(default_timeout_ms, resolveDefaultTimeoutMs(null));
 }
 
 // ─── v1.7.4 — background + chunked emission ─────────────────────

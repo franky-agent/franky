@@ -112,7 +112,17 @@ directly against existing in-process APIs (`Agent.steer`,
 
 **Effort:** ~3-5 days.
 
-## Option C — Focused proxy.zig diet (no architectural change)
+## Option C — Focused proxy.zig diet (no architectural change) — ✅ partially shipped v1.20.0
+
+**Status (2026-04-28): two extractions landed, three deferred.** v1.20.0 shipped:
+- `proxyHttpClient` + `runProxyHttpRequest` test fixture (replaces 11 duplicated client-thread blocks)
+- `ProxyTestSession.initFor` bundle (collapses cfg + environ_map + session boilerplate across 12 HTTP tests)
+
+Net −188 LOC, 878/878 tests green, no behavioral change. Below the optimistic 500-950 estimate — the
+remaining cleanups (slash-handler unification with interactive.zig, endpoint dispatcher, renderer merge,
+JSON-helper extraction) stay deferred as medium-risk-for-marginal-return. proxy.zig is a hot-bug zone;
+conservative cuts are honest cuts.
+
 
 Cut local duplication inside proxy.zig only. Five plausible
 cleanups, savings split between prod (~2386 lines) and tests

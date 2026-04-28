@@ -259,6 +259,15 @@ fn runPrint(
 
     var bash_state = tools_mod.bash.SessionBashState.init(allocator);
     defer bash_state.deinit();
+    var read_ctx = tools_mod.read.ReadCtx{
+        .workspace = if (workspace_state) |*ws| ws else null,
+    };
+    {
+        var settings = try loadSettingsForOverlay(allocator, io, environ);
+        defer settings.deinit();
+        applyBashSettingsOverlay(&bash_state, &settings);
+        applyReadSettingsOverlay(&read_ctx, &settings);
+    }
     var bash_ctx = tools_mod.bash.BashCtx{
         .state = &bash_state,
         .workspace = if (workspace_state) |*ws| ws else null,
@@ -267,10 +276,11 @@ fn runPrint(
     // ── Tool registration ──────────────────────────────────────────
     // When a workspace root is known, each path-taking tool routes
     // user-supplied paths through `path_safety.canonicalize`; bash
-    // gets the combined state+workspace ctx. Otherwise we keep the
+    // gets the combined state+workspace ctx and read gets the
+    // ReadCtx (workspace + settings overlay). Otherwise we keep the
     // v0.4.* plain factories.
     const all_tools = if (workspace_state) |*ws| [_]at.AgentTool{
-        tools_mod.read.toolWithWorkspace(ws),
+        tools_mod.read.toolWithCtx(&read_ctx),
         tools_mod.write.toolWithWorkspace(ws),
         tools_mod.edit.toolWithWorkspace(ws),
         tools_mod.bash.toolWithStateAndWorkspace(&bash_ctx),
@@ -305,7 +315,18 @@ fn runPrint(
     // deny with a hint pointing at --yes / --allow-tools.
     var permission_store = permissions_mod.Store.init(allocator);
     defer permission_store.deinit();
-    permission_store.yes_to_all = cfg.yes;
+    // v1.19.0 — settings-layer overlay applies first; CLI overlay
+    // below additively augments it. Precedence works out because
+    // CLI flags only *lift* (set scalars to true / append to sets);
+    // they never clear values the settings layer set.
+    var prompts_enabled: bool = cfg.prompts;
+    {
+        var settings = try loadSettingsForOverlay(allocator, io, environ);
+        defer settings.deinit();
+        try applyPermissionsSettingsOverlay(&permission_store, &settings);
+        prompts_enabled = resolvePromptsDefault(cfg, &settings);
+    }
+    if (cfg.yes) permission_store.yes_to_all = true;
     if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
     if (cfg.deny_tools_csv) |s| try permission_store.addDenyList(s);
     if (cfg.ask_tools_csv) |s| try permission_store.addAskList(s);
@@ -318,7 +339,7 @@ fn runPrint(
     );
     var session_gates: permissions_mod.SessionGates = .{
         .role = &role_gate,
-        .permissions = if (cfg.prompts) &permission_store else null,
+        .permissions = if (prompts_enabled) &permission_store else null,
     };
 
     // The sandbox warning fires only when role is `code`/`full`
@@ -351,6 +372,9 @@ fn runPrint(
             session_state.parent_dir orelse "",
         });
     }
+
+    // v1.18.0 — per-session log file (opt-in via --log-per-session).
+    maybeReinitLoggerForSession(allocator, io, cfg, environ_map, session_state.id());
 
     // Append the new user prompt (if any — an empty prompt under --resume
     // means "continue with whatever is in the transcript").
@@ -595,6 +619,144 @@ pub fn resolveHttpTraceDirFromMap(
     if (cfg.http_trace_dir) |p| if (p.len > 0) return p;
     if (environ_map.get("FRANKY_HTTP_TRACE_DIR")) |p| if (p.len > 0) return p;
     return null;
+}
+
+/// v1.18.0 — true when the user wants per-session log files.
+/// Precedence: `--log-per-session` CLI flag → non-empty
+/// `FRANKY_LOG_PER_SESSION` env var → false.
+pub fn resolveLogPerSessionFromMap(
+    cfg: *const cli_mod.Config,
+    environ_map: *const std.process.Environ.Map,
+) bool {
+    if (cfg.log_per_session) return true;
+    if (environ_map.get("FRANKY_LOG_PER_SESSION")) |v| if (v.len > 0) return true;
+    return false;
+}
+
+/// v1.18.0 — build the per-session log path from the active
+/// session id. Prefers `$FRANKY_HOME/logs/<id>.log`; falls back
+/// to `$HOME/.franky/logs/<id>.log`. Returns null when neither
+/// env var is set. Caller owns the slice and frees it.
+pub fn buildPerSessionLogPath(
+    allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+    session_id: []const u8,
+) !?[]u8 {
+    const filename = try std.fmt.allocPrint(allocator, "{s}.log", .{session_id});
+    defer allocator.free(filename);
+    if (environ_map.get("FRANKY_HOME")) |h| if (h.len > 0) {
+        return try std.fs.path.join(allocator, &.{ h, "logs", filename });
+    };
+    if (environ_map.get("HOME")) |h| if (h.len > 0) {
+        return try std.fs.path.join(allocator, &.{ h, ".franky", "logs", filename });
+    };
+    return null;
+}
+
+/// v1.18.0 — re-init the leveled logger to the per-session
+/// path when `--log-per-session` is on AND the user didn't pass
+/// an explicit `--log-file`. No-op otherwise. Best-effort: a
+/// reopen failure leaves the previous sink active so logging
+/// continues to wherever it was already going.
+pub fn maybeReinitLoggerForSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *const cli_mod.Config,
+    environ_map: *const std.process.Environ.Map,
+    session_id: []const u8,
+) void {
+    // Explicit `--log-file` always wins; never override it.
+    if (resolveLogFileFromMap(cfg, environ_map)) |_| return;
+    if (!resolveLogPerSessionFromMap(cfg, environ_map)) return;
+    const path = (buildPerSessionLogPath(allocator, environ_map, session_id) catch return) orelse return;
+    defer allocator.free(path);
+    const level: ai.log.Level = ai.log.currentLevel();
+    ai.log.initWithFile(io, level, path) catch {
+        // Keep the previous sink (stderr or the auto-divert path).
+    };
+}
+
+/// v1.19.0 — load layered settings.json (project → user) using
+/// the same path resolution as `resolveProviderIo`. Returns the
+/// fresh `Settings` so callers can apply overlays. Caller owns
+/// the returned struct and must `deinit` it.
+///
+/// Failure modes: a malformed JSON layer surfaces as
+/// `SettingsError.MalformedJson` from `loadLayered`; this helper
+/// catches that and returns built-in defaults so a bad file
+/// can't abort startup. (The malformed-file case is already
+/// surfaced in logs by callers that want to know.)
+pub fn loadSettingsForOverlay(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+) !settings_mod.Settings {
+    const home = environ.getPosix("FRANKY_HOME") orelse environ.getPosix("HOME");
+    const pwd = environ.getPosix("PWD");
+    return settings_mod.loadLayered(allocator, io, pwd, home) catch
+        try settings_mod.defaults(allocator);
+}
+
+/// v1.19.0 — copy the relevant settings.json overlay fields onto
+/// `bash_state`. Today this is just `tools.bash.timeoutMs`; the
+/// per-call `timeoutMs` arg always wins. Idempotent; safe to call
+/// after `SessionBashState.init`.
+pub fn applyBashSettingsOverlay(
+    bash_state: *tools_mod.bash.SessionBashState,
+    settings: *const settings_mod.Settings,
+) void {
+    if (settings.bash_timeout_ms) |ms| {
+        bash_state.default_timeout_ms_override = ms;
+    }
+}
+
+/// v1.19.0 — copy the relevant settings.json overlay fields onto
+/// `read_ctx`. Today this is just `tools.read.maxBytes`; the
+/// per-call `limit` arg always wins. Idempotent.
+pub fn applyReadSettingsOverlay(
+    read_ctx: *tools_mod.read.ReadCtx,
+    settings: *const settings_mod.Settings,
+) void {
+    if (settings.read_max_bytes) |b| {
+        read_ctx.max_bytes_without_limit_override = b;
+    }
+}
+
+/// v1.19.0 — pre-seed a `permissions.Store` from settings.json's
+/// `permissions.{always_allow,always_deny}.{tools,bash}` arrays
+/// and the `permissions.{ask_all,yes_to_all}` scalars. Call after
+/// `Store.init` and before applying CLI flags so CLI always wins
+/// (CLI just adds entries; deny still beats allow in `Store.check`
+/// regardless of which layer added them).
+pub fn applyPermissionsSettingsOverlay(
+    store: *permissions_mod.Store,
+    settings: *const settings_mod.Settings,
+) !void {
+    if (settings.permissions_ask_all) |b| store.ask_all = b;
+    if (settings.permissions_yes_to_all) |b| store.yes_to_all = b;
+    for (settings.permissions_always_allow_tools) |t| {
+        try store.addBareEntry(t, .allow, false);
+    }
+    for (settings.permissions_always_deny_tools) |t| {
+        try store.addBareEntry(t, .deny, false);
+    }
+    for (settings.permissions_always_allow_bash) |fp| {
+        try store.addBareEntry(fp, .allow, true);
+    }
+    for (settings.permissions_always_deny_bash) |fp| {
+        try store.addBareEntry(fp, .deny, true);
+    }
+}
+
+/// v1.19.0 — settings-layer default for `--prompts`. CLI flag
+/// always wins. Returns `true` when prompts should be enabled
+/// at this layer (settings says so AND CLI didn't set it).
+pub fn resolvePromptsDefault(
+    cfg: *const cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) bool {
+    if (cfg.prompts) return true; // CLI wins.
+    return settings.prompts_default orelse false;
 }
 
 /// True when `base_url` parses to a loopback host. Whole-host
@@ -1362,6 +1524,63 @@ test "resolveLogFileFromMap: nothing set → null" {
     try testing.expect(resolveLogFileFromMap(&cfg, &m) == null);
 }
 
+// v1.18.0 — per-session log path resolution
+
+test "resolveLogPerSessionFromMap: CLI flag turns it on" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{ "franky", "--log-per-session" });
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try testing.expect(resolveLogPerSessionFromMap(&cfg, &m));
+}
+
+test "resolveLogPerSessionFromMap: env var turns it on" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try m.put("FRANKY_LOG_PER_SESSION", "1");
+    try testing.expect(resolveLogPerSessionFromMap(&cfg, &m));
+}
+
+test "resolveLogPerSessionFromMap: empty env var stays off" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try m.put("FRANKY_LOG_PER_SESSION", "");
+    try testing.expect(!resolveLogPerSessionFromMap(&cfg, &m));
+}
+
+test "buildPerSessionLogPath: prefers FRANKY_HOME" {
+    const gpa = testing.allocator;
+    var m = std.process.Environ.Map.init(gpa);
+    defer m.deinit();
+    try m.put("FRANKY_HOME", "/etc/franky");
+    try m.put("HOME", "/home/me");
+    const p = (try buildPerSessionLogPath(gpa, &m, "01ABC")).?;
+    defer gpa.free(p);
+    try testing.expectEqualStrings("/etc/franky/logs/01ABC.log", p);
+}
+
+test "buildPerSessionLogPath: falls back to HOME/.franky/logs" {
+    const gpa = testing.allocator;
+    var m = std.process.Environ.Map.init(gpa);
+    defer m.deinit();
+    try m.put("HOME", "/home/me");
+    const p = (try buildPerSessionLogPath(gpa, &m, "01ABC")).?;
+    defer gpa.free(p);
+    try testing.expectEqualStrings("/home/me/.franky/logs/01ABC.log", p);
+}
+
+test "buildPerSessionLogPath: no HOME → null" {
+    const gpa = testing.allocator;
+    var m = std.process.Environ.Map.init(gpa);
+    defer m.deinit();
+    const p = try buildPerSessionLogPath(gpa, &m, "01ABC");
+    try testing.expect(p == null);
+}
+
 test "isLoopbackBaseUrl: matches loopback hosts" {
     try testing.expect(isLoopbackBaseUrl("http://localhost:11434/v1/messages"));
     try testing.expect(isLoopbackBaseUrl("http://127.0.0.1:11434"));
@@ -1652,4 +1871,84 @@ test "buildSystemPromptIo: missing system.md falls back to default" {
     const out = try buildSystemPromptIo(gpa, io, env, &cfg);
     defer gpa.free(out);
     try testing.expectEqualStrings(default_system_prompt, out);
+}
+
+// ─── v1.19.0 — settings-layer overlay helper tests ──────────────────
+
+test "applyBashSettingsOverlay: copies timeoutMs onto bash_state" {
+    var state = tools_mod.bash.SessionBashState.init(testing.allocator);
+    defer state.deinit();
+
+    var settings = try settings_mod.defaults(testing.allocator);
+    defer settings.deinit();
+    settings.bash_timeout_ms = 30_000;
+
+    applyBashSettingsOverlay(&state, &settings);
+    try testing.expectEqual(@as(?u64, 30_000), state.default_timeout_ms_override);
+    try testing.expectEqual(@as(u64, 30_000), state.defaultTimeoutMs());
+}
+
+test "applyBashSettingsOverlay: null setting leaves override unset" {
+    var state = tools_mod.bash.SessionBashState.init(testing.allocator);
+    defer state.deinit();
+
+    var settings = try settings_mod.defaults(testing.allocator);
+    defer settings.deinit();
+    // settings.bash_timeout_ms stays null
+
+    applyBashSettingsOverlay(&state, &settings);
+    try testing.expectEqual(@as(?u64, null), state.default_timeout_ms_override);
+}
+
+test "applyReadSettingsOverlay: copies maxBytes onto read_ctx" {
+    var ctx: tools_mod.read.ReadCtx = .{};
+    var settings = try settings_mod.defaults(testing.allocator);
+    defer settings.deinit();
+    settings.read_max_bytes = 1024;
+    applyReadSettingsOverlay(&ctx, &settings);
+    try testing.expectEqual(@as(?usize, 1024), ctx.max_bytes_without_limit_override);
+    try testing.expectEqual(@as(usize, 1024), ctx.effectiveMaxBytes());
+}
+
+test "applyPermissionsSettingsOverlay: pre-seeds Store from arrays + scalars" {
+    var store = permissions_mod.Store.init(testing.allocator);
+    defer store.deinit();
+
+    var settings = try settings_mod.defaults(testing.allocator);
+    defer settings.deinit();
+    settings.permissions_ask_all = true;
+    settings.permissions_yes_to_all = true;
+    settings.permissions_always_allow_tools = try testing.allocator.alloc([]const u8, 1);
+    settings.permissions_always_allow_tools[0] = try testing.allocator.dupe(u8, "read");
+    settings.permissions_always_deny_bash = try testing.allocator.alloc([]const u8, 1);
+    settings.permissions_always_deny_bash[0] = try testing.allocator.dupe(u8, "rm");
+
+    try applyPermissionsSettingsOverlay(&store, &settings);
+    try testing.expect(store.ask_all);
+    try testing.expect(store.yes_to_all);
+    try testing.expectEqual(permissions_mod.Decision.auto_allow, store.check("read", "{}"));
+    try testing.expectEqual(permissions_mod.Decision.auto_deny, store.check("bash", "{\"command\":\"rm -rf /\"}"));
+}
+
+test "resolvePromptsDefault: CLI wins; settings only when CLI is off" {
+    var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(testing.allocator) };
+    defer cfg.deinit();
+    var settings = try settings_mod.defaults(testing.allocator);
+    defer settings.deinit();
+
+    // Both off → false.
+    try testing.expect(!resolvePromptsDefault(&cfg, &settings));
+
+    // Settings on, CLI off → true.
+    settings.prompts_default = true;
+    try testing.expect(resolvePromptsDefault(&cfg, &settings));
+
+    // CLI on, settings off → true (CLI wins).
+    settings.prompts_default = false;
+    cfg.prompts = true;
+    try testing.expect(resolvePromptsDefault(&cfg, &settings));
+
+    // CLI on, settings on → true.
+    settings.prompts_default = true;
+    try testing.expect(resolvePromptsDefault(&cfg, &settings));
 }

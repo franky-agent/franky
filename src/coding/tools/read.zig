@@ -31,6 +31,20 @@ pub const max_bytes_without_limit: usize = 256 * 1024;
 pub const default_limit: usize = 2000;
 pub const binary_sniff_bytes: usize = 8 * 1024;
 
+/// v1.19.0 — opt-in ctx for the read tool, used by callers that
+/// want to feed in the settings-layer overlay alongside workspace
+/// scope. The legacy `tool()` and `toolWithWorkspace(ws)` factories
+/// remain — they don't carry the overlay (use module-level default).
+pub const ReadCtx = struct {
+    workspace: ?*const workspace_mod.Workspace = null,
+    /// `tools.read.maxBytes` from settings.json. null = no override.
+    max_bytes_without_limit_override: ?usize = null,
+
+    pub fn effectiveMaxBytes(self: *const ReadCtx) usize {
+        return self.max_bytes_without_limit_override orelse max_bytes_without_limit;
+    }
+};
+
 pub fn tool() at.AgentTool {
     return .{
         .name = "read",
@@ -52,6 +66,20 @@ pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
         .execution_mode = .parallel,
         .ctx = @constCast(@ptrCast(ws)),
         .execute = execute,
+    };
+}
+
+/// v1.19.0 — workspace + settings-layer overlay variant. When a
+/// settings.json defines `tools.read.maxBytes`, callers wire it
+/// through `ReadCtx`; per-call `limit` arg always wins.
+pub fn toolWithCtx(ctx: *const ReadCtx) at.AgentTool {
+    return .{
+        .name = "read",
+        .description = "Read a file from the workspace (path-safety + max-bytes overlay).",
+        .parameters_json = parameters_json,
+        .execution_mode = .parallel,
+        .ctx = @constCast(@ptrCast(ctx)),
+        .execute = executeWithCtx,
     };
 }
 
@@ -103,7 +131,57 @@ fn execute(
         }
     } else user_path;
 
-    return try readFile(allocator, io, effective_path, offset, limit);
+    return try readFileWithCap(allocator, io, effective_path, offset, limit, max_bytes_without_limit);
+}
+
+fn executeWithCtx(
+    self: *const at.AgentTool,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    call_id: []const u8,
+    args_json: []const u8,
+    cancel: *ai.stream.Cancel,
+    on_update: at.OnUpdate,
+) anyerror!at.ToolResult {
+    _ = call_id;
+    _ = cancel;
+    _ = on_update;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), args_json, .{});
+    const root = parsed.value;
+    const path_val = root.object.get("path") orelse
+        return common.toolError(allocator, "invalid_args", "missing path");
+    if (path_val != .string) return common.toolError(allocator, "invalid_args", "path must be a string");
+    const user_path = path_val.string;
+
+    const offset: usize = if (root.object.get("offset")) |v| blk: {
+        if (v == .integer and v.integer >= 1) break :blk @intCast(v.integer);
+        break :blk 1;
+    } else 1;
+    const limit: ?usize = if (root.object.get("limit")) |v| blk: {
+        if (v == .integer and v.integer >= 1) break :blk @as(?usize, @intCast(v.integer));
+        break :blk null;
+    } else null;
+
+    const ctx: *const ReadCtx = @ptrCast(@alignCast(self.ctx.?));
+
+    var canon_path: ?[]u8 = null;
+    defer if (canon_path) |p| allocator.free(p);
+    const effective_path: []const u8 = if (ctx.workspace) |ws| blk: {
+        const r = try workspace_mod.canonicalizeOrError(allocator, ws, user_path);
+        switch (r) {
+            .ok => |c| {
+                canon_path = c.abs;
+                break :blk c.abs;
+            },
+            .err => |e| return common.toolError(allocator, e.code, e.message),
+        }
+    } else user_path;
+
+    return try readFileWithCap(allocator, io, effective_path, offset, limit, ctx.effectiveMaxBytes());
 }
 
 pub fn readFile(
@@ -112,6 +190,17 @@ pub fn readFile(
     path: []const u8,
     offset: usize,
     limit: ?usize,
+) !at.ToolResult {
+    return try readFileWithCap(allocator, io, path, offset, limit, max_bytes_without_limit);
+}
+
+pub fn readFileWithCap(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    offset: usize,
+    limit: ?usize,
+    max_bytes_cap: usize,
 ) !at.ToolResult {
     const cwd = std.Io.Dir.cwd();
     var file = cwd.openFile(io, path, .{}) catch |err| switch (err) {
@@ -123,8 +212,8 @@ pub fn readFile(
 
     const len = file.length(io) catch |err|
         return common.toolError(allocator, "stat_failed", @errorName(err));
-    if (limit == null and len > max_bytes_without_limit) {
-        return common.toolError(allocator, "read_too_large", "file exceeds 256 KiB without explicit limit");
+    if (limit == null and len > max_bytes_cap) {
+        return common.toolError(allocator, "read_too_large", "file exceeds without-limit cap");
     }
 
     const buf = try allocator.alloc(u8, @intCast(len));
@@ -289,4 +378,64 @@ test "read tool with workspace: rejects workspace escape" {
         try testing.expect(res.is_error);
         try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "path_escape_workspace") != null);
     }
+}
+
+// ─── v1.19.0 — ReadCtx + max_bytes overlay tests ────────────────────
+
+test "ReadCtx.effectiveMaxBytes honors override" {
+    var ctx: ReadCtx = .{};
+    try testing.expectEqual(max_bytes_without_limit, ctx.effectiveMaxBytes());
+    ctx.max_bytes_without_limit_override = 1024;
+    try testing.expectEqual(@as(usize, 1024), ctx.effectiveMaxBytes());
+}
+
+test "toolWithCtx: max_bytes override caps without-limit reads tighter than module default" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    // 2048-byte file: above a 1024-byte cap, below the 256 KiB module default.
+    const tmp_path = "/tmp/franky_read_overlay_cap.txt";
+    var contents: [2048]u8 = undefined;
+    @memset(&contents, 'x');
+    try writeTempFile(io, tmp_path, &contents);
+    defer deleteTempFile(io, tmp_path);
+
+    var ctx: ReadCtx = .{ .max_bytes_without_limit_override = 1024 };
+    const t = toolWithCtx(&ctx);
+    var cancel = ai.stream.Cancel{};
+
+    // No `limit` arg → tighter override hits → read_too_large.
+    {
+        var res = try t.execute(&t, gpa, io, "id1", "{\"path\":\"/tmp/franky_read_overlay_cap.txt\"}", &cancel, .{});
+        defer res.deinit(gpa);
+        try testing.expect(res.is_error);
+        try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "read_too_large") != null);
+    }
+    // Explicit `limit` arg → cap is bypassed (per-call still wins).
+    {
+        var res = try t.execute(&t, gpa, io, "id2", "{\"path\":\"/tmp/franky_read_overlay_cap.txt\",\"limit\":10}", &cancel, .{});
+        defer res.deinit(gpa);
+        try testing.expect(!res.is_error);
+    }
+}
+
+test "toolWithCtx: null override falls back to module default" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const tmp_path = "/tmp/franky_read_overlay_null.txt";
+    try writeTempFile(io, tmp_path, "small\n");
+    defer deleteTempFile(io, tmp_path);
+
+    var ctx: ReadCtx = .{}; // no override; effective = 256 KiB
+    const t = toolWithCtx(&ctx);
+    var cancel = ai.stream.Cancel{};
+
+    var res = try t.execute(&t, gpa, io, "id", "{\"path\":\"/tmp/franky_read_overlay_null.txt\"}", &cancel, .{});
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
 }

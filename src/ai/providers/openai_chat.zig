@@ -393,6 +393,27 @@ const Driver = struct {
             } });
         };
 
+        // v1.17.5 — `reasoning_content` (Kimi, DeepSeek, some
+        // OpenAI-compat shims) and `reasoning` (others) carry the
+        // model's thinking output as a separate field. Without this
+        // arm the entire reasoning stream gets silently dropped:
+        // a thinking-heavy model can emit megabytes of `reasoning_content`
+        // chunks, and franky's UI shows nothing because no `content`
+        // arrives. We translate to the existing `thinking_delta`
+        // event, the same channel Anthropic's reasoning takes.
+        if (delta.get("reasoning_content")) |rv| if (rv == .string) {
+            try self.out.push(self.io, .{ .thinking_delta = .{
+                .block_index = 0,
+                .delta = try self.allocator.dupe(u8, rv.string),
+            } });
+        };
+        if (delta.get("reasoning")) |rv| if (rv == .string) {
+            try self.out.push(self.io, .{ .thinking_delta = .{
+                .block_index = 0,
+                .delta = try self.allocator.dupe(u8, rv.string),
+            } });
+        };
+
         // Tool-call fragments.
         if (delta.get("tool_calls")) |tv| if (tv == .array) {
             for (tv.array.items) |entry| {
@@ -697,6 +718,73 @@ test "runFromSse: text delta + finish_reason → done" {
     try testing.expectEqual(@as(usize, 5), seen_text); // "Hel" + "lo"
     try testing.expect(seen_usage);
     try testing.expectEqual(@as(?types.StopReason, .stop), done_reason);
+}
+
+test "runFromSse: reasoning_content delta becomes thinking_delta" {
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ch = try Channel.init(gpa, 16);
+    defer ch.deinit();
+    var cancel: stream_mod.Cancel = .{};
+
+    // Mirrors what Cloudflare's openai-compat shim emits for Kimi-K2.6
+    // and DeepSeek-style reasoning models: thinking content arrives in
+    // `delta.reasoning_content` rather than `delta.content`.
+    const sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"let me\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" think\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: [DONE]\n\n";
+
+    try runFromSse(gpa, io, sse, &ch, &cancel);
+
+    var thinking_bytes: usize = 0;
+    var text_bytes: usize = 0;
+    while (ch.next(io)) |ev| switch (ev) {
+        .thinking_delta => |d| {
+            thinking_bytes += d.delta.len;
+            gpa.free(d.delta);
+        },
+        .text_delta => |d| {
+            text_bytes += d.delta.len;
+            gpa.free(d.delta);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, "let me".len + " think".len), thinking_bytes);
+    try testing.expectEqual(@as(usize, 2), text_bytes); // "OK"
+}
+
+test "runFromSse: bare `reasoning` field is also accepted" {
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ch = try Channel.init(gpa, 16);
+    defer ch.deinit();
+    var cancel: stream_mod.Cancel = .{};
+
+    const sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"hmm\"},\"finish_reason\":null}]}\n\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: [DONE]\n\n";
+
+    try runFromSse(gpa, io, sse, &ch, &cancel);
+
+    var thinking_bytes: usize = 0;
+    while (ch.next(io)) |ev| switch (ev) {
+        .thinking_delta => |d| {
+            thinking_bytes += d.delta.len;
+            gpa.free(d.delta);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 3), thinking_bytes); // "hmm"
 }
 
 test "runFromSse: tool-call argument streaming" {

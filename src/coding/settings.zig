@@ -39,15 +39,92 @@ pub const Settings = struct {
     keybindings: KeybindingPreset,
     theme: []const u8,
 
+    // v1.19.0 — settings-layer overlay (§4.5 + §4.10 + §4.12).
+    //
+    // All `?T` fields use `null` to mean "no setting present at any
+    // layer; built-in default applies." A non-null value carries the
+    // last-write-wins resolution across user → project layers.
+    //
+    // Arrays are owned ([]const u8 slices duped onto `allocator`) and
+    // concatenate across layers (project items appended after user
+    // items; consumers treat them as set-semantic so order is moot).
+
+    /// `tools.bash.timeoutMs` — settings-layer default for bash
+    /// per-call timeout. Per-call `timeoutMs` arg still wins.
+    bash_timeout_ms: ?u64 = null,
+    /// `tools.read.maxBytes` — settings-layer default for read
+    /// without-explicit-limit cap. Per-call `limit` arg still wins.
+    read_max_bytes: ?usize = null,
+
+    /// `permissions.ask_all` — settings-layer default for the
+    /// "ask before every tool call" toggle. CLI `--ask-tools all`
+    /// still wins.
+    permissions_ask_all: ?bool = null,
+    /// `permissions.yes_to_all` — settings-layer default for the
+    /// "auto-allow every prompt" CI toggle. CLI `--yes` / `-y`
+    /// still wins.
+    permissions_yes_to_all: ?bool = null,
+    /// `permissions.always_allow.tools` — pre-seeded into the
+    /// permission `Store` at session init.
+    permissions_always_allow_tools: [][]const u8 = &.{},
+    /// `permissions.always_allow.bash` — bash fingerprints (verb
+    /// level, e.g. `git`, `ls`) pre-seeded into the `Store`.
+    permissions_always_allow_bash: [][]const u8 = &.{},
+    /// `permissions.always_deny.tools` — pre-seeded into the
+    /// `Store`. Deny beats allow per the v1.11.0 precedence.
+    permissions_always_deny_tools: [][]const u8 = &.{},
+    /// `permissions.always_deny.bash` — pre-seeded into the
+    /// `Store`. Deny beats allow.
+    permissions_always_deny_bash: [][]const u8 = &.{},
+
+    /// `prompts: bool` — settings-layer toggle for the per-tool
+    /// permission overlay (§5.11). CLI `--prompts` still wins.
+    prompts_default: ?bool = null,
+
     pub fn deinit(self: *Settings) void {
         self.allocator.free(self.default_provider);
         self.allocator.free(self.default_model_anthropic);
         self.allocator.free(self.default_model_openai);
         self.allocator.free(self.thinking);
         self.allocator.free(self.theme);
+        deinitStringArray(self.allocator, self.permissions_always_allow_tools);
+        deinitStringArray(self.allocator, self.permissions_always_allow_bash);
+        deinitStringArray(self.allocator, self.permissions_always_deny_tools);
+        deinitStringArray(self.allocator, self.permissions_always_deny_bash);
         self.* = undefined;
     }
 };
+
+fn deinitStringArray(alloc: std.mem.Allocator, arr: [][]const u8) void {
+    for (arr) |s| alloc.free(s);
+    if (arr.len > 0) alloc.free(arr);
+}
+
+/// Append all string entries from `src` (duped onto `alloc`) to the
+/// slice pointed at by `target`. Reallocates the slice. Non-string
+/// entries are silently skipped — settings.json is permissive at the
+/// edges (matches every other field's parsing here).
+fn appendStringArray(
+    alloc: std.mem.Allocator,
+    target: *[][]const u8,
+    src: std.json.Array,
+) !void {
+    var n_strings: usize = 0;
+    for (src.items) |item| if (item == .string) {
+        n_strings += 1;
+    };
+    if (n_strings == 0) return;
+    const old = target.*;
+    const combined = try alloc.alloc([]const u8, old.len + n_strings);
+    @memcpy(combined[0..old.len], old);
+    var i: usize = old.len;
+    for (src.items) |item| if (item == .string) {
+        combined[i] = try alloc.dupe(u8, item.string);
+        i += 1;
+    };
+    if (old.len > 0) alloc.free(old);
+    target.* = combined;
+}
 
 pub const default_provider: []const u8 = "anthropic";
 pub const default_model_anthropic: []const u8 = "claude-sonnet-4-6";
@@ -147,6 +224,50 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
     if (obj.get("theme")) |v| if (v == .string) {
         alloc.free(settings.theme);
         settings.theme = try alloc.dupe(u8, v.string);
+    };
+
+    // v1.19.0 — settings-layer overlay parsers.
+
+    if (obj.get("tools")) |tools_v| if (tools_v == .object) {
+        if (tools_v.object.get("bash")) |bash_v| if (bash_v == .object) {
+            if (bash_v.object.get("timeoutMs")) |t| if (t == .integer and t.integer >= 1) {
+                settings.bash_timeout_ms = @intCast(t.integer);
+            };
+        };
+        if (tools_v.object.get("read")) |read_v| if (read_v == .object) {
+            if (read_v.object.get("maxBytes")) |m| if (m == .integer and m.integer >= 1) {
+                settings.read_max_bytes = @intCast(m.integer);
+            };
+        };
+    };
+
+    if (obj.get("permissions")) |perms_v| if (perms_v == .object) {
+        if (perms_v.object.get("ask_all")) |b| if (b == .bool) {
+            settings.permissions_ask_all = b.bool;
+        };
+        if (perms_v.object.get("yes_to_all")) |b| if (b == .bool) {
+            settings.permissions_yes_to_all = b.bool;
+        };
+        if (perms_v.object.get("always_allow")) |aa| if (aa == .object) {
+            if (aa.object.get("tools")) |arr| if (arr == .array) {
+                try appendStringArray(alloc, &settings.permissions_always_allow_tools, arr.array);
+            };
+            if (aa.object.get("bash")) |arr| if (arr == .array) {
+                try appendStringArray(alloc, &settings.permissions_always_allow_bash, arr.array);
+            };
+        };
+        if (perms_v.object.get("always_deny")) |ad| if (ad == .object) {
+            if (ad.object.get("tools")) |arr| if (arr == .array) {
+                try appendStringArray(alloc, &settings.permissions_always_deny_tools, arr.array);
+            };
+            if (ad.object.get("bash")) |arr| if (arr == .array) {
+                try appendStringArray(alloc, &settings.permissions_always_deny_bash, arr.array);
+            };
+        };
+    };
+
+    if (obj.get("prompts")) |v| if (v == .bool) {
+        settings.prompts_default = v.bool;
     };
 }
 
@@ -278,4 +399,167 @@ test "loadLayered: partial file preserves unspecified defaults" {
     // Every other field keeps its default.
     try testing.expectEqualStrings("anthropic", s.default_provider);
     try testing.expect(s.auto_compact);
+}
+
+// ─── v1.19.0 — settings-layer overlay tests ───────────────────────
+
+test "loadLayered: tools.bash.timeoutMs + tools.read.maxBytes" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "/tmp/franky_settings_tools_overlay";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"tools":{"bash":{"timeoutMs":30000},"read":{"maxBytes":524288}}}
+        );
+    }
+
+    var s = try loadLayered(testing.allocator, io, base, null);
+    defer s.deinit();
+    try testing.expectEqual(@as(?u64, 30_000), s.bash_timeout_ms);
+    try testing.expectEqual(@as(?usize, 524_288), s.read_max_bytes);
+}
+
+test "loadLayered: tools overlay defaults remain null when absent" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var s = try loadLayered(testing.allocator, io, null, null);
+    defer s.deinit();
+    try testing.expectEqual(@as(?u64, null), s.bash_timeout_ms);
+    try testing.expectEqual(@as(?usize, null), s.read_max_bytes);
+    try testing.expectEqual(@as(?bool, null), s.permissions_ask_all);
+    try testing.expectEqual(@as(?bool, null), s.permissions_yes_to_all);
+    try testing.expectEqual(@as(?bool, null), s.prompts_default);
+    try testing.expectEqual(@as(usize, 0), s.permissions_always_allow_tools.len);
+    try testing.expectEqual(@as(usize, 0), s.permissions_always_allow_bash.len);
+}
+
+test "loadLayered: permissions overlay — scalars + arrays" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "/tmp/franky_settings_perms_overlay";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"permissions":{"ask_all":true,"yes_to_all":false,"always_allow":{"tools":["read","ls"],"bash":["git","ls"]},"always_deny":{"tools":["write"],"bash":["rm"]}}}
+        );
+    }
+
+    var s = try loadLayered(testing.allocator, io, base, null);
+    defer s.deinit();
+    try testing.expectEqual(@as(?bool, true), s.permissions_ask_all);
+    try testing.expectEqual(@as(?bool, false), s.permissions_yes_to_all);
+    try testing.expectEqual(@as(usize, 2), s.permissions_always_allow_tools.len);
+    try testing.expectEqualStrings("read", s.permissions_always_allow_tools[0]);
+    try testing.expectEqualStrings("ls", s.permissions_always_allow_tools[1]);
+    try testing.expectEqual(@as(usize, 2), s.permissions_always_allow_bash.len);
+    try testing.expectEqualStrings("git", s.permissions_always_allow_bash[0]);
+    try testing.expectEqual(@as(usize, 1), s.permissions_always_deny_tools.len);
+    try testing.expectEqualStrings("write", s.permissions_always_deny_tools[0]);
+    try testing.expectEqual(@as(usize, 1), s.permissions_always_deny_bash.len);
+    try testing.expectEqualStrings("rm", s.permissions_always_deny_bash[0]);
+}
+
+test "loadLayered: permissions arrays concatenate user + project" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const user_base = "/tmp/franky_settings_perms_user";
+    _ = std.Io.Dir.cwd().deleteTree(io, user_base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, user_base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, user_base ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, user_base ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"permissions":{"always_allow":{"tools":["read"]}}}
+        );
+    }
+    const proj_base = "/tmp/franky_settings_perms_proj";
+    _ = std.Io.Dir.cwd().deleteTree(io, proj_base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, proj_base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, proj_base ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, proj_base ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"permissions":{"always_allow":{"tools":["ls","grep"]}}}
+        );
+    }
+
+    var s = try loadLayered(gpa, io, proj_base, user_base);
+    defer s.deinit();
+    // user applied first, project appended after.
+    try testing.expectEqual(@as(usize, 3), s.permissions_always_allow_tools.len);
+    try testing.expectEqualStrings("read", s.permissions_always_allow_tools[0]);
+    try testing.expectEqualStrings("ls", s.permissions_always_allow_tools[1]);
+    try testing.expectEqualStrings("grep", s.permissions_always_allow_tools[2]);
+}
+
+test "loadLayered: prompts: bool overlay" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "/tmp/franky_settings_prompts_overlay";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"prompts":true}
+        );
+    }
+    var s = try loadLayered(testing.allocator, io, base, null);
+    defer s.deinit();
+    try testing.expectEqual(@as(?bool, true), s.prompts_default);
+}
+
+test "loadLayered: rejects ill-typed overlay fields silently" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "/tmp/franky_settings_overlay_illtype";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        // timeoutMs as string, maxBytes negative, ask_all as int,
+        // always_allow.tools mixed-type — every bad value should be
+        // silently dropped, leaving the field at default null/empty.
+        try f.writeStreamingAll(io,
+            \\{"tools":{"bash":{"timeoutMs":"30s"},"read":{"maxBytes":-1}},"permissions":{"ask_all":1,"always_allow":{"tools":["read",42]}},"prompts":"yes"}
+        );
+    }
+    var s = try loadLayered(testing.allocator, io, base, null);
+    defer s.deinit();
+    try testing.expectEqual(@as(?u64, null), s.bash_timeout_ms);
+    try testing.expectEqual(@as(?usize, null), s.read_max_bytes);
+    try testing.expectEqual(@as(?bool, null), s.permissions_ask_all);
+    try testing.expectEqual(@as(?bool, null), s.prompts_default);
+    // Mixed-type array drops the non-string entry but keeps the
+    // valid one; settings.json is permissive at the edges.
+    try testing.expectEqual(@as(usize, 1), s.permissions_always_allow_tools.len);
+    try testing.expectEqualStrings("read", s.permissions_always_allow_tools[0]);
 }
