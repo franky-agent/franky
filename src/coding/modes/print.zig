@@ -227,6 +227,11 @@ fn runPrint(
         .provider = "gateway",
         .stream_fn = ai.providers.openai_gateway.streamFn,
     });
+    try reg.register(.{
+        .api = "google-gemini",
+        .provider = "google-gemini",
+        .stream_fn = ai.providers.google_gemini.streamFn,
+    });
 
     // If we're running the faux provider, seed a scripted response so the
     // demo stays self-contained without an API key. The allocations below
@@ -342,6 +347,32 @@ fn runPrint(
         .permissions = if (prompts_enabled) &permission_store else null,
     };
 
+    // v1.24.0 — subagent tool. Always available (not subject to
+    // role gating itself; the role demotion applies to the
+    // SUB-agent's tool set, not whether the parent can spawn one).
+    // `filtered_tools` is the parent tool list the sub-agent
+    // inherits from (minus `subagent` itself, enforced inside the
+    // tool's execute path). v1.24.0 ships with `parent_session_dir
+    // = null` — sub-agent transcripts aren't persisted yet
+    // (follow-up).
+    const subagent_ctx = tools_mod.subagent.Ctx{
+        .registry = &reg,
+        .environ = environ,
+        .environ_map = environ_map,
+        .parent_tools = filtered_tools,
+        .parent_role = active_role,
+        .permission_store = if (prompts_enabled) &permission_store else null,
+        .permission_prompter_slot = null, // print mode has no interactive prompter; sub-agents un-gate
+        .parent_session_dir = null,
+    };
+    const final_tools = blk: {
+        const slice = try allocator.alloc(at.AgentTool, filtered_tools.len + 1);
+        @memcpy(slice[0..filtered_tools.len], filtered_tools);
+        slice[filtered_tools.len] = tools_mod.subagent.toolWithCtx(&subagent_ctx);
+        break :blk slice;
+    };
+    defer allocator.free(final_tools);
+
     // The sandbox warning fires only when role is `code`/`full`
     // outside a detected sandbox — host filesystem reachable from
     // a shell is the dangerous combination.
@@ -429,7 +460,7 @@ fn runPrint(
         .config = .{
             .model = model,
             .system_prompt = system_prompt,
-            .tools = filtered_tools,
+            .tools = final_tools,
             .registry = &reg,
             .cancel = &cancel,
             .hook_userdata = @ptrCast(&session_gates),
@@ -888,6 +919,7 @@ pub fn resolveProviderIo(
     const anthropic_file = if (auth_state) |as| as.get("anthropic") else null;
     const openai_file = if (auth_state) |as| as.get("openai") else null;
     const gateway_file = if (auth_state) |as| as.get("gateway") else null;
+    const gemini_file = if (auth_state) |as| as.get("google-gemini") else null;
 
     const api_key: ?[]const u8 = blk: {
         if (cfg.api_key) |k| break :blk k;
@@ -912,9 +944,27 @@ pub fn resolveProviderIo(
         if (openai_file) |rec| if (rec.api_key) |k| break :blk try a.dupe(u8, k);
         break :blk null;
     };
+    // v1.23.0 — Gemini credentials. AI Studio API key
+    // (`GEMINI_API_KEY` / `GOOGLE_API_KEY`) goes through
+    // `?key=` query param; OAuth bearer (from `franky login
+    // --provider google-gemini`, stored in auth.json under
+    // "google-gemini") goes through `Authorization: Bearer`.
+    // Resolved separately so the provider streamFn can pick the
+    // right transport.
+    const gemini_api_key: ?[]const u8 = blk: {
+        if (environ.getPosix("GEMINI_API_KEY")) |k| break :blk try a.dupe(u8, k);
+        if (environ.getPosix("GOOGLE_API_KEY")) |k| break :blk try a.dupe(u8, k);
+        if (gemini_file) |rec| if (rec.api_key) |k| break :blk try a.dupe(u8, k);
+        break :blk null;
+    };
+    const gemini_auth_token: ?[]const u8 = blk: {
+        if (gemini_file) |rec| if (rec.access_token) |t| break :blk try a.dupe(u8, t);
+        break :blk null;
+    };
 
     const has_anthropic_credential = api_key != null or auth_token != null;
     const has_openai_credential = openai_api_key != null or (cfg.api_key != null and !has_anthropic_credential);
+    const has_gemini_credential = gemini_api_key != null or gemini_auth_token != null;
 
     // Settings supplies the default provider when the user didn't
     // pass `--provider` and no credentials tell us what to pick.
@@ -924,6 +974,7 @@ pub fn resolveProviderIo(
         if (cfg.provider) |p| break :blk p;
         if (has_anthropic_credential) break :blk "anthropic";
         if (has_openai_credential) break :blk "openai";
+        if (has_gemini_credential) break :blk "google-gemini";
         // Respect settings.default_provider if it points at one we
         // can actually satisfy with available credentials; else faux.
         if (std.mem.eql(u8, settings.default_provider, "faux")) break :blk "faux";
@@ -1020,7 +1071,35 @@ pub fn resolveProviderIo(
         }, cfg, models_extras);
     }
 
-    const msg = try std.fmt.allocPrint(allocator, "unknown --provider '{s}'; use faux, anthropic, openai, or gateway\n", .{chosen});
+    if (std.mem.eql(u8, chosen, "google-gemini") or std.mem.eql(u8, chosen, "gemini") or std.mem.eql(u8, chosen, "google")) {
+        // v1.23.0 — native Gemini provider. API key from
+        // GEMINI_API_KEY / GOOGLE_API_KEY (sent as `?key=`) OR
+        // OAuth bearer from auth.json (sent as
+        // `Authorization: Bearer`). `--api-key` on the CLI
+        // double-binds to the api-key path so users can pass it
+        // ad-hoc.
+        const effective_key: ?[]const u8 = gemini_api_key orelse cfg.api_key;
+        const effective_token: ?[]const u8 = gemini_auth_token;
+        if (effective_key == null and effective_token == null) {
+            const msg =
+                "google-gemini provider requires one of: --api-key, GEMINI_API_KEY, GOOGLE_API_KEY, " ++
+                "or `franky login --provider google-gemini` to mint an OAuth token in auth.json\n";
+            return exitWithMessageErr(allocator, msg, 2);
+        }
+        const model = cfg.model orelse try a.dupe(u8, "gemini-2.5-pro");
+        return finalize(a, .{
+            .provider_name = "google-gemini",
+            .api_tag = "google-gemini",
+            .model_id = model,
+            .api_key = effective_key,
+            .auth_token = effective_token,
+            .base_url = null,
+            .context_window = default_context_window,
+            .max_output = default_max_output,
+        }, cfg, models_extras);
+    }
+
+    const msg = try std.fmt.allocPrint(allocator, "unknown --provider '{s}'; use faux, anthropic, openai, gateway, or google-gemini\n", .{chosen});
     defer allocator.free(msg);
     return exitWithMessageErr(allocator, msg, 2);
 }
@@ -1371,13 +1450,62 @@ pub fn buildSystemPromptIo(
     }
     defer if (base_owned) allocator.free(base);
 
+    // v1.24.1 — append a concise subagent hint when we're using
+    // the built-in default prompt. Skipped for disk-loaded prompts
+    // (operator chose their own wording — don't muck with it).
+    // Profile list is interpolated at runtime; falls back to a
+    // static placeholder if the lookup fails.
+    var with_hint: []u8 = base;
+    var hint_owned = false;
+    if (!loaded_from_disk) {
+        const hint = try buildSubagentHint(allocator, io, cfg);
+        defer allocator.free(hint);
+        if (hint.len > 0) {
+            const trimmed = std.mem.trimEnd(u8, base, &std.ascii.whitespace);
+            with_hint = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed, hint });
+            hint_owned = true;
+        }
+    }
+    defer if (hint_owned) allocator.free(with_hint);
+
     if (cfg.append_system_prompt) |extra| {
-        const trimmed = std.mem.trimEnd(u8, base, &std.ascii.whitespace);
+        const trimmed = std.mem.trimEnd(u8, with_hint, &std.ascii.whitespace);
         const out = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed, extra });
         return out;
     }
+    if (hint_owned) {
+        // Transfer ownership of with_hint to the caller.
+        hint_owned = false;
+        return with_hint;
+    }
     base_owned = false;
     return base;
+}
+
+/// v1.24.1 — concise subagent guidance for the system prompt.
+/// Empty string when there are no profiles to list (degenerate
+/// case — pointless paragraph). Caller frees.
+fn buildSubagentHint(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    cfg: *const cli_mod.Config,
+) ![]u8 {
+    _ = cfg;
+    const ioref = io orelse return try allocator.dupe(u8, "");
+    // Build a borrowed environ_map view for the profiles helper.
+    // The helper needs a *Map; we don't have a stable one here, so
+    // synthesize a transient one from the standard env. Empty map
+    // is fine — it just means no `${VAR}` interpolation in profile
+    // bodies, which is irrelevant for name-listing.
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const profile_list = profiles_mod.listProfileNamesCSV(allocator, ioref, &env_map) catch return try allocator.dupe(u8, "");
+    defer allocator.free(profile_list);
+    if (profile_list.len == 0) return try allocator.dupe(u8, "");
+    return try std.fmt.allocPrint(allocator,
+        "You also have a `subagent` tool that spawns an isolated agent with its own model. Use it for parallel sub-tasks or when a different profile fits the work better — skip it for single tool calls. Profiles: {s}.",
+        .{profile_list},
+    );
 }
 
 // ─── helpers ────────────────────────────────────────────────────
@@ -1763,6 +1891,45 @@ test "resolveProvider (no io): --offline forces faux even with --api-key" {
     try testing.expectEqualStrings("faux", info.provider_name);
 }
 
+test "resolveProvider (no io): --provider google-gemini + --api-key wires native gemini" {
+    var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(testing.allocator) };
+    defer cfg.deinit();
+    cfg.provider = try cfg.arena.allocator().dupe(u8, "google-gemini");
+    cfg.api_key = try cfg.arena.allocator().dupe(u8, "AIza-test");
+    const env: std.process.Environ = .empty;
+    const info = try resolveProvider(testing.allocator, env, &cfg);
+    try testing.expectEqualStrings("google-gemini", info.provider_name);
+    try testing.expectEqualStrings("google-gemini", info.api_tag);
+    try testing.expectEqualStrings("gemini-2.5-pro", info.model_id);
+    try testing.expectEqualStrings("AIza-test", info.api_key.?);
+    try testing.expect(info.auth_token == null);
+}
+
+test "resolveProvider (no io): --provider gemini alias also routes to native" {
+    var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(testing.allocator) };
+    defer cfg.deinit();
+    cfg.provider = try cfg.arena.allocator().dupe(u8, "gemini");
+    cfg.api_key = try cfg.arena.allocator().dupe(u8, "AIza-test");
+    cfg.model = try cfg.arena.allocator().dupe(u8, "gemini-2.5-flash");
+    const env: std.process.Environ = .empty;
+    const info = try resolveProvider(testing.allocator, env, &cfg);
+    try testing.expectEqualStrings("google-gemini", info.provider_name);
+    try testing.expectEqualStrings("gemini-2.5-flash", info.model_id);
+}
+
+test "resolveProvider (no io): --provider google-gemini without any credential errors" {
+    // resolveProvider calls exitWithMessageErr on missing creds via
+    // std.process.exit, so we can't directly catch — instead pin
+    // the auto-detection behavior: NO --provider, NO Gemini env →
+    // chosen=faux (not google-gemini). Pairs with the full CLI
+    // path that does exit on missing creds.
+    var cfg = try makeCfg(null, .off, false);
+    defer cfg.deinit();
+    const env: std.process.Environ = .empty;
+    const info = try resolveProvider(testing.allocator, env, &cfg);
+    try testing.expectEqualStrings("faux", info.provider_name);
+}
+
 test "authJsonPathFrom: FRANKY_HOME takes precedence over HOME" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1857,7 +2024,7 @@ test "buildSystemPromptIo: --system-prompt flag beats disk + default" {
     try testing.expectEqualStrings("you are a test", out);
 }
 
-test "buildSystemPromptIo: missing system.md falls back to default" {
+test "buildSystemPromptIo: missing system.md falls back to default + appends subagent hint" {
     const gpa = testing.allocator;
     var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
     defer cfg.deinit();
@@ -1870,7 +2037,13 @@ test "buildSystemPromptIo: missing system.md falls back to default" {
     const env: std.process.Environ = .empty;
     const out = try buildSystemPromptIo(gpa, io, env, &cfg);
     defer gpa.free(out);
-    try testing.expectEqualStrings(default_system_prompt, out);
+    // Default prompt body is preserved verbatim at the start.
+    try testing.expect(std.mem.startsWith(u8, out, default_system_prompt));
+    // v1.24.1 — subagent hint is appended with the profile catalog.
+    try testing.expect(std.mem.indexOf(u8, out, "subagent") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Profiles:") != null);
+    // At least one built-in profile name should appear.
+    try testing.expect(std.mem.indexOf(u8, out, "gemini") != null);
 }
 
 // ─── v1.19.0 — settings-layer overlay helper tests ──────────────────

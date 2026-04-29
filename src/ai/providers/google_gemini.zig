@@ -86,7 +86,16 @@ pub fn buildRequestJson(
             try buf.appendSlice(allocator, ",\"description\":");
             try utils.appendJsonStr(&buf, allocator, t.description);
             try buf.appendSlice(allocator, ",\"parameters\":");
-            try buf.appendSlice(allocator, t.parameters_json);
+            // v1.23.1 — Gemini's tool-parameter schema is a strict
+            // subset of OpenAPI/JSON-Schema and rejects keywords
+            // like `additionalProperties` / `$schema` that
+            // OpenAI + Anthropic accept. franky's built-in tools
+            // emit `additionalProperties: false` for strict
+            // validation, so we have to scrub the schema before
+            // inlining. Recursive — `additionalProperties` can
+            // appear inside nested arrays' `items` and per-property
+            // sub-schemas.
+            try appendSanitizedSchema(&buf, allocator, t.parameters_json);
             try buf.append(allocator, '}');
         }
         try buf.appendSlice(allocator, "]}]");
@@ -103,6 +112,83 @@ pub fn buildRequestJson(
 
     try buf.append(allocator, '}');
     return buf.toOwnedSlice(allocator);
+}
+
+/// v1.23.1 — JSON Schema keywords Gemini rejects with
+/// `request_invalid: Unknown name "<key>"`. Stripped recursively
+/// from every nested object before sending. Add to this list as
+/// new incompatibilities surface from real prompts.
+const gemini_unsupported_schema_keys = [_][]const u8{
+    "additionalProperties",
+    "$schema",
+    "$defs",
+    "definitions",
+};
+
+/// Parse `schema_json`, walk it recursively, drop keys Gemini
+/// rejects, then serialize the result back into `buf`. Falls back
+/// to inlining the original (unsanitized) schema if parsing
+/// fails — better to attempt a request with the original than to
+/// fail closed; Gemini will return its own error which the user
+/// can act on.
+///
+/// Fast path (most schemas): a substring scan. If none of the
+/// unsupported keywords appear, the schema is already valid for
+/// Gemini and we inline it verbatim — skipping the parse / walk /
+/// re-stringify entirely. This is the common case (only franky's
+/// own tools currently emit `additionalProperties` for strict
+/// mode); avoids ~1KB of allocations × N tools per HTTP request.
+fn appendSanitizedSchema(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    schema_json: []const u8,
+) !void {
+    var needs_sanitize = false;
+    for (gemini_unsupported_schema_keys) |key| {
+        if (std.mem.indexOf(u8, schema_json, key) != null) {
+            needs_sanitize = true;
+            break;
+        }
+    }
+    if (!needs_sanitize) {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, aalloc, schema_json, .{}) catch {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    };
+    var root = parsed.value;
+    sanitizeValue(&root);
+
+    const out = std.json.Stringify.valueAlloc(aalloc, root, .{}) catch {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    };
+    try buf.appendSlice(allocator, out);
+}
+
+/// Recursively strip Gemini-unsupported keys from `v`'s objects.
+/// Mutates in place. Arrays' elements are walked too so
+/// `additionalProperties` nested inside `items` (e.g. an array of
+/// edit-records) gets removed.
+fn sanitizeValue(v: *std.json.Value) void {
+    switch (v.*) {
+        .object => |*obj| {
+            for (gemini_unsupported_schema_keys) |k| _ = obj.swapRemove(k);
+            var it = obj.iterator();
+            while (it.next()) |entry| sanitizeValue(entry.value_ptr);
+        },
+        .array => |*arr| {
+            for (arr.items) |*item| sanitizeValue(item);
+        },
+        else => {},
+    }
 }
 
 fn appendContent(
@@ -127,39 +213,17 @@ fn appendContent(
     try buf.appendSlice(allocator, ",\"parts\":[");
 
     var emitted: usize = 0;
-    for (m.content) |cb| {
-        switch (cb) {
-            .text => |t| {
-                if (emitted > 0) try buf.append(allocator, ',');
-                try buf.appendSlice(allocator, "{\"text\":");
-                try utils.appendJsonStr(buf, allocator, t.text);
-                try buf.append(allocator, '}');
-                emitted += 1;
-            },
-            .tool_call => |tc| {
-                if (emitted > 0) try buf.append(allocator, ',');
-                try buf.appendSlice(allocator, "{\"functionCall\":{\"name\":");
-                try utils.appendJsonStr(buf, allocator, tc.name);
-                try buf.appendSlice(allocator, ",\"args\":");
-                try buf.appendSlice(allocator, if (tc.arguments_json.len == 0) "{}" else tc.arguments_json);
-                try buf.appendSlice(allocator, "}}");
-                emitted += 1;
-            },
-            .image => |img| {
-                if (emitted > 0) try buf.append(allocator, ',');
-                try buf.appendSlice(allocator, "{\"inlineData\":{\"mimeType\":");
-                try utils.appendJsonStr(buf, allocator, img.mime_type);
-                try buf.appendSlice(allocator, ",\"data\":");
-                try utils.appendJsonStr(buf, allocator, img.data);
-                try buf.appendSlice(allocator, "}}");
-                emitted += 1;
-            },
-            .thinking => {},
-        }
-    }
-
     if (m.role == .tool_result) {
-        // Wrap the stringified tool output as a `functionResponse` part.
+        // v1.23.3 — for tool_result messages, emit ONLY the
+        // `functionResponse` wrapper. Pre-fix, the loop below
+        // *also* emitted `{"text":...}` for each text content
+        // block, producing a malformed `[{"text":...}{"functionResponse":...}]`
+        // (missing comma between the two parts) that Gemini
+        // rejected with `request_invalid: Expected , or ] after
+        // array value`. The functionResponse wrapper already
+        // concatenates the text payload into its `response.content`
+        // field, so the separate text emission was both wrong AND
+        // duplicate.
         var text_buf: std.ArrayList(u8) = .empty;
         defer text_buf.deinit(allocator);
         for (m.content) |cb| switch (cb) {
@@ -172,6 +236,37 @@ fn appendContent(
         try utils.appendJsonStr(buf, allocator, text_buf.items);
         try buf.appendSlice(allocator, "}}}");
         emitted += 1;
+    } else {
+        for (m.content) |cb| {
+            switch (cb) {
+                .text => |t| {
+                    if (emitted > 0) try buf.append(allocator, ',');
+                    try buf.appendSlice(allocator, "{\"text\":");
+                    try utils.appendJsonStr(buf, allocator, t.text);
+                    try buf.append(allocator, '}');
+                    emitted += 1;
+                },
+                .tool_call => |tc| {
+                    if (emitted > 0) try buf.append(allocator, ',');
+                    try buf.appendSlice(allocator, "{\"functionCall\":{\"name\":");
+                    try utils.appendJsonStr(buf, allocator, tc.name);
+                    try buf.appendSlice(allocator, ",\"args\":");
+                    try buf.appendSlice(allocator, if (tc.arguments_json.len == 0) "{}" else tc.arguments_json);
+                    try buf.appendSlice(allocator, "}}");
+                    emitted += 1;
+                },
+                .image => |img| {
+                    if (emitted > 0) try buf.append(allocator, ',');
+                    try buf.appendSlice(allocator, "{\"inlineData\":{\"mimeType\":");
+                    try utils.appendJsonStr(buf, allocator, img.mime_type);
+                    try buf.appendSlice(allocator, ",\"data\":");
+                    try utils.appendJsonStr(buf, allocator, img.data);
+                    try buf.appendSlice(allocator, "}}");
+                    emitted += 1;
+                },
+                .thinking => {},
+            }
+        }
     }
 
     if (emitted == 0) try buf.appendSlice(allocator, "{\"text\":\"\"}");
@@ -334,14 +429,25 @@ fn mapFinishReason(s: []const u8) ?types.StopReason {
 // ─── registry entry ──────────────────────────────────────────────
 
 pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
-    const credential: []const u8 = ctx.options.api_key orelse {
+    // Two auth shapes for the Google Generative Language API:
+    //  - API key as `?key=...` query param (the AI Studio key path).
+    //  - OAuth bearer in the `Authorization` header (the
+    //    `franky login --provider google-gemini` path; Google's
+    //    own OAuth-issued access tokens). Detected from
+    //    `auth_token` being present.
+    // If both happen to be set, prefer the OAuth bearer (the
+    // OAuth path is the more privileged one — keys are cheap to
+    // mint, OAuth implies a real Google identity).
+    const has_api_key = ctx.options.api_key != null and ctx.options.api_key.?.len > 0;
+    const has_auth_token = ctx.options.auth_token != null and ctx.options.auth_token.?.len > 0;
+    if (!has_api_key and !has_auth_token) {
         try ctx.out.push(ctx.io, .start);
         ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
             .code = errors.Code.auth,
-            .message = try ctx.allocator.dupe(u8, "google-gemini: no credential (set --api-key or GOOGLE_API_KEY / GEMINI_API_KEY)"),
+            .message = try ctx.allocator.dupe(u8, "google-gemini: no credential (set --api-key, GOOGLE_API_KEY / GEMINI_API_KEY, or run `franky login --provider google-gemini`)"),
         } });
         return;
-    };
+    }
 
     const body = try buildRequestJson(ctx.allocator, ctx.model, ctx.context, ctx.options);
     defer ctx.allocator.free(body);
@@ -349,17 +455,39 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     log.log(.debug, "http", "request", "provider=google-gemini model={s} body_bytes={d}", .{ ctx.model.id, body.len });
     log.body(.trace, "http", "request_body", body, 64 * 1024);
 
-    const url = try std.fmt.allocPrint(
-        ctx.allocator,
-        "https://{s}/v1beta/models/{s}:streamGenerateContent?alt=sse&key={s}",
-        .{ default_host, ctx.model.id, credential },
-    );
+    // URL: OAuth path drops the `key=` param (Google's API rejects
+    // the dual-auth combination); API-key path appends `&key=...`.
+    const url = if (has_auth_token)
+        try std.fmt.allocPrint(
+            ctx.allocator,
+            "https://{s}/v1beta/models/{s}:streamGenerateContent?alt=sse",
+            .{ default_host, ctx.model.id },
+        )
+    else
+        try std.fmt.allocPrint(
+            ctx.allocator,
+            "https://{s}/v1beta/models/{s}:streamGenerateContent?alt=sse&key={s}",
+            .{ default_host, ctx.model.id, ctx.options.api_key.? },
+        );
     defer ctx.allocator.free(url);
 
-    var http_headers_buf: [2]std.http.Header = undefined;
-    http_headers_buf[0] = .{ .name = "content-type", .value = "application/json" };
-    http_headers_buf[1] = .{ .name = "accept", .value = "text/event-stream" };
-    const http_headers = http_headers_buf[0..2];
+    const auth_header: ?[]u8 = if (has_auth_token)
+        try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{ctx.options.auth_token.?})
+    else
+        null;
+    defer if (auth_header) |h| ctx.allocator.free(h);
+
+    var http_headers_buf: [3]std.http.Header = undefined;
+    var http_headers_len: usize = 0;
+    if (auth_header) |h| {
+        http_headers_buf[http_headers_len] = .{ .name = "authorization", .value = h };
+        http_headers_len += 1;
+    }
+    http_headers_buf[http_headers_len] = .{ .name = "content-type", .value = "application/json" };
+    http_headers_len += 1;
+    http_headers_buf[http_headers_len] = .{ .name = "accept", .value = "text/event-stream" };
+    http_headers_len += 1;
+    const http_headers = http_headers_buf[0..http_headers_len];
 
     const cancel = ctx.options.cancel orelse unreachable;
 
@@ -439,6 +567,23 @@ test "buildRequestJson: contents + systemInstruction shape" {
     try testing.expect(std.mem.indexOf(u8, body, "\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\"hello\"}]}]") != null);
 }
 
+test "buildRequestJson: thinking=off omits thinkingBudget entirely (v1.23.2)" {
+    // gemini-2.5-pro rejects `Budget 0 is invalid`; the safer
+    // behavior is to send NO thinkingBudget so Google's per-model
+    // default kicks in. Pin that contract: with thinking=off, the
+    // request body must not contain "thinkingBudget".
+    const gpa = testing.allocator;
+    var uc = [_]types.ContentBlock{.{ .text = .{ .text = "?" } }};
+    var msgs = [_]types.Message{.{ .role = .user, .content = &uc, .timestamp = 0 }};
+    const ctx: types.Context = .{ .system_prompt = "", .messages = &msgs, .tools = &.{} };
+    const model: types.Model = .{ .id = "gemini-2.5-pro", .provider = "google", .api = "google-gemini" };
+
+    const body = try buildRequestJson(gpa, model, ctx, .{ .thinking = .off });
+    defer gpa.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "thinkingBudget") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "thinkingConfig") == null);
+}
+
 test "buildRequestJson: thinkingConfig from §B mapping" {
     const gpa = testing.allocator;
     var uc = [_]types.ContentBlock{.{ .text = .{ .text = "?" } }};
@@ -449,6 +594,49 @@ test "buildRequestJson: thinkingConfig from §B mapping" {
     const body = try buildRequestJson(gpa, model, ctx, .{ .thinking = .high });
     defer gpa.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "\"thinkingConfig\":{\"thinkingBudget\":16384}") != null);
+}
+
+test "appendSanitizedSchema: fast-path inlines verbatim when no keyword present" {
+    // A clean schema (no additionalProperties / $schema / etc.)
+    // should round-trip exactly — sanitizer's fast-path skips
+    // parse/walk/stringify and saves ~1KB of allocations per
+    // tool per HTTP request.
+    const gpa = testing.allocator;
+    const clean =
+        \\{"type":"object","properties":{"q":{"type":"string"}}}
+    ;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try appendSanitizedSchema(&buf, gpa, clean);
+    try testing.expectEqualStrings(clean, buf.items);
+}
+
+test "buildRequestJson: strips additionalProperties from tool parameters" {
+    const gpa = testing.allocator;
+    // Mimics the franky `edit` tool's nested schema — array of
+    // objects, each with `additionalProperties: false`. Gemini
+    // rejected all three depths in real usage; the sanitizer must
+    // strip them all.
+    const params =
+        \\{"type":"object","required":["path","edits"],"properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","required":["old","new"],"properties":{"old":{"type":"string"},"new":{"type":"string"}},"additionalProperties":false}}},"additionalProperties":false}
+    ;
+    const tool: types.Tool = .{
+        .name = "edit",
+        .description = "edit",
+        .parameters_json = params,
+    };
+    var uc = [_]types.ContentBlock{.{ .text = .{ .text = "q" } }};
+    var msgs = [_]types.Message{.{ .role = .user, .content = &uc, .timestamp = 0 }};
+    var tools = [_]types.Tool{tool};
+    const ctx: types.Context = .{ .system_prompt = "", .messages = &msgs, .tools = &tools };
+    const model: types.Model = .{ .id = "gemini-2.5-pro", .provider = "google", .api = "google-gemini" };
+    const body = try buildRequestJson(gpa, model, ctx, .{});
+    defer gpa.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "additionalProperties") == null);
+    // Sanity: the rest of the schema survived.
+    try testing.expect(std.mem.indexOf(u8, body, "\"items\":") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"old\":") != null);
 }
 
 test "buildRequestJson: tools nested under functionDeclarations" {
@@ -467,6 +655,34 @@ test "buildRequestJson: tools nested under functionDeclarations" {
     defer gpa.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"functionDeclarations\":[{\"name\":\"search\"") != null);
+}
+
+test "buildRequestJson: tool_result emits ONE functionResponse, not text+functionResponse (v1.23.3)" {
+    // Regression: pre-v1.23.3 a tool_result message emitted both
+    // `{"text":...}` (from the per-content-block loop) AND a
+    // `{"functionResponse":...}` after it — without a comma —
+    // yielding `[{"text":"…"}{"functionResponse":…}]` which
+    // Gemini rejected with `request_invalid: Expected , or ] …`.
+    // Pin the new shape: a single functionResponse part.
+    const gpa = testing.allocator;
+    var tool_result_content = [_]types.ContentBlock{.{ .text = .{ .text = "refactoring.md\n" } }};
+    var msgs = [_]types.Message{.{
+        .role = .tool_result,
+        .content = &tool_result_content,
+        .timestamp = 0,
+        .tool_call_id = "call-abc",
+    }};
+    const ctx: types.Context = .{ .system_prompt = "", .messages = &msgs, .tools = &.{} };
+    const model: types.Model = .{ .id = "gemini-2.5-pro", .provider = "google", .api = "google-gemini" };
+    const body = try buildRequestJson(gpa, model, ctx, .{});
+    defer gpa.free(body);
+
+    // Exactly one functionResponse, no separate {"text":...} part.
+    try testing.expect(std.mem.indexOf(u8, body, "\"parts\":[{\"functionResponse\":") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"call-abc\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"content\":\"refactoring.md\\n\"") != null);
+    // No malformed `}{` adjacency anywhere in the parts array.
+    try testing.expect(std.mem.indexOf(u8, body, "}{\"functionResponse\":") == null);
 }
 
 test "buildRequestJson: assistant role renders as 'model'" {

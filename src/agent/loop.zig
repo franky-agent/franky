@@ -159,6 +159,16 @@ pub const BetweenTurnsFn = *const fn (
     transcript: *Transcript,
 ) bool;
 
+/// v1.22.0 — per-hook userdata resolver. Returns the hook's
+/// override if set, otherwise the shared `hook_userdata`.
+fn beforeToolCallUserdata(c: *const Config) ?*anyopaque {
+    return c.before_tool_call_userdata orelse c.hook_userdata;
+}
+
+fn roleDeniedUserdata(c: *const Config) ?*anyopaque {
+    return c.role_denied_userdata orelse c.hook_userdata;
+}
+
 pub const Config = struct {
     model: ai.types.Model,
     system_prompt: []const u8 = "",
@@ -167,9 +177,21 @@ pub const Config = struct {
     convert_to_llm: ConvertToLlmFn = defaultConvertToLlm,
     execution_mode: at.ExecutionMode = .sequential,
     cancel: *ai.stream.Cancel,
+    /// Default `userdata` for every hook below. Existing v1.x
+    /// callers set this once and all hooks share it.
     hook_userdata: ?*anyopaque = null,
     before_tool_call: ?BeforeToolCallFn = null,
+    /// v1.22.0 — optional per-hook userdata override. Falls back
+    /// to `hook_userdata` when null. Lets a single Agent class
+    /// wire its own `between_turns` userdata (the Agent itself,
+    /// for queue-drain access) AND a separately-owned `before_tool_call`
+    /// userdata (e.g. a `permissions.SessionGates`) without forcing
+    /// every hook to share one downcast target. `null` keeps
+    /// pre-v1.22 semantics.
+    before_tool_call_userdata: ?*anyopaque = null,
     role_denied: ?RoleDeniedFn = null,
+    /// v1.22.0 — same fallback shape as `before_tool_call_userdata`.
+    role_denied_userdata: ?*anyopaque = null,
     after_tool_call: ?AfterToolCallFn = null,
     /// §4.3 steer/followUp drain hooks. Called between turns —
     /// after a turn naturally ends, before the next turn's LLM
@@ -426,7 +448,7 @@ fn runTurn(
         if (maybe_tool == null) {
             const r = blk: {
                 if (config.role_denied) |fn_| {
-                    if (fn_(config.hook_userdata, tc.name)) |denial| {
+                    if (fn_(roleDeniedUserdata(&config), tc.name)) |denial| {
                         break :blk try makeRoleDeniedResult(allocator, tc.name, denial);
                     }
                 }
@@ -441,7 +463,7 @@ fn runTurn(
 
         // beforeToolCall
         if (config.before_tool_call) |hook| {
-            const dec = hook(config.hook_userdata, &tool_def, tc.id, tc.arguments_json);
+            const dec = hook(beforeToolCallUserdata(&config), &tool_def, tc.id, tc.arguments_json);
             if (dec.block) {
                 const reason = dec.reason_text orelse "blocked by beforeToolCall";
                 const r = try makeErrorResult(allocator, reason);
@@ -578,7 +600,7 @@ fn runToolsParallel(
     for (tool_calls, 0..) |tc, i| {
         const tool_def = findTool(config.tools, tc.name).?;
         if (config.before_tool_call) |hook| {
-            const dec = hook(config.hook_userdata, &tool_def, tc.id, tc.arguments_json);
+            const dec = hook(beforeToolCallUserdata(&config), &tool_def, tc.id, tc.arguments_json);
             if (dec.block) {
                 const reason = dec.reason_text orelse "blocked by beforeToolCall";
                 vetoed[i] = try makeErrorResult(allocator, reason);

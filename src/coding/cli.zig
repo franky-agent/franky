@@ -425,7 +425,7 @@ pub const usage_text: []const u8 =
     \\  franky [FLAGS] [--] PROMPT...
     \\
     \\FLAGS:
-    \\  --provider NAME              Provider (faux, anthropic, openai, gateway) [default: faux]
+    \\  --provider NAME              Provider (faux, anthropic, openai, gateway, google-gemini) [default: faux]
     \\  --model ID                   Model id (provider-specific default)
     \\  --api-key KEY                API key (X-Api-Key); env: ANTHROPIC_API_KEY
     \\  --auth-token TOKEN           OAuth / JWT bearer; env: ANTHROPIC_AUTH_TOKEN,

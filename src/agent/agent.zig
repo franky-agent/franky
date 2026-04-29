@@ -55,6 +55,10 @@ pub const Agent = struct {
     /// hooks).
     stream_options: ai.registry.StreamOptions = .{},
 
+    /// v1.22.0 — see `Config.tool_gate`. Plain copy from Config
+    /// at init time; the userdata pointer stays caller-owned.
+    tool_gate: ?ToolGate = null,
+
     // ── subscribers ───────────────────────────────────────────────
     subs: std.ArrayList(Subscription) = .empty,
     next_sub_id: u32 = 1,
@@ -93,6 +97,36 @@ pub const Agent = struct {
         /// `auth_token` to be set, or `environ_map` populated so
         /// the provider can pull them from env.
         stream_options: ai.registry.StreamOptions = .{},
+        /// v1.22.0 — per-Agent tool gate. Lets SDK consumers
+        /// (franky-do, future siblings) plug their own
+        /// `before_tool_call` / `role_denied` callbacks into the
+        /// agent loop without forking the Agent class. Pass
+        /// `coding/permissions.SessionGates`'s static methods
+        /// here — the type is intentionally generic to preserve
+        /// the `agent → coding` one-way layering. `null` keeps
+        /// pre-v1.22 semantics (no per-tool gate).
+        tool_gate: ?ToolGate = null,
+    };
+
+    /// v1.22.0 — generic per-tool-call gate. Each callback is
+    /// independent of the others; a consumer can wire just one if
+    /// the others aren't needed. Lives in `agent.zig` (not
+    /// `coding/permissions.zig`) so the Agent class stays free of
+    /// any `coding/` dependency, preserving the one-way layering.
+    pub const ToolGate = struct {
+        /// Caller-owned. Lives at the same address for the
+        /// lifetime of the Agent. Passed to both callbacks.
+        userdata: ?*anyopaque = null,
+        /// Called before every tool execution attempt. Returns
+        /// `{ block: true, reason_text }` to veto the call (a
+        /// synthetic error tool result is sent back to the
+        /// model). Returns `{ block: false }` to allow.
+        before_tool_call: ?loop_mod.BeforeToolCallFn = null,
+        /// Called when the model emits a tool name that's NOT
+        /// in the registered tool set. A non-null return turns
+        /// the synthetic error into a structured `role_denied`
+        /// emission (more debuggable than "unknown tool").
+        role_denied: ?loop_mod.RoleDeniedFn = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) !Agent {
@@ -109,6 +143,7 @@ pub const Agent = struct {
             .transcript = loop_mod.Transcript.init(allocator),
             .registry = config.registry,
             .stream_options = config.stream_options,
+            .tool_gate = config.tool_gate,
         };
     }
 
@@ -359,6 +394,15 @@ pub const Agent = struct {
         var stream_opts: ai.registry.StreamOptions = self.stream_options;
         stream_opts.thinking = self.thinking_level;
 
+        // v1.22.0 — wire the tool_gate's hooks into the loop's
+        // per-hook userdata fields. `hook_userdata` stays as
+        // `self` so `betweenTurnsHook` can reach the Agent's
+        // queue state. The tool_gate's hooks (typically
+        // `permissions.SessionGates.beforeToolCall` and friends)
+        // get their own userdata via the v1.22.0 fallback fields,
+        // so a single hook_userdata pointer doesn't have to
+        // service both.
+        const gate = self.tool_gate orelse ToolGate{};
         const cfg: loop_mod.Config = .{
             .model = self.model,
             .system_prompt = self.system_prompt,
@@ -368,6 +412,10 @@ pub const Agent = struct {
             .stream_options = stream_opts,
             .hook_userdata = @ptrCast(self),
             .between_turns = betweenTurnsHook,
+            .before_tool_call = gate.before_tool_call,
+            .before_tool_call_userdata = gate.userdata,
+            .role_denied = gate.role_denied,
+            .role_denied_userdata = gate.userdata,
         };
 
         const loop_args: LoopWorkerArgs = .{

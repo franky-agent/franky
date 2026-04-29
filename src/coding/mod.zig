@@ -8,6 +8,7 @@ pub const tools = struct {
     pub const ls = @import("tools/ls.zig");
     pub const find = @import("tools/find.zig");
     pub const grep = @import("tools/grep.zig");
+    pub const subagent = @import("tools/subagent.zig");
     pub const workspace = @import("tools/workspace.zig");
     pub const common = @import("tools/common.zig");
 };
@@ -57,6 +58,7 @@ test {
     _ = tools.ls;
     _ = tools.find;
     _ = tools.grep;
+    _ = tools.subagent;
     _ = tools.workspace;
     _ = tools.common;
     _ = modes.print;

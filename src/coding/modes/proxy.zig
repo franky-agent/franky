@@ -515,6 +515,35 @@ fn initSession(
         .provider = "gateway",
         .stream_fn = ai.providers.openai_gateway.streamFn,
     });
+    try session.registry.register(.{
+        .api = "google-gemini",
+        .provider = "google-gemini",
+        .stream_fn = ai.providers.google_gemini.streamFn,
+    });
+
+    // v1.24.0 — append subagent tool. Same shape as rpc.zig: ctx
+    // and the appended tool slice both live in role_arena.
+    {
+        const ra = session.role_arena.allocator();
+        const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
+        subagent_ctx.* = .{
+            .registry = &session.registry,
+            .environ = environ,
+            .environ_map = environ_map,
+            .parent_tools = session.tools,
+            .parent_role = session.role_gate.role,
+            .permission_store = if (session.prompts_enabled) &session.permission_store else null,
+            // v1.24.3 — sub-agents share the parent's live prompter
+            // (set per-prompt). The `current_prompter` slot is on
+            // the session struct so its address is stable.
+            .permission_prompter_slot = &session.current_prompter,
+            .parent_session_dir = null,
+        };
+        const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 1);
+        @memcpy(final_tools[0..session.tools.len], session.tools);
+        final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
+        session.tools = final_tools;
+    }
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg);
 }
@@ -905,8 +934,37 @@ fn compactHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!vo
     };
 
     if (!result.proceeded) {
-        try ctx.output.appendSlice(ctx.allocator,
-            "Transcript is not yet compactable (no anchor found, or span too small).");
+        // v1.24.5 — diagnostic: show the actual numbers so the
+        // user can tell *when* /compact will start working
+        // instead of just being told it won't yet. Numbers come
+        // from `compaction.estimateTranscriptTokens` (same
+        // accounting the tail-budget heuristic uses) +
+        // `countUserTurns` (mirrors `selectSpan`'s anchor logic).
+        const compact = franky.coding.compaction;
+        const total_tokens = compact.estimateTranscriptTokens(session.transcript.messages.items);
+        const user_turns = compact.countUserTurns(session.transcript.messages.items);
+        const tail_budget: u64 = (@as(u64, session.provider.context_window) * 15) / 100;
+        const cause: []const u8 = if (user_turns < 2)
+            "compaction needs at least 2 user turns (to anchor on the most recent one and compact what's before)"
+        else
+            "transcript still fits inside the 15% tail budget that compaction reserves untouched";
+        const diag = std.fmt.allocPrint(ctx.allocator,
+            "Transcript not yet compactable: {d} messages / {d} user turn{s} / ~{d} tokens estimated; tail budget = {d} tokens (15% of the {d}-token window). {s}.",
+            .{
+                session.transcript.messages.items.len,
+                user_turns,
+                if (user_turns == 1) "" else "s",
+                total_tokens,
+                tail_budget,
+                session.provider.context_window,
+                cause,
+            },
+        ) catch {
+            try ctx.output.appendSlice(ctx.allocator, "Transcript not yet compactable (anchor missing or span too small).");
+            return;
+        };
+        defer ctx.allocator.free(diag);
+        try ctx.output.appendSlice(ctx.allocator, diag);
         return;
     }
 
@@ -3696,6 +3754,12 @@ test "slash: /compact on short transcript reports not-yet-compactable" {
     defer if (px.data_json) |d| gpa.free(d);
 
     try testing.expect(std.mem.indexOf(u8, output.items, "not yet compactable") != null);
+    // v1.24.5 — diagnostic now reports the actual numbers so
+    // users can tell *when* /compact will start working.
+    try testing.expect(std.mem.indexOf(u8, output.items, "messages") != null);
+    try testing.expect(std.mem.indexOf(u8, output.items, "user turn") != null);
+    try testing.expect(std.mem.indexOf(u8, output.items, "tokens estimated") != null);
+    try testing.expect(std.mem.indexOf(u8, output.items, "tail budget") != null);
     try testing.expectEqual(SlashSideEffect.none, px.side_effect);
     // Transcript untouched.
     try testing.expectEqual(orig_len, session.transcript.messages.items.len);

@@ -1735,6 +1735,37 @@ const SessionBinding = struct {
             .provider = "gateway",
             .stream_fn = ai.providers.openai_gateway.streamFn,
         });
+        try binding.registry.register(.{
+            .api = "google-gemini",
+            .provider = "google-gemini",
+            .stream_fn = ai.providers.google_gemini.streamFn,
+        });
+
+        // v1.24.0 — append subagent tool. ctx + slice in arena.
+        {
+            const aa = binding.arena.allocator();
+            const subagent_ctx = try aa.create(tools_mod.subagent.Ctx);
+            subagent_ctx.* = .{
+                .registry = &binding.registry,
+                .environ = environ,
+                .environ_map = environ_map,
+                .parent_tools = binding.tools,
+                .parent_role = binding.role_gate.role,
+                .permission_store = if (binding.prompts_enabled) &binding.permission_store else null,
+                // v1.24.3 — interactive's prompter lives on a per-
+                // turn stack frame, not a session field, so we
+                // can't take its address stably. Sub-agents in
+                // interactive mode run un-gated for now (same as
+                // print). v2 follow-up: hoist the prompter to a
+                // session field OR add a callback registry.
+                .permission_prompter_slot = null,
+                .parent_session_dir = null,
+            };
+            const final_tools = try aa.alloc(at.AgentTool, binding.tools.len + 1);
+            @memcpy(final_tools[0..binding.tools.len], binding.tools);
+            final_tools[binding.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
+            binding.tools = final_tools;
+        }
 
         binding.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg);
     }

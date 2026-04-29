@@ -334,11 +334,17 @@ pub const ThinkingLevel = enum {
         };
     }
 
-    /// §B — Google `thinkingBudget`. `off` returns 0 (which means disabled
-    /// per Google's API), all others return a positive budget.
+    /// §B — Google `thinkingBudget`. `off` returns `null` so the
+    /// provider OMITS the field entirely (v1.23.2). Letting
+    /// Google's default apply works for both: models that
+    /// support disabling (Flash) ignore the missing field, and
+    /// models that REQUIRE thinking (Pro) get their default
+    /// budget instead of being told `0` and rejecting the
+    /// request with `Budget 0 is invalid. This model only
+    /// works in thinking mode.`
     pub fn googleBudget(self: ThinkingLevel) ?u32 {
         return switch (self) {
-            .off => 0,
+            .off => null,
             .minimal => 512,
             .low => 2048,
             .medium => 8192,
@@ -386,7 +392,11 @@ test "ThinkingLevel provider mappings" {
     try std.testing.expectEqual(@as(?u32, 8192), ThinkingLevel.medium.anthropicBudget());
     try std.testing.expectEqual(@as(?u32, 32768), ThinkingLevel.xhigh.anthropicBudget());
     try std.testing.expectEqualStrings("high", ThinkingLevel.xhigh.openaiResponsesEffort().?);
-    try std.testing.expectEqual(@as(?u32, 0), ThinkingLevel.off.googleBudget());
+    // v1.23.2 — `off` now returns null so google_gemini omits
+    // the `thinkingBudget` field entirely (gemini-2.5-pro
+    // rejects `0` as invalid; letting Google's default apply
+    // works for Pro + Flash both).
+    try std.testing.expectEqual(@as(?u32, null), ThinkingLevel.off.googleBudget());
     try std.testing.expectEqual(@as(?u32, 24576), ThinkingLevel.xhigh.googleBudget());
 }
 

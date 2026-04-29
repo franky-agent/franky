@@ -156,6 +156,8 @@ fn initSession(
         tools_mod.grep.tool(),
     };
     const filtered = try role_mod.filterTools(role_arena.allocator(), &all_tools, role_gate.set);
+    // v1.24.0 — subagent wiring deferred until after permission_store
+    // is built (we need its address). See the `final_tools` block below.
 
     var permission_store = permissions_mod.Store.init(allocator);
     errdefer permission_store.deinit();
@@ -225,6 +227,33 @@ fn initSession(
         .provider = "gateway",
         .stream_fn = ai.providers.openai_gateway.streamFn,
     });
+    try session.registry.register(.{
+        .api = "google-gemini",
+        .provider = "google-gemini",
+        .stream_fn = ai.providers.google_gemini.streamFn,
+    });
+
+    // v1.24.0 — append subagent tool to session.tools. ctx + slice
+    // both live in role_arena, which the session owns.
+    const ra = session.role_arena.allocator();
+    const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
+    subagent_ctx.* = .{
+        .registry = &session.registry,
+        .environ = environ,
+        .environ_map = environ_map,
+        .parent_tools = session.tools,
+        .parent_role = session.role_gate.role,
+        .permission_store = if (session.prompts_enabled) &session.permission_store else null,
+        // v1.24.3 — pointer-to-slot reads `session.current_prompter`
+        // at sub-agent spawn time (parent is mid-prompt then,
+        // so the slot holds the live prompter).
+        .permission_prompter_slot = &session.current_prompter,
+        .parent_session_dir = null,
+    };
+    const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 1);
+    @memcpy(final_tools[0..session.tools.len], session.tools);
+    final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
+    session.tools = final_tools;
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg);
 }

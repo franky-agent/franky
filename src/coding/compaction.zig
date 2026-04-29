@@ -218,6 +218,29 @@ pub fn selectSpan(
     };
 }
 
+/// v1.24.5 — public sum of `messageTokens` over a transcript.
+/// Used by the `/compact` slash handlers to render diagnostic
+/// messages ("not yet compactable" stays informative — shows
+/// actual transcript size + tail budget). Same accounting
+/// compaction uses internally for the tail-budget heuristic.
+pub fn estimateTranscriptTokens(messages: []const types.Message) u32 {
+    var total: u64 = 0;
+    for (messages) |m| total += messageTokens(m);
+    return @intCast(@min(total, std.math.maxInt(u32)));
+}
+
+/// v1.24.5 — count user-and-not-tool-result messages. Mirrors
+/// `selectSpan`'s anchor logic: a transcript with zero or one
+/// such message can never be compacted (anchor at index 0 or
+/// missing).
+pub fn countUserTurns(messages: []const types.Message) u32 {
+    var n: u32 = 0;
+    for (messages) |m| if (m.role == .user and m.tool_call_id == null) {
+        n += 1;
+    };
+    return n;
+}
+
 fn messageTokens(m: types.Message) u32 {
     var total_bytes: usize = 0;
     for (m.content) |cb| switch (cb) {
@@ -568,6 +591,41 @@ test "estimateTokens: english divides bytes by 3.5 (rounded up)" {
 test "estimateTokens: code divides bytes by 2 (rounded up)" {
     try testing.expectEqual(@as(u32, 1), estimateTokens("x", .code));
     try testing.expectEqual(@as(u32, 5), estimateTokens("abcdefghij", .code));
+}
+
+test "estimateTranscriptTokens + countUserTurns: diagnostic helpers (v1.24.5)" {
+    var user_first = [_]types.ContentBlock{.{ .text = .{ .text = "hello" } }};
+    var asst_first = [_]types.ContentBlock{.{ .text = .{ .text = "hi back, how can I help?" } }};
+    var user_second = [_]types.ContentBlock{.{ .text = .{ .text = "tell me about cats" } }};
+    const msgs = [_]types.Message{
+        .{ .role = .user, .content = &user_first, .timestamp = 0 },
+        .{ .role = .assistant, .content = &asst_first, .timestamp = 1 },
+        .{ .role = .user, .content = &user_second, .timestamp = 2 },
+    };
+
+    // 2 user turns, neither is a tool_result.
+    try testing.expectEqual(@as(u32, 2), countUserTurns(&msgs));
+
+    // ~ "hello" (5) + "hi back, how can I help?" (24) + "tell me about cats" (18) = 47 bytes
+    // / 3.5 ≈ 14 tokens. Just assert it's non-zero and ≥ each
+    // individual message — the precise number is brittle to
+    // estimateFromLen rounding.
+    const total = estimateTranscriptTokens(&msgs);
+    try testing.expect(total >= messageTokens(msgs[0]));
+    try testing.expect(total > 0);
+}
+
+test "countUserTurns: tool_result messages don't count as user turns" {
+    var user_only = [_]types.ContentBlock{.{ .text = .{ .text = "hi" } }};
+    var tr = [_]types.ContentBlock{.{ .text = .{ .text = "tool output" } }};
+    const msgs = [_]types.Message{
+        .{ .role = .user, .content = &user_only, .timestamp = 0 },
+        .{ .role = .tool_result, .content = &tr, .timestamp = 1, .tool_call_id = "call-1" },
+    };
+    // Only the first message counts — tool_result is excluded
+    // (matches selectSpan's anchor logic that excludes tool_result
+    // messages from being eligible anchors).
+    try testing.expectEqual(@as(u32, 1), countUserTurns(&msgs));
 }
 
 test "shouldTrigger: below 80% returns .none" {

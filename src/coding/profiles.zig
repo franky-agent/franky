@@ -525,6 +525,14 @@ const builtin_lm_studio_body =
     \\}
 ;
 
+const builtin_gemini_body =
+    \\{
+    \\  "provider": "google-gemini",
+    \\  "model": "gemini-2.5-pro",
+    \\  "api_key_env": "GEMINI_API_KEY"
+    \\}
+;
+
 pub const builtin_catalog = [_]Builtin{
     .{
         .name = "cloudflare-gemma",
@@ -561,6 +569,11 @@ pub const builtin_catalog = [_]Builtin{
         .description = "Local LM Studio on http://localhost:1234 (no auth)",
         .body = builtin_lm_studio_body,
     },
+    .{
+        .name = "gemini",
+        .description = "Google AI Studio Gemini — gemini-2.5-pro via native provider (env: GEMINI_API_KEY; or `franky login --provider google-gemini`)",
+        .body = builtin_gemini_body,
+    },
 };
 
 /// Return the embedded body for the named built-in, or null if no
@@ -579,6 +592,47 @@ pub fn getBuiltinBody(name: []const u8) ?[]const u8 {
 /// User profiles take priority — if a name exists in both, the user
 /// version wins at apply time and the built-in is marked
 /// `[overridden]`. Owned slice; caller frees.
+/// v1.24.1 — comma-separated list of available profile names
+/// (user from settings.json layers + built-in catalog, deduped),
+/// for embedding in the system prompt's subagent guidance.
+/// Names only — no descriptions. Sorted alphabetically for
+/// determinism (the prompt cache benefits from a stable order).
+pub fn listProfileNamesCSV(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *std.process.Environ.Map,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var names = std.StringHashMap(void).init(a);
+    const paths = try settingsPaths(a, environ_map);
+    const candidates = [_]?[]const u8{ paths.project, paths.franky_home, paths.home_canonical };
+    for (candidates) |maybe_path| {
+        const path = maybe_path orelse continue;
+        try collectUserProfileNames(a, io, path, &names);
+    }
+    for (builtin_catalog) |b| try names.put(try a.dupe(u8, b.name), {});
+
+    var sorted: std.ArrayList([]const u8) = .empty;
+    var it = names.iterator();
+    while (it.next()) |e| try sorted.append(a, e.key_ptr.*);
+    std.mem.sort([]const u8, sorted.items, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (sorted.items, 0..) |n, i| {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try out.appendSlice(allocator, n);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn listProfiles(
     allocator: std.mem.Allocator,
     io: std.Io,

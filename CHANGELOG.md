@@ -7,6 +7,156 @@ versions correspond to the roadmap milestones in `franky-spec-v1.md`
 `franky-spec-v0.md` under "Port implementation log" and the v0.\*
 roadmap section — this file starts from v1.x.
 
+## [1.22.0] — 2026-04-28 — `Agent.Config.tool_gate` (unblocks SDK consumers' permission gating)
+
+Surfaces `before_tool_call` and `role_denied` hooks on the
+high-level `Agent` class so SDK consumers (franky-do today,
+future siblings) can plug their own gating into the agent loop
+without forking. Pre-v1.22, only `between_turns` was wired; the
+other two hooks were live in `agent_loop.Config` but unreachable
+through `Agent`. franky-do hit this trying to wire Slack-side
+permission prompting in v0.3.2 and stalled.
+
+### Root cause
+
+`Agent.workerFn` hardcoded:
+
+```zig
+const cfg: loop_mod.Config = .{
+    ...
+    .hook_userdata = @ptrCast(self),  // → Agent
+    .between_turns = betweenTurnsHook,
+    // before_tool_call / role_denied: never set
+};
+```
+
+A consumer trying to plug in `coding/permissions.SessionGates`
+hit two walls:
+
+1. The hook *function* fields weren't routed from `Agent.Config`.
+2. Even if they were, the loop's single `hook_userdata` was
+   already taken by `*Agent` (needed by `betweenTurnsHook` for
+   queue access). Sharing the userdata across hooks would force
+   either a wrapper struct downcast on every hook entry, or a
+   loss of `between_turns` queue functionality.
+
+### Fix
+
+Two layers of additive change:
+
+**1. `agent_loop.Config` gains per-hook userdata fallbacks.**
+New fields `before_tool_call_userdata` and `role_denied_userdata`,
+both `?*anyopaque`. When set, the loop passes the override to
+the matching callback; when null, falls back to the existing
+`hook_userdata` (so every pre-v1.22 caller continues to work
+unchanged). Two tiny resolver helpers
+(`beforeToolCallUserdata` / `roleDeniedUserdata`) at the call
+sites consolidate the fallback logic.
+
+**2. `Agent.Config` gains a `tool_gate: ?ToolGate` field.**
+`ToolGate` is a generic three-field struct living in `agent.zig`
+(NOT in `coding/permissions.zig`) so the `agent → coding`
+one-way layering is preserved:
+
+```zig
+pub const ToolGate = struct {
+    userdata: ?*anyopaque = null,
+    before_tool_call: ?loop_mod.BeforeToolCallFn = null,
+    role_denied: ?loop_mod.RoleDeniedFn = null,
+};
+```
+
+`Agent.workerFn` reads the gate (or a defaulted empty one),
+plumbs the userdata + callbacks into the new `loop.Config`
+fields, and `between_turns` keeps its `*Agent` userdata via
+the shared `hook_userdata`:
+
+```zig
+const gate = self.tool_gate orelse ToolGate{};
+const cfg: loop_mod.Config = .{
+    ...
+    .hook_userdata = @ptrCast(self),       // for between_turns
+    .between_turns = betweenTurnsHook,
+    .before_tool_call = gate.before_tool_call,
+    .before_tool_call_userdata = gate.userdata,
+    .role_denied = gate.role_denied,
+    .role_denied_userdata = gate.userdata,
+};
+```
+
+### Usage from a downstream SDK consumer
+
+```zig
+// The bot owns a per-thread `permissions.Store` + `PermissionPrompter`
+// + `SessionGates` exactly as v1.11.x designed. The new piece is
+// passing those callbacks through `Agent.Config.tool_gate`:
+
+var session_gates: permissions.SessionGates = .{
+    .role = &role_gate,
+    .permissions = &store,
+    .prompter = &prompter,
+};
+
+var agent = try franky.agent.Agent.init(gpa, io, .{
+    ...,
+    .tool_gate = .{
+        .userdata = @ptrCast(&session_gates),
+        .before_tool_call = permissions.SessionGates.beforeToolCall,
+        .role_denied = permissions.SessionGates.roleDenied,
+    },
+});
+```
+
+The agent loop now calls `SessionGates.beforeToolCall` before
+every tool execution. When the policy returns `ask`, the
+prompter pushes `tool_permission_request` to the channel,
+suspends the worker, and the consumer's reaction handler /
+modal / whatever resolves via `prompter.resolve(call_id, …)`.
+
+### Backward compatibility
+
+Pre-v1.22 callers don't set `tool_gate`; the field defaults to
+`null` and the loop config's two new userdata fields default to
+`null` (fall back to `hook_userdata`). All 879 v1.21.0 tests
+continue to pass without modification.
+
+### Tests (+2 → 881)
+
+`Agent.tool_gate.before_tool_call fires with its own userdata;
+block: true vetoes the call` — registers a faux `noop` tool with
+an `unreachableTool` body, hooks the spy's `before_tool_call`
+returning `block = true`, asserts (a) the spy fires once, (b)
+args round-trip through, (c) the synthetic error result is
+emitted via `tool_execution_end` with `is_error = true`, (d) the
+unreachable tool body never runs.
+
+`Agent.tool_gate is independent of between_turns userdata` —
+sanity check that adding the gate doesn't clobber the Agent's
+own queue-drain hook. Sets up a tool_gate, prompts the agent,
+asserts the conversation completes (which requires
+`betweenTurnsHook`'s `*Agent` userdata to still be valid).
+
+### Files changed
+
+- `src/agent/loop.zig` — `Config` gains `before_tool_call_userdata`
+  + `role_denied_userdata`; two resolver helpers; three call
+  sites updated.
+- `src/agent/agent.zig` — `ToolGate` type definition;
+  `Agent.tool_gate` field; `Agent.Config.tool_gate` field;
+  `init` populates; `workerFn` plumbs into the loop config.
+- `test/agent_class_test.zig` — `ToolGateSpy` + `ToolEventCounter`
+  + `unreachableTool` test fixtures + 2 new tests.
+- `src/root.zig`, `build.zig.zon` — 1.21.0 → 1.22.0.
+
+### What this unblocks
+
+franky-do v0.3.2's Slack-side permission prompting (Feature B
+from `franky-do/v0.4-design.md`) is now a thin wrapper:
+implement the reaction → resolution mapping, plug
+`SessionGates` callbacks into `Agent.Config.tool_gate`, ship.
+The §1.5 + §7.1 work originally queued for v1.22.0 in
+`v1.21-design.md` slides to v1.23.0.
+
 ## [1.21.0] — 2026-04-28 — `Agent.workerFn` deadlock fix (concurrent drain)
 
 Fixes a hard hang in the high-level `Agent` class when a turn
