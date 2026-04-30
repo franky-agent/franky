@@ -36,6 +36,7 @@ const at = agent.types;
 const tools_mod = franky.coding.tools;
 const cli_mod = franky.coding.cli;
 const slash_mod = franky.coding.slash;
+const diagnostics_mod = franky.coding.diagnostics;
 const templates_mod = franky.coding.templates;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
@@ -251,6 +252,7 @@ fn runInteractive(
     try slash_registry.register(.{ .name = "branch", .description = "Fork a new branch at the head", .handler = interactiveBranchHandler });
     try slash_registry.register(.{ .name = "branches", .description = "List branches", .handler = interactiveBranchesHandler });
     try slash_registry.register(.{ .name = "checkout", .description = "Switch active branch", .handler = interactiveCheckoutHandler });
+    try slash_registry.register(.{ .name = "diagnostics", .description = "Per-turn diagnostic report (anomalies + trace pointers)", .handler = interactiveDiagnosticsHandler });
 
     // ── Extensions runtime ────────────────────────────────────────
     // Tier-1 extensions are compiled in and opt-in via `--extensions
@@ -775,6 +777,7 @@ fn paintHelpOverlay(buf: *tui.buffer.Buffer, no_color: bool) void {
         .{ "/branch NAME", "fork a new branch" },
         .{ "/branches", "list branches" },
         .{ "/checkout NAME", "switch active branch" },
+        .{ "/diagnostics", "per-turn anomaly report (see docs/reference/diagnostics.md)" },
         .{ "/template NAME", "expand + submit a prompt template" },
         .{ "/clear", "reset the transcript" },
         .{ "/login / logout", "OAuth flow info" },
@@ -1610,6 +1613,11 @@ const SessionBinding = struct {
     /// v1.19.0 — ReadCtx for the read tool (workspace + settings
     /// overlay). Stable address: tool ctx pointers reference it.
     read_ctx: tools_mod.read.ReadCtx = .{},
+    /// v1.29.2 — wall-clock at SessionBinding.init. Used by
+    /// `/diagnostics` to synthesize a stable per-run id
+    /// (`interactive-<startup_ms>`) for the persist path; rpc and
+    /// proxy use real session ids instead.
+    startup_ms: i64 = 0,
 
     /// Fills `binding` in place. Taking the destination pointer is
     /// required: the `FauxProvider`'s address gets registered with
@@ -1642,6 +1650,7 @@ const SessionBinding = struct {
                 tools_mod.workspace.Workspace{ .root = pwd, .host_env = environ_map }
             else
                 null,
+            .startup_ms = ai.stream.nowMillis(),
         };
         binding.read_ctx = .{
             .workspace = if (binding.workspace) |*ws| ws else null,
@@ -2023,6 +2032,78 @@ fn interactiveToolHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_m
     const msg = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{name});
     defer ctx.allocator.free(msg);
     try ctx.output.appendSlice(ctx.allocator, msg);
+}
+
+/// v1.29.1 — `/diagnostics` runs the
+/// `coding/diagnostics` analyzer over the live transcript and
+/// renders the report into `ctx.output`. Mirrors the process in
+/// `docs/reference/diagnostics.md` — Layer 1 (Message.diagnostics)
+/// always; Layer 4 (HTTP traces) when `--http-trace-dir` is set;
+/// Layer 3 (reducer dumps) is interactive-mode-deferred per v1
+/// spec §J (no on-disk session).
+///
+/// v1.29.2 — also persists the rendered report to
+/// `<franky_home>/diagnostics/<sid>/<unix_ms>.txt`. Interactive
+/// has no real session id; we synthesize
+/// `interactive-<startup_ms>` from the binding's startup
+/// timestamp so multiple invocations within one run group
+/// together. The output stays out of the LLM's transcript by
+/// construction — slash commands write to `ctx.output`
+/// (scrollback), never to `bridge.session.transcript.messages`.
+fn interactiveDiagnosticsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
+    const bridge = bridgeFromCtx(ctx);
+    const cfg = bridge.session.cfg;
+
+    const opts: diagnostics_mod.Options = .{
+        .transcript = bridge.session.transcript.messages.items,
+        .http_trace_dir = if (cfg.http_trace_dir) |s| (if (s.len > 0) s else null) else null,
+        .session_dir = null,
+        .session_label = "interactive (in-memory transcript)",
+        .mode_name = "interactive",
+    };
+
+    // Resolve $FRANKY_HOME / $HOME/.franky for the persist path.
+    const home_owned = diagnostics_mod.resolveFrankyHome(ctx.allocator, bridge.session.environ_map) catch |e| switch (e) {
+        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
+    };
+    defer if (home_owned) |h| ctx.allocator.free(h);
+
+    const sid_owned = std.fmt.allocPrint(
+        ctx.allocator,
+        "interactive-{d}",
+        .{bridge.session.startup_ms},
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
+    };
+    defer ctx.allocator.free(sid_owned);
+
+    const persist_opts: ?diagnostics_mod.PersistOptions = if (home_owned) |h| .{
+        .franky_home = h,
+        .session_id = sid_owned,
+        .timestamp_ms = ai.stream.nowMillis(),
+    } else null;
+
+    const result = diagnostics_mod.runAndPersist(
+        ctx.allocator,
+        bridge.session.io,
+        opts,
+        persist_opts,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
+    };
+    defer result.deinit(ctx.allocator);
+
+    try ctx.output.appendSlice(ctx.allocator, result.rendered);
+    if (result.persisted_path) |path| {
+        try ctx.output.appendSlice(ctx.allocator, "\nReport saved to: ");
+        try ctx.output.appendSlice(ctx.allocator, path);
+        try ctx.output.append(ctx.allocator, '\n');
+    } else {
+        try ctx.output.appendSlice(
+            ctx.allocator,
+            "\n(persist skipped: $FRANKY_HOME and $HOME both unset, or write failed)\n",
+        );
+    }
 }
 
 fn interactiveCostHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {

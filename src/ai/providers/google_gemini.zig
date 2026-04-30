@@ -283,12 +283,38 @@ pub fn runFromSse(
     out: *Channel,
     cancel: *stream_mod.Cancel,
 ) !void {
+    return runFromSseWithTrace(allocator, io, sse_body, out, cancel, null);
+}
+
+/// v1.29.0 — runFromSse + trace_id. The legacy 5-arg shape is
+/// retained so existing tests keep compiling without churn.
+pub fn runFromSseWithTrace(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sse_body: []const u8,
+    out: *Channel,
+    cancel: *stream_mod.Cancel,
+    trace_id: ?[]u8,
+) !void {
     try out.push(io, .start);
+    stream_mod.pushTraceId(out, io, allocator, trace_id);
     var driver = Driver{ .allocator = allocator, .io = io, .out = out };
     defer driver.deinit();
     const result = http_mod.driveSseFromBytes(allocator, sse_body, cancel, Driver.onEvent, @ptrCast(&driver));
     if (result) |_| {
-        if (!driver.closed) out.closeWithFinal(io, .{ .done = .{ .stop_reason = driver.stop_reason orelse .stop } });
+        if (!driver.closed) {
+            stream_mod.closeWithDiagnostics(out, io, allocator, .{
+                .provider = "google-gemini",
+                .stop_reason = driver.stop_reason orelse .stop,
+                .text_seen = driver.text_seen,
+                .thinking_seen = driver.thinking_seen,
+                .tool_count = driver.tool_count,
+                .parts_seen = driver.parts_seen,
+                .finish_reason_raw = driver.finish_reason_raw,
+                .candidates_tokens = driver.candidates_tokens,
+                .thoughts_tokens = driver.thoughts_tokens,
+            });
+        }
     } else |e| switch (e) {
         error.Aborted => out.closeWithFinal(io, .{ .error_ev = .{ .code = .aborted, .message = try allocator.dupe(u8, "cancelled") } }),
         error.ProtocolViolation => out.closeWithFinal(io, .{ .error_ev = .{ .code = .protocol_violation, .message = try allocator.dupe(u8, "malformed SSE") } }),
@@ -305,8 +331,26 @@ const Driver = struct {
     tool_count: u32 = 0,
     stop_reason: ?types.StopReason = null,
     closed: bool = false,
+    /// v1.29.0 — diagnostic counters. `parts_seen` increments on
+    /// every SSE event whose `candidates[0].content.parts` array
+    /// has at least one part. `text_seen`/`thinking_seen` flip on
+    /// the first non-empty text/thinking part. `finish_reason_raw`
+    /// captures the raw provider string verbatim. The `_tokens`
+    /// fields mirror what we already pull out of `usageMetadata`.
+    parts_seen: u32 = 0,
+    text_seen: bool = false,
+    thinking_seen: bool = false,
+    finish_reason_raw: ?[]const u8 = null, // arena-owned; valid while handle() runs
+    candidates_tokens: ?u64 = null,
+    thoughts_tokens: ?u64 = null,
+    /// Persisted copy of `finish_reason_raw` so it survives the
+    /// arena-lifetime of `handle`. Allocated on the Driver's
+    /// allocator; freed in `deinit`.
+    finish_reason_owned: ?[]u8 = null,
 
-    fn deinit(_: *Driver) void {}
+    fn deinit(self: *Driver) void {
+        if (self.finish_reason_owned) |s| self.allocator.free(s);
+    }
 
     fn onEvent(ud: ?*anyopaque, ev: sse_mod.Event) http_mod.EventHandlerError!void {
         const self: *Driver = @ptrCast(@alignCast(ud.?));
@@ -328,7 +372,8 @@ const Driver = struct {
             const cand = cs.array.items[0];
             if (cand != .object) return;
             if (cand.object.get("content")) |ct| if (ct == .object) {
-                if (ct.object.get("parts")) |ps| if (ps == .array) {
+                if (ct.object.get("parts")) |ps| if (ps == .array and ps.array.items.len > 0) {
+                    self.parts_seen +%= 1;
                     for (ps.array.items) |p| {
                         if (p != .object) continue;
                         // Gemini's `Part` proto carries two thinking-related
@@ -358,6 +403,7 @@ const Driver = struct {
                         };
                         if (is_thought) {
                             if (p.object.get("text")) |t| if (t == .string) {
+                                if (t.string.len > 0) self.thinking_seen = true;
                                 try self.out.push(self.io, .{ .thinking_delta = .{
                                     .block_index = 0,
                                     .delta = try self.allocator.dupe(u8, t.string),
@@ -366,6 +412,7 @@ const Driver = struct {
                             continue;
                         }
                         if (p.object.get("text")) |t| if (t == .string) {
+                            if (t.string.len > 0) self.text_seen = true;
                             try self.out.push(self.io, .{ .text_delta = .{
                                 .block_index = 0,
                                 .delta = try self.allocator.dupe(u8, t.string),
@@ -400,12 +447,25 @@ const Driver = struct {
             };
             if (cand.object.get("finishReason")) |fr| if (fr == .string) {
                 self.stop_reason = mapFinishReason(fr.string);
+                // v1.29.0 — preserve raw provider string for diagnostics.
+                // Last-write-wins; Gemini emits the final reason once.
+                if (self.finish_reason_owned) |old| self.allocator.free(old);
+                self.finish_reason_owned = self.allocator.dupe(u8, fr.string) catch null;
+                self.finish_reason_raw = self.finish_reason_owned;
             };
         };
 
         if (obj.get("usageMetadata")) |um| if (um == .object) {
             const inp: u64 = if (um.object.get("promptTokenCount")) |v| (if (v == .integer) @intCast(v.integer) else 0) else 0;
             const out: u64 = if (um.object.get("candidatesTokenCount")) |v| (if (v == .integer) @intCast(v.integer) else 0) else 0;
+            // v1.29.0 — also pull thoughtsTokenCount; both end up in
+            // the diagnostic struct so an after-the-fact reader can
+            // tell the empty-response signature ("thoughts > 0,
+            // candidates == 0") from a normal turn.
+            self.candidates_tokens = out;
+            if (um.object.get("thoughtsTokenCount")) |v| if (v == .integer) {
+                self.thoughts_tokens = @intCast(v.integer);
+            };
             try self.out.push(self.io, .{ .usage = .{ .input = inp, .output = out } });
         };
     }
@@ -536,7 +596,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     };
 
     const response_body = bw.written();
-    http_mod.writeTraceFile(
+    const trace_id_owned = http_mod.writeTraceFile(
         ctx.allocator,
         ctx.io,
         ctx.options.http_trace_dir,
@@ -548,6 +608,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         response_body,
     );
     if (@intFromEnum(result.status) >= 400) {
+        if (trace_id_owned) |tid| ctx.allocator.free(tid);
         try ctx.out.push(ctx.io, .start);
         const details = try @import("../error_map.zig").mapError(
             ctx.allocator,
@@ -559,7 +620,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         return;
     }
 
-    try runFromSse(ctx.allocator, ctx.io, response_body, ctx.out, cancel);
+    try runFromSseWithTrace(ctx.allocator, ctx.io, response_body, ctx.out, cancel, trace_id_owned);
 }
 
 // ─── tests ────────────────────────────────────────────────────────
@@ -744,7 +805,7 @@ test "runFromSse: text + finishReason STOP → done" {
             try testing.expectEqual(@as(u64, 2), u.output);
         },
         .done => |d| done_reason = d.stop_reason,
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expectEqual(@as(usize, 5), bytes);
     try testing.expect(saw_usage);
@@ -786,7 +847,7 @@ test "runFromSse: thoughtSignature parts route to thinking_delta (v1.26.4)" {
             text_bytes += d.delta.len;
             gpa.free(d.delta);
         },
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expect(thinking_bytes > 0);
     try testing.expectEqual(@as(usize, 0), text_bytes);
@@ -816,7 +877,7 @@ test "runFromSse: thought=true alone still routes to thinking (v1.26.4)" {
             thinking_bytes += d.delta.len;
             gpa.free(d.delta);
         },
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expectEqual(@as(usize, "reasoning".len), thinking_bytes);
 }
@@ -849,7 +910,7 @@ test "runFromSse: bare text (no thought, no signature) still routes to text" {
             text_bytes += d.delta.len;
             gpa.free(d.delta);
         },
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expectEqual(@as(usize, 0), thinking_bytes);
     try testing.expectEqual(@as(usize, "hello".len), text_bytes);
@@ -874,7 +935,7 @@ test "runFromSse: SAFETY → refusal" {
     while (ch.next(io)) |ev| switch (ev) {
         .text_delta => |d| gpa.free(d.delta),
         .done => |d| reason = d.stop_reason,
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expectEqual(@as(?types.StopReason, .refusal), reason);
 }
@@ -944,4 +1005,83 @@ test "renderArgs: null / non-object → \"{}\"" {
     const b = try renderArgs(gpa, .{ .string = "not-an-object" });
     defer gpa.free(b);
     try testing.expectEqualStrings("{}", b);
+}
+
+test "runFromSse: empty-response (STOP, no parts) closes with error_ev{empty_response} (v1.29.0)" {
+    // Pin the demonstrated Gemini-2.5-pro failure mode: the model
+    // returns a clean STOP terminal but emits zero content parts.
+    // Pre-v1.29.0 we'd silently close with `.done{.stop}` and the
+    // saved transcript would have an empty assistant message. With
+    // the v1.29.0 detection this must surface as a loud
+    // `error_ev{ code = .empty_response }` so the agent-loop UI
+    // can act on it.
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ch = try Channel.init(gpa, 16);
+    defer ch.deinit();
+    var cancel: stream_mod.Cancel = .{};
+
+    // Single SSE event matching the user-supplied trace: candidate
+    // content has no `parts` array, finishReason STOP, usageMetadata
+    // says 0 candidate tokens (only thoughts).
+    const sse =
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}]," ++
+        "\"usageMetadata\":{\"promptTokenCount\":3619,\"totalTokenCount\":4180,\"thoughtsTokenCount\":561}}\n\n";
+
+    try runFromSse(gpa, io, sse, &ch, &cancel);
+
+    var saw_error_empty = false;
+    var saw_done = false;
+    while (ch.next(io)) |ev| switch (ev) {
+        .error_ev => |e| {
+            if (e.code == .empty_response) saw_error_empty = true;
+            gpa.free(e.message);
+            if (e.tool_code) |v| gpa.free(v);
+            if (e.provider_code) |v| gpa.free(v);
+            if (e.provider_message) |v| gpa.free(v);
+        },
+        .done => saw_done = true,
+        else => ev.deinit(gpa),
+    };
+    try testing.expect(saw_error_empty);
+    try testing.expect(!saw_done);
+}
+
+test "runFromSseWithTrace: trace_id surfaces as a .diagnostic event (v1.29.0)" {
+    // The provider hands trace_id_owned (allocated by writeTraceFile)
+    // to runFromSseWithTrace, which pushes it as the first
+    // diagnostic event. Channel takes ownership; we free it here
+    // after popping.
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ch = try Channel.init(gpa, 16);
+    defer ch.deinit();
+    var cancel: stream_mod.Cancel = .{};
+
+    const tid = try gpa.dupe(u8, "1777498943846-0001");
+    const sse =
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n" ++
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+
+    try runFromSseWithTrace(gpa, io, sse, &ch, &cancel, tid);
+
+    var saw_trace_id = false;
+    while (ch.next(io)) |ev| switch (ev) {
+        .diagnostic => |d| {
+            if (d.trace_id) |s| {
+                if (std.mem.eql(u8, s, "1777498943846-0001")) saw_trace_id = true;
+                gpa.free(s);
+            }
+            if (d.finish_reason_raw) |s| gpa.free(s);
+        },
+        .text_delta => |d| gpa.free(d.delta),
+        else => ev.deinit(gpa),
+    };
+    try testing.expect(saw_trace_id);
 }

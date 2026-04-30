@@ -263,7 +263,21 @@ pub fn runFromSse(
     out: *Channel,
     cancel: *stream_mod.Cancel,
 ) !void {
+    return runFromSseWithTrace(allocator, io, sse_body, out, cancel, null);
+}
+
+/// v1.29.0 — runFromSse + trace_id. Channel takes ownership of
+/// `trace_id`; pass `null` to skip.
+pub fn runFromSseWithTrace(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sse_body: []const u8,
+    out: *Channel,
+    cancel: *stream_mod.Cancel,
+    trace_id: ?[]u8,
+) !void {
     try out.push(io, .start);
+    stream_mod.pushTraceId(out, io, allocator, trace_id);
 
     var driver = Driver{
         .allocator = allocator,
@@ -282,7 +296,16 @@ pub fn runFromSse(
 
     if (result) |_| {
         if (!driver.closed) {
-            out.closeWithFinal(io, .{ .done = .{ .stop_reason = driver.stop_reason orelse .stop } });
+            stream_mod.closeWithDiagnostics(out, io, allocator, .{
+                .provider = "anthropic",
+                .stop_reason = driver.stop_reason orelse .stop,
+                .text_seen = driver.text_seen,
+                .thinking_seen = driver.thinking_seen,
+                .tool_count = driver.tool_count,
+                .parts_seen = driver.parts_seen,
+                .finish_reason_raw = driver.finish_reason_owned,
+                .candidates_tokens = driver.candidates_tokens,
+            });
         }
     } else |e| switch (e) {
         error.Aborted => out.closeWithFinal(io, .{ .error_ev = .{
@@ -331,6 +354,15 @@ const Driver = struct {
 
     stop_reason: ?types.StopReason = null,
     closed: bool = false,
+    /// v1.29.0 — diagnostic counters (see `stream.TerminalInfo`).
+    /// `parts_seen` increments on `content_block_start` (each opens
+    /// a "part" in Anthropic's model); the seen-flags track whether
+    /// any non-empty delta of that kind was actually pushed.
+    parts_seen: u32 = 0,
+    text_seen: bool = false,
+    thinking_seen: bool = false,
+    finish_reason_owned: ?[]u8 = null,
+    candidates_tokens: ?u64 = null,
 
     const SlotKind = enum { text, thinking, tool_call };
 
@@ -346,6 +378,7 @@ const Driver = struct {
             self.slot_kind.deinit();
             self.slot_kind_idx.deinit();
         }
+        if (self.finish_reason_owned) |s| self.allocator.free(s);
     }
 
     fn onEvent(ud: ?*anyopaque, ev: sse_mod.Event) http_mod.EventHandlerError!void {
@@ -370,6 +403,7 @@ const Driver = struct {
         if (std.mem.eql(u8, name, "message_start")) return;
 
         if (std.mem.eql(u8, name, "content_block_start")) {
+            self.parts_seen +%= 1;
             const idx: u32 = @intCast(root.object.get("index").?.integer);
             const cb = root.object.get("content_block") orelse return;
             const ty = cb.object.get("type") orelse return;
@@ -407,6 +441,7 @@ const Driver = struct {
             if (std.mem.eql(u8, ty.string, "text_delta")) {
                 const text = delta.object.get("text") orelse return;
                 if (text != .string) return;
+                if (text.string.len > 0) self.text_seen = true;
                 try self.out.push(self.io, .{ .text_delta = .{
                     .block_index = kidx,
                     .delta = try self.allocator.dupe(u8, text.string),
@@ -414,6 +449,7 @@ const Driver = struct {
             } else if (std.mem.eql(u8, ty.string, "thinking_delta")) {
                 const text = delta.object.get("thinking") orelse return;
                 if (text != .string) return;
+                if (text.string.len > 0) self.thinking_seen = true;
                 try self.out.push(self.io, .{ .thinking_delta = .{
                     .block_index = kidx,
                     .delta = try self.allocator.dupe(u8, text.string),
@@ -459,18 +495,30 @@ const Driver = struct {
             if (root.object.get("delta")) |d| if (d == .object) {
                 if (d.object.get("stop_reason")) |sr| if (sr == .string) {
                     self.stop_reason = types.StopReason.fromString(sr.string) orelse .stop;
+                    if (self.finish_reason_owned) |old| self.allocator.free(old);
+                    self.finish_reason_owned = self.allocator.dupe(u8, sr.string) catch null;
                 };
             };
             if (root.object.get("usage")) |uv| if (uv == .object) {
                 const inp: u64 = if (uv.object.get("input_tokens")) |v| @intCast(v.integer) else 0;
                 const out: u64 = if (uv.object.get("output_tokens")) |v| @intCast(v.integer) else 0;
+                self.candidates_tokens = out;
                 try self.out.push(self.io, .{ .usage = .{ .input = inp, .output = out } });
             };
             return;
         }
 
         if (std.mem.eql(u8, name, "message_stop")) {
-            self.out.closeWithFinal(self.io, .{ .done = .{ .stop_reason = self.stop_reason orelse .stop } });
+            stream_mod.closeWithDiagnostics(self.out, self.io, self.allocator, .{
+                .provider = "anthropic",
+                .stop_reason = self.stop_reason orelse .stop,
+                .text_seen = self.text_seen,
+                .thinking_seen = self.thinking_seen,
+                .tool_count = self.tool_count,
+                .parts_seen = self.parts_seen,
+                .finish_reason_raw = self.finish_reason_owned,
+                .candidates_tokens = self.candidates_tokens,
+            });
             self.closed = true;
             return;
         }
@@ -605,7 +653,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     const response_body = bw.written();
     log.log(.debug, "http", "response", "status={d} body_bytes={d}", .{ @intFromEnum(result.status), response_body.len });
     log.body(.trace, "http", "response_body", response_body, 64 * 1024);
-    http_mod.writeTraceFile(
+    const trace_id_owned = http_mod.writeTraceFile(
         ctx.allocator,
         ctx.io,
         ctx.options.http_trace_dir,
@@ -618,6 +666,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     );
 
     if (@intFromEnum(result.status) >= 400) {
+        if (trace_id_owned) |tid| ctx.allocator.free(tid);
         try ctx.out.push(ctx.io, .start);
         const details = try @import("../error_map.zig").mapError(
             ctx.allocator,
@@ -629,7 +678,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         return;
     }
 
-    try runFromSse(ctx.allocator, ctx.io, response_body, ctx.out, cancel);
+    try runFromSseWithTrace(ctx.allocator, ctx.io, response_body, ctx.out, cancel, trace_id_owned);
 }
 
 // ─── tests ────────────────────────────────────────────────────────

@@ -186,14 +186,35 @@ pub fn runFromSse(
     out: *Channel,
     cancel: *stream_mod.Cancel,
 ) !void {
+    return runFromSseWithTrace(allocator, io, sse_body, out, cancel, null);
+}
+
+/// v1.29.0 — runFromSse + trace_id. Channel takes ownership.
+pub fn runFromSseWithTrace(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sse_body: []const u8,
+    out: *Channel,
+    cancel: *stream_mod.Cancel,
+    trace_id: ?[]u8,
+) !void {
     try out.push(io, .start);
+    stream_mod.pushTraceId(out, io, allocator, trace_id);
     var driver = Driver{ .allocator = allocator, .io = io, .out = out };
     defer driver.deinit();
 
     const result = http_mod.driveSseFromBytes(allocator, sse_body, cancel, Driver.onEvent, @ptrCast(&driver));
     if (result) |_| {
         if (!driver.closed) {
-            out.closeWithFinal(io, .{ .done = .{ .stop_reason = driver.stop_reason orelse .stop } });
+            stream_mod.closeWithDiagnostics(out, io, allocator, .{
+                .provider = "openai-responses",
+                .stop_reason = driver.stop_reason orelse .stop,
+                .text_seen = driver.text_seen,
+                .thinking_seen = driver.thinking_seen,
+                .tool_count = driver.seen_tool_slots,
+                .parts_seen = driver.parts_seen,
+                .candidates_tokens = driver.candidates_tokens,
+            });
         }
     } else |e| switch (e) {
         error.Aborted => out.closeWithFinal(io, .{ .error_ev = .{ .code = .aborted, .message = try allocator.dupe(u8, "cancelled") } }),
@@ -213,6 +234,11 @@ const Driver = struct {
     seen_tool_slots: u32 = 0,
     stop_reason: ?types.StopReason = null,
     closed: bool = false,
+    /// v1.29.0 — diagnostics (see `stream.TerminalInfo`).
+    parts_seen: u32 = 0,
+    text_seen: bool = false,
+    thinking_seen: bool = false,
+    candidates_tokens: ?u64 = null,
 
     fn lazyInit(self: *Driver) !void {
         if (self.started_init) return;
@@ -244,6 +270,8 @@ const Driver = struct {
 
         if (std.mem.eql(u8, name, "response.output_text.delta")) {
             if (obj.get("delta")) |d| if (d == .string) {
+                self.parts_seen +%= 1;
+                if (d.string.len > 0) self.text_seen = true;
                 try self.out.push(self.io, .{ .text_delta = .{
                     .block_index = 0,
                     .delta = try self.allocator.dupe(u8, d.string),
@@ -253,6 +281,8 @@ const Driver = struct {
         }
         if (std.mem.eql(u8, name, "response.reasoning_summary_text.delta")) {
             if (obj.get("delta")) |d| if (d == .string) {
+                self.parts_seen +%= 1;
+                if (d.string.len > 0) self.thinking_seen = true;
                 try self.out.push(self.io, .{ .thinking_delta = .{
                     .block_index = 0,
                     .delta = try self.allocator.dupe(u8, d.string),
@@ -298,11 +328,20 @@ const Driver = struct {
                 if (r.object.get("usage")) |uv| if (uv == .object) {
                     const inp: u64 = if (uv.object.get("input_tokens")) |v| (if (v == .integer) @intCast(v.integer) else 0) else 0;
                     const out: u64 = if (uv.object.get("output_tokens")) |v| (if (v == .integer) @intCast(v.integer) else 0) else 0;
+                    self.candidates_tokens = out;
                     try self.out.push(self.io, .{ .usage = .{ .input = inp, .output = out } });
                 };
             };
             self.stop_reason = .stop;
-            self.out.closeWithFinal(self.io, .{ .done = .{ .stop_reason = self.stop_reason.? } });
+            stream_mod.closeWithDiagnostics(self.out, self.io, self.allocator, .{
+                .provider = "openai-responses",
+                .stop_reason = self.stop_reason.?,
+                .text_seen = self.text_seen,
+                .thinking_seen = self.thinking_seen,
+                .tool_count = self.seen_tool_slots,
+                .parts_seen = self.parts_seen,
+                .candidates_tokens = self.candidates_tokens,
+            });
             self.closed = true;
             return;
         }
@@ -381,7 +420,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     };
 
     const response_body = bw.written();
-    http_mod.writeTraceFile(
+    const trace_id_owned = http_mod.writeTraceFile(
         ctx.allocator,
         ctx.io,
         ctx.options.http_trace_dir,
@@ -393,6 +432,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         response_body,
     );
     if (@intFromEnum(result.status) >= 400) {
+        if (trace_id_owned) |tid| ctx.allocator.free(tid);
         try ctx.out.push(ctx.io, .start);
         const details = try @import("../error_map.zig").mapError(
             ctx.allocator,
@@ -404,7 +444,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         return;
     }
 
-    try runFromSse(ctx.allocator, ctx.io, response_body, ctx.out, cancel);
+    try runFromSseWithTrace(ctx.allocator, ctx.io, response_body, ctx.out, cancel, trace_id_owned);
 }
 
 // ─── tests ────────────────────────────────────────────────────────
@@ -515,7 +555,7 @@ test "runFromSse: text delta + completed → done" {
             try testing.expectEqual(@as(u64, 2), u.output);
         },
         .done => seen_done = true,
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expectEqual(@as(usize, 5), seen_bytes);
     try testing.expect(seen_usage);
@@ -560,7 +600,7 @@ test "runFromSse: function_call_arguments.delta emits toolcall events" {
             gpa.free(e.args_json);
         },
         .done => {},
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expect(saw_start);
     try testing.expect(saw_end);

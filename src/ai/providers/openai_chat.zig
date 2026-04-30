@@ -253,7 +253,20 @@ pub fn runFromSse(
     out: *Channel,
     cancel: *stream_mod.Cancel,
 ) !void {
+    return runFromSseWithTrace(allocator, io, sse_body, out, cancel, null);
+}
+
+/// v1.29.0 — runFromSse + trace_id. Channel takes ownership.
+pub fn runFromSseWithTrace(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sse_body: []const u8,
+    out: *Channel,
+    cancel: *stream_mod.Cancel,
+    trace_id: ?[]u8,
+) !void {
     try out.push(io, .start);
+    stream_mod.pushTraceId(out, io, allocator, trace_id);
 
     var driver = Driver{
         .allocator = allocator,
@@ -272,7 +285,16 @@ pub fn runFromSse(
 
     if (result) |_| {
         if (!driver.closed) {
-            out.closeWithFinal(io, .{ .done = .{ .stop_reason = driver.stop_reason orelse .stop } });
+            stream_mod.closeWithDiagnostics(out, io, allocator, .{
+                .provider = "openai-chat",
+                .stop_reason = driver.stop_reason orelse .stop,
+                .text_seen = driver.text_seen,
+                .thinking_seen = driver.thinking_seen,
+                .tool_count = driver.seen_tool_slots,
+                .parts_seen = driver.parts_seen,
+                .finish_reason_raw = driver.finish_reason_owned,
+                .candidates_tokens = driver.candidates_tokens,
+            });
         }
     } else |e| switch (e) {
         error.Aborted => out.closeWithFinal(io, .{ .error_ev = .{
@@ -316,6 +338,14 @@ const Driver = struct {
     seen_tool_slots: u32 = 0,
     stop_reason: ?types.StopReason = null,
     closed: bool = false,
+    /// v1.29.0 — diagnostics. `parts_seen` increments on each
+    /// `choices[0].delta` chunk that carried any field; `text_seen`
+    /// flips on the first non-empty content delta.
+    parts_seen: u32 = 0,
+    text_seen: bool = false,
+    thinking_seen: bool = false,
+    finish_reason_owned: ?[]u8 = null,
+    candidates_tokens: ?u64 = null,
 
     fn lazyInit(self: *Driver) !void {
         if (self.started_init) return;
@@ -325,6 +355,7 @@ const Driver = struct {
 
     fn deinit(self: *Driver) void {
         if (self.started_init) self.started_tool_slots.deinit();
+        if (self.finish_reason_owned) |s| self.allocator.free(s);
     }
 
     fn onEvent(ud: ?*anyopaque, ev: sse_mod.Event) http_mod.EventHandlerError!void {
@@ -346,7 +377,16 @@ const Driver = struct {
                     .args_json = try self.allocator.dupe(u8, ""),
                 } });
             }
-            self.out.closeWithFinal(self.io, .{ .done = .{ .stop_reason = self.stop_reason orelse .stop } });
+            stream_mod.closeWithDiagnostics(self.out, self.io, self.allocator, .{
+                .provider = "openai-chat",
+                .stop_reason = self.stop_reason orelse .stop,
+                .text_seen = self.text_seen,
+                .thinking_seen = self.thinking_seen,
+                .tool_count = self.seen_tool_slots,
+                .parts_seen = self.parts_seen,
+                .finish_reason_raw = self.finish_reason_owned,
+                .candidates_tokens = self.candidates_tokens,
+            });
             self.closed = true;
             return;
         }
@@ -367,6 +407,7 @@ const Driver = struct {
                 (if (v == .integer) @intCast(v.integer) else 0)
             else
                 0;
+            self.candidates_tokens = out;
             try self.out.push(self.io, .{ .usage = .{ .input = inp, .output = out } });
         };
 
@@ -376,17 +417,21 @@ const Driver = struct {
         if (choice != .object) return;
 
         if (choice.object.get("delta")) |dv| if (dv == .object) {
+            self.parts_seen +%= 1;
             try self.handleDelta(dv.object);
         };
 
         if (choice.object.get("finish_reason")) |fr| if (fr == .string) {
             self.stop_reason = mapFinishReason(fr.string);
+            if (self.finish_reason_owned) |old| self.allocator.free(old);
+            self.finish_reason_owned = self.allocator.dupe(u8, fr.string) catch null;
         };
     }
 
     fn handleDelta(self: *Driver, delta: std.json.ObjectMap) !void {
         // Content fragment.
         if (delta.get("content")) |cv| if (cv == .string) {
+            if (cv.string.len > 0) self.text_seen = true;
             try self.out.push(self.io, .{ .text_delta = .{
                 .block_index = 0,
                 .delta = try self.allocator.dupe(u8, cv.string),
@@ -402,12 +447,14 @@ const Driver = struct {
         // arrives. We translate to the existing `thinking_delta`
         // event, the same channel Anthropic's reasoning takes.
         if (delta.get("reasoning_content")) |rv| if (rv == .string) {
+            if (rv.string.len > 0) self.thinking_seen = true;
             try self.out.push(self.io, .{ .thinking_delta = .{
                 .block_index = 0,
                 .delta = try self.allocator.dupe(u8, rv.string),
             } });
         };
         if (delta.get("reasoning")) |rv| if (rv == .string) {
+            if (rv.string.len > 0) self.thinking_seen = true;
             try self.out.push(self.io, .{ .thinking_delta = .{
                 .block_index = 0,
                 .delta = try self.allocator.dupe(u8, rv.string),
@@ -547,7 +594,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 
     const response_body = bw.written();
     log.log(.debug, "http", "response", "status={d} body_bytes={d}", .{ @intFromEnum(result.status), response_body.len });
-    http_mod.writeTraceFile(
+    const trace_id_owned = http_mod.writeTraceFile(
         ctx.allocator,
         ctx.io,
         ctx.options.http_trace_dir,
@@ -560,6 +607,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     );
 
     if (@intFromEnum(result.status) >= 400) {
+        if (trace_id_owned) |tid| ctx.allocator.free(tid);
         try ctx.out.push(ctx.io, .start);
         const details = try @import("../error_map.zig").mapError(
             ctx.allocator,
@@ -571,7 +619,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         return;
     }
 
-    try runFromSse(ctx.allocator, ctx.io, response_body, ctx.out, cancel);
+    try runFromSseWithTrace(ctx.allocator, ctx.io, response_body, ctx.out, cancel, trace_id_owned);
 }
 
 // ─── tests ────────────────────────────────────────────────────────
@@ -712,7 +760,7 @@ test "runFromSse: text delta + finish_reason → done" {
             try testing.expectEqual(@as(u64, 2), u.output);
         },
         .done => |d| done_reason = d.stop_reason,
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expectEqual(@as(usize, 5), seen_text); // "Hel" + "lo"
     try testing.expect(seen_usage);
@@ -752,7 +800,7 @@ test "runFromSse: reasoning_content delta becomes thinking_delta" {
             text_bytes += d.delta.len;
             gpa.free(d.delta);
         },
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expectEqual(@as(usize, "let me".len + " think".len), thinking_bytes);
     try testing.expectEqual(@as(usize, 2), text_bytes); // "OK"
@@ -781,7 +829,7 @@ test "runFromSse: bare `reasoning` field is also accepted" {
             thinking_bytes += d.delta.len;
             gpa.free(d.delta);
         },
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expectEqual(@as(usize, 3), thinking_bytes); // "hmm"
 }
@@ -828,7 +876,7 @@ test "runFromSse: tool-call argument streaming" {
             gpa.free(e.args_json);
         },
         .done => |d| done_reason = d.stop_reason,
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expect(saw_start);
     try testing.expectEqualStrings("call_1", start_id);
@@ -861,7 +909,7 @@ test "runFromSse: content_filter → refusal stop_reason" {
     while (ch.next(io)) |ev| switch (ev) {
         .text_delta => |d| gpa.free(d.delta),
         .done => |d| reason = d.stop_reason,
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expectEqual(@as(?types.StopReason, .refusal), reason);
 }
@@ -901,7 +949,7 @@ test "runFromSse: ignores malformed chunks, preserves earlier deltas" {
             gpa.free(d.delta);
         },
         .done => |d| reason = d.stop_reason,
-        else => {},
+        else => ev.deinit(gpa),
     };
     try testing.expectEqual(@as(usize, 2), seen);
     try testing.expectEqual(@as(?types.StopReason, .stop), reason);

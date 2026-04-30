@@ -374,6 +374,59 @@ fn appendMessageJson(
         try buf.appendSlice(allocator, ",\"api\":");
         try appendJsonStr(buf, allocator, p);
     }
+    // v1.29.0 — Message.Diagnostics. Only emit when at least one
+    // field is non-default; pre-v1.29 transcripts round-trip
+    // unchanged.
+    if (m.diagnostics) |d| if (!d.isEmpty()) {
+        try buf.appendSlice(allocator, ",\"diagnostics\":{");
+        var first = true;
+        if (d.trace_id) |s| {
+            try buf.appendSlice(allocator, "\"traceId\":");
+            try appendJsonStr(buf, allocator, s);
+            first = false;
+        }
+        if (d.finish_reason_raw) |s| {
+            if (!first) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "\"finishReasonRaw\":");
+            try appendJsonStr(buf, allocator, s);
+            first = false;
+        }
+        if (d.parts_seen != 0) {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"partsSeen\":", d.parts_seen);
+            first = false;
+        }
+        if (d.candidates_tokens) |n| {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"candidatesTokens\":", n);
+            first = false;
+        }
+        if (d.thoughts_tokens) |n| {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"thoughtsTokens\":", n);
+            first = false;
+        }
+        if (d.text_event_count != 0) {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"textEvents\":", d.text_event_count);
+            first = false;
+        }
+        if (d.thinking_event_count != 0) {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"thinkingEvents\":", d.thinking_event_count);
+            first = false;
+        }
+        if (d.tool_call_event_count != 0) {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"toolCallEvents\":", d.tool_call_event_count);
+            first = false;
+        }
+        if (d.was_degenerate) {
+            if (!first) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "\"wasDegenerate\":true");
+        }
+        try buf.append(allocator, '}');
+    };
     try buf.appendSlice(allocator, "}");
 }
 
@@ -490,6 +543,42 @@ fn parseMessage(
         }
     };
 
+    // v1.29.0 — Diagnostics round-trip. Old transcripts without
+    // the field decode as null and round-trip cleanly.
+    var diag_opt: ?ai.types.Diagnostics = null;
+    if (o.get("diagnostics")) |dv| if (dv == .object) {
+        const dobj = dv.object;
+        var diag: ai.types.Diagnostics = .{};
+        if (dobj.get("traceId")) |v| if (v == .string) {
+            diag.trace_id = try allocator.dupe(u8, v.string);
+        };
+        if (dobj.get("finishReasonRaw")) |v| if (v == .string) {
+            diag.finish_reason_raw = try allocator.dupe(u8, v.string);
+        };
+        if (dobj.get("partsSeen")) |v| if (v == .integer) {
+            diag.parts_seen = @intCast(v.integer);
+        };
+        if (dobj.get("candidatesTokens")) |v| if (v == .integer) {
+            diag.candidates_tokens = @intCast(v.integer);
+        };
+        if (dobj.get("thoughtsTokens")) |v| if (v == .integer) {
+            diag.thoughts_tokens = @intCast(v.integer);
+        };
+        if (dobj.get("textEvents")) |v| if (v == .integer) {
+            diag.text_event_count = @intCast(v.integer);
+        };
+        if (dobj.get("thinkingEvents")) |v| if (v == .integer) {
+            diag.thinking_event_count = @intCast(v.integer);
+        };
+        if (dobj.get("toolCallEvents")) |v| if (v == .integer) {
+            diag.tool_call_event_count = @intCast(v.integer);
+        };
+        if (dobj.get("wasDegenerate")) |v| if (v == .bool) {
+            diag.was_degenerate = v.bool;
+        };
+        diag_opt = diag;
+    };
+
     return .{
         .role = role,
         .content = try content.toOwnedSlice(allocator),
@@ -501,6 +590,7 @@ fn parseMessage(
         .model = if (o.get("model")) |v| try allocator.dupe(u8, v.string) else null,
         .api = if (o.get("api")) |v| try allocator.dupe(u8, v.string) else null,
         .custom_role = if (role == .custom) try allocator.dupe(u8, role_str) else null,
+        .diagnostics = diag_opt,
     };
 }
 
@@ -633,6 +723,21 @@ fn appendJsonNumField(
     allocator: std.mem.Allocator,
     prefix: []const u8,
     value: i64,
+) !void {
+    try buf.appendSlice(allocator, prefix);
+    const s = try std.fmt.allocPrint(allocator, "{d}", .{value});
+    defer allocator.free(s);
+    try buf.appendSlice(allocator, s);
+}
+
+/// v1.29.0 — same shape but for unsigned 64-bit values used in
+/// the diagnostics serializer (token counts can exceed i64 range
+/// in pathological cases; cheap to keep them unsigned).
+fn appendJsonU64Field(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    value: u64,
 ) !void {
     try buf.appendSlice(allocator, prefix);
     const s = try std.fmt.allocPrint(allocator, "{d}", .{value});
@@ -1293,4 +1398,62 @@ test "transcript: threshold edge — just below stays inline, at threshold spill
         return;
     };
     try testing.expect(std.mem.indexOfPos(u8, t_bytes, first_ref + 1, "\"type\":\"ref\"") == null);
+}
+
+test "Diagnostics round-trips through writeTranscript / readTranscript (v1.29.0)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky-session-diag";
+    std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    var transcript = agent_mod.loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    const c = try gpa.alloc(ai.types.ContentBlock, 1);
+    c[0] = .{ .text = .{ .text = try gpa.dupe(u8, "ok") } };
+    try transcript.append(.{
+        .role = .assistant,
+        .content = c,
+        .timestamp = 100,
+        .stop_reason = .stop,
+        .diagnostics = .{
+            .trace_id = try gpa.dupe(u8, "1777498943846-0007"),
+            .finish_reason_raw = try gpa.dupe(u8, "STOP"),
+            .parts_seen = 4,
+            .candidates_tokens = 12,
+            .thoughts_tokens = 561,
+            .text_event_count = 3,
+            .was_degenerate = false,
+        },
+    });
+
+    const header: SessionHeader = .{
+        .id = "01JDIAG",
+        .created_at_ms = 0,
+        .updated_at_ms = 0,
+        .title = "diag",
+        .provider = "google-gemini",
+        .model = "gemini-2.5-pro",
+        .api = "google-gemini",
+        .thinking_level = "high",
+    };
+    try save(gpa, io, base, header, &transcript);
+
+    var loaded = try load(gpa, io, base, "01JDIAG");
+    defer loaded.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 1), loaded.transcript.messages.items.len);
+    const m = loaded.transcript.messages.items[0];
+    try testing.expect(m.diagnostics != null);
+    const d = m.diagnostics.?;
+    try testing.expectEqualStrings("1777498943846-0007", d.trace_id.?);
+    try testing.expectEqualStrings("STOP", d.finish_reason_raw.?);
+    try testing.expectEqual(@as(u32, 4), d.parts_seen);
+    try testing.expectEqual(@as(?u64, 12), d.candidates_tokens);
+    try testing.expectEqual(@as(?u64, 561), d.thoughts_tokens);
+    try testing.expectEqual(@as(u32, 3), d.text_event_count);
 }

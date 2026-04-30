@@ -426,11 +426,16 @@ fn runPrint(
     // persistence is skipped.
     var session_dir_path: ?[]u8 = null;
     defer if (session_dir_path) |p| allocator.free(p);
+    var events_dir_path: ?[]u8 = null;
+    defer if (events_dir_path) |p| allocator.free(p);
     if (session_state.parent_dir) |parent| {
         session_dir_path = std.fs.path.join(allocator, &.{ parent, session_state.id() }) catch null;
         if (session_dir_path) |sd| {
             bash_state.setSessionDir(sd) catch {};
             subagent_ctx.parent_session_dir = sd;
+            // v1.29.0 — `<session>/events` for reducer-state dumps
+            // when a turn ends degenerate (clean STOP, zero content).
+            events_dir_path = std.fs.path.join(allocator, &.{ sd, "events" }) catch null;
         }
     }
 
@@ -497,6 +502,7 @@ fn runPrint(
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .text_tool_call_fallback = cfg.text_tool_call_fallback,
+            .reducer_dump_dir = events_dir_path,
             .stream_options = .{
                 .api_key = provider_info.api_key,
                 .auth_token = provider_info.auth_token,

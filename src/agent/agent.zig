@@ -58,6 +58,11 @@ pub const Agent = struct {
     /// v1.22.0 — see `Config.tool_gate`. Plain copy from Config
     /// at init time; the userdata pointer stays caller-owned.
     tool_gate: ?ToolGate = null,
+    /// v1.29.0 — directory the agent loop dumps reducer-state
+    /// snapshots to when a turn ends with zero content blocks
+    /// (see `loop.Config.reducer_dump_dir`). Caller-owned slice
+    /// (typically a session-arena allocation); `null` disables.
+    reducer_dump_dir: ?[]const u8 = null,
 
     // ── subscribers ───────────────────────────────────────────────
     subs: std.ArrayList(Subscription) = .empty,
@@ -106,6 +111,11 @@ pub const Agent = struct {
         /// the `agent → coding` one-way layering. `null` keeps
         /// pre-v1.22 semantics (no per-tool gate).
         tool_gate: ?ToolGate = null,
+        /// v1.29.0 — see `Agent.reducer_dump_dir`. When set, the
+        /// agent loop snapshots reducer state to disk on
+        /// degenerate (zero-content) turns. Mode drivers point
+        /// this at `<session>/events`.
+        reducer_dump_dir: ?[]const u8 = null,
     };
 
     /// v1.22.0 — generic per-tool-call gate. Each callback is
@@ -144,6 +154,7 @@ pub const Agent = struct {
             .registry = config.registry,
             .stream_options = config.stream_options,
             .tool_gate = config.tool_gate,
+            .reducer_dump_dir = config.reducer_dump_dir,
         };
     }
 
@@ -416,6 +427,7 @@ pub const Agent = struct {
             .before_tool_call_userdata = gate.userdata,
             .role_denied = gate.role_denied,
             .role_denied_userdata = gate.userdata,
+            .reducer_dump_dir = self.reducer_dump_dir,
         };
 
         const loop_args: LoopWorkerArgs = .{

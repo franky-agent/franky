@@ -37,6 +37,7 @@ pub const default_region: []const u8 = "us-central1";
 /// discoverability + tests.
 pub const buildRequestJson = gemini.buildRequestJson;
 pub const runFromSse = gemini.runFromSse;
+pub const runFromSseWithTrace = gemini.runFromSseWithTrace;
 
 /// Build the Vertex endpoint path. `base` is the host (either
 /// caller-supplied or defaulted). No-op validation — malformed URLs
@@ -125,7 +126,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     };
 
     const response_body = bw.written();
-    http_mod.writeTraceFile(
+    const trace_id_owned = http_mod.writeTraceFile(
         ctx.allocator,
         ctx.io,
         ctx.options.http_trace_dir,
@@ -137,6 +138,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         response_body,
     );
     if (@intFromEnum(result.status) >= 400) {
+        if (trace_id_owned) |tid| ctx.allocator.free(tid);
         try ctx.out.push(ctx.io, .start);
         const details = try @import("../error_map.zig").mapError(
             ctx.allocator,
@@ -148,7 +150,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         return;
     }
 
-    try runFromSse(ctx.allocator, ctx.io, response_body, ctx.out, cancel);
+    try runFromSseWithTrace(ctx.allocator, ctx.io, response_body, ctx.out, cancel, trace_id_owned);
 }
 
 // ─── tests ────────────────────────────────────────────────────────

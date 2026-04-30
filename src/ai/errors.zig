@@ -38,6 +38,15 @@ pub const Code = enum {
     transport,
     // model
     safety_refusal,
+    /// v1.29.0 — provider returned a clean STOP terminal but emitted
+    /// zero content (no text, no thinking, no tool call). Most-seen
+    /// trigger today is gemini-2.5-pro exhausting its `thinkingBudget`
+    /// before serializing a `functionCall`, but the same shape can
+    /// fire on any provider when the model's reasoning eats the
+    /// output budget. Surfaced loudly instead of silently saving an
+    /// empty assistant message; not retried automatically because
+    /// the same prompt typically reproduces the same regression.
+    empty_response,
     // caller
     aborted,
     // tool
@@ -76,6 +85,7 @@ pub const AgentError = error{
     Timeout,
     Transport,
     SafetyRefusal,
+    EmptyResponse,
     Aborted,
     ToolArgValidation,
     ToolRuntime,
@@ -113,6 +123,7 @@ pub const ErrorDetails = struct {
             .timeout => error.Timeout,
             .transport => error.Transport,
             .safety_refusal => error.SafetyRefusal,
+            .empty_response => error.EmptyResponse,
             .aborted => error.Aborted,
             .tool_arg_validation => error.ToolArgValidation,
             .tool_runtime => error.ToolRuntime,

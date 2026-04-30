@@ -44,6 +44,7 @@ pub const models_render = @import("models_render.zig");
 pub const models_fetch = @import("models_fetch.zig");
 pub const rpc = @import("rpc.zig");
 pub const slash = @import("slash.zig");
+pub const diagnostics = @import("diagnostics.zig");
 pub const templates = @import("templates.zig");
 pub const extensions = @import("extensions.zig");
 pub const extensions_builtin = struct {
@@ -89,6 +90,7 @@ test {
     _ = models_fetch;
     _ = rpc;
     _ = slash;
+    _ = diagnostics;
     _ = templates;
     _ = extensions;
     _ = extensions_builtin.catalog;

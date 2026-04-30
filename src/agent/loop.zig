@@ -215,6 +215,14 @@ pub const Config = struct {
     /// openai-compat shim with Llama, Cloudflare native endpoint with
     /// any model) where tool-call output isn't structurally translated.
     text_tool_call_fallback: bool = false,
+    /// v1.29.0 — directory to dump a JSON snapshot of the reducer
+    /// state when `finalize` is about to ship a degenerate (zero
+    /// content blocks, clean stop) assistant message. `null`
+    /// disables the dump. Mode drivers populate this with
+    /// `<session_dir>/events`. Files are named
+    /// `<turn-N>.reducer-dump.json`; turn index is 0-based and
+    /// reset per agent-loop run.
+    reducer_dump_dir: ?[]const u8 = null,
 };
 
 /// Transcript owned by the loop.
@@ -374,6 +382,21 @@ fn runTurn(
         try pushAgentError(out, io, allocator, pe.code, pe.message);
         allocator.free(pe.message);
         return false;
+    }
+
+    // v1.29.0 — if `finalize` is about to emit a degenerate
+    // assistant message AND a dump dir is configured, snapshot
+    // the reducer's full internal state to
+    // `<dump_dir>/<turn-N>.reducer-dump.json`. After-the-fact
+    // readers can inspect block_order, every text/thinking/tool
+    // buffer, and the diagnostic counters without needing a live
+    // repro. Best-effort: any IO error is swallowed since the
+    // primary path (saving the assistant message) must not be
+    // blocked by a debug-aid failure.
+    if (config.reducer_dump_dir) |dump_dir| {
+        if (reducer.isLikelyDegenerate()) {
+            dumpReducerSnapshot(allocator, io, dump_dir, transcript.messages.items.len, &reducer);
+        }
     }
 
     var assistant_msg = try reducer.finalize(
@@ -1069,6 +1092,34 @@ fn pushAgentError(
     out.closeWithFinal(io, .{ .agent_error = .{ .code = code, .message = owned } });
 }
 
+/// v1.29.0 — write a JSON snapshot of the reducer's internal
+/// state to `<dump_dir>/turn-<N>.reducer-dump.json`. Best-effort
+/// — any IO failure (mkdir, allocation, snapshot generation,
+/// write) is swallowed silently. Caller has already decided this
+/// turn produced a degenerate message, so we're racing to capture
+/// the state before `finalize` ships it.
+fn dumpReducerSnapshot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dump_dir: []const u8,
+    turn_index: usize,
+    reducer: *const ai.stream.Reducer,
+) void {
+    std.Io.Dir.cwd().createDirPath(io, dump_dir) catch return;
+    const snap = reducer.snapshotJson(allocator) catch return;
+    defer allocator.free(snap);
+    const path = std.fmt.allocPrint(
+        allocator,
+        "{s}/turn-{d}.reducer-dump.json",
+        .{ dump_dir, turn_index },
+    ) catch return;
+    defer allocator.free(path);
+    var f = std.Io.Dir.cwd().createFile(io, path, .{}) catch return;
+    defer f.close(io);
+    f.writeStreamingAll(io, snap) catch return;
+    ai.log.log(.warn, "loop", "reducer_dump_written", "path={s} bytes={d}", .{ path, snap.len });
+}
+
 fn agentErrorCode(e: anyerror) ai.errors.Code {
     return switch (e) {
         error.Auth => .auth,
@@ -1082,6 +1133,7 @@ fn agentErrorCode(e: anyerror) ai.errors.Code {
         error.Timeout => .timeout,
         error.Transport => .transport,
         error.SafetyRefusal => .safety_refusal,
+        error.EmptyResponse => .empty_response,
         error.Aborted => .aborted,
         error.ToolArgValidation => .tool_arg_validation,
         error.ToolRuntime => .tool_runtime,

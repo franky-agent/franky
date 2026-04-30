@@ -191,6 +191,70 @@ pub const Role = enum {
     }
 };
 
+/// v1.29.0 — assistant-message diagnostics. Optional struct attached
+/// to assistant messages so an after-the-fact reader can answer
+/// "where did this content come from?" without re-running the
+/// session. Only populated by the agent layer (the Reducer fills it
+/// from stream events); only serialized when at least one field is
+/// non-default (`isEmpty()` returns false). All string fields are
+/// owned by the message's allocator.
+pub const Diagnostics = struct {
+    /// Filename stem of the matching `--http-trace-dir` file, e.g.
+    /// `1777498943846-0001`. Pairs the saved Message with the raw
+    /// HTTP request/response bytes. `null` when tracing was off.
+    trace_id: ?[]const u8 = null,
+    /// Raw provider-side `finishReason` / `stop_reason` string
+    /// (Gemini's `STOP`, OpenAI's `tool_calls`, Anthropic's
+    /// `end_turn`, etc.). Preserved verbatim because the
+    /// canonicalized `Message.stop_reason` discards information
+    /// useful when chasing provider-specific anomalies.
+    finish_reason_raw: ?[]const u8 = null,
+    /// Number of SSE events whose `candidates[…].content.parts`
+    /// (Gemini-shaped) or equivalent contained at least one part.
+    /// `0` plus a clean stop_reason is the empty-response shape.
+    parts_seen: u32 = 0,
+    candidates_tokens: ?u64 = null,
+    thoughts_tokens: ?u64 = null,
+    /// How many of each delta-class event the Reducer applied.
+    /// Cheap counters that survive even when the buffers fail to
+    /// produce content blocks (e.g. every text_delta was empty).
+    text_event_count: u32 = 0,
+    thinking_event_count: u32 = 0,
+    tool_call_event_count: u32 = 0,
+    /// Set by `Reducer.finalize` when the message ended cleanly
+    /// (stop_reason ≠ err, no error_message) but produced ZERO
+    /// content blocks. Cheap "this turn was anomalous" flag for
+    /// downstream filters / UIs.
+    was_degenerate: bool = false,
+
+    pub fn isEmpty(self: Diagnostics) bool {
+        return self.trace_id == null and self.finish_reason_raw == null and
+            self.parts_seen == 0 and self.candidates_tokens == null and
+            self.thoughts_tokens == null and self.text_event_count == 0 and
+            self.thinking_event_count == 0 and self.tool_call_event_count == 0 and
+            !self.was_degenerate;
+    }
+
+    pub fn deinit(self: Diagnostics, allocator: std.mem.Allocator) void {
+        if (self.trace_id) |s| allocator.free(s);
+        if (self.finish_reason_raw) |s| allocator.free(s);
+    }
+
+    pub fn dupe(self: Diagnostics, allocator: std.mem.Allocator) !Diagnostics {
+        return .{
+            .trace_id = if (self.trace_id) |s| try allocator.dupe(u8, s) else null,
+            .finish_reason_raw = if (self.finish_reason_raw) |s| try allocator.dupe(u8, s) else null,
+            .parts_seen = self.parts_seen,
+            .candidates_tokens = self.candidates_tokens,
+            .thoughts_tokens = self.thoughts_tokens,
+            .text_event_count = self.text_event_count,
+            .thinking_event_count = self.thinking_event_count,
+            .tool_call_event_count = self.tool_call_event_count,
+            .was_degenerate = self.was_degenerate,
+        };
+    }
+};
+
 /// Message — tagged by role. Carries the content blocks plus role-specific
 /// metadata. Callers use `deinit(allocator)` when done.
 pub const Message = struct {
@@ -205,6 +269,9 @@ pub const Message = struct {
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
     api: ?[]const u8 = null,
+    /// v1.29.0 — optional, see `Diagnostics`. Always `null` for
+    /// non-assistant roles.
+    diagnostics: ?Diagnostics = null,
     // tool_result-only
     tool_call_id: ?[]const u8 = null,
     is_error: bool = false,
@@ -223,6 +290,7 @@ pub const Message = struct {
         if (self.tool_call_id) |s| allocator.free(s);
         if (self.custom_role) |s| allocator.free(s);
         if (self.meta_json) |s| allocator.free(s);
+        if (self.diagnostics) |d| d.deinit(allocator);
     }
 };
 

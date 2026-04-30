@@ -955,6 +955,11 @@ var trace_seq: std.atomic.Value(u32) = .init(0);
 /// failure must never break the live fetch path). Filename:
 /// `<unix_ms>-<seq>-<provider>.txt`.
 ///
+/// v1.29.0 — returns an allocated `<unix_ms>-<seq>` "trace id" on
+/// success so callers can stamp it into `Message.diagnostics`. The
+/// caller owns the slice and must `allocator.free()` it. Returns
+/// `null` when `dir` is null OR any IO step fails.
+///
 /// File format (plain text, easy to grep / diff):
 ///
 ///     === franky http trace ===
@@ -986,23 +991,23 @@ pub fn writeTraceFile(
     status: u16,
     request_body: []const u8,
     response_body: []const u8,
-) void {
-    const trace_dir = dir orelse return;
+) ?[]u8 {
+    const trace_dir = dir orelse return null;
     const seq = trace_seq.fetchAdd(1, .monotonic);
     const ts_ms = stream_mod.nowMillis();
 
     // mkdir -p the trace dir. Anything other than "already exists"
     // is a soft fail — give up on this trace silently.
-    std.Io.Dir.cwd().createDirPath(io, trace_dir) catch return;
+    std.Io.Dir.cwd().createDirPath(io, trace_dir) catch return null;
 
     const path = std.fmt.allocPrint(
         allocator,
         "{s}/{d}-{d:0>4}-{s}.txt",
         .{ trace_dir, ts_ms, seq, provider },
-    ) catch return;
+    ) catch return null;
     defer allocator.free(path);
 
-    var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch return;
+    var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch return null;
     defer file.close(io);
 
     var buf: [256]u8 = undefined;
@@ -1025,14 +1030,17 @@ pub fn writeTraceFile(
         \\
     ,
         .{ ts_ms, seq, provider, url, method, status, request_body.len, response_body.len },
-    ) catch return;
+    ) catch return null;
     defer allocator.free(header);
 
-    out.writeAll(header) catch return;
-    out.writeAll(request_body) catch return;
-    out.writeAll("\n\n--- response body ---\n") catch return;
-    out.writeAll(response_body) catch return;
-    out.flush() catch return;
+    out.writeAll(header) catch return null;
+    out.writeAll(request_body) catch return null;
+    out.writeAll("\n\n--- response body ---\n") catch return null;
+    out.writeAll(response_body) catch return null;
+    out.flush() catch return null;
+
+    // Caller-owned trace id matching the filename stem.
+    return std.fmt.allocPrint(allocator, "{d}-{d:0>4}", .{ ts_ms, seq }) catch null;
 }
 
 // ─── tests ────────────────────────────────────────────────────────
@@ -1457,8 +1465,9 @@ test "writeTraceFile: null dir is a no-op" {
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
-    // Just verify it doesn't crash and doesn't error.
-    writeTraceFile(testing.allocator, io, null, "x", "http://x", "POST", 200, "req", "resp");
+    // Just verify it doesn't crash and doesn't error. Null dir → null trace_id.
+    const tid = writeTraceFile(testing.allocator, io, null, "x", "http://x", "POST", 200, "req", "resp");
+    try testing.expect(tid == null);
 }
 
 test "writeTraceFile: writes a file with header + bodies, mkdir-p semantics" {
@@ -1474,7 +1483,7 @@ test "writeTraceFile: writes a file with header + bodies, mkdir-p semantics" {
     defer gpa.free(dir_path);
     defer std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
 
-    writeTraceFile(
+    const tid = writeTraceFile(
         gpa,
         io,
         dir_path,
@@ -1485,6 +1494,8 @@ test "writeTraceFile: writes a file with header + bodies, mkdir-p semantics" {
         "{\"hello\":\"req\"}",
         "data: {\"hello\":\"resp\"}\n\n",
     );
+    if (tid) |s| gpa.free(s);
+    try testing.expect(tid != null);
 
     // Read the directory and find the one file we wrote.
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |e| {
@@ -1536,7 +1547,8 @@ test "writeTraceFile: monotonic seq across concurrent calls in same ms" {
 
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        writeTraceFile(gpa, io, dir_path, "test", "http://x", "GET", 200, "req", "resp");
+        const tid = writeTraceFile(gpa, io, dir_path, "test", "http://x", "GET", 200, "req", "resp");
+        if (tid) |s| gpa.free(s);
     }
 
     var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });

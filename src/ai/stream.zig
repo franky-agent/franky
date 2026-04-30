@@ -75,6 +75,12 @@ pub const EventKind = enum {
     toolcall_delta,
     toolcall_end,
     usage,
+    /// v1.29.0 — non-terminal "side-channel" event. Providers push
+    /// these to populate `Message.Diagnostics` on the final message
+    /// without conflating them with the content-stream proper.
+    /// Multiple may fire per turn; the Reducer absorbs whichever
+    /// fields are present and last-write-wins.
+    diagnostic,
     done,
     error_ev,
 };
@@ -112,6 +118,16 @@ pub const StreamEvent = union(EventKind) {
         args_json: []const u8,
     },
     usage: types.Usage,
+    /// v1.29.0 — diagnostic side-channel; non-terminal. Strings
+    /// are owned by the producer's allocator and freed via the
+    /// channel's drop-hook on `deinit` like every other event.
+    diagnostic: struct {
+        trace_id: ?[]const u8 = null,
+        finish_reason_raw: ?[]const u8 = null,
+        parts_seen: ?u32 = null,
+        candidates_tokens: ?u64 = null,
+        thoughts_tokens: ?u64 = null,
+    },
     /// Terminal: stream ended successfully. The final Message is produced
     /// by calling `drainToMessage` or `Reducer.finalize()` after the
     /// terminal — the `done` event intentionally carries no payload so the
@@ -143,6 +159,10 @@ pub const StreamEvent = union(EventKind) {
             },
             .toolcall_delta => |d| allocator.free(d.args_delta),
             .toolcall_end => |e| allocator.free(e.args_json),
+            .diagnostic => |d| {
+                if (d.trace_id) |s| allocator.free(s);
+                if (d.finish_reason_raw) |s| allocator.free(s);
+            },
             .error_ev => |e| {
                 allocator.free(e.message);
                 if (e.tool_code) |v| allocator.free(v);
@@ -193,6 +213,10 @@ pub const Reducer = struct {
     /// Order in which blocks are opened, for later ordered emission.
     /// Each entry is {kind, logical_index_within_kind}.
     block_order: std.ArrayList(BlockRef),
+    /// v1.29.0 — diagnostic state accumulated from `.diagnostic`
+    /// side-channel events plus per-event counters. Surfaced on the
+    /// final Message via `finalize`.
+    diag: types.Diagnostics = .{},
 
     const ToolCallState = struct {
         id: []u8,
@@ -233,6 +257,7 @@ pub const Reducer = struct {
         self.tool_calls.deinit(self.allocator);
         self.block_order.deinit(self.allocator);
         if (self.error_message) |m| self.allocator.free(m);
+        self.diag.deinit(self.allocator);
     }
 
     fn ensureTextBlock(self: *Reducer, idx: u32) !void {
@@ -260,6 +285,7 @@ pub const Reducer = struct {
             .text_delta => |d| {
                 try self.ensureTextBlock(d.block_index);
                 try self.text_blocks.items[d.block_index].appendSlice(self.allocator, d.delta);
+                self.diag.text_event_count +%= 1;
             },
             .thinking_delta => |d| {
                 try self.ensureThinkingBlock(d.block_index);
@@ -271,6 +297,7 @@ pub const Reducer = struct {
                     try self.thinking_blocks.items[d.block_index].appendSlice(self.allocator, d.delta);
                 }
                 if (d.redacted) self.thinking_redacted.items[d.block_index] = true;
+                self.diag.thinking_event_count +%= 1;
             },
             .toolcall_start => |s| {
                 while (self.tool_calls.items.len <= s.block_index) {
@@ -287,6 +314,7 @@ pub const Reducer = struct {
                 self.allocator.free(tc.name);
                 tc.id = try self.allocator.dupe(u8, s.id);
                 tc.name = try self.allocator.dupe(u8, s.name);
+                self.diag.tool_call_event_count +%= 1;
             },
             .toolcall_delta => |d| {
                 if (d.block_index >= self.tool_calls.items.len) return; // protocol violation — ignored here, caller should have emitted error_ev
@@ -305,6 +333,19 @@ pub const Reducer = struct {
                 }
             },
             .usage => |u| self.usage = u,
+            .diagnostic => |d| {
+                if (d.trace_id) |s| {
+                    if (self.diag.trace_id) |old| self.allocator.free(old);
+                    self.diag.trace_id = try self.allocator.dupe(u8, s);
+                }
+                if (d.finish_reason_raw) |s| {
+                    if (self.diag.finish_reason_raw) |old| self.allocator.free(old);
+                    self.diag.finish_reason_raw = try self.allocator.dupe(u8, s);
+                }
+                if (d.parts_seen) |n| self.diag.parts_seen = n;
+                if (d.candidates_tokens) |n| self.diag.candidates_tokens = n;
+                if (d.thoughts_tokens) |n| self.diag.thoughts_tokens = n;
+            },
             .done => |d| {
                 self.stop_reason = d.stop_reason;
             },
@@ -314,6 +355,131 @@ pub const Reducer = struct {
                 self.error_message = try self.allocator.dupe(u8, e.message);
             },
         }
+    }
+
+    /// v1.29.0 — would `finalize` produce a degenerate (zero
+    /// content blocks) message right now? Used by the agent loop
+    /// to decide whether to dump reducer state to disk before
+    /// finalize transfers ownership of the buffers.
+    pub fn isLikelyDegenerate(self: *const Reducer) bool {
+        if (self.error_message != null) return false;
+        if (self.stop_reason) |sr| if (sr == .err) return false;
+        for (self.block_order.items) |ref| switch (ref.kind) {
+            .text => {
+                if (self.text_blocks.items[ref.index].items.len > 0) return false;
+            },
+            .thinking => {
+                const idx = ref.index;
+                if (self.thinking_blocks.items[idx].items.len > 0) return false;
+                if (self.thinking_signatures.items[idx] != null) return false;
+                if (self.thinking_redacted.items[idx]) return false;
+            },
+            .tool_call => return false, // tool_calls always emit content blocks
+        };
+        return true;
+    }
+
+    /// v1.29.0 — render a JSON snapshot of the current state for
+    /// diagnostic dumps. Pure (no IO); caller writes the result to
+    /// disk if desired. Safe to call at any point in the reducer's
+    /// lifetime (including before `finalize`); does not transfer
+    /// ownership.
+    pub fn snapshotJson(self: *const Reducer, allocator: std.mem.Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{\"version\":1");
+        if (self.stop_reason) |sr| {
+            try buf.appendSlice(allocator, ",\"stopReason\":\"");
+            try buf.appendSlice(allocator, sr.toString());
+            try buf.append(allocator, '"');
+        }
+        if (self.error_message) |m| {
+            try buf.appendSlice(allocator, ",\"errorMessage\":");
+            try appendJsonStrLocal(allocator, &buf, m);
+        }
+        // diagnostics
+        try buf.appendSlice(allocator, ",\"diagnostics\":{");
+        var first_d = true;
+        if (self.diag.trace_id) |s| {
+            try writeFieldStr(allocator, &buf, &first_d, "traceId", s);
+        }
+        if (self.diag.finish_reason_raw) |s| {
+            try writeFieldStr(allocator, &buf, &first_d, "finishReasonRaw", s);
+        }
+        try writeFieldUint(allocator, &buf, &first_d, "partsSeen", self.diag.parts_seen);
+        if (self.diag.candidates_tokens) |n| try writeFieldUint(allocator, &buf, &first_d, "candidatesTokens", n);
+        if (self.diag.thoughts_tokens) |n| try writeFieldUint(allocator, &buf, &first_d, "thoughtsTokens", n);
+        try writeFieldUint(allocator, &buf, &first_d, "textEvents", self.diag.text_event_count);
+        try writeFieldUint(allocator, &buf, &first_d, "thinkingEvents", self.diag.thinking_event_count);
+        try writeFieldUint(allocator, &buf, &first_d, "toolCallEvents", self.diag.tool_call_event_count);
+        try buf.append(allocator, '}');
+
+        // block_order
+        try buf.appendSlice(allocator, ",\"blockOrder\":[");
+        for (self.block_order.items, 0..) |ref, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "{\"kind\":\"");
+            try buf.appendSlice(allocator, switch (ref.kind) {
+                .text => "text",
+                .thinking => "thinking",
+                .tool_call => "toolCall",
+            });
+            const ix_str = try std.fmt.allocPrint(allocator, "\",\"index\":{d}}}", .{ref.index});
+            defer allocator.free(ix_str);
+            try buf.appendSlice(allocator, ix_str);
+        }
+        try buf.append(allocator, ']');
+
+        // text buffers (size + content)
+        try buf.appendSlice(allocator, ",\"textBlocks\":[");
+        for (self.text_blocks.items, 0..) |b, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "{\"len\":");
+            const ln = try std.fmt.allocPrint(allocator, "{d}", .{b.items.len});
+            defer allocator.free(ln);
+            try buf.appendSlice(allocator, ln);
+            try buf.appendSlice(allocator, ",\"text\":");
+            try appendJsonStrLocal(allocator, &buf, b.items);
+            try buf.append(allocator, '}');
+        }
+        try buf.append(allocator, ']');
+
+        // thinking buffers
+        try buf.appendSlice(allocator, ",\"thinkingBlocks\":[");
+        for (self.thinking_blocks.items, 0..) |b, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "{\"len\":");
+            const ln = try std.fmt.allocPrint(allocator, "{d}", .{b.items.len});
+            defer allocator.free(ln);
+            try buf.appendSlice(allocator, ln);
+            try buf.appendSlice(allocator, ",\"text\":");
+            try appendJsonStrLocal(allocator, &buf, b.items);
+            const sig = self.thinking_signatures.items[i];
+            if (sig) |sv| {
+                try buf.appendSlice(allocator, ",\"signature\":");
+                try appendJsonStrLocal(allocator, &buf, sv);
+            }
+            if (self.thinking_redacted.items[i]) try buf.appendSlice(allocator, ",\"redacted\":true");
+            try buf.append(allocator, '}');
+        }
+        try buf.append(allocator, ']');
+
+        // tool_calls
+        try buf.appendSlice(allocator, ",\"toolCalls\":[");
+        for (self.tool_calls.items, 0..) |tc, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "{\"id\":");
+            try appendJsonStrLocal(allocator, &buf, tc.id);
+            try buf.appendSlice(allocator, ",\"name\":");
+            try appendJsonStrLocal(allocator, &buf, tc.name);
+            try buf.appendSlice(allocator, ",\"args\":");
+            try appendJsonStrLocal(allocator, &buf, tc.args.items);
+            try buf.append(allocator, '}');
+        }
+        try buf.append(allocator, ']');
+
+        try buf.append(allocator, '}');
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Transfer accumulated state into a `types.Message` (role = assistant).
@@ -367,6 +533,26 @@ pub const Reducer = struct {
         const owned_model = if (model) |v| try allocator.dupe(u8, v) else null;
         const owned_api = if (api) |v| try allocator.dupe(u8, v) else null;
 
+        // v1.29.0 — attach diagnostics. `was_degenerate` fires when
+        // finalize is about to ship an assistant message with zero
+        // content blocks AND no error path was taken (clean STOP →
+        // nothing). Other fields are absorbed verbatim from
+        // `.diagnostic` events the provider pushed during streaming.
+        var diag = self.diag;
+        diag.was_degenerate = (content.items.len == 0) and
+            (self.error_message == null) and
+            ((self.stop_reason orelse .stop) != .err);
+        // Move ownership of diag's owned strings to the message
+        // allocator (currently they're already on `self.allocator`,
+        // which IS the message's allocator). Zero out the reducer's
+        // copy so its `deinit` can no longer free them.
+        self.diag = .{};
+        const diag_attached: ?types.Diagnostics = if (diag.isEmpty()) blk: {
+            // Free the owned strings since we're throwing the struct away.
+            diag.deinit(allocator);
+            break :blk null;
+        } else diag;
+
         return .{
             .role = .assistant,
             .content = try content.toOwnedSlice(allocator),
@@ -377,9 +563,151 @@ pub const Reducer = struct {
             .provider = owned_provider,
             .model = owned_model,
             .api = owned_api,
+            .diagnostics = diag_attached,
         };
     }
 };
+
+// ─── v1.29.0 — provider-side helpers ───────────────────────────────
+
+/// Aggregates the metrics every provider Driver collects so the
+/// degenerate-response check + final `.diagnostic` push can be
+/// shared across providers without each one re-implementing it.
+pub const TerminalInfo = struct {
+    provider: []const u8,
+    stop_reason: types.StopReason = .stop,
+    /// At least one `.text_delta` of non-zero length was pushed.
+    text_seen: bool = false,
+    /// At least one non-signature `.thinking_delta` of non-zero
+    /// length was pushed.
+    thinking_seen: bool = false,
+    tool_count: u32 = 0,
+    /// Number of provider events that carried at least one
+    /// `content.parts` entry (Gemini-shaped) or equivalent. `0`
+    /// plus a clean stop_reason is the empty-response signature.
+    parts_seen: u32 = 0,
+    /// Raw provider stop string (`STOP`, `tool_calls`, `end_turn`),
+    /// duped before we put it on the channel. Caller-owned slice;
+    /// safe to be from an arena that's about to drop.
+    finish_reason_raw: ?[]const u8 = null,
+    candidates_tokens: ?u64 = null,
+    thoughts_tokens: ?u64 = null,
+};
+
+/// v1.29.0 — provider-side terminal close. Pushes a final
+/// `.diagnostic` event with the captured metrics, then closes the
+/// channel with either `.done` or `.error_ev{empty_response}`
+/// depending on whether any content was emitted.
+///
+/// Best-effort: if `push` fails because the channel was already
+/// closed we still close gracefully. Any allocations made for the
+/// diagnostic payload are freed on that path.
+pub fn closeWithDiagnostics(
+    out: *Channel,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    info: TerminalInfo,
+) void {
+    const fr_dup_opt: ?[]u8 = if (info.finish_reason_raw) |s|
+        allocator.dupe(u8, s) catch null
+    else
+        null;
+    out.push(io, .{ .diagnostic = .{
+        .finish_reason_raw = fr_dup_opt,
+        .parts_seen = info.parts_seen,
+        .candidates_tokens = info.candidates_tokens,
+        .thoughts_tokens = info.thoughts_tokens,
+    } }) catch {
+        if (fr_dup_opt) |s| allocator.free(s);
+    };
+
+    const has_content = info.text_seen or info.thinking_seen or info.tool_count > 0;
+    if (!has_content and info.stop_reason == .stop) {
+        const msg = std.fmt.allocPrint(
+            allocator,
+            "{s} returned stop_reason={s} but emitted no content (parts_seen={d}, candidates_tokens={?d}, thoughts_tokens={?d}). Likely model regression — re-run with adjusted thinking budget or a format-reminder nudge.",
+            .{ info.provider, info.finish_reason_raw orelse "stop", info.parts_seen, info.candidates_tokens, info.thoughts_tokens },
+        ) catch return;
+        out.closeWithFinal(io, .{ .error_ev = .{
+            .code = errors.Code.empty_response,
+            .message = msg,
+        } });
+    } else {
+        out.closeWithFinal(io, .{ .done = .{ .stop_reason = info.stop_reason } });
+    }
+}
+
+/// v1.29.0 — push a trace_id diagnostic right after the `start`
+/// event. Channel takes ownership of `trace_id` on success; on
+/// channel-closed failure the slice is freed locally so callers
+/// don't have to manage cleanup. Pass `null` to skip.
+pub fn pushTraceId(
+    out: *Channel,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    trace_id: ?[]u8,
+) void {
+    const tid = trace_id orelse return;
+    out.push(io, .{ .diagnostic = .{ .trace_id = tid } }) catch {
+        allocator.free(tid);
+    };
+}
+
+// ─── v1.29.0 helpers shared by Reducer.snapshotJson ────────────────
+
+fn appendJsonStrLocal(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    s: []const u8,
+) !void {
+    try buf.append(allocator, '"');
+    for (s) |c| switch (c) {
+        '"' => try buf.appendSlice(allocator, "\\\""),
+        '\\' => try buf.appendSlice(allocator, "\\\\"),
+        '\n' => try buf.appendSlice(allocator, "\\n"),
+        '\r' => try buf.appendSlice(allocator, "\\r"),
+        '\t' => try buf.appendSlice(allocator, "\\t"),
+        0x08 => try buf.appendSlice(allocator, "\\b"),
+        0x0c => try buf.appendSlice(allocator, "\\f"),
+        else => {
+            if (c < 0x20) {
+                const esc = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{c});
+                defer allocator.free(esc);
+                try buf.appendSlice(allocator, esc);
+            } else try buf.append(allocator, c);
+        },
+    };
+    try buf.append(allocator, '"');
+}
+
+fn writeFieldStr(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    first: *bool,
+    name: []const u8,
+    value: []const u8,
+) !void {
+    if (!first.*) try buf.append(allocator, ',');
+    first.* = false;
+    try buf.append(allocator, '"');
+    try buf.appendSlice(allocator, name);
+    try buf.appendSlice(allocator, "\":");
+    try appendJsonStrLocal(allocator, buf, value);
+}
+
+fn writeFieldUint(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    first: *bool,
+    name: []const u8,
+    value: u64,
+) !void {
+    if (!first.*) try buf.append(allocator, ',');
+    first.* = false;
+    const piece = try std.fmt.allocPrint(allocator, "\"{s}\":{d}", .{ name, value });
+    defer allocator.free(piece);
+    try buf.appendSlice(allocator, piece);
+}
 
 // ─── tests ────────────────────────────────────────────────────────────
 
@@ -449,6 +777,74 @@ test "Cancel is observable across threads" {
     try std.testing.expect(!c.isFired());
     c.fire();
     try std.testing.expect(c.isFired());
+}
+
+test "Reducer.apply absorbs .diagnostic events, finalize attaches non-empty (v1.29.0)" {
+    const gpa = std.testing.allocator;
+    var r = Reducer.init(gpa);
+    defer r.deinit();
+
+    // `apply` borrows: it dupes the strings into reducer state.
+    // Use literals so we don't have to free anything afterwards.
+    try r.apply(.{ .diagnostic = .{
+        .trace_id = "trace-7",
+        .parts_seen = 4,
+        .candidates_tokens = 0,
+        .thoughts_tokens = 561,
+    } });
+    try r.apply(.{ .text_delta = .{ .block_index = 0, .delta = "hello" } });
+
+    var msg = try r.finalize("anthropic", "claude-sonnet-4", "anthropic-messages");
+    defer msg.deinit(gpa);
+
+    try std.testing.expect(msg.diagnostics != null);
+    const d = msg.diagnostics.?;
+    try std.testing.expectEqualStrings("trace-7", d.trace_id.?);
+    try std.testing.expectEqual(@as(u32, 4), d.parts_seen);
+    try std.testing.expectEqual(@as(?u64, 0), d.candidates_tokens);
+    try std.testing.expectEqual(@as(?u64, 561), d.thoughts_tokens);
+    try std.testing.expectEqual(@as(u32, 1), d.text_event_count);
+    try std.testing.expect(!d.was_degenerate);
+}
+
+test "Reducer.finalize sets was_degenerate when message has zero content (v1.29.0)" {
+    const gpa = std.testing.allocator;
+    var r = Reducer.init(gpa);
+    defer r.deinit();
+    try r.apply(.{ .done = .{ .stop_reason = .stop } });
+
+    var msg = try r.finalize(null, null, null);
+    defer msg.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), msg.content.len);
+    try std.testing.expect(msg.diagnostics != null);
+    try std.testing.expect(msg.diagnostics.?.was_degenerate);
+}
+
+test "Reducer.isLikelyDegenerate flips false on tool_call (v1.29.0)" {
+    const gpa = std.testing.allocator;
+    var r = Reducer.init(gpa);
+    defer r.deinit();
+    try std.testing.expect(r.isLikelyDegenerate());
+    try r.apply(.{ .toolcall_start = .{ .block_index = 0, .id = "id", .name = "read" } });
+    try std.testing.expect(!r.isLikelyDegenerate());
+}
+
+test "Reducer.snapshotJson contains structural keys + diagnostics (v1.29.0)" {
+    const gpa = std.testing.allocator;
+    var r = Reducer.init(gpa);
+    defer r.deinit();
+    try r.apply(.{ .text_delta = .{ .block_index = 0, .delta = "abc" } });
+    try r.apply(.{ .diagnostic = .{ .finish_reason_raw = "STOP", .parts_seen = 2 } });
+
+    const snap = try r.snapshotJson(gpa);
+    defer gpa.free(snap);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "\"version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "\"diagnostics\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "\"finishReasonRaw\":\"STOP\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "\"partsSeen\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "\"blockOrder\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "\"textBlocks\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "abc") != null);
 }
 
 test "nowMillis: returns a non-zero monotonically-advancing timestamp" {

@@ -1186,6 +1186,8 @@ const Markdown = (function () {
         { name: 'retry',    desc: 'Re-run the last turn', argHint: '' },
         { name: 'edit',     desc: 'Edit the last user message', argHint: '' },
         { name: 'compact',  desc: 'Compact older messages into a summary', argHint: '' },
+        // v1.29.2 — diagnostic report (saved to ~/.franky/diagnostics/<sid>/<ts>.txt)
+        { name: 'diagnostics', desc: 'Per-turn anomaly report (see docs/reference/diagnostics.md)', argHint: '' },
         { name: 'quit',     desc: 'Close this browser tab', argHint: '' },
     ];
 
