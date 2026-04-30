@@ -156,6 +156,12 @@ pub fn findMatches(
         }
         // find matches only files (spec §C.6 default behavior; dirs are not "finds").
         if (entry.kind != .file) continue;
+        // Hard-skip the `.git` directory regardless of `.gitignore`
+        // contents. Git's internal data store isn't tracked-or-ignored
+        // (it's a special directory git manages); without this skip a
+        // recursive find from repo root pulls in thousands of object
+        // hashes and derails the LLM's context.
+        if (std.mem.eql(u8, entry.path, ".git") or std.mem.startsWith(u8, entry.path, ".git/")) continue;
         if (ignore_stack) |*s| {
             if (s.isIgnored(entry.path, false)) continue;
         }
@@ -331,6 +337,48 @@ test "find tool: returns matching files" {
     try testing.expect(std.mem.indexOf(u8, text, "alpha.zig") != null);
     try testing.expect(std.mem.indexOf(u8, text, "beta.zig") != null);
     try testing.expect(std.mem.indexOf(u8, text, "beta.c") == null);
+}
+
+test "find tool: hard-skips .git directory regardless of respectGitignore" {
+    // `.git` is git's internal data store, not source — it's a
+    // special directory git manages, never matched by `.gitignore`.
+    // Without this hard-skip, a broad glob from repo root pulls in
+    // thousands of object hashes and derails the LLM's context.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_find_dot_git_test";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/.git/objects/ab");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.git/config", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.git/objects/ab/cdef", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/src.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+
+    // respect_gitignore=false intentionally — proves the .git skip is
+    // independent of gitignore handling.
+    var cancel: ai.stream.Cancel = .{};
+    var res = try findMatches(gpa, io, base, "**/*", 100, false, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "src.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, text, ".git/config") == null);
+    try testing.expect(std.mem.indexOf(u8, text, ".git/objects/ab/cdef") == null);
 }
 
 test "find tool: respectGitignore drops ignored matches" {

@@ -154,6 +154,12 @@ pub fn listPath(
                 try out.appendSlice(allocator, "(truncated: too many entries)\n");
                 break;
             }
+            // Hard-skip the `.git` directory regardless of `.gitignore`
+            // contents. Git's internal data store isn't tracked-or-ignored
+            // (it's a special directory git manages), so even with
+            // `respectGitignore=true` it would otherwise show up. No
+            // legitimate ls result lives in there for an LLM agent.
+            if (std.mem.eql(u8, entry.name, ".git")) continue;
             if (ignore_stack) |*s| {
                 if (s.isIgnored(entry.name, entry.kind == .directory)) continue;
             }
@@ -171,6 +177,9 @@ pub fn listPath(
                 try out.appendSlice(allocator, "(truncated: too many entries)\n");
                 break;
             }
+            // Hard-skip `.git` (and its subtree) regardless of
+            // `.gitignore`. See note in the non-recursive branch.
+            if (std.mem.eql(u8, entry.path, ".git") or std.mem.startsWith(u8, entry.path, ".git/")) continue;
             if (ignore_stack) |*s| {
                 if (s.isIgnored(entry.path, entry.kind == .directory)) continue;
             }
@@ -315,6 +324,59 @@ test "ls tool: respectGitignore skips ignored entries" {
     try testing.expect(std.mem.indexOf(u8, text, "debug.log") == null);
     try testing.expect(std.mem.indexOf(u8, text, "build/") == null);
     try testing.expect(std.mem.indexOf(u8, text, "out.o") == null);
+}
+
+test "ls tool: hard-skips .git directory regardless of respectGitignore" {
+    // `.git` is git's internal data store, not source — it's a
+    // special directory git manages, never matched by `.gitignore`.
+    // Without this hard-skip, a recursive ls from repo root pulls in
+    // thousands of object hashes and derails the LLM's context.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_ls_dot_git_test";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/.git/objects/ab");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.git/config", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.git/objects/ab/cdef", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/foo.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+
+    // respect_gitignore=false intentionally — proves the .git skip is
+    // independent of gitignore handling.
+    var cancel: ai.stream.Cancel = .{};
+
+    // Recursive: must skip the entire .git subtree.
+    var res_rec = try listPath(gpa, io, base, true, 10, false, &cancel);
+    defer res_rec.deinit(gpa);
+    const text_rec = res_rec.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text_rec, "foo.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, text_rec, ".git") == null);
+    try testing.expect(std.mem.indexOf(u8, text_rec, "config") == null);
+    try testing.expect(std.mem.indexOf(u8, text_rec, "objects") == null);
+    try testing.expect(std.mem.indexOf(u8, text_rec, "abcdef") == null);
+
+    // Non-recursive: must skip the top-level .git entry too.
+    var res_flat = try listPath(gpa, io, base, false, 1, false, &cancel);
+    defer res_flat.deinit(gpa);
+    const text_flat = res_flat.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text_flat, "foo.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, text_flat, ".git") == null);
 }
 
 test "ls tool: respectGitignore=false preserves full listing" {
