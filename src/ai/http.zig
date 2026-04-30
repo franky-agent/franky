@@ -79,9 +79,25 @@ pub const Client = @import("vendored/http_client.zig");
 // `/etc/ssl/certs/` rather than appended to
 // `/etc/ssl/certs/ca-certificates.crt`.
 //
-// Lifetime: the proxy arena is consumed inside the call (proxy
-// state is stored on the client itself); the caller owns
-// `client`. The CA bundle uses the client's allocator.
+// **v1.29.4 lifetime correction.** Pre-fix, this allocated the
+// proxy struct in a function-scoped `ArenaAllocator` that
+// `defer`-deinited on return — but the vendored Zig Client's
+// `http_proxy` / `https_proxy` fields are pointers into that
+// arena (per `vendored/http_client.zig:1331-1334`: "Uses `arena`
+// for a few small allocations that must outlive the client"),
+// so the next request's `connect()` deref'd freed memory. Real-
+// user segfault in franky-do v0.4.7 against an HTTPS_PROXY
+// (Squid via `gateway.docker.internal:3128`); fault address
+// `0xffff936e0040` matched the v1.26.x high-bit user-space UAF
+// pattern the v1.28.1 spec row already framed correctly. The
+// fix passes `allocator` (caller's, long-lived) directly to
+// `initDefaultProxies` instead. Each call leaks ~100 bytes
+// (Proxy struct + host string + optional Basic-auth value) for
+// the lifetime of the process; acceptable until the vendored
+// Client grows a proper Proxy destructor (deferred per
+// `docs/spec/v2.md`).
+//
+// CA bundle uses the client's allocator (unchanged).
 
 pub fn setupClientFromEnv(
     client: *Client,
@@ -89,9 +105,7 @@ pub fn setupClientFromEnv(
     io: std.Io,
     environ_map: *const std.process.Environ.Map,
 ) anyerror!void {
-    var proxy_arena = std.heap.ArenaAllocator.init(allocator);
-    defer proxy_arena.deinit();
-    try client.initDefaultProxies(proxy_arena.allocator(), environ_map);
+    try client.initDefaultProxies(allocator, environ_map);
 
     if (environ_map.get("FRANKY_CA_BUNDLE")) |ca_path| {
         if (ca_path.len == 0) return;
