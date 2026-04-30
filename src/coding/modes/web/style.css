@@ -227,6 +227,20 @@ header h1 {
 .role-pill-code { color: #d39a3a; border-color: #d39a3a; }
 .role-pill-full { color: var(--error-text); border-color: var(--error-border); }
 
+/* Model pill — sibling of role-pill. Mirrors layout so the two
+ * sit cleanly side-by-side; muted color since the value is
+ * informational, not a safety signal. */
+.model-pill {
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    border: 1px solid var(--border);
+    margin-left: 6px;
+    user-select: none;
+    color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+}
+
 /* ── v1.7.2 Activity pill ─────────────────────────────────────
  * Persistent feedback that's NOT inside the conversation pane,
  * so it's visible regardless of scroll position. Pulsing dot

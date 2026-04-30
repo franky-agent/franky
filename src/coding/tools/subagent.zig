@@ -56,6 +56,7 @@ const print_mod = @import("../modes/print.zig");
 const role_mod = @import("../role.zig");
 const permissions_mod = @import("../permissions.zig");
 const session_mod = @import("../session.zig");
+const truncate_mod = @import("truncate.zig");
 
 pub const tool_name: []const u8 = "subagent";
 
@@ -534,13 +535,63 @@ fn runSubagent(
         return errorResult(allocator, .agent_error, msg, .{ .partial_text = partial, .turn_count = turn_count });
     }
 
-    const final_text = (lastAssistantText(allocator, &sub_agent.transcript) catch null) orelse try allocator.dupe(u8, "");
-    defer allocator.free(final_text);
+    const final_text_raw = (lastAssistantText(allocator, &sub_agent.transcript) catch null) orelse try allocator.dupe(u8, "");
+    defer allocator.free(final_text_raw);
     const turn_count = countAssistantTurns(&sub_agent.transcript);
     const tool_call_count = countToolCalls(&sub_agent.transcript);
+
+    // v1.28.0 — cap `final_text` at `final_text_max_bytes` (4 KB
+    // default). The parent agent's context is the resource we're
+    // protecting; a sub-agent that produces a 60 KB monologue
+    // would otherwise injection-flood the parent's transcript.
+    // When truncated, append a one-line hint encouraging the
+    // parent to re-prompt the sub-agent with a more focused
+    // question rather than trying to recover the elided text.
+    const trunc = truncate_mod.truncateHead(final_text_raw, .{
+        .max_lines = std.math.maxInt(usize),
+        .max_bytes = final_text_max_bytes,
+    });
+    var capped: std.ArrayList(u8) = .empty;
+    defer capped.deinit(allocator);
+    try capped.appendSlice(allocator, trunc.content);
+    if (trunc.truncated) {
+        const cap_size = try truncate_mod.formatSize(allocator, final_text_max_bytes);
+        defer allocator.free(cap_size);
+        const total_size = try truncate_mod.formatSize(allocator, trunc.total_bytes);
+        defer allocator.free(total_size);
+        const trailer = try std.fmt.allocPrint(
+            allocator,
+            "\n\n[final_text truncated: showing first {s} of {s}. Re-prompt the sub-agent with a more focused question if you need the full answer.]",
+            .{ cap_size, total_size },
+        );
+        defer allocator.free(trailer);
+        try capped.appendSlice(allocator, trailer);
+    }
+
+    // v1.28.0 — if persistence happened, expose the transcript
+    // path so the parent agent can `read` it on demand for full
+    // conversation details. Only emitted when persistence
+    // actually wrote — null when `parent_session_dir` was unset
+    // OR when `persistSubagentSession` failed (the failure was
+    // already warn-logged).
+    const transcript_path: ?[]u8 = if (ctx.parent_session_dir) |parent|
+        std.fs.path.join(allocator, &.{ parent, "subagents", call_id, "transcript.json" }) catch null
+    else
+        null;
+    defer if (transcript_path) |p| allocator.free(p);
+
     ai.log.log(.info, "subagent", "done", "call_id={s} turns={d} tool_calls={d} duration_ms={d}", .{ call_id, turn_count, tool_call_count, elapsed_ms });
-    return successResult(allocator, final_text, turn_count, tool_call_count, elapsed_ms, call_id);
+    return successResult(allocator, capped.items, turn_count, tool_call_count, elapsed_ms, call_id, transcript_path);
 }
+
+/// v1.28.0 — cap on the `final_text` field returned by every
+/// sub-agent run. Sub-agents already firewall their tool results
+/// from the parent's context, but `final_text` rides back into the
+/// parent's transcript verbatim — uncapped, that's a regression
+/// vector ("ask sub-agent to summarize, get a 50 KB monologue
+/// dumped into context"). 4 KB is generous for a focused-question
+/// answer and tight enough to keep parent context clean.
+pub const final_text_max_bytes: usize = 4 * 1024;
 
 // ─── supervisor ────────────────────────────────────────────────────
 
@@ -702,6 +753,13 @@ fn successResult(
     tool_call_count: u32,
     duration_ms: i64,
     session_id: []const u8,
+    /// v1.28.0 — when the parent has an on-disk session, the
+    /// sub-agent's full transcript is persisted to this path. The
+    /// parent agent can `read` it for full conversation details
+    /// without burning context on the round-trip back. Null in
+    /// `--no-session` runs and in interactive mode (in-memory
+    /// transcripts only).
+    transcript_path: ?[]const u8,
 ) !at.ToolResult {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -715,6 +773,10 @@ fn successResult(
     try ai.utils.appendJsonInt(&buf, allocator, duration_ms);
     try buf.appendSlice(allocator, ",\"session_id\":");
     try ai.utils.appendJsonStr(&buf, allocator, session_id);
+    if (transcript_path) |p| {
+        try buf.appendSlice(allocator, ",\"transcript_path\":");
+        try ai.utils.appendJsonStr(&buf, allocator, p);
+    }
     try buf.append(allocator, '}');
 
     const text = try buf.toOwnedSlice(allocator);
@@ -924,7 +986,7 @@ test "ErrorKind hints are non-empty for all variants" {
 
 test "successResult emits valid JSON with the expected fields" {
     const gpa = testing.allocator;
-    var r = try successResult(gpa, "the answer", 4, 7, 1234, "01J0");
+    var r = try successResult(gpa, "the answer", 4, 7, 1234, "01J0", null);
     defer r.deinit(gpa);
     try testing.expect(!r.is_error);
     try testing.expectEqual(@as(usize, 1), r.content.len);
@@ -935,6 +997,26 @@ test "successResult emits valid JSON with the expected fields" {
     try testing.expect(std.mem.indexOf(u8, text, "\"tool_call_count\":7") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"duration_ms\":1234") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"session_id\":\"01J0\"") != null);
+    // null transcript_path → field omitted entirely.
+    try testing.expect(std.mem.indexOf(u8, text, "transcript_path") == null);
+}
+
+test "successResult emits transcript_path field when set (v1.28.0)" {
+    const gpa = testing.allocator;
+    var r = try successResult(
+        gpa,
+        "the answer",
+        4,
+        7,
+        1234,
+        "01J0",
+        "/home/user/.franky/sessions/abc/subagents/01J0/transcript.json",
+    );
+    defer r.deinit(gpa);
+    try testing.expect(!r.is_error);
+    const text = r.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "\"transcript_path\":") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "/subagents/01J0/transcript.json") != null);
 }
 
 test "errorResult emits valid JSON with kind + hint + tool_code" {

@@ -243,14 +243,16 @@ pub fn renderRoleStatusJson(
     role: Role,
     set: ToolSet,
     sandboxed: bool,
+    provider_name: []const u8,
+    model_id: []const u8,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     const head = try std.fmt.allocPrint(
         allocator,
-        "{{\"role\":\"{s}\",\"description\":\"{s}\",\"sandbox\":{s},\"allowed_tools\":[",
-        .{ role.toString(), role.shortDescription(), if (sandboxed) "true" else "false" },
+        "{{\"role\":\"{s}\",\"description\":\"{s}\",\"sandbox\":{s},\"provider\":\"{s}\",\"model\":\"{s}\",\"allowed_tools\":[",
+        .{ role.toString(), role.shortDescription(), if (sandboxed) "true" else "false", provider_name, model_id },
     );
     defer allocator.free(head);
     try buf.appendSlice(allocator, head);
@@ -331,7 +333,7 @@ test "minRoleFor: bash needs code; read needs read" {
 }
 
 test "renderRoleStatusJson: plan emits the wire shape" {
-    const json = try renderRoleStatusJson(testing.allocator, .plan, ToolSet.forRole(.plan), false);
+    const json = try renderRoleStatusJson(testing.allocator, .plan, ToolSet.forRole(.plan), false, "anthropic", "claude-sonnet-4-6");
     defer testing.allocator.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\"role\":\"plan\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"sandbox\":false") != null);

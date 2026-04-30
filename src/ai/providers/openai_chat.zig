@@ -516,17 +516,16 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 
     const cancel = ctx.options.cancel orelse unreachable;
 
-    var client = std.http.Client{ .allocator = ctx.allocator, .io = ctx.io };
+    var client = http_mod.Client{ .allocator = ctx.allocator, .io = ctx.io };
     defer client.deinit();
 
     if (ctx.options.environ_map) |env_map| {
-        var proxy_arena = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer proxy_arena.deinit();
-        client.initDefaultProxies(proxy_arena.allocator(), env_map) catch |e| {
+        // v1.25.0 — proxy + FRANKY_CA_BUNDLE in one call.
+        http_mod.setupClientFromEnv(&client, ctx.allocator, ctx.io, env_map) catch |e| {
             try ctx.out.push(ctx.io, .start);
             ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
                 .code = errors.Code.transport,
-                .message = try std.fmt.allocPrint(ctx.allocator, "proxy init failed: {s}", .{@errorName(e)}),
+                .message = try std.fmt.allocPrint(ctx.allocator, "client setup failed: {s}", .{@errorName(e)}),
             } });
             return;
         };

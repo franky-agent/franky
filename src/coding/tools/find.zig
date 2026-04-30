@@ -44,7 +44,7 @@ pub const max_walk_entries: usize = 500_000;
 pub fn tool() at.AgentTool {
     return .{
         .name = "find",
-        .description = "Find files by glob pattern (*, **, ?, [abc]).",
+        .description = "Find files by glob pattern (*, **, ?, [abc]). Default limit is 1000 results. Pass a focused `cwd` first when searching a large tree — broad globs from repo root truncate.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .execute = execute,
@@ -54,7 +54,7 @@ pub fn tool() at.AgentTool {
 pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
     return .{
         .name = "find",
-        .description = "Find files by glob pattern (path-safety enforced).",
+        .description = "Find files by glob pattern (path-safety enforced). Default limit is 1000. Narrow with `cwd` before scanning from repo root.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .ctx = @constCast(@ptrCast(ws)),

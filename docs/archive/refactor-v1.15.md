@@ -10,7 +10,7 @@ these are scheduled; this is a catalog with a recommendation.
 
 ## Context
 
-- We are at v1.15.2. The v2 deferred-work catalog (`franky-spec-v2.md`)
+- We are at v1.15.2. The v2 deferred-work catalog (`../spec/v2.md`)
   has §1.7 RPC method-surface depth open — the dispatcher in
   `src/coding/modes/rpc.zig` ships only `ping`, `version`, `role`,
   `prompt`, `abort`, `permission/resolve`. The full §I.1 catalog
@@ -53,7 +53,7 @@ service call + response serialization.
 `/session/*`, `/compact`, `/retry`, `/edit` endpoints.
 
 **Phase 4 (doc-only).** Record the larger "TUI as out-of-process
-RPC client" idea in `franky-spec-v2.md` so it isn't re-discovered.
+RPC client" idea in `../spec/v2.md` so it isn't re-discovered.
 
 **Net LOC delta:** +300 to +1100 across all phases. Phase 2 is
 pure addition (12 new methods); Phase 3 saves less than Phase 2 adds.
@@ -202,11 +202,11 @@ independent of both.
 
 ## When picking up later — what to do first
 
-- Re-read `franky-spec-v1.md` §I.1 (RPC method catalog) and
-  `franky-spec-v2.md` §1.7 to confirm the spec hasn't drifted.
+- Re-read `../spec/v1.md` §I.1 (RPC method catalog) and
+  `../spec/v2.md` §1.7 to confirm the spec hasn't drifted.
 - Re-measure `wc -l src/coding/modes/*.zig` — numbers may have
   shifted since this record was captured.
-- Confirm no v2.x item has migrated to `franky-spec-v2.md` §5
+- Confirm no v2.x item has migrated to `../spec/v2.md` §5
   ("items shipped after v1.0.0") that would change the picture.
 - Confirm the `Session` triplicate still exists (`grep -n
   '^const Session = struct' src/coding/modes/*.zig`).

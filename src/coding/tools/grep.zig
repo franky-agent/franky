@@ -1,7 +1,7 @@
 //! grep tool — §C.7 of the spec.
 //!
 //! Schema: `{pattern, path?, filesGlob?, regex?, caseSensitive?,
-//!           contextBefore?, contextAfter?, maxMatches?}`.
+//!           contextBefore?, contextAfter?, maxMatches?, respectGitignore?}`.
 //!
 //! Two matching modes:
 //!   - `regex=true` (default): `pattern` is compiled by `coding/regex.zig`
@@ -15,6 +15,13 @@
 //! Binary files are skipped (NUL byte in the first 8 KiB). Matches are
 //! reported as `path:line:snippet`. Context lines (before/after) are
 //! prefixed with `path-line-snippet`.
+//!
+//! `respectGitignore` (default `true`, matching `find` / `ls`): drops
+//! files whose path is ignored by any `.gitignore` under `path`. Note
+//! pre-v1.26.2 grep was missing this wiring entirely — a bare
+//! `grep "<term>"` against a fresh build directory would scan every
+//! `.zig-cache/.../*.yml` debug-info dump, easily emitting hundreds of
+//! megabytes of cache-internal hits and exhausting context budgets.
 
 const std = @import("std");
 const ai = struct {
@@ -25,6 +32,8 @@ const at = @import("../../agent/types.zig");
 const find_mod = @import("find.zig");
 const regex_mod = @import("../regex.zig");
 const workspace_mod = @import("workspace.zig");
+const gitignore = @import("../gitignore.zig");
+const truncate_mod = @import("truncate.zig");
 const common = @import("common.zig");
 
 pub const parameters_json: []const u8 =
@@ -39,7 +48,8 @@ pub const parameters_json: []const u8 =
     \\    "caseSensitive": {"type": "boolean", "description": "Default true."},
     \\    "contextBefore": {"type": "integer", "minimum": 0},
     \\    "contextAfter": {"type": "integer", "minimum": 0},
-    \\    "maxMatches": {"type": "integer", "minimum": 1, "description": "Max matches across all files. Default 500."}
+    \\    "maxMatches": {"type": "integer", "minimum": 1, "description": "Max matches across all files. Default 500."},
+    \\    "respectGitignore": {"type": "boolean", "description": "Respect .gitignore rules under path. Default true."}
     \\  },
     \\  "additionalProperties": false
     \\}
@@ -52,7 +62,7 @@ pub const binary_sniff_bytes: usize = 8 * 1024;
 pub fn tool() at.AgentTool {
     return .{
         .name = "grep",
-        .description = "Search files for a regex (default) or literal substring. Skips binaries; supports file glob.",
+        .description = "Search files for a regex (default) or literal substring. Skips binaries. Output truncates at 500 matches OR 50 KB OR 500 chars per line — whichever first. Narrow with `path` and `filesGlob` (e.g. `**/*.zig`) before searching from repo root, otherwise broad searches truncate.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .execute = execute,
@@ -62,7 +72,7 @@ pub fn tool() at.AgentTool {
 pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
     return .{
         .name = "grep",
-        .description = "Search files for a regex (path-safety enforced).",
+        .description = "Search files for a regex (path-safety enforced). Output truncates at 500 matches / 50 KB / 500 chars per line. Narrow with `path` and `filesGlob` before searching from repo root.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .ctx = @constCast(@ptrCast(ws)),
@@ -135,6 +145,10 @@ fn execute(
         (v != .bool or v.bool)
     else
         true;
+    const respect_gitignore: bool = if (root.object.get("respectGitignore")) |v|
+        (v != .bool or v.bool)
+    else
+        true;
 
     // Compile the regex up front so a bad pattern surfaces as a clean
     // `grep_bad_regex` tool error before we touch the filesystem.
@@ -154,7 +168,7 @@ fn execute(
     }
     defer matcher.deinit();
 
-    return try grepTree(allocator, io, path, &matcher, files_glob, context_before, context_after, max_matches, cancel);
+    return try grepTree(allocator, io, path, &matcher, files_glob, context_before, context_after, max_matches, respect_gitignore, cancel);
 }
 
 /// Unified matcher abstraction so `grepFile` can stay pattern-agnostic.
@@ -220,6 +234,7 @@ pub fn grepTree(
     context_before: usize,
     context_after: usize,
     max_matches: usize,
+    respect_gitignore: bool,
     cancel: *ai.stream.Cancel,
 ) !at.ToolResult {
     const root_dir = std.Io.Dir.cwd().openDir(io, cwd, .{ .iterate = true }) catch |err| switch (err) {
@@ -237,13 +252,33 @@ pub fn grepTree(
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
+    // Mirror the find/ls pattern: load every `.gitignore` under `cwd`
+    // once and consult `Stack.isIgnored` per entry. Falls back silently
+    // to "no ignore" when the load fails (e.g. no permission to walk
+    // the tree) — same behavior as find.zig.
+    var ignore_stack: ?gitignore.Stack = null;
+    defer if (ignore_stack) |*s| s.deinit();
+    if (respect_gitignore) {
+        ignore_stack = gitignore.loadFromTree(allocator, io, cwd) catch null;
+    }
+
     var total: usize = 0;
+    var any_line_truncated: bool = false;
+    var match_limit_reached: bool = false;
     while (walker.next(io) catch |e| return common.toolError(allocator, "walk_failed", @errorName(e))) |entry| {
         if (cancel.isFired()) return common.toolError(allocator, "aborted", "cancelled");
         if (entry.kind != .file) continue;
+        // Hard-skip the `.git` directory regardless of `.gitignore`
+        // contents. It's an internal data store, not source — no
+        // legitimate grep result lives in there, and even one
+        // packfile lookup is enough to derail a search.
+        if (std.mem.startsWith(u8, entry.path, ".git/") or std.mem.eql(u8, entry.path, ".git")) continue;
+        if (ignore_stack) |*s| {
+            if (s.isIgnored(entry.path, false)) continue;
+        }
         if (files_glob) |g| if (!find_mod.globMatch(g, entry.path)) continue;
         if (total >= max_matches) {
-            try out.appendSlice(allocator, "(truncated: maxMatches reached)\n");
+            match_limit_reached = true;
             break;
         }
         const before = total;
@@ -258,13 +293,70 @@ pub fn grepTree(
             max_matches,
             &total,
             &out,
+            &any_line_truncated,
         ) catch {
             // Skip unreadable files quietly.
             total = before;
         };
     }
 
-    const text = try allocator.dupe(u8, out.items);
+    // v1.27.1 — apply the byte-cap from `truncate_mod`. Match limit
+    // already governs row count, so we set `max_lines` to a no-op
+    // ceiling (max usize) and let `default_max_bytes` (50 KB) be the
+    // sole secondary bound. truncateHead returns a slice into
+    // out.items so we don't need to dupe it twice.
+    const trunc = truncate_mod.truncateHead(out.items, .{
+        .max_lines = std.math.maxInt(usize),
+        .max_bytes = truncate_mod.default_max_bytes,
+    });
+
+    var notices: std.ArrayList(u8) = .empty;
+    defer notices.deinit(allocator);
+    if (match_limit_reached) {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "{d} matches limit reached. Use limit={d} for more, or refine pattern",
+            .{ max_matches, max_matches * 2 },
+        );
+        defer allocator.free(msg);
+        if (notices.items.len > 0) try notices.appendSlice(allocator, ". ");
+        try notices.appendSlice(allocator, msg);
+    }
+    if (trunc.truncated and trunc.truncated_by == .bytes) {
+        const cap = try truncate_mod.formatSize(allocator, trunc.max_bytes);
+        defer allocator.free(cap);
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "{s} byte limit reached; refine pattern or use a narrower path/filesGlob",
+            .{cap},
+        );
+        defer allocator.free(msg);
+        if (notices.items.len > 0) try notices.appendSlice(allocator, ". ");
+        try notices.appendSlice(allocator, msg);
+    }
+    if (any_line_truncated) {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "Some lines truncated to {d} chars. Use the read tool to see full lines",
+            .{truncate_mod.grep_max_line_length},
+        );
+        defer allocator.free(msg);
+        if (notices.items.len > 0) try notices.appendSlice(allocator, ". ");
+        try notices.appendSlice(allocator, msg);
+    }
+
+    var final: std.ArrayList(u8) = .empty;
+    defer final.deinit(allocator);
+    try final.appendSlice(allocator, trunc.content);
+    if (notices.items.len > 0) {
+        if (final.items.len > 0 and final.items[final.items.len - 1] != '\n') try final.append(allocator, '\n');
+        try final.append(allocator, '\n');
+        try final.append(allocator, '[');
+        try final.appendSlice(allocator, notices.items);
+        try final.appendSlice(allocator, "]\n");
+    }
+
+    const text = try allocator.dupe(u8, final.items);
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };
     return .{ .content = arr };
@@ -281,6 +373,7 @@ fn grepFile(
     max_matches: usize,
     total: *usize,
     out: *std.ArrayList(u8),
+    lines_truncated: *bool,
 ) !void {
     var file = try dir.openFile(io, rel_path, .{});
     defer file.close(io);
@@ -326,11 +419,11 @@ fn grepFile(
         const begin_print = if (last_printed) |lp| @max(ctx_start, lp + 1) else ctx_start;
         var bi = begin_print;
         while (bi < l) : (bi += 1) {
-            try writeContextLine(out, allocator, rel_path, bi + 1, getLine(bytes, line_starts.items, bi));
+            try writeContextLine(out, allocator, rel_path, bi + 1, getLine(bytes, line_starts.items, bi), lines_truncated);
         }
 
         // The match line.
-        try writeMatchLine(out, allocator, rel_path, l + 1, line);
+        try writeMatchLine(out, allocator, rel_path, l + 1, line, lines_truncated);
         total.* += 1;
         last_printed = l;
 
@@ -339,7 +432,7 @@ fn grepFile(
         while (a_off <= context_after) : (a_off += 1) {
             const idx = l + a_off;
             if (idx >= line_count) break;
-            try writeContextLine(out, allocator, rel_path, idx + 1, getLine(bytes, line_starts.items, idx));
+            try writeContextLine(out, allocator, rel_path, idx + 1, getLine(bytes, line_starts.items, idx), lines_truncated);
             last_printed = idx;
         }
 
@@ -359,8 +452,12 @@ fn writeMatchLine(
     path: []const u8,
     line_no: usize,
     line: []const u8,
+    lines_truncated: *bool,
 ) !void {
-    const s = try std.fmt.allocPrint(allocator, "{s}:{d}:{s}\n", .{ path, line_no, line });
+    const t = truncate_mod.truncateLine(line, truncate_mod.grep_max_line_length);
+    if (t.was_truncated) lines_truncated.* = true;
+    const suffix: []const u8 = if (t.was_truncated) "... [truncated]" else "";
+    const s = try std.fmt.allocPrint(allocator, "{s}:{d}:{s}{s}\n", .{ path, line_no, t.text, suffix });
     defer allocator.free(s);
     try out.appendSlice(allocator, s);
 }
@@ -371,8 +468,12 @@ fn writeContextLine(
     path: []const u8,
     line_no: usize,
     line: []const u8,
+    lines_truncated: *bool,
 ) !void {
-    const s = try std.fmt.allocPrint(allocator, "{s}-{d}-{s}\n", .{ path, line_no, line });
+    const t = truncate_mod.truncateLine(line, truncate_mod.grep_max_line_length);
+    if (t.was_truncated) lines_truncated.* = true;
+    const suffix: []const u8 = if (t.was_truncated) "... [truncated]" else "";
+    const s = try std.fmt.allocPrint(allocator, "{s}-{d}-{s}{s}\n", .{ path, line_no, t.text, suffix });
     defer allocator.free(s);
     try out.appendSlice(allocator, s);
 }
@@ -435,7 +536,7 @@ test "grep tool: finds literal matches with line numbers" {
     var cancel: ai.stream.Cancel = .{};
     var m = literalMatcher("NEEDLE", true);
     defer m.deinit();
-    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, &cancel);
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, false, &cancel);
     defer res.deinit(gpa);
     const text = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, ":2:NEEDLE here") != null);
@@ -462,7 +563,7 @@ test "grep tool: case-insensitive literal match" {
     var cancel: ai.stream.Cancel = .{};
     var m = literalMatcher("world", false);
     defer m.deinit();
-    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, &cancel);
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, false, &cancel);
     defer res.deinit(gpa);
     try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "Hello World") != null);
 }
@@ -487,7 +588,7 @@ test "grep tool: context before/after" {
     var cancel: ai.stream.Cancel = .{};
     var m = literalMatcher("MATCH", true);
     defer m.deinit();
-    var res = try grepTree(gpa, io, base, &m, null, 1, 1, 100, &cancel);
+    var res = try grepTree(gpa, io, base, &m, null, 1, 1, 100, false, &cancel);
     defer res.deinit(gpa);
     const text = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, "-2-l2") != null);
@@ -515,7 +616,7 @@ test "grep tool: skips binary files" {
     var cancel: ai.stream.Cancel = .{};
     var m = literalMatcher("NEEDLE", true);
     defer m.deinit();
-    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, &cancel);
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, false, &cancel);
     defer res.deinit(gpa);
     try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "NEEDLE") == null);
 }
@@ -548,7 +649,7 @@ test "grep tool: regex metacharacters across files" {
     // Match function declarations: `fn <name>` (pub optional)
     var m = try regexMatcher("(pub )?fn \\w+", false);
     defer m.deinit();
-    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, &cancel);
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, false, &cancel);
     defer res.deinit(gpa);
     const text = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, "pub fn foo") != null);
@@ -582,7 +683,7 @@ test "grep tool: regex + filesGlob combo" {
     var cancel: ai.stream.Cancel = .{};
     var m = try regexMatcher("^TODO:", false);
     defer m.deinit();
-    var res = try grepTree(gpa, io, base, &m, "*.zig", 0, 0, 100, &cancel);
+    var res = try grepTree(gpa, io, base, &m, "*.zig", 0, 0, 100, false, &cancel);
     defer res.deinit(gpa);
     const text = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, "a.zig") != null);
@@ -658,8 +759,174 @@ test "grep tool: cancellation fires cleanly with regex compiled" {
     cancel.fire();
     var m = try regexMatcher("match", false);
     defer m.deinit();
-    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, &cancel);
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, false, &cancel);
     defer res.deinit(gpa);
     try testing.expect(res.is_error);
     try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "aborted") != null);
+}
+
+test "grep tool: respectGitignore drops ignored matches (v1.26.2 regression)" {
+    // Pre-v1.26.2 grep had no gitignore wiring at all — this test
+    // would return matches from `cache/leak.txt` even though the
+    // sibling `.gitignore` says `cache/`. The literal repro is what
+    // chewed through 1M context tokens in a sub-agent run: a bare
+    // `grep "<term>"` in a fresh build directory walked every
+    // `.zig-cache/.../*.yml` debug-info dump.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_grep_gitignore";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/cache");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.gitignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "cache/\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/visible.txt", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "needle here\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/cache/leak.txt", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "needle inside cache\n");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    var m = try regexMatcher("needle", false);
+    defer m.deinit();
+
+    // respect_gitignore = true → cache/leak.txt is skipped.
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, true, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "visible.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "cache/leak.txt") == null);
+
+    // respect_gitignore = false → both files surface.
+    var res2 = try grepTree(gpa, io, base, &m, null, 0, 0, 100, false, &cancel);
+    defer res2.deinit(gpa);
+    const text2 = res2.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text2, "visible.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, text2, "cache/leak.txt") != null);
+}
+
+test "grep tool: hard-skips .git directory regardless of respectGitignore" {
+    // `.git` is an internal data store, not source — never grep-able
+    // even when no `.gitignore` mentions it. Verifies the explicit
+    // skip in grepTree, not the gitignore stack.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_grep_dotgit";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/.git");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.git/config", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "[core]\n\trepositoryformatversion = needle\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/README.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "needle in source\n");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    var m = try regexMatcher("needle", false);
+    defer m.deinit();
+    // respect_gitignore=false intentionally — proves the .git skip is
+    // independent of the gitignore stack.
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, false, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "README.md") != null);
+    try testing.expect(std.mem.indexOf(u8, text, ".git/config") == null);
+}
+
+test "grep tool: long match line is truncated to grep_max_line_length (v1.27.1)" {
+    // A single long match line should be capped at 500 chars and
+    // suffixed with `... [truncated]`. The notice block at the end
+    // should mention `Use the read tool to see full lines`.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_grep_long_line";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/big.txt", .{});
+        defer f.close(io);
+        // 800-char line containing "needle" at the start.
+        var buf: [800]u8 = undefined;
+        @memset(&buf, 'x');
+        @memcpy(buf[0..6], "needle");
+        try f.writeStreamingAll(io, &buf);
+        try f.writeStreamingAll(io, "\n");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    var m = try regexMatcher("needle", false);
+    defer m.deinit();
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, false, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "needle") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "... [truncated]") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Use the read tool to see full lines") != null);
+    // Sanity: the capped match line shouldn't contain all 800 'x's.
+    try testing.expect(text.len < 1500);
+}
+
+test "grep tool: total output is byte-capped at default_max_bytes (v1.27.1)" {
+    // 200 short matching files, each contributing ~30 bytes of output,
+    // gives ~6 KB total. To exercise the byte cap we make 4000+ files
+    // — each "needle: <id>" match emits ~15 bytes. Combined with a
+    // generous match limit so the byte cap is the trigger, not the
+    // match count.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_grep_byte_cap";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        const path = try std.fmt.allocPrint(gpa, "{s}/f{d:0>4}.txt", .{ base, i });
+        defer gpa.free(path);
+        var f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "needle here\n");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    var m = try regexMatcher("needle", false);
+    defer m.deinit();
+    // max_matches = 10000 so the byte cap trips first.
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 10000, false, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    // Cap is 50 KB; allow some headroom for the notice trailer.
+    try testing.expect(text.len <= 60 * 1024);
+    try testing.expect(std.mem.indexOf(u8, text, "byte limit reached") != null);
 }

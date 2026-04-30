@@ -184,7 +184,7 @@ own automated reviews.
 ## Slack bot — the franky-do pattern
 
 `franky-do` is the planned Slack-bot sibling (`permission.md`
-§"Slack-bot pattern", `franky-spec-v1.md` §8.1). The constraints
+§"Slack-bot pattern", `../spec/v1.md` §8.1). The constraints
 are tighter than print/interactive/proxy because **the prompt
 source is untrusted** — anyone in the Slack workspace can DM the
 bot, and prompt-injection attacks cross the trust boundary.

@@ -446,7 +446,7 @@ prompts as a secondary opt-in for users who don't sandbox.
 > **Status (2026-04-25):** all six milestones (v1.4.0–v1.4.5
 > below) shipped. They map to binary versions v1.9.0–v1.9.5;
 > the "v1.4.x" labels in this doc are step IDs internal to this
-> roadmap, not binary versions. See `franky-spec-v1.md` §5.10
+> roadmap, not binary versions. See `../../spec/v1.md` §5.10
 > for the design and the v1.9.0 → v1.9.5 row in the
 > "What shipped" log.
 

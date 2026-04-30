@@ -110,7 +110,8 @@ pub fn run(
 
     // Stderr banner so operators see where to point their client.
     var sb: [256]u8 = undefined;
-    const banner = std.fmt.bufPrint(&sb,
+    const banner = std.fmt.bufPrint(
+        &sb,
         "franky proxy listening on http://{s}:{d}/\n  · web UI:   http://{s}:{d}/\n  · health:  http://{s}:{d}/health\n  · events:  http://{s}:{d}/events  (SSE)\n  · prompt:  POST http://{s}:{d}/prompt\n",
         .{ default_host, port, default_host, port, default_host, port, default_host, port, default_host, port },
     ) catch "";
@@ -141,7 +142,14 @@ pub fn run(
 
 // ─── session ─────────────────────────────────────────────────────
 
-const max_subs: usize = 16;
+/// v1.28.1 — bumped from 16 to 32. The 16 cap was tripping casual
+/// users with hot-reload + dev-tools open: each EventSource holds
+/// a slot until the connection closes (immediate close on browser
+/// reload, but the brief overlap between old + new tabs accumulated
+/// quickly). 32 gives realistic headroom; the per-slot cost is
+/// just `?*SseSubscriber` (~16 bytes), so 32 slots = ~512 bytes
+/// per session. When we hit this cap in practice we'll bump again.
+const max_subs: usize = 32;
 
 /// v1.16.0 — replay ring capacity. Each replay-eligible event
 /// (real `AgentEvent` frame + the synthetic `session_switched`
@@ -225,6 +233,13 @@ const Session = struct {
     parent_dir: ?[]u8,
     created_at_ms: i64,
 
+    /// v1.27.3 — bash-tool session state. Carries the on-disk
+    /// session directory so over-50KB bash captures spill to
+    /// `<session>/bash/<call_id>.log` instead of `/tmp` (matching
+    /// print mode's v1.27.2 behavior). Address is stable for the
+    /// session's lifetime — referenced by `tools_mod.bash.toolWithState`.
+    bash_state: tools_mod.bash.SessionBashState,
+
     /// Single-flight gate around the agent loop. Concurrent
     /// `POST /prompt` requests queue here.
     run_mutex: std.Io.Mutex = .init,
@@ -259,6 +274,7 @@ const Session = struct {
         self.allocator.free(self.system_prompt);
         self.allocator.free(self.session_id);
         if (self.parent_dir) |p| self.allocator.free(p);
+        self.bash_state.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -281,10 +297,24 @@ const Session = struct {
         for (self.subs[0..], 0..) |s, i| {
             if (s == null) {
                 self.subs[i] = sub;
+                // v1.28.1 — log lifecycle so a future pool-fill is
+                // visible without curl-probing. `live` is the count
+                // AFTER this addition.
+                ai.log.log(.warn, "proxy", "subscriber.added", "live={d}/{d}", .{ self.liveSubsLocked(), max_subs });
                 return true;
             }
         }
+        ai.log.log(.warn, "proxy", "subscriber.refused", "pool_full={d}/{d}", .{ max_subs, max_subs });
         return false;
+    }
+
+    /// v1.28.1 — count occupied slots. Caller must hold `events_mutex`.
+    fn liveSubsLocked(self: *const Session) usize {
+        var n: usize = 0;
+        for (self.subs[0..]) |s| if (s != null) {
+            n += 1;
+        };
+        return n;
     }
 
     fn removeSub(self: *Session, sub: *SseSubscriber) void {
@@ -293,6 +323,8 @@ const Session = struct {
         for (self.subs[0..], 0..) |s, i| {
             if (s == sub) {
                 self.subs[i] = null;
+                // v1.28.1 — `live` is the count AFTER this removal.
+                ai.log.log(.warn, "proxy", "subscriber.removed", "live={d}/{d}", .{ self.liveSubsLocked(), max_subs });
                 return;
             }
         }
@@ -478,12 +510,44 @@ fn initSession(
         .session_id = session_id,
         .parent_dir = parent_dir,
         .created_at_ms = created_at_ms,
+        .bash_state = tools_mod.bash.SessionBashState.init(allocator),
         .prompts_enabled = prompts_enabled,
     };
     session.session_gates = .{
         .role = &session.role_gate,
         .permissions = if (session.prompts_enabled) &session.permission_store else null,
     };
+
+    // v1.27.3 — wire the session's on-disk dir into bash_state so
+    // over-50KB bash spills land at `<session>/bash/<call_id>.log`
+    // instead of `/tmp` (matches print mode's v1.27.2 behavior).
+    // Best-effort — the spill writer falls back to /tmp on any
+    // failure here.
+    if (session.parent_dir) |parent| {
+        if (std.fs.path.join(allocator, &.{ parent, session.session_id })) |sd| {
+            defer allocator.free(sd);
+            session.bash_state.setSessionDir(sd) catch {};
+        } else |_| {}
+    }
+
+    // v1.27.3 — rebuild the filtered tool list with `bash.toolWithState`
+    // now that `&session.bash_state` is at a stable address. The
+    // initial `bash.tool()` factory above couldn't reference the
+    // bash_state because the session struct hadn't been populated
+    // yet; switching here ensures the bash invocation actually sees
+    // the session-dir spill plumbing.
+    {
+        const all_tools_with_state = [_]at.AgentTool{
+            tools_mod.read.tool(),
+            tools_mod.write.tool(),
+            tools_mod.edit.tool(),
+            tools_mod.bash.toolWithState(&session.bash_state),
+            tools_mod.ls.tool(),
+            tools_mod.find.tool(),
+            tools_mod.grep.tool(),
+        };
+        session.tools = try role_mod.filterTools(session.role_arena.allocator(), &all_tools_with_state, session.role_gate.set);
+    }
     if (resume_loaded) |loaded| {
         // Header strings are arena-owned by the loader; free them
         // since we kept only the transcript.
@@ -523,9 +587,19 @@ fn initSession(
 
     // v1.24.0 — append subagent tool. Same shape as rpc.zig: ctx
     // and the appended tool slice both live in role_arena.
+    //
+    // v1.28.0 — wire `parent_session_dir` so the sub-agent's
+    // transcript persists to
+    // `<session>/subagents/<call_id>/transcript.json`. The path
+    // is duped into role_arena so it lives as long as the session.
     {
         const ra = session.role_arena.allocator();
         const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
+        var parent_session_dir: ?[]const u8 = null;
+        if (session.parent_dir) |parent| {
+            const sd = try std.fs.path.join(ra, &.{ parent, session.session_id });
+            parent_session_dir = sd;
+        }
         subagent_ctx.* = .{
             .registry = &session.registry,
             .environ = environ,
@@ -537,7 +611,7 @@ fn initSession(
             // (set per-prompt). The `current_prompter` slot is on
             // the session struct so its address is stable.
             .permission_prompter_slot = &session.current_prompter,
-            .parent_session_dir = null,
+            .parent_session_dir = parent_session_dir,
         };
         const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 1);
         @memcpy(final_tools[0..session.tools.len], session.tools);
@@ -643,8 +717,7 @@ fn modelHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!v
     const owned = try px.session.allocator.dupe(u8, args[0]);
     px.session.provider.model_id = owned;
     px.side_effect = .model_changed;
-    px.data_json = try std.fmt.allocPrint(ctx.allocator,
-        "{{\"model\":\"{s}\"}}", .{owned});
+    px.data_json = try std.fmt.allocPrint(ctx.allocator, "{{\"model\":\"{s}\"}}", .{owned});
     try ctx.output.appendSlice(ctx.allocator, "Model swapped to `");
     try ctx.output.appendSlice(ctx.allocator, args[0]);
     try ctx.output.appendSlice(ctx.allocator, "` for the next turn.");
@@ -724,7 +797,8 @@ fn costHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void 
         return;
     }
     var line: [256]u8 = undefined;
-    const s = std.fmt.bufPrint(&line,
+    const s = std.fmt.bufPrint(
+        &line,
         "**Usage** — input: {d}, output: {d}, cache read: {d}, cache write: {d}\n\nApprox. cost: ${d:.4}",
         .{ total_in, total_out, total_cache_r, total_cache_w, total_usd },
     ) catch unreachable;
@@ -948,7 +1022,8 @@ fn compactHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!vo
             "compaction needs at least 2 user turns (to anchor on the most recent one and compact what's before)"
         else
             "transcript still fits inside the 15% tail budget that compaction reserves untouched";
-        const diag = std.fmt.allocPrint(ctx.allocator,
+        const diag = std.fmt.allocPrint(
+            ctx.allocator,
             "Transcript not yet compactable: {d} messages / {d} user turn{s} / ~{d} tokens estimated; tail budget = {d} tokens (15% of the {d}-token window). {s}.",
             .{
                 session.transcript.messages.items.len,
@@ -982,8 +1057,7 @@ fn compactHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!vo
     const replaced_str = std.fmt.bufPrint(&num_buf, "{d}", .{result.replaced_count}) catch "?";
     try msg.appendSlice(ctx.allocator, "Compacted ");
     try msg.appendSlice(ctx.allocator, replaced_str);
-    try msg.appendSlice(ctx.allocator,
-        " messages into a summary. Earlier history is preserved on the `pre-compact-<ts>` branch on disk.");
+    try msg.appendSlice(ctx.allocator, " messages into a summary. Earlier history is preserved on the `pre-compact-<ts>` branch on disk.");
     try ctx.output.appendSlice(ctx.allocator, msg.items);
 }
 
@@ -1254,10 +1328,7 @@ fn handleConnection(arg: ConnArg) void {
         return;
     }
     // GET /sessions/<id>/transcript
-    if (std.mem.eql(u8, req.method, "GET")
-        and std.mem.startsWith(u8, req.path, "/sessions/")
-        and std.mem.endsWith(u8, req.path, "/transcript"))
-    {
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/sessions/") and std.mem.endsWith(u8, req.path, "/transcript")) {
         const head_len = "/sessions/".len;
         const tail_len = "/transcript".len;
         if (req.path.len > head_len + tail_len) {
@@ -1762,7 +1833,8 @@ fn renderFrame(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
 
 fn respondStatus(stream: *std.Io.net.Stream, io: std.Io, status: u16, reason: []const u8) void {
     var buf: [512]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf,
+    const text = std.fmt.bufPrint(
+        &buf,
         "HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         .{ status, reason },
     ) catch return;
@@ -1774,7 +1846,8 @@ fn respondStatus(stream: *std.Io.net.Stream, io: std.Io, status: u16, reason: []
 
 fn respondJson(stream: *std.Io.net.Stream, io: std.Io, status: u16, body: []const u8) void {
     var hdr: [256]u8 = undefined;
-    const text = std.fmt.bufPrint(&hdr,
+    const text = std.fmt.bufPrint(
+        &hdr,
         "HTTP/1.1 {d} OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
         .{ status, body.len },
     ) catch return;
@@ -1962,7 +2035,8 @@ fn respondActiveSession(
     };
     session.events_mutex.unlock(session.io);
     defer allocator.free(id_copy);
-    const body = std.fmt.allocPrint(allocator,
+    const body = std.fmt.allocPrint(
+        allocator,
         "{{\"id\":\"{s}\",\"messageCount\":{d},\"persisted\":{}}}",
         .{ id_copy, count, session.parent_dir != null },
     ) catch {
@@ -1989,6 +2063,8 @@ fn respondRole(
         session.role_gate.role,
         session.role_gate.set,
         sandboxed,
+        session.provider.provider_name,
+        session.provider.model_id,
     ) catch {
         respondStatus(stream, io, 500, "Internal Server Error");
         return;
@@ -2047,7 +2123,8 @@ fn renderSessionListJson(
     var dir = std.Io.Dir.cwd().openDir(io, parent_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
             // No sessions dir yet — return empty list.
-            return try std.fmt.allocPrint(allocator,
+            return try std.fmt.allocPrint(
+                allocator,
                 "{{\"sessions\":[],\"active\":\"{s}\",\"persisted\":true}}",
                 .{active_id},
             );
@@ -2214,7 +2291,8 @@ fn respondNewSession(
     };
     broadcastSessionSwitched(session, allocator);
 
-    const body = std.fmt.allocPrint(allocator,
+    const body = std.fmt.allocPrint(
+        allocator,
         "{{\"id\":\"{s}\",\"created\":true}}",
         .{session.session_id},
     ) catch {
@@ -2294,7 +2372,8 @@ fn respondSlashCommand(
             slash_mod.Error.Rejected => "rejected",
             else => "internal",
         };
-        const body = std.fmt.allocPrint(allocator,
+        const body = std.fmt.allocPrint(
+            allocator,
             "{{\"ok\":false,\"error\":\"{s}\",\"errorCode\":\"{s}\"}}",
             .{ @errorName(err), code },
         ) catch {
@@ -2394,7 +2473,8 @@ fn respondActivateSession(
 
     broadcastSessionSwitched(session, allocator);
 
-    const resp = std.fmt.allocPrint(allocator,
+    const resp = std.fmt.allocPrint(
+        allocator,
         "{{\"id\":\"{s}\",\"activated\":true}}",
         .{session.session_id},
     ) catch {
@@ -2489,7 +2569,8 @@ fn swapToLoadedSession(session: *Session, loaded: *session_mod.Session, target_i
 /// know to drop their conversation pane and rehydrate from
 /// `/transcript`.
 fn broadcastSessionSwitched(session: *Session, allocator: std.mem.Allocator) void {
-    const frame = std.fmt.allocPrint(allocator,
+    const frame = std.fmt.allocPrint(
+        allocator,
         "event: session_switched\ndata: {{\"id\":\"{s}\"}}\n\n",
         .{session.session_id},
     ) catch return;
@@ -2546,7 +2627,8 @@ fn extractJsonStringField(body: []const u8, field: []const u8) ?[]const u8 {
 /// for the MVP; if asset size grows we'll add gzip + ETag.
 fn respondAsset(stream: *std.Io.net.Stream, io: std.Io, body: []const u8, content_type: []const u8) void {
     var hdr: [320]u8 = undefined;
-    const text = std.fmt.bufPrint(&hdr,
+    const text = std.fmt.bufPrint(
+        &hdr,
         "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nCache-Control: no-cache\r\n\r\n",
         .{ content_type, body.len },
     ) catch return;
@@ -2643,11 +2725,13 @@ fn initSessionForTestWithDir(
         .session_id = owned_id,
         .parent_dir = owned_parent,
         .created_at_ms = ai.stream.nowMillis(),
+        .bash_state = tools_mod.bash.SessionBashState.init(allocator),
     };
     session.session_gates = .{ .role = &session.role_gate };
     errdefer session.registry.deinit();
     errdefer session.faux.deinit();
     errdefer session.permission_store.deinit();
+    errdefer session.bash_state.deinit();
     try session.registry.register(.{
         .api = "faux",
         .provider = "faux",
@@ -3136,7 +3220,7 @@ test "renderTranscriptForUi: escapes JSON specials in text content" {
 
 test "isUlidLike accepts 26-char base32, rejects path traversal" {
     try testing.expect(isUlidLike("01J9XK7QM4WN89PQRSTU2VWXY3"));
-    try testing.expect(!isUlidLike("01J9"));               // too short
+    try testing.expect(!isUlidLike("01J9")); // too short
     try testing.expect(!isUlidLike("../../../etc/passwd"));
     try testing.expect(!isUlidLike("01J9XK7QM4WN89PQRSTU2VWXY!"));
 }
@@ -3827,7 +3911,8 @@ test "proxy: POST /command end-to-end via HTTP" {
     defer ts.deinit();
 
     const body = "/help";
-    const req = try std.fmt.allocPrint(gpa,
+    const req = try std.fmt.allocPrint(
+        gpa,
         "POST /command HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
         .{ body.len, body },
     );
@@ -3946,7 +4031,8 @@ test "proxy: POST /permission/resolve without an in-flight prompt returns 409" {
     // current_prompter is null by default — no runPrompt active.
 
     const body = "{\"call_id\":\"c1\",\"resolution\":\"allow_once\"}";
-    const req = try std.fmt.allocPrint(gpa,
+    const req = try std.fmt.allocPrint(
+        gpa,
         "POST /permission/resolve HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
         .{ body.len, body },
     );
@@ -3999,7 +4085,8 @@ test "proxy: POST /permission/resolve with a wired prompter succeeds + wakes the
     ev.deinit(gpa);
 
     const body = "{\"call_id\":\"c1\",\"resolution\":\"allow_once\"}";
-    const req = try std.fmt.allocPrint(gpa,
+    const req = try std.fmt.allocPrint(
+        gpa,
         "POST /permission/resolve HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
         .{ body.len, body },
     );
@@ -4145,7 +4232,8 @@ test "proxy: POST /prompt fans assistant events to /events subscribers" {
             var stream = std.Io.net.IpAddress.connect(&addr, client_io, .{ .mode = .stream }) catch return;
             defer stream.close(client_io);
             const body = "hello";
-            const req = std.fmt.allocPrint(alloc,
+            const req = std.fmt.allocPrint(
+                alloc,
                 "POST /prompt HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
                 .{ body.len, body },
             ) catch return;

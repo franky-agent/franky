@@ -1,6 +1,6 @@
 FROM docker/sandbox-templates:claude-code
 USER root
-RUN sudo apt-get update && sudo apt-get install -y wget gnupg podman xz-utils
+RUN sudo apt-get update && sudo apt-get install -y wget gnupg podman xz-utils tcpdump
 RUN wget https://ziglang.org/builds/zig-aarch64-linux-0.17.0-dev.87+9b177a7d2.tar.xz && \
     tar -xf zig-aarch64-linux-0.17.0-dev.87+9b177a7d2.tar.xz -C /usr/local/bin --strip-components=1 && \
     rm zig-aarch64-linux-0.17.0-dev.87+9b177a7d2.tar.xz

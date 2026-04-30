@@ -126,7 +126,7 @@ Note the separation franky uses: **zig errors stay small**
 (just a tag), while **rich metadata** (HTTP status, retry-after,
 provider sub-code) rides in a separate `ErrorDetails` struct that
 flows through the stream channel. See
-[the session CHANGELOG's §F.2 note](CHANGELOG.md) for why.
+[`spec/v1.md` §F.2 — Tool vs agent errors](../spec/v1.md) for why.
 
 **Official docs:** [Errors](https://ziglang.org/documentation/master/#Errors).
 
@@ -493,7 +493,7 @@ to dig deeper when you're ready.
 - **`std.Io`** — Zig 0.17-dev's pluggable IO model. Every
   IO-performing API in franky takes an `io: std.Io` parameter so
   the backend can swap (threaded today, green-threads "concurrent"
-  when it stabilizes — see §N.2 in `franky-spec-v1.md`).
+  when it stabilizes — see §N.2 in `../spec/v1.md`).
   [Docs: std.Io](https://ziglang.org/documentation/master/std/#std.Io).
 - **`build.zig`** — Zig's build system is just a Zig program.
   Open `build.zig` in this repo: ~80 lines that add a binary,

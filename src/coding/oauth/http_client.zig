@@ -14,6 +14,7 @@
 //! for 4xx/5xx, only for transport failures.
 
 const std = @import("std");
+const HttpClient = @import("../../ai/http.zig").Client;
 
 pub const Response = struct {
     status: std.http.Status,
@@ -25,7 +26,7 @@ pub const Response = struct {
     }
 };
 
-pub const Error = std.http.Client.FetchError || error{OutOfMemory};
+pub const Error = HttpClient.FetchError || error{OutOfMemory};
 
 /// POST `body_form` as `application/x-www-form-urlencoded` to
 /// `url`. Captures the response body into caller-owned bytes.
@@ -44,10 +45,10 @@ pub fn postForm(
     var body_writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer body_writer.deinit();
 
-    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    var client: HttpClient = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
-    const headers: std.http.Client.Request.Headers = .{
+    const headers: HttpClient.Request.Headers = .{
         .content_type = .{ .override = "application/x-www-form-urlencoded" },
         .accept_encoding = .omit,
     };

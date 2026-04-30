@@ -7,7 +7,7 @@
 //!     bounded gap between emitted events; returns `Timeout` if the gap
 //!     exceeds `event_gap_ms`.
 //!   - `streamSse(...)` — one-shot fetch + parse convenience built on
-//!     `std.http.Client.fetch` (buffered). Used by provider-side tests;
+//!     `Client.fetch` (buffered). Used by provider-side tests;
 //!     production providers inline their own fetch so they can inspect
 //!     status/headers before parsing.
 //!
@@ -46,8 +46,78 @@ const sse_mod = @import("sse.zig");
 const stream_mod = @import("stream.zig");
 const errors_mod = @import("errors.zig");
 const registry_mod = @import("registry.zig");
+const log = @import("log.zig");
 
 pub const Timeouts = registry_mod.Timeouts;
+
+// `Client` is a vendored copy of `std.http.Client` from the bundled Zig
+// 0.17-dev toolchain with Zig PR #23365 applied. Without that patch, when
+// `HTTPS_PROXY` points at a forward proxy and the origin uses HTTPS, the
+// stdlib client opens the CONNECT tunnel correctly but then sends the
+// request body as plaintext through the tunnel — TLS-intercepting proxies
+// (Squid with `host_strict_verify`, Docker Sandboxes' MITM proxy) reject
+// that with "Host header does not match CONNECT request". The vendored
+// copy performs the missing TLS handshake on the established tunnel.
+//
+// All franky internals (providers, OAuth client, model index generator)
+// and franky-do's Slack web_api consume this alias, not `std.http.Client`,
+// so the patch is in effect everywhere we make HTTP calls.
+//
+// See https://github.com/ziglang/zig/issues/19878 and PR #23365 for
+// background, and `vendored/http_client.zig` for the patched source.
+pub const Client = @import("vendored/http_client.zig");
+
+// ─── client setup (v1.25.0) ──────────────────────────────────────
+//
+// `setupClientFromEnv` consolidates proxy + CA-bundle extension
+// for any `Client` we hand out. Each provider streamFn
+// previously did `initDefaultProxies` inline; v1.25.0 also honors
+// `FRANKY_CA_BUNDLE` (path to a PEM file with extra root certs)
+// for environments where Zig's `rescanLinux` doesn't pick up the
+// trust bundle the operator needs — typically corp / sandbox
+// MITM proxies whose CA was installed as a per-cert .pem in
+// `/etc/ssl/certs/` rather than appended to
+// `/etc/ssl/certs/ca-certificates.crt`.
+//
+// Lifetime: the proxy arena is consumed inside the call (proxy
+// state is stored on the client itself); the caller owns
+// `client`. The CA bundle uses the client's allocator.
+
+pub fn setupClientFromEnv(
+    client: *Client,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+) anyerror!void {
+    var proxy_arena = std.heap.ArenaAllocator.init(allocator);
+    defer proxy_arena.deinit();
+    try client.initDefaultProxies(proxy_arena.allocator(), environ_map);
+
+    if (environ_map.get("FRANKY_CA_BUNDLE")) |ca_path| {
+        if (ca_path.len == 0) return;
+        const now = std.Io.Clock.real.now(io);
+        // Force the system-bundle rescan now (the lazy path inside
+        // `Client.connect` would otherwise CLOBBER our additions
+        // because `rescanLinux` calls `clearRetainingCapacity()`
+        // first). Then append the operator's extra CAs. Then
+        // mark `client.now` so the lazy rescan is skipped.
+        client.ca_bundle.rescan(allocator, io, now) catch |e| switch (e) {
+            error.Canceled => |ce| return ce,
+            else => |other| {
+                log.log(.warn, "http", "ca-bundle", "system rescan failed: {s} (proceeding with extra CAs only)", .{@errorName(other)});
+            },
+        };
+        client.ca_bundle.addCertsFromFilePathAbsolute(allocator, io, now, ca_path) catch |e| switch (e) {
+            error.Canceled => |ce| return ce,
+            else => |other| {
+                log.log(.warn, "http", "ca-bundle", "FRANKY_CA_BUNDLE={s} load failed: {s}", .{ ca_path, @errorName(other) });
+                return;
+            },
+        };
+        client.now = now;
+        log.log(.info, "http", "ca-bundle", "extended trust store with FRANKY_CA_BUNDLE={s}", .{ca_path});
+    }
+}
 
 // ─── §G.4 per-phase timeout primitives (v1.8.0) ──────────────────
 
@@ -90,7 +160,7 @@ const PhaseGuard = struct {
     mutex: std.Io.Mutex = .init,
     /// Connection whose stream we close when the deadline fires.
     /// Null while no connection exists yet (i.e. during `connect`).
-    connection: ?*std.http.Client.Connection = null,
+    connection: ?*Client.Connection = null,
     /// Absolute deadline in ms-since-epoch for the active phase.
     /// 0 = no active deadline (between phases or done).
     deadline_ms: i64 = 0,
@@ -138,7 +208,7 @@ fn watchdogLoop(g: *PhaseGuard) void {
 /// Arm `g` for a new phase. Caller-side: the request thread calls
 /// this immediately before the IO op and `disarmPhase` immediately
 /// after it returns.
-fn armPhase(g: *PhaseGuard, phase: PhaseTag, conn: ?*std.http.Client.Connection, budget_ms: u32) void {
+fn armPhase(g: *PhaseGuard, phase: PhaseTag, conn: ?*Client.Connection, budget_ms: u32) void {
     if (budget_ms == 0) return; // disabled — leave deadline=0
     g.mutex.lockUncancelable(g.io);
     defer g.mutex.unlock(g.io);
@@ -271,7 +341,7 @@ pub fn driveSseFromBytesWithTimeouts(
 
 // ─── Full fetch + SSE ─────────────────────────────────────────────────
 
-/// Full streaming POST + SSE parse — issues a request via `std.http.Client`
+/// Full streaming POST + SSE parse — issues a request via `Client`
 /// and feeds the response body into the parser, invoking `on_event` for
 /// every parsed event.
 ///
@@ -289,7 +359,7 @@ pub fn streamSse(
     userdata: ?*anyopaque,
     timeouts: Timeouts,
 ) !void {
-    var client = std.http.Client{ .allocator = allocator, .io = io };
+    var client = Client{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     var body_writer = std.Io.Writer.Allocating.init(allocator);
@@ -322,8 +392,8 @@ pub fn streamSse(
 const retry_mod = @import("retry.zig");
 
 pub const FetchRetryCtx = struct {
-    client: *std.http.Client,
-    options: *std.http.Client.FetchOptions,
+    client: *Client,
+    options: *Client.FetchOptions,
     /// Output slot — on success contains the FetchResult; on
     /// terminal failure contains the error from the final attempt.
     last_status: std.http.Status = .ok,
@@ -511,7 +581,7 @@ pub fn fetchAttemptPhased(userdata: ?*anyopaque, attempt: u32) retry_mod.Attempt
 fn fetchPhased(
     ctx: *FetchRetryCtx,
     guard: *PhaseGuard,
-) !std.http.Client.FetchResult {
+) !Client.FetchResult {
     const opts = ctx.options.*;
     const uri = switch (opts.location) {
         .url => |u| try std.Uri.parse(u),
@@ -527,7 +597,7 @@ fn fetchPhased(
     // timeout still bounds it. Once `request` returns, we own a
     // connection and the next two phases get full interrupt.
     armPhase(guard, .connect, null, ctx.timeouts.connect_ms);
-    var req = std.http.Client.request(ctx.client, method, uri, .{
+    var req = Client.request(ctx.client, method, uri, .{
         .redirect_behavior = opts.redirect_behavior orelse
             if (opts.payload == null) @enumFromInt(3) else .unhandled,
         .headers = opts.headers,
@@ -628,12 +698,12 @@ fn fetchPhased(
 /// followed by a 200 on attempt 2 is valid; a 200 followed by a
 /// broken SSE stream is NOT retryable from this layer.
 pub fn fetchWithRetry(
-    client: *std.http.Client,
-    options: std.http.Client.FetchOptions,
+    client: *Client,
+    options: Client.FetchOptions,
     body_writer: *std.Io.Writer.Allocating,
     cancel: *stream_mod.Cancel,
     policy: retry_mod.Policy,
-) !std.http.Client.FetchResult {
+) !Client.FetchResult {
     return fetchWithRetryAndTimeouts(client, options, body_writer, cancel, policy, .{});
 }
 
@@ -644,13 +714,13 @@ pub fn fetchWithRetry(
 /// enforcement still requires streaming-reads migration; this
 /// covers the coarser "total budget" case.
 pub fn fetchWithRetryAndTimeouts(
-    client: *std.http.Client,
-    options: std.http.Client.FetchOptions,
+    client: *Client,
+    options: Client.FetchOptions,
     body_writer: *std.Io.Writer.Allocating,
     cancel: *stream_mod.Cancel,
     policy: retry_mod.Policy,
     timeouts: Timeouts,
-) !std.http.Client.FetchResult {
+) !Client.FetchResult {
     return fetchWithRetryAndTimeoutsAndHooks(client, options, body_writer, cancel, policy, timeouts, .{});
 }
 
@@ -756,14 +826,14 @@ fn formatTimeoutMessage(
 }
 
 pub fn fetchWithRetryAndTimeoutsAndHooks(
-    client: *std.http.Client,
-    options: std.http.Client.FetchOptions,
+    client: *Client,
+    options: Client.FetchOptions,
     body_writer: *std.Io.Writer.Allocating,
     cancel: *stream_mod.Cancel,
     policy: retry_mod.Policy,
     timeouts: Timeouts,
     hooks: Hooks,
-) !std.http.Client.FetchResult {
+) !Client.FetchResult {
     return fetchWithRetryAndTimeoutsAndHooksAndPhases(
         client,
         options,
@@ -782,15 +852,15 @@ pub fn fetchWithRetryAndTimeoutsAndHooks(
 /// `client.fetch`) remains for backward compat but is no longer
 /// reachable through any of the public entry points.
 pub fn fetchWithRetryAndTimeoutsAndHooksAndPhases(
-    client: *std.http.Client,
-    options: std.http.Client.FetchOptions,
+    client: *Client,
+    options: Client.FetchOptions,
     body_writer: *std.Io.Writer.Allocating,
     cancel: *stream_mod.Cancel,
     policy: retry_mod.Policy,
     timeouts: Timeouts,
     hooks: Hooks,
     phase_info: ?*PhaseInfo,
-) !std.http.Client.FetchResult {
+) !Client.FetchResult {
     var opts_copy = options;
     opts_copy.response_writer = &body_writer.writer;
 
@@ -1305,7 +1375,7 @@ test "fetchPhased: happy path keeps PhaseInfo at .none" {
     const server_thread = try std.Thread.spawn(.{}, stallServerLoop, .{&s});
     defer server_thread.join();
 
-    var client = std.http.Client{ .allocator = gpa, .io = io };
+    var client = Client{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     var bw = std.Io.Writer.Allocating.init(gpa);
@@ -1344,7 +1414,7 @@ test "fetchPhased: first_byte phase fires when server stalls past budget" {
     const server_thread = try std.Thread.spawn(.{}, stallServerLoop, .{&s});
     defer server_thread.join();
 
-    var client = std.http.Client{ .allocator = gpa, .io = io };
+    var client = Client{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     var bw = std.Io.Writer.Allocating.init(gpa);

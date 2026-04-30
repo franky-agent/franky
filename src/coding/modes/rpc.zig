@@ -120,10 +120,18 @@ const Session = struct {
     /// v1.19.0 — resolved per-tool-prompt toggle. CLI `--prompts`
     /// wins; otherwise honors settings.json `prompts: bool`.
     prompts_enabled: bool = false,
+    /// v1.27.3 — bash-tool session state. RPC mode doesn't persist
+    /// transcripts to disk, but it can still spill bash output to
+    /// `<FRANKY_HOME>/sessions/rpc-<pid>-<startup_ms>/bash/<call_id>.log`
+    /// when `FRANKY_HOME`/`HOME` is set. Falls back to `/tmp` when
+    /// neither env var is set. Address stable for the rpc process's
+    /// lifetime — referenced by `bash.toolWithState`.
+    bash_state: tools_mod.bash.SessionBashState,
 
     fn deinit(self: *Session) void {
         self.transcript.deinit();
         self.allocator.free(self.system_prompt);
+        self.bash_state.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -196,6 +204,7 @@ fn initSession(
         .cfg = cfg,
         .environ_map = environ_map,
         .prompts_enabled = prompts_enabled,
+        .bash_state = tools_mod.bash.SessionBashState.init(allocator),
     };
     session.session_gates = .{
         .role = &session.role_gate,
@@ -203,6 +212,55 @@ fn initSession(
     };
     errdefer session.registry.deinit();
     errdefer session.faux.deinit();
+    errdefer session.bash_state.deinit();
+
+    // v1.27.3 — synthesize a process-scoped session dir for bash
+    // spills. RPC has no on-disk transcript persistence (matching
+    // the v1 spec note about virtual-session multiplexing), but
+    // bash captures still want a discoverable home that isn't /tmp.
+    // Layout: `<FRANKY_HOME or $HOME/.franky>/sessions/rpc-<pid>-<unix_ms>/bash/<call_id>.log`.
+    // Best-effort — if neither env var is set, the spill writer
+    // falls back to /tmp via its own gate, matching v1.27.0
+    // behavior. The dir lives until manually cleaned (or until a
+    // future `--gc-sessions` reaps it); RPC processes are
+    // long-lived so leaving the dir around per-run is fine.
+    {
+        const home_root = if (environ.getPosix("FRANKY_HOME")) |h|
+            try std.fs.path.join(allocator, &.{ h, "sessions" })
+        else if (environ.getPosix("HOME")) |h|
+            try std.fs.path.join(allocator, &.{ h, ".franky", "sessions" })
+        else
+            null;
+        if (home_root) |hr| {
+            defer allocator.free(hr);
+            // Process-scoped id from the startup timestamp. Two rpc
+            // processes started in the same millisecond would collide,
+            // but that's vanishingly rare and the worst-case symptom is
+            // a shared spill dir — not corruption.
+            const startup_ms: i64 = ai.stream.nowMillis();
+            const rpc_id = try std.fmt.allocPrint(allocator, "rpc-{d}", .{startup_ms});
+            defer allocator.free(rpc_id);
+            const sd = try std.fs.path.join(allocator, &.{ hr, rpc_id });
+            defer allocator.free(sd);
+            session.bash_state.setSessionDir(sd) catch {};
+        }
+    }
+
+    // v1.27.3 — rebuild the filtered tool list with `bash.toolWithState`
+    // now that `&session.bash_state` is at a stable address. Same
+    // pattern as proxy.zig.
+    {
+        const all_tools_with_state = [_]at.AgentTool{
+            tools_mod.read.tool(),
+            tools_mod.write.tool(),
+            tools_mod.edit.tool(),
+            tools_mod.bash.toolWithState(&session.bash_state),
+            tools_mod.ls.tool(),
+            tools_mod.find.tool(),
+            tools_mod.grep.tool(),
+        };
+        session.tools = try role_mod.filterTools(session.role_arena.allocator(), &all_tools_with_state, session.role_gate.set);
+    }
 
     session.provider = try print_mode.resolveProviderIo(allocator, io, environ, cfg);
 
@@ -235,8 +293,22 @@ fn initSession(
 
     // v1.24.0 — append subagent tool to session.tools. ctx + slice
     // both live in role_arena, which the session owns.
+    //
+    // v1.28.0 — RPC reuses the same synthesized rpc-<startup_ms>
+    // dir that bash_state already points at (set via
+    // `setSessionDir` above). Sub-agent transcripts land at
+    // `<rpc-dir>/subagents/<call_id>/transcript.json` and the
+    // path is surfaced in the result so the parent can `read`
+    // it on demand. When neither `FRANKY_HOME` nor `HOME` is
+    // set the bash_state has no session dir — sub-agent
+    // persistence is then skipped and the result omits
+    // `transcript_path`.
     const ra = session.role_arena.allocator();
     const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
+    const parent_session_dir: ?[]const u8 = if (session.bash_state.getSessionDir()) |sd|
+        try ra.dupe(u8, sd)
+    else
+        null;
     subagent_ctx.* = .{
         .registry = &session.registry,
         .environ = environ,
@@ -248,7 +320,7 @@ fn initSession(
         // at sub-agent spawn time (parent is mid-prompt then,
         // so the slot holds the live prompter).
         .permission_prompter_slot = &session.current_prompter,
-        .parent_session_dir = null,
+        .parent_session_dir = parent_session_dir,
     };
     const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 1);
     @memcpy(final_tools[0..session.tools.len], session.tools);
@@ -622,6 +694,8 @@ fn writeRoleResult(
         session.role_gate.role,
         session.role_gate.set,
         sandboxed,
+        session.provider.provider_name,
+        session.provider.model_id,
     );
     defer allocator.free(body);
     try writeResultFrame(allocator, io, stdout, id, body);

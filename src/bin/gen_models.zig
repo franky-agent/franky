@@ -372,7 +372,7 @@ fn fetchOllamaShow(
     base: []const u8,
     model_id: []const u8,
 ) !fetch_mod.OllamaShowDetails {
-    var client = std.http.Client{ .allocator = gpa, .io = io };
+    var client = franky.ai.http.Client{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     var body_writer = std.Io.Writer.Allocating.init(gpa);
@@ -417,7 +417,7 @@ fn fetchJson(
     /// Credential for anthropic/openai/google; base URL for ollama.
     key_or_base: []const u8,
 ) ![]u8 {
-    var client = std.http.Client{ .allocator = gpa, .io = io };
+    var client = franky.ai.http.Client{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     var body_writer = std.Io.Writer.Allocating.init(gpa);

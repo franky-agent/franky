@@ -331,7 +331,32 @@ const Driver = struct {
                 if (ct.object.get("parts")) |ps| if (ps == .array) {
                     for (ps.array.items) |p| {
                         if (p != .object) continue;
-                        if (p.object.get("thought")) |th| if (th == .bool and th.bool) {
+                        // Gemini's `Part` proto carries two thinking-related
+                        // fields:
+                        //   `thought: bool`              — explicit "this is a
+                        //                                  thought summary"
+                        //   `thoughtSignature: string`   — opaque continuation
+                        //                                  token attached to
+                        //                                  every part of a
+                        //                                  thinking response
+                        // v1.26.4 — treat *either* signal as thinking. Real
+                        // incident: gemini-2.5-pro emitted a long
+                        // self-correcting reasoning monologue as a sequence
+                        // of `text` parts each carrying `thoughtSignature`
+                        // but **without** an explicit `thought: true` flag,
+                        // followed by a `functionCall`. Pre-v1.26.4 we
+                        // routed all those parts to `text_delta`; the web
+                        // UI rendered them as the assistant's answer, which
+                        // confused the user (the model never produced a
+                        // user-facing answer — only a tool call). Post-fix
+                        // they route to `thinking_delta` and surface in the
+                        // dimmed thinking pane where they belong.
+                        const is_thought = blk: {
+                            if (p.object.get("thought")) |th| if (th == .bool and th.bool) break :blk true;
+                            if (p.object.get("thoughtSignature")) |sig| if (sig == .string and sig.string.len > 0) break :blk true;
+                            break :blk false;
+                        };
+                        if (is_thought) {
                             if (p.object.get("text")) |t| if (t == .string) {
                                 try self.out.push(self.io, .{ .thinking_delta = .{
                                     .block_index = 0,
@@ -339,7 +364,7 @@ const Driver = struct {
                                 } });
                             };
                             continue;
-                        };
+                        }
                         if (p.object.get("text")) |t| if (t == .string) {
                             try self.out.push(self.io, .{ .text_delta = .{
                                 .block_index = 0,
@@ -386,36 +411,25 @@ const Driver = struct {
     }
 };
 
+/// Re-encode Gemini's `functionCall.args` (an already-parsed
+/// `std.json.Value`) back to a JSON string for the agent loop.
+///
+/// The handwritten walker this replaced (v1.23–v1.26.0) wrote
+/// raw bytes from each string value verbatim — no JSON-escape
+/// pass — and dropped nested objects/arrays to `null`. Both
+/// were bugs surfaced by real subagent calls: a multi-line
+/// `prompt` arg arrived through the wire with embedded `\n`
+/// chars, and the unescaped re-emit produced "JSON" with
+/// literal control characters that strict parsers (the
+/// subagent tool's `parseArgs`) reject as `invalid_args`.
+///
+/// `std.json.Stringify.valueAlloc` handles control-char
+/// escaping, nested objects/arrays, and number/bool formatting
+/// in one shot.
 fn renderArgs(allocator: std.mem.Allocator, v: ?std.json.Value) ![]u8 {
-    if (v == null or v.? != .object) return try allocator.dupe(u8, "{}");
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try buf.append(allocator, '{');
-    var first = true;
-    var it = v.?.object.iterator();
-    while (it.next()) |entry| {
-        if (!first) try buf.append(allocator, ',');
-        try buf.append(allocator, '"');
-        try buf.appendSlice(allocator, entry.key_ptr.*);
-        try buf.appendSlice(allocator, "\":");
-        switch (entry.value_ptr.*) {
-            .string => |s| {
-                try buf.append(allocator, '"');
-                try buf.appendSlice(allocator, s);
-                try buf.append(allocator, '"');
-            },
-            .integer => |i| {
-                var tmp: [24]u8 = undefined;
-                const rendered = std.fmt.bufPrint(&tmp, "{d}", .{i}) catch unreachable;
-                try buf.appendSlice(allocator, rendered);
-            },
-            .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-            else => try buf.appendSlice(allocator, "null"),
-        }
-        first = false;
-    }
-    try buf.append(allocator, '}');
-    return try buf.toOwnedSlice(allocator);
+    const value = v orelse return try allocator.dupe(u8, "{}");
+    if (value != .object) return try allocator.dupe(u8, "{}");
+    return try std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
 fn mapFinishReason(s: []const u8) ?types.StopReason {
@@ -491,17 +505,16 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 
     const cancel = ctx.options.cancel orelse unreachable;
 
-    var client = std.http.Client{ .allocator = ctx.allocator, .io = ctx.io };
+    var client = http_mod.Client{ .allocator = ctx.allocator, .io = ctx.io };
     defer client.deinit();
 
     if (ctx.options.environ_map) |env_map| {
-        var proxy_arena = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer proxy_arena.deinit();
-        client.initDefaultProxies(proxy_arena.allocator(), env_map) catch |e| {
+        // v1.25.0 — proxy + FRANKY_CA_BUNDLE in one call.
+        http_mod.setupClientFromEnv(&client, ctx.allocator, ctx.io, env_map) catch |e| {
             try ctx.out.push(ctx.io, .start);
             ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
                 .code = errors.Code.transport,
-                .message = try std.fmt.allocPrint(ctx.allocator, "proxy init failed: {s}", .{@errorName(e)}),
+                .message = try std.fmt.allocPrint(ctx.allocator, "client setup failed: {s}", .{@errorName(e)}),
             } });
             return;
         };
@@ -738,6 +751,110 @@ test "runFromSse: text + finishReason STOP → done" {
     try testing.expectEqual(@as(?types.StopReason, .stop), done_reason);
 }
 
+test "runFromSse: thoughtSignature parts route to thinking_delta (v1.26.4)" {
+    // Regression for the http-trace where gemini-2.5-pro emitted a long
+    // self-correcting reasoning monologue as `text` parts each carrying
+    // `thoughtSignature` (without `thought: true`). Pre-v1.26.4 these
+    // routed to `text_delta` and surfaced in the assistant's answer
+    // bubble; the user perceived "no answer was rendered" because the
+    // actual answer was empty (the turn ended with a `functionCall`,
+    // and only thinking text preceded it). Post-fix the same parts
+    // route to `thinking_delta` and end up in the thinking pane.
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ch = try Channel.init(gpa, 16);
+    defer ch.deinit();
+    var cancel: stream_mod.Cancel = .{};
+
+    const sse =
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking aloud\",\"thoughtSignature\":\"sigA\"}]}}]}\n\n" ++
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" more thinking\",\"thoughtSignature\":\"sigB\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+
+    try runFromSse(gpa, io, sse, &ch, &cancel);
+
+    var thinking_bytes: usize = 0;
+    var text_bytes: usize = 0;
+    while (ch.next(io)) |ev| switch (ev) {
+        .thinking_delta => |d| {
+            thinking_bytes += d.delta.len;
+            gpa.free(d.delta);
+        },
+        .text_delta => |d| {
+            text_bytes += d.delta.len;
+            gpa.free(d.delta);
+        },
+        else => {},
+    };
+    try testing.expect(thinking_bytes > 0);
+    try testing.expectEqual(@as(usize, 0), text_bytes);
+}
+
+test "runFromSse: thought=true alone still routes to thinking (v1.26.4)" {
+    // Backward-compat: explicit `thought: true` parts (the API-doc-spec
+    // shape, set when `thinkingConfig.includeThoughts: true` is
+    // requested) still route to thinking_delta even if no signature
+    // is present.
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ch = try Channel.init(gpa, 8);
+    defer ch.deinit();
+    var cancel: stream_mod.Cancel = .{};
+
+    const sse =
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"reasoning\",\"thought\":true}]},\"finishReason\":\"STOP\"}]}\n\n";
+    try runFromSse(gpa, io, sse, &ch, &cancel);
+
+    var thinking_bytes: usize = 0;
+    while (ch.next(io)) |ev| switch (ev) {
+        .thinking_delta => |d| {
+            thinking_bytes += d.delta.len;
+            gpa.free(d.delta);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, "reasoning".len), thinking_bytes);
+}
+
+test "runFromSse: bare text (no thought, no signature) still routes to text" {
+    // Pin the negative case: a regular response part without any
+    // thinking markers must remain a `text_delta`. This is the
+    // common path under default thinking config (no `includeThoughts`).
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ch = try Channel.init(gpa, 8);
+    defer ch.deinit();
+    var cancel: stream_mod.Cancel = .{};
+
+    const sse =
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+    try runFromSse(gpa, io, sse, &ch, &cancel);
+
+    var thinking_bytes: usize = 0;
+    var text_bytes: usize = 0;
+    while (ch.next(io)) |ev| switch (ev) {
+        .thinking_delta => |d| {
+            thinking_bytes += d.delta.len;
+            gpa.free(d.delta);
+        },
+        .text_delta => |d| {
+            text_bytes += d.delta.len;
+            gpa.free(d.delta);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 0), thinking_bytes);
+    try testing.expectEqual(@as(usize, "hello".len), text_bytes);
+}
+
 test "runFromSse: SAFETY → refusal" {
     const gpa = testing.allocator;
     var threaded = test_h.threadedIo();
@@ -768,4 +885,63 @@ test "mapFinishReason covers documented Google values" {
     try testing.expectEqual(@as(?types.StopReason, .refusal), mapFinishReason("SAFETY"));
     try testing.expectEqual(@as(?types.StopReason, .tool_use), mapFinishReason("TOOL_USE"));
     try testing.expectEqual(@as(?types.StopReason, null), mapFinishReason("OTHER"));
+}
+
+test "renderArgs: JSON-escapes control chars in string values (v1.26.1)" {
+    // Regression for the subagent-with-multiline-prompt failure: when
+    // the model emits `args.prompt` as a string with embedded `\n`,
+    // the re-stringified args_json must contain `\n` ESCAPED so
+    // strict downstream parsers (subagent.parseArgs) accept it.
+    const gpa = testing.allocator;
+    const src =
+        \\{"profile":"google","prompt":"line1\nline2\twith \"quotes\""}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+    defer parsed.deinit();
+
+    const out = try renderArgs(gpa, parsed.value);
+    defer gpa.free(out);
+
+    // Round-trip must succeed under strict JSON.
+    var roundtrip = try std.json.parseFromSlice(std.json.Value, gpa, out, .{});
+    defer roundtrip.deinit();
+    try testing.expect(roundtrip.value == .object);
+    const prompt = roundtrip.value.object.get("prompt").?;
+    try testing.expect(prompt == .string);
+    try testing.expectEqualStrings("line1\nline2\twith \"quotes\"", prompt.string);
+
+    // The serialized form must NOT contain a raw newline byte.
+    try testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
+}
+
+test "renderArgs: preserves nested objects + arrays" {
+    // Pre-v1.26.1 the handwritten walker dropped non-scalar values
+    // to `null`, so a nested `edits` array would arrive as a bogus
+    // null and the tool would reject. Now that we hand off to
+    // std.json.Stringify the nesting survives.
+    const gpa = testing.allocator;
+    const src =
+        \\{"path":"foo.txt","edits":[{"old":"a","new":"b"}],"meta":{"k":1}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+    defer parsed.deinit();
+
+    const out = try renderArgs(gpa, parsed.value);
+    defer gpa.free(out);
+
+    var roundtrip = try std.json.parseFromSlice(std.json.Value, gpa, out, .{});
+    defer roundtrip.deinit();
+    try testing.expect(roundtrip.value.object.get("edits").? == .array);
+    try testing.expect(roundtrip.value.object.get("meta").? == .object);
+}
+
+test "renderArgs: null / non-object → \"{}\"" {
+    const gpa = testing.allocator;
+    const a = try renderArgs(gpa, null);
+    defer gpa.free(a);
+    try testing.expectEqualStrings("{}", a);
+
+    const b = try renderArgs(gpa, .{ .string = "not-an-object" });
+    defer gpa.free(b);
+    try testing.expectEqualStrings("{}", b);
 }

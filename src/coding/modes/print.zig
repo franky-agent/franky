@@ -352,10 +352,16 @@ fn runPrint(
     // SUB-agent's tool set, not whether the parent can spawn one).
     // `filtered_tools` is the parent tool list the sub-agent
     // inherits from (minus `subagent` itself, enforced inside the
-    // tool's execute path). v1.24.0 ships with `parent_session_dir
-    // = null` — sub-agent transcripts aren't persisted yet
-    // (follow-up).
-    const subagent_ctx = tools_mod.subagent.Ctx{
+    // tool's execute path).
+    //
+    // v1.28.0 — `parent_session_dir` is populated AFTER
+    // `session_state.init` runs (a few sections below), so the
+    // sub-agent's transcript is persisted to
+    // `<session>/subagents/<call_id>/transcript.json` and the
+    // result includes the path. Closes the v1.24.0 deferred
+    // "wire session_dir through" follow-up. Held as `var` so the
+    // late-bound assignment is allowed.
+    var subagent_ctx = tools_mod.subagent.Ctx{
         .registry = &reg,
         .environ = environ,
         .environ_map = environ_map,
@@ -402,6 +408,30 @@ fn runPrint(
             session_state.id(),
             session_state.parent_dir orelse "",
         });
+    }
+
+    // v1.27.2 + v1.28.0 — once `session_state.parent_dir +
+    // session_id` is known, plumb the on-disk session directory
+    // into:
+    //   - `bash_state` so over-50KB bash captures spill to
+    //     `<session>/bash/<call_id>.log` (v1.27.2)
+    //   - `subagent_ctx.parent_session_dir` so each sub-agent
+    //     persists its full transcript to
+    //     `<session>/subagents/<call_id>/transcript.json` and
+    //     surfaces the path in its result (v1.28.0)
+    // `session_dir_path` lives the rest of `runPrint` because
+    // `subagent_ctx` borrows the slice — a per-block defer-free
+    // would dangle. Best-effort: a join failure leaves both
+    // null and bash falls back to `/tmp` while sub-agent
+    // persistence is skipped.
+    var session_dir_path: ?[]u8 = null;
+    defer if (session_dir_path) |p| allocator.free(p);
+    if (session_state.parent_dir) |parent| {
+        session_dir_path = std.fs.path.join(allocator, &.{ parent, session_state.id() }) catch null;
+        if (session_dir_path) |sd| {
+            bash_state.setSessionDir(sd) catch {};
+            subagent_ctx.parent_session_dir = sd;
+        }
     }
 
     // v1.18.0 — per-session log file (opt-in via --log-per-session).
@@ -1406,6 +1436,12 @@ pub const default_system_prompt: []const u8 =
     \\
     \\If a task needs information you don't have, use your tools to
     \\gather it. Do not guess file contents.
+    \\
+    \\When a sub-agent reports `ok: true`, trust its result and move on.
+    \\Do not re-read files to verify the sub-agent's work — the work is
+    \\done. Only re-investigate when the sub-agent reports `ok: false` or
+    \\its `final_text` describes a problem. Re-verifying successful
+    \\sub-agent runs wastes tokens and tends to revert correct edits.
 ;
 
 pub fn buildSystemPrompt(allocator: std.mem.Allocator, cfg: *const cli_mod.Config) ![]u8 {
@@ -2044,6 +2080,12 @@ test "buildSystemPromptIo: missing system.md falls back to default + appends sub
     try testing.expect(std.mem.indexOf(u8, out, "Profiles:") != null);
     // At least one built-in profile name should appear.
     try testing.expect(std.mem.indexOf(u8, out, "gemini") != null);
+    // v1.26.5 — trust-the-subagent nudge. The prompt instructs the
+    // model not to re-verify successful sub-agent runs, since real
+    // incidents have shown re-verification spirals where the parent
+    // agent reverts a sub-agent's correct edits.
+    try testing.expect(std.mem.indexOf(u8, out, "ok: true") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "trust") != null);
 }
 
 // ─── v1.19.0 — settings-layer overlay helper tests ──────────────────

@@ -30,6 +30,7 @@ const ai = struct {
 const at = @import("../../agent/types.zig");
 const workspace_mod = @import("workspace.zig");
 const common = @import("common.zig");
+const truncate_mod = @import("truncate.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -47,10 +48,23 @@ pub const parameters_json: []const u8 =
 ;
 
 pub const default_timeout_ms: u64 = 120_000;
-pub const max_output_bytes: usize = 1 * 1024 * 1024; // 1 MiB per stream
+/// v1.27.0 — bumped from 1 MiB to 8 MiB to give the spill-to-disk
+/// path more headroom before `std.process.run` bails with
+/// `error.StreamTooLong`. The in-memory cap is the absolute hard
+/// limit — outputs over 8 MiB will still surface as
+/// `bash_output_too_large`. Outputs in the 50 KB → 8 MiB range now
+/// trigger truncation + on-disk spill instead.
+pub const max_output_bytes: usize = 8 * 1024 * 1024;
 /// v1.7.4 — chunk size for incremental `on_update` emission when
 /// captured output exceeds this. Matches §C.4's "64 KB chunks".
 pub const chunk_bytes: usize = 64 * 1024;
+/// v1.27.0 — directory for the `truncated → on-disk spill` files.
+/// Each spill file is named `franky-bash-<call_id>.log` and contains
+/// the full pre-truncation `[stdout]…[stderr]…` formatted output.
+/// `/tmp` matches pi-mono's convention and avoids tying spill files
+/// to the session lifecycle (so they're inspectable after process
+/// exit). Override via env var `FRANKY_BASH_SPILL_DIR` if needed.
+pub const spill_dir_default: []const u8 = "/tmp";
 /// Byte string appended to stdout by the wrapped command so `execute`
 /// can recover the new cwd. Prefixed with `\n` to guarantee it lands
 /// on its own line even when the user's command doesn't trailing-
@@ -72,6 +86,12 @@ pub const SessionBashState = struct {
     /// timeout. Null = use module-level `default_timeout_ms`. The
     /// per-call `timeoutMs` arg always wins regardless.
     default_timeout_ms_override: ?u64 = null,
+    /// v1.27.2 — directory under which bash output spill files
+    /// land (`<session_dir>/bash/<call_id>.log`). Set by mode
+    /// drivers after the session is materialized. Null falls back
+    /// to `/tmp/franky-bash-<call_id>.log` so `--no-session`,
+    /// rpc, and proxy bash invocations still get a spill path.
+    session_dir_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) SessionBashState {
         return .{ .allocator = allocator };
@@ -79,6 +99,7 @@ pub const SessionBashState = struct {
 
     pub fn deinit(self: *SessionBashState) void {
         self.cwd_buf.deinit(self.allocator);
+        self.session_dir_buf.deinit(self.allocator);
     }
 
     pub fn setCwd(self: *SessionBashState, dir: []const u8) !void {
@@ -89,6 +110,21 @@ pub const SessionBashState = struct {
     pub fn getCwd(self: *const SessionBashState) ?[]const u8 {
         if (self.cwd_buf.items.len == 0) return null;
         return self.cwd_buf.items;
+    }
+
+    /// v1.27.2 — record the session's on-disk directory so bash
+    /// spills can land under it. Caller passes the materialized
+    /// `<parent_dir>/<session_id>` path (the directory that holds
+    /// `session.json` + `transcript.json`); `bash/` is added by
+    /// the spill writer on demand.
+    pub fn setSessionDir(self: *SessionBashState, dir: []const u8) !void {
+        self.session_dir_buf.clearRetainingCapacity();
+        try self.session_dir_buf.appendSlice(self.allocator, dir);
+    }
+
+    pub fn getSessionDir(self: *const SessionBashState) ?[]const u8 {
+        if (self.session_dir_buf.items.len == 0) return null;
+        return self.session_dir_buf.items;
     }
 
     pub fn defaultTimeoutMs(self: *const SessionBashState) u64 {
@@ -107,7 +143,7 @@ pub fn resolveDefaultTimeoutMs(state: ?*SessionBashState) u64 {
 pub fn tool() at.AgentTool {
     return .{
         .name = "bash",
-        .description = "Run a shell command (via /bin/sh -c). Reports stdout/stderr + exit code; cwd changes persist across calls when a SessionBashState is wired in via toolWithState.",
+        .description = "Run a shell command (via /bin/sh -c). Reports stdout/stderr + exit code; cwd persists across calls via SessionBashState when wired. Output truncates to last 2000 lines / 50 KB; full output spills to <session>/bash/<call_id>.log (or /tmp fallback). Pipe through `head`/`tail`/`grep` or redirect to a file rather than dumping unbounded output.",
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
         .execute = execute,
@@ -117,7 +153,7 @@ pub fn tool() at.AgentTool {
 pub fn toolWithState(state: *SessionBashState) at.AgentTool {
     return .{
         .name = "bash",
-        .description = "Run a shell command (via /bin/sh -c). Cwd persists across calls via the supplied SessionBashState.",
+        .description = "Run a shell command (via /bin/sh -c). Cwd persists via SessionBashState. Output truncates to last 2000 lines / 50 KB with on-disk spill — pipe through `head`/`tail`/`grep` for long output.",
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
         .ctx = @ptrCast(state),
@@ -137,7 +173,7 @@ pub const BashCtx = struct {
 pub fn toolWithStateAndWorkspace(ctx: *BashCtx) at.AgentTool {
     return .{
         .name = "bash",
-        .description = "Run a shell command with session-tracked cwd + workspace path-safety + env denylist + shell-trust policy.",
+        .description = "Run a shell command with session-tracked cwd + workspace path-safety + env denylist + shell-trust policy. Output truncates to last 2000 lines / 50 KB with on-disk spill — pipe through `head`/`tail`/`grep` for long output.",
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
         .ctx = @ptrCast(ctx),
@@ -229,7 +265,6 @@ fn execute(
     cancel: *ai.stream.Cancel,
     on_update: at.OnUpdate,
 ) anyerror!at.ToolResult {
-    _ = call_id;
     _ = cancel;
 
     const state: ?*SessionBashState = if (self.ctx) |c| @ptrCast(@alignCast(c)) else null;
@@ -291,7 +326,7 @@ fn execute(
         .stderr_limit = std.Io.Limit.limited(max_output_bytes),
         .timeout = timeout,
     }) catch |err| switch (err) {
-        error.StreamTooLong => return common.toolError(allocator, "bash_output_too_large", "output exceeded 1 MiB cap"),
+        error.StreamTooLong => return common.toolError(allocator, "bash_output_too_large", "output exceeded 8 MiB cap; redirect to a file or pipe through head/tail"),
         error.FileNotFound => return common.toolError(allocator, "bash_shell_missing", "/bin/sh not found"),
         error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", "cannot execute /bin/sh"),
         else => |e| return common.toolError(allocator, "bash_spawn_failed", @errorName(e)),
@@ -315,7 +350,8 @@ fn execute(
     // a single giant tool_execution_end payload.
     emitChunked(allocator, on_update, parsed_trailer.clean_stdout);
 
-    return try formatResult(allocator, result, parsed_trailer.clean_stdout);
+    const session_dir: ?[]const u8 = if (state) |s| s.getSessionDir() else null;
+    return try formatResult(allocator, io, call_id, session_dir, result, parsed_trailer.clean_stdout);
 }
 
 /// Full §R.5/§R.6 bash: session state + workspace-scope path-check
@@ -330,7 +366,6 @@ fn executeWithCtx(
     cancel: *ai.stream.Cancel,
     on_update: at.OnUpdate,
 ) anyerror!at.ToolResult {
-    _ = call_id;
     _ = cancel;
 
     const bash_ctx: ?*BashCtx = if (self.ctx) |c| @ptrCast(@alignCast(c)) else null;
@@ -420,7 +455,7 @@ fn executeWithCtx(
         .timeout = timeout,
         .environ_map = if (filtered_env) |*m| m else null,
     }) catch |err| switch (err) {
-        error.StreamTooLong => return common.toolError(allocator, "bash_output_too_large", "output exceeded 1 MiB cap"),
+        error.StreamTooLong => return common.toolError(allocator, "bash_output_too_large", "output exceeded 8 MiB cap; redirect to a file or pipe through head/tail"),
         error.FileNotFound => return common.toolError(allocator, "bash_shell_missing", "shell not found"),
         error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", "cannot execute shell"),
         else => |e| return common.toolError(allocator, "bash_spawn_failed", @errorName(e)),
@@ -437,7 +472,8 @@ fn executeWithCtx(
     }
 
     emitChunked(allocator, on_update, parsed_trailer.clean_stdout);
-    return try formatResult(allocator, result, parsed_trailer.clean_stdout);
+    const session_dir: ?[]const u8 = if (state) |s| s.getSessionDir() else null;
+    return try formatResult(allocator, io, call_id, session_dir, result, parsed_trailer.clean_stdout);
 }
 
 pub const TrailerResult = struct {
@@ -463,8 +499,26 @@ pub fn parseTrailer(stdout: []const u8) TrailerResult {
     return .{ .clean_stdout = stdout[0..strip_start], .cwd = cwd_val };
 }
 
+/// Format the run's full output (term line + `[stdout]…[stderr]…`),
+/// then apply `truncateTail` so over-long captures don't dominate
+/// the agent's context. When truncation kicks in (v1.27.0):
+///   1. Open `<spill_dir>/franky-bash-<call_id>.log` and write the
+///      FULL pre-truncation text. Best-effort — a write failure
+///      degrades to "no spill, just truncated text" rather than
+///      failing the whole tool call.
+///   2. Append an actionable trailer to the truncated content with
+///      the spill path and line range so the model can `cat` it back
+///      if it actually needs the elided content.
+///
+/// Tail-truncation rather than head-truncation because errors (the
+/// thing the model usually needs) typically land at the end of the
+/// stream — `error: foo` from a failed compile, `Killed` from OOM,
+/// the final exit-status trailer, etc.
 fn formatResult(
     allocator: std.mem.Allocator,
+    io: std.Io,
+    call_id: []const u8,
+    session_dir: ?[]const u8,
     result: std.process.RunResult,
     clean_stdout: []const u8,
 ) !at.ToolResult {
@@ -490,11 +544,153 @@ fn formatResult(
         try buf.appendSlice(allocator, "(no output)\n");
     }
 
+    const trunc = truncate_mod.truncateTail(buf.items, .{});
     const is_error = !termOk(result.term);
-    const text = try allocator.dupe(u8, buf.items);
+
+    if (!trunc.truncated) {
+        const text = try allocator.dupe(u8, buf.items);
+        const arr = try allocator.alloc(ai.types.ContentBlock, 1);
+        arr[0] = .{ .text = .{ .text = text } };
+        return .{ .content = arr, .is_error = is_error };
+    }
+
+    // Truncated: best-effort spill the FULL formatted text, then
+    // append an actionable trailer pointing at the spill path. Spill
+    // failure degrades gracefully — we still return the truncated
+    // content with a trailer that omits the path.
+    const spill_path = trySpillBashOutput(allocator, io, call_id, session_dir, buf.items);
+    defer if (spill_path) |p| allocator.free(p);
+
+    const start_line = trunc.total_lines - trunc.output_lines + 1;
+    const end_line = trunc.total_lines;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, trunc.content);
+    try out.append(allocator, '\n');
+    try out.append(allocator, '\n');
+
+    const trailer: []u8 = blk: {
+        if (trunc.last_line_partial) {
+            // Edge case: a single line larger than the byte cap — show
+            // the tail of that line and a hint about its true size.
+            const last_line_len: usize = ll: {
+                const last_nl = std.mem.lastIndexOfScalar(u8, buf.items, '\n');
+                if (last_nl) |i| break :ll buf.items.len - i - 1;
+                break :ll buf.items.len;
+            };
+            const line_size = try truncate_mod.formatSize(allocator, last_line_len);
+            defer allocator.free(line_size);
+            const shown_size = try truncate_mod.formatSize(allocator, trunc.output_bytes);
+            defer allocator.free(shown_size);
+            break :blk if (spill_path) |p|
+                try std.fmt.allocPrint(
+                    allocator,
+                    "[Showing last {s} of line {d} (line is {s}). Full output: {s}]\n",
+                    .{ shown_size, end_line, line_size, p },
+                )
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "[Showing last {s} of line {d} (line is {s}). Spill failed; full output unavailable.]\n",
+                    .{ shown_size, end_line, line_size },
+                );
+        }
+        const by = trunc.truncated_by orelse break :blk try allocator.dupe(u8, "");
+        const cap_size = if (by == .bytes) try truncate_mod.formatSize(allocator, trunc.max_bytes) else try allocator.dupe(u8, "");
+        defer allocator.free(cap_size);
+        break :blk if (spill_path) |p| switch (by) {
+            .lines => try std.fmt.allocPrint(
+                allocator,
+                "[Showing lines {d}-{d} of {d}. Full output: {s}]\n",
+                .{ start_line, end_line, trunc.total_lines, p },
+            ),
+            .bytes => try std.fmt.allocPrint(
+                allocator,
+                "[Showing lines {d}-{d} of {d} ({s} limit). Full output: {s}]\n",
+                .{ start_line, end_line, trunc.total_lines, cap_size, p },
+            ),
+        } else switch (by) {
+            .lines => try std.fmt.allocPrint(
+                allocator,
+                "[Showing lines {d}-{d} of {d}. Spill failed; full output unavailable.]\n",
+                .{ start_line, end_line, trunc.total_lines },
+            ),
+            .bytes => try std.fmt.allocPrint(
+                allocator,
+                "[Showing lines {d}-{d} of {d} ({s} limit). Spill failed; full output unavailable.]\n",
+                .{ start_line, end_line, trunc.total_lines, cap_size },
+            ),
+        };
+    };
+    defer allocator.free(trailer);
+    try out.appendSlice(allocator, trailer);
+
+    const text = try allocator.dupe(u8, out.items);
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };
     return .{ .content = arr, .is_error = is_error };
+}
+
+/// Best-effort write of `full_output` to a spill file the model
+/// can read back later. Returns the path on success (caller frees)
+/// or null on any failure; the caller must keep working from the
+/// truncated output regardless.
+///
+/// **v1.27.2 — session-aware spill location.**
+///   - When `session_dir` is non-null, the spill lands at
+///     `<session_dir>/bash/<call_id>.log`. The `bash/` subdir is
+///     created on demand. This ties the spill lifecycle to the
+///     session — when the session directory is removed (manual
+///     `rm`, future `--gc-sessions`), spill files go with it.
+///   - When `session_dir` is null (rpc/proxy uses `bash.tool()`
+///     without a session, or `--no-session` print/interactive
+///     runs), falls back to `/tmp/franky-bash-<call_id>.log`
+///     matching v1.27.0 behavior.
+fn trySpillBashOutput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    call_id: []const u8,
+    session_dir: ?[]const u8,
+    full_output: []const u8,
+) ?[]u8 {
+    if (session_dir) |sd| {
+        // `<session_dir>/bash/<call_id>.log` — create the subdir
+        // on demand. createDirPath is idempotent (treats already-
+        // exists as success), so calling it per-spill is cheap.
+        const subdir = std.fmt.allocPrint(allocator, "{s}/bash", .{sd}) catch return spillTmp(allocator, io, call_id, full_output);
+        defer allocator.free(subdir);
+        std.Io.Dir.cwd().createDirPath(io, subdir) catch return spillTmp(allocator, io, call_id, full_output);
+
+        const path = std.fmt.allocPrint(allocator, "{s}/{s}.log", .{ subdir, call_id }) catch return spillTmp(allocator, io, call_id, full_output);
+        var f = std.Io.Dir.cwd().createFile(io, path, .{}) catch {
+            allocator.free(path);
+            return spillTmp(allocator, io, call_id, full_output);
+        };
+        defer f.close(io);
+        f.writeStreamingAll(io, full_output) catch {
+            allocator.free(path);
+            return spillTmp(allocator, io, call_id, full_output);
+        };
+        return path;
+    }
+    return spillTmp(allocator, io, call_id, full_output);
+}
+
+/// `/tmp` fallback for `trySpillBashOutput`. Used when no session
+/// dir is available or when the session-dir write fails.
+fn spillTmp(allocator: std.mem.Allocator, io: std.Io, call_id: []const u8, full_output: []const u8) ?[]u8 {
+    const path = std.fmt.allocPrint(allocator, "{s}/franky-bash-{s}.log", .{ spill_dir_default, call_id }) catch return null;
+    var f = std.Io.Dir.cwd().createFile(io, path, .{}) catch {
+        allocator.free(path);
+        return null;
+    };
+    defer f.close(io);
+    f.writeStreamingAll(io, full_output) catch {
+        allocator.free(path);
+        return null;
+    };
+    return path;
 }
 
 fn termOk(t: std.process.Child.Term) bool {
@@ -884,4 +1080,192 @@ test "bash tool: background: true returns pid + outputFile, command runs detache
     }
     // Clean up.
     std.Io.Dir.cwd().deleteFile(io, "/tmp/franky_bg_test_sentinel") catch {};
+}
+
+test "bash tool: large output is tail-truncated and spilled to disk (v1.27.0)" {
+    // Generate ~80 KB of output (above the 50 KB truncation threshold)
+    // and verify:
+    //   - the result body is truncated (much smaller than the full)
+    //   - the truncation trailer points at /tmp/franky-bash-<call_id>.log
+    //   - that file exists and contains the FULL formatted output
+    //   - the trailer is "[Showing lines …]" with the right line range
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const call_id = "spill-test-1";
+    const spill_path = "/tmp/franky-bash-" ++ call_id ++ ".log";
+    // Best-effort cleanup before + after so a stale file from a
+    // previous failed run can't poison this one.
+    std.Io.Dir.cwd().deleteFile(io, spill_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, spill_path) catch {};
+
+    var cancel: ai.stream.Cancel = .{};
+    const t = tool();
+    // 4000 lines × 20 bytes each = ~80 KB. Crosses the 2000-line cap
+    // from `truncate.default_max_lines` AND the 50 KB byte cap.
+    const args =
+        \\{"command":"i=1; while [ $i -le 4000 ]; do printf 'line%04d=padding%s\n' \"$i\" 'xxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done"}
+    ;
+    var res = try t.execute(&t, gpa, io, call_id, args, &cancel, .{});
+    defer res.deinit(gpa);
+
+    const txt = res.content[0].text.text;
+    // Truncated — should be FAR shorter than the ~80 KB raw output.
+    try testing.expect(txt.len < 60 * 1024);
+    // Trailer mentions the spill path and a line range.
+    try testing.expect(std.mem.indexOf(u8, txt, "Full output: ") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, spill_path) != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "[Showing lines ") != null);
+
+    // Tail truncation kept the LAST lines, not the first. Line 4000
+    // should be present in the visible body; line 1 should not.
+    try testing.expect(std.mem.indexOf(u8, txt, "line4000=") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "line0001=") == null);
+
+    // Spill file exists and has the full content (line 1 is in there).
+    var f = try std.Io.Dir.cwd().openFile(io, spill_path, .{});
+    defer f.close(io);
+    const len = try f.length(io);
+    // Full output is much larger than the truncated body.
+    try testing.expect(len > 70 * 1024);
+    const full = try gpa.alloc(u8, @intCast(len));
+    defer gpa.free(full);
+    _ = try f.readPositionalAll(io, full, 0);
+    try testing.expect(std.mem.indexOf(u8, full, "line0001=") != null);
+    try testing.expect(std.mem.indexOf(u8, full, "line4000=") != null);
+}
+
+test "bash tool: small output is not truncated, no spill file (v1.27.0)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const call_id = "spill-test-2";
+    const spill_path = "/tmp/franky-bash-" ++ call_id ++ ".log";
+    std.Io.Dir.cwd().deleteFile(io, spill_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, spill_path) catch {};
+
+    var cancel: ai.stream.Cancel = .{};
+    const t = tool();
+    var res = try t.execute(
+        &t,
+        gpa,
+        io,
+        call_id,
+        \\{"command":"echo hello"}
+        ,
+        &cancel,
+        .{},
+    );
+    defer res.deinit(gpa);
+
+    const txt = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, txt, "hello") != null);
+    // No truncation trailer.
+    try testing.expect(std.mem.indexOf(u8, txt, "Full output: ") == null);
+    try testing.expect(std.mem.indexOf(u8, txt, "[Showing lines ") == null);
+
+    // No spill file was created.
+    if (std.Io.Dir.cwd().openFile(io, spill_path, .{})) |f| {
+        var f_local = f;
+        f_local.close(io);
+        try testing.expect(false); // should not exist
+    } else |_| {
+        // Expected — file does not exist.
+    }
+}
+
+test "bash tool: spill lands in <session_dir>/bash/<call_id>.log when state has session dir (v1.27.2)" {
+    // With a SessionBashState that's been pointed at an on-disk
+    // session directory, large bash output should spill to
+    // `<session_dir>/bash/<call_id>.log` instead of `/tmp`.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const session_dir = "/tmp/franky_session_spill_test";
+    _ = std.Io.Dir.cwd().deleteTree(io, session_dir) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, session_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, session_dir);
+
+    const call_id = "spill-session-1";
+    const session_spill_path = session_dir ++ "/bash/" ++ call_id ++ ".log";
+    const tmp_spill_path = "/tmp/franky-bash-" ++ call_id ++ ".log";
+    // Pre-clean both possible locations to make sure the test is
+    // observing this run's output, not a leftover.
+    std.Io.Dir.cwd().deleteFile(io, session_spill_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, tmp_spill_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_spill_path) catch {};
+
+    var state = SessionBashState.init(gpa);
+    defer state.deinit();
+    try state.setSessionDir(session_dir);
+
+    var cancel: ai.stream.Cancel = .{};
+    const t = toolWithState(&state);
+    // Same fixture as the v1.27.0 spill test — ~80 KB of output.
+    const args =
+        \\{"command":"i=1; while [ $i -le 4000 ]; do printf 'line%04d=padding%s\n' \"$i\" 'xxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done"}
+    ;
+    var res = try t.execute(&t, gpa, io, call_id, args, &cancel, .{});
+    defer res.deinit(gpa);
+
+    const txt = res.content[0].text.text;
+    // Trailer points at the SESSION-dir path, not the /tmp fallback.
+    try testing.expect(std.mem.indexOf(u8, txt, session_spill_path) != null);
+    try testing.expect(std.mem.indexOf(u8, txt, tmp_spill_path) == null);
+
+    // The session-dir file exists and has the full content.
+    var f = try std.Io.Dir.cwd().openFile(io, session_spill_path, .{});
+    defer f.close(io);
+    const len = try f.length(io);
+    try testing.expect(len > 70 * 1024);
+
+    // The /tmp fallback was NOT used.
+    if (std.Io.Dir.cwd().openFile(io, tmp_spill_path, .{})) |bad_f| {
+        var bf = bad_f;
+        bf.close(io);
+        try testing.expect(false); // /tmp file should not exist when session dir was set
+    } else |_| {
+        // Expected.
+    }
+}
+
+test "bash tool: spill falls back to /tmp when state has no session dir (v1.27.2)" {
+    // Mirror of the above but `setSessionDir` is never called —
+    // SessionBashState reports no session dir. Spill must land at
+    // `/tmp/franky-bash-<call_id>.log` (the v1.27.0 fallback).
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const call_id = "spill-session-fallback";
+    const tmp_spill_path = "/tmp/franky-bash-" ++ call_id ++ ".log";
+    std.Io.Dir.cwd().deleteFile(io, tmp_spill_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_spill_path) catch {};
+
+    var state = SessionBashState.init(gpa);
+    defer state.deinit();
+    // No setSessionDir call.
+
+    var cancel: ai.stream.Cancel = .{};
+    const t = toolWithState(&state);
+    const args =
+        \\{"command":"i=1; while [ $i -le 4000 ]; do printf 'line%04d=padding%s\n' \"$i\" 'xxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done"}
+    ;
+    var res = try t.execute(&t, gpa, io, call_id, args, &cancel, .{});
+    defer res.deinit(gpa);
+
+    const txt = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, txt, tmp_spill_path) != null);
+
+    var f = try std.Io.Dir.cwd().openFile(io, tmp_spill_path, .{});
+    defer f.close(io);
+    const len = try f.length(io);
+    try testing.expect(len > 70 * 1024);
 }

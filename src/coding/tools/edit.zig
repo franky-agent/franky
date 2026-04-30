@@ -186,9 +186,7 @@ pub fn applyEdits(
         try summary.appendSlice(allocator, s);
     }
     for (diff_rows.items, 0..) |d, i| {
-        const s = try std.fmt.allocPrint(allocator, "  [{d}] -{s}\n  [{d}] +{s}\n", .{ i, firstLine(d.old), i, firstLine(d.new) });
-        defer allocator.free(s);
-        try summary.appendSlice(allocator, s);
+        try renderEditDiff(&summary, allocator, i, d.old, d.new);
     }
 
     const details = try std.fmt.allocPrint(allocator, "{{\"edits\":{d}}}", .{edits.len});
@@ -200,9 +198,89 @@ pub fn applyEdits(
 
 const DiffRow = struct { old: []const u8, new: []const u8 };
 
-fn firstLine(s: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, s, '\n')) |nl| return s[0..nl];
-    return s;
+/// Render one edit's diff as `[i] - <old line>` / `[i] + <new line>` rows,
+/// one row per source line. Pre-v1.26.3 this only emitted the first line
+/// of each side via `firstLine` — when `old` and `new` shared a first line
+/// (e.g. a multi-line block where only later lines changed) the diff
+/// looked like a no-op even though the whole tail had been replaced. Real
+/// incident: a parent-agent revert silently undid a sub-agent's correct
+/// edit because the apparent "no diff" output convinced the model the
+/// edit hadn't taken; it then ping-ponged the file state across several
+/// turns trying to reapply.
+///
+/// Each side is capped at `max_diff_lines_per_side` rows so a wholesale
+/// rewrite doesn't dominate the tool result. When the cap is exceeded
+/// we render the first ⌊cap/2⌋ lines, an `… (N more lines elided) …`
+/// marker, then the last ⌈cap/2⌉ lines — matching the standard truncated-
+/// diff format from `git`/`hg`.
+fn renderEditDiff(
+    summary: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    edit_index: usize,
+    old_text: []const u8,
+    new_text: []const u8,
+) !void {
+    try renderEditSide(summary, allocator, edit_index, '-', old_text);
+    try renderEditSide(summary, allocator, edit_index, '+', new_text);
+}
+
+const max_diff_lines_per_side: usize = 12;
+
+fn renderEditSide(
+    summary: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    edit_index: usize,
+    sign: u8,
+    text: []const u8,
+) !void {
+    // Empty side renders as a single sentinel row so the reader sees
+    // "block was deleted" / "block was inserted from nothing" instead
+    // of just absent lines.
+    if (text.len == 0) {
+        const s = try std.fmt.allocPrint(allocator, "  [{d}] {c}(empty)\n", .{ edit_index, sign });
+        defer allocator.free(s);
+        try summary.appendSlice(allocator, s);
+        return;
+    }
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(allocator);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |ln| try lines.append(allocator, ln);
+    // splitScalar on a trailing-newline string emits a final empty slice
+    // — drop it so a 3-line `old` doesn't render as 4 rows. Single
+    // empty input was already handled above.
+    if (lines.items.len > 1 and lines.items[lines.items.len - 1].len == 0) {
+        lines.items.len -= 1;
+    }
+
+    const total = lines.items.len;
+    if (total <= max_diff_lines_per_side) {
+        for (lines.items) |ln| try emitLine(summary, allocator, edit_index, sign, ln);
+        return;
+    }
+    const head = max_diff_lines_per_side / 2;
+    const tail = max_diff_lines_per_side - head;
+    for (lines.items[0..head]) |ln| try emitLine(summary, allocator, edit_index, sign, ln);
+    {
+        const elided = total - head - tail;
+        const s = try std.fmt.allocPrint(allocator, "  [{d}] {c}… ({d} more lines elided) …\n", .{ edit_index, sign, elided });
+        defer allocator.free(s);
+        try summary.appendSlice(allocator, s);
+    }
+    for (lines.items[total - tail ..]) |ln| try emitLine(summary, allocator, edit_index, sign, ln);
+}
+
+fn emitLine(
+    summary: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    edit_index: usize,
+    sign: u8,
+    line: []const u8,
+) !void {
+    const s = try std.fmt.allocPrint(allocator, "  [{d}] {c}{s}\n", .{ edit_index, sign, line });
+    defer allocator.free(s);
+    try summary.appendSlice(allocator, s);
 }
 
 fn replaceOnce(
@@ -378,4 +456,119 @@ test "edit applies multiple edits in order atomically" {
     const got = try readAllAlloc(gpa, io, path);
     defer gpa.free(got);
     try testing.expectEqualStrings("A B C\n", got);
+}
+
+test "edit diff renders every line of multi-line old/new (v1.26.3)" {
+    // Regression for the http-trace failure where Gemini's parent
+    // model reverted a sub-agent's correct multi-line edit because
+    // the diff display only showed the first line of each side.
+    // When `old` and `new` share a first line (common case: only
+    // the *tail* of a block changed) the pre-v1.26.3 output looked
+    // like `[0] - foo\n[0] + foo\n` — visually a no-op even though
+    // four lines had been replaced.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const path = "/tmp/franky_edit_multiline_diff.txt";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const before =
+        "const role = data.role || 'plan';\n" ++
+        "const provider = data.provider || '?';\n" ++
+        "const model = data.model || '?';\n" ++
+        "el.textContent = 'role: ' + role + ' · ' + provider + ':' + model;\n";
+    try writeTempFile(io, path, before);
+
+    const edits = [_]EditOp{.{
+        .old =
+            "const role = data.role || 'plan';\n" ++
+            "const provider = data.provider || '?';\n" ++
+            "const model = data.model || '?';\n" ++
+            "el.textContent = 'role: ' + role + ' · ' + provider + ':' + model;",
+        .new =
+            "const role = data.role || 'plan';\n" ++
+            "el.textContent = 'role: ' + role;",
+        .replace_all = false,
+    }};
+    var res = try applyEdits(gpa, io, path, &edits);
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    const summary = res.content[0].text.text;
+
+    // Every line of `old` is rendered with `-`.
+    try testing.expect(std.mem.indexOf(u8, summary, "-const provider") != null);
+    try testing.expect(std.mem.indexOf(u8, summary, "-const model") != null);
+    try testing.expect(std.mem.indexOf(u8, summary, "-el.textContent") != null);
+    // Every line of `new` is rendered with `+`.
+    try testing.expect(std.mem.indexOf(u8, summary, "+el.textContent = 'role: ' + role;") != null);
+    // The shared first line shows on both sides — proves the diff
+    // isn't suppressing identical-prefix lines (it's a literal
+    // remove + add of the whole block, which is what actually
+    // happened on disk).
+    var minus_count: usize = 0;
+    var plus_count: usize = 0;
+    for (summary) |c| {
+        if (c == '-') minus_count += 1;
+        if (c == '+') plus_count += 1;
+    }
+    try testing.expect(minus_count >= 4);
+    try testing.expect(plus_count >= 2);
+}
+
+test "edit diff elides huge replacements past the per-side cap" {
+    // 30-line replacement should render head + elision + tail, not
+    // 30 individual rows. Caps the worst-case tool result size on
+    // wholesale rewrites.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const path = "/tmp/franky_edit_diff_elision.txt";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(gpa);
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        const ln = try std.fmt.allocPrint(gpa, "line {d}\n", .{i});
+        defer gpa.free(ln);
+        try big.appendSlice(gpa, ln);
+    }
+    try writeTempFile(io, path, big.items);
+
+    const edits = [_]EditOp{.{
+        .old = big.items[0 .. big.items.len - 1], // drop trailing \n so the text matches as a literal
+        .new = "shorter",
+        .replace_all = false,
+    }};
+    var res = try applyEdits(gpa, io, path, &edits);
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    const summary = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, summary, "more lines elided") != null);
+}
+
+test "edit diff renders empty new as `(empty)` sentinel" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const path = "/tmp/franky_edit_empty_side.txt";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeTempFile(io, path, "remove me\n");
+    const edits = [_]EditOp{.{
+        .old = "remove me",
+        .new = "",
+        .replace_all = false,
+    }};
+    var res = try applyEdits(gpa, io, path, &edits);
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    const summary = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, summary, "+(empty)") != null);
 }

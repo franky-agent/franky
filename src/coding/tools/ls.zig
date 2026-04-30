@@ -41,7 +41,7 @@ pub const max_entries: usize = 5_000;
 pub fn tool() at.AgentTool {
     return .{
         .name = "ls",
-        .description = "List directory entries (tree-style when recursive).",
+        .description = "List directory entries (tree-style when recursive). Recursive=true with no focused `path` walks the whole tree — pass a specific subdir first.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .execute = execute,
@@ -51,7 +51,7 @@ pub fn tool() at.AgentTool {
 pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
     return .{
         .name = "ls",
-        .description = "List directory entries (path-safety enforced).",
+        .description = "List directory entries (path-safety enforced). Pass a focused `path` before using `recursive=true`.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .ctx = @constCast(@ptrCast(ws)),

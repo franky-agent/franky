@@ -13,6 +13,7 @@ const ai = struct {
 const at = @import("../../agent/types.zig");
 const workspace_mod = @import("workspace.zig");
 const common = @import("common.zig");
+const truncate_mod = @import("truncate.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -48,7 +49,7 @@ pub const ReadCtx = struct {
 pub fn tool() at.AgentTool {
     return .{
         .name = "read",
-        .description = "Read a file from the workspace.",
+        .description = "Read a file from the workspace. Files >256 KB without `limit` are refused — paginate with `offset`+`limit` (default limit emits up to 2000 lines and a continuation hint).",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .execute = execute,
@@ -61,7 +62,7 @@ pub fn tool() at.AgentTool {
 pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
     return .{
         .name = "read",
-        .description = "Read a file from the workspace (path-safety enforced).",
+        .description = "Read a file from the workspace (path-safety enforced). Files >256 KB without `limit` are refused — paginate with `offset`+`limit` (default limit emits up to 2000 lines and a continuation hint).",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .ctx = @constCast(@ptrCast(ws)),
@@ -75,7 +76,7 @@ pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
 pub fn toolWithCtx(ctx: *const ReadCtx) at.AgentTool {
     return .{
         .name = "read",
-        .description = "Read a file from the workspace (path-safety + max-bytes overlay).",
+        .description = "Read a file from the workspace (path-safety + max-bytes overlay). Files over the cap without `limit` are refused — paginate with `offset`+`limit`.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .ctx = @constCast(@ptrCast(ctx)),
@@ -213,7 +214,21 @@ pub fn readFileWithCap(
     const len = file.length(io) catch |err|
         return common.toolError(allocator, "stat_failed", @errorName(err));
     if (limit == null and len > max_bytes_cap) {
-        return common.toolError(allocator, "read_too_large", "file exceeds without-limit cap");
+        // v1.27.1 — actionable hint per pi-mono. Tells the model
+        // exactly how to paginate AND a `bash sed | head -c` fallback
+        // for the rare single-giant-line case (minified JSON, etc).
+        const cap_size = try truncate_mod.formatSize(allocator, max_bytes_cap);
+        defer allocator.free(cap_size);
+        const file_size = try truncate_mod.formatSize(allocator, @intCast(len));
+        defer allocator.free(file_size);
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "file is {s} (exceeds {s} without-limit cap). Use `offset`+`limit` to paginate, " ++
+                "or `bash sed -n '1,Np' {s} | head -c {d}` to inspect a chunk.",
+            .{ file_size, cap_size, path, max_bytes_cap },
+        );
+        defer allocator.free(msg);
+        return common.toolError(allocator, "read_too_large", msg);
     }
 
     const buf = try allocator.alloc(u8, @intCast(len));
@@ -227,7 +242,54 @@ pub fn readFileWithCap(
         return common.toolError(allocator, "read_binary", "file appears to be binary");
     }
 
+    // v1.27.1 — pi-mono first-line-too-big fallback. After loading
+    // the file, check whether any of the first few requested lines
+    // alone exceed `truncate.default_max_bytes` (50 KB). If so,
+    // refuse with an actionable bash hint — the model needs a tool
+    // that can chunk-read a single line, which is `bash sed`. Common
+    // case: minified JSON dumps, single-line CSVs, generated lookup
+    // tables. This check fires AFTER the file-size check so a
+    // multi-line file under the file cap with one giant line at e.g.
+    // line 42 is the only path that hits it.
+    const effective_offset: usize = if (offset == 0) 1 else offset;
+    if (firstLongLineWithin(bytes, effective_offset, limit orelse default_limit, truncate_mod.default_max_bytes)) |hit| {
+        const cap_size = try truncate_mod.formatSize(allocator, truncate_mod.default_max_bytes);
+        defer allocator.free(cap_size);
+        const line_size = try truncate_mod.formatSize(allocator, hit.bytes);
+        defer allocator.free(line_size);
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "line {d} is {s} (exceeds {s} per-line cap). Use `bash sed -n '{d}p' {s} | head -c {d}` to inspect a chunk of it.",
+            .{ hit.line_no, line_size, cap_size, hit.line_no, path, truncate_mod.default_max_bytes },
+        );
+        defer allocator.free(msg);
+        return common.toolError(allocator, "read_line_too_large", msg);
+    }
+
     return try formatLineNumbered(allocator, bytes, offset, limit orelse default_limit);
+}
+
+/// Returns the first line within `[offset, offset+limit)` whose byte
+/// length exceeds `cap`. Lines are 1-indexed externally; offset=0
+/// is treated as 1 (the read tool's own normalization).
+const LongLineHit = struct { line_no: usize, bytes: usize };
+
+fn firstLongLineWithin(bytes: []const u8, offset: usize, limit: usize, cap: usize) ?LongLineHit {
+    var line_no: usize = 1;
+    var checked: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len and checked < limit) {
+        const nl = std.mem.indexOfScalarPos(u8, bytes, i, '\n') orelse bytes.len;
+        if (line_no >= offset) {
+            const line_len = nl - i;
+            if (line_len > cap) return .{ .line_no = line_no, .bytes = line_len };
+            checked += 1;
+        }
+        if (nl == bytes.len) break;
+        i = nl + 1;
+        line_no += 1;
+    }
+    return null;
 }
 
 fn formatLineNumbered(
@@ -239,8 +301,25 @@ fn formatLineNumbered(
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
+    // First pass: count total lines so we can render an actionable
+    // continuation hint when the limit truncates output. Cheap byte
+    // scan — we already loaded the whole file into `bytes`.
+    var total_lines: usize = 0;
+    if (bytes.len > 0) {
+        total_lines = 1;
+        for (bytes) |c| if (c == '\n') {
+            total_lines += 1;
+        };
+        // Trailing-newline files count as N lines, not N+1 (final
+        // empty after the last `\n` is elided to match the
+        // splitScalar(...).len convention pi-mono uses).
+        if (bytes[bytes.len - 1] == '\n') total_lines -= 1;
+    }
+
     var line_no: usize = 1;
     var emitted: usize = 0;
+    var first_emitted_line: ?usize = null;
+    var last_emitted_line: usize = 0;
     var i: usize = 0;
     while (i < bytes.len and emitted < limit) {
         const nl = std.mem.indexOfScalarPos(u8, bytes, i, '\n') orelse bytes.len;
@@ -249,11 +328,31 @@ fn formatLineNumbered(
             const chunk = try std.fmt.allocPrint(allocator, "{d:>6}\t{s}\n", .{ line_no, line });
             defer allocator.free(chunk);
             try out.appendSlice(allocator, chunk);
+            if (first_emitted_line == null) first_emitted_line = line_no;
+            last_emitted_line = line_no;
             emitted += 1;
         }
         if (nl == bytes.len) break;
         i = nl + 1;
         line_no += 1;
+    }
+
+    // v1.28.0 — append a continuation hint when the limit truncated
+    // output and there are still lines past `last_emitted_line`.
+    // Pi-mono pattern: the model needs to know both that more
+    // exists AND the exact `offset` value to read next so it can
+    // paginate without guessing. The hint never fires when the
+    // file ended naturally within the limit.
+    if (emitted == limit and last_emitted_line < total_lines) {
+        const start = first_emitted_line orelse offset;
+        const next_offset = last_emitted_line + 1;
+        const hint = try std.fmt.allocPrint(
+            allocator,
+            "\n[Showing lines {d}-{d} of {d}. Use offset={d} to continue.]\n",
+            .{ start, last_emitted_line, total_lines, next_offset },
+        );
+        defer allocator.free(hint);
+        try out.appendSlice(allocator, hint);
     }
 
     const owned_text = try allocator.dupe(u8, out.items);
@@ -438,4 +537,177 @@ test "toolWithCtx: null override falls back to module default" {
     var res = try t.execute(&t, gpa, io, "id", "{\"path\":\"/tmp/franky_read_overlay_null.txt\"}", &cancel, .{});
     defer res.deinit(gpa);
     try testing.expect(!res.is_error);
+}
+
+test "read tool: read_too_large now embeds offset+limit + bash sed hint (v1.27.1)" {
+    // Prior to v1.27.1 the message was just "file exceeds without-limit
+    // cap" — non-actionable. The new message names the cap, the file
+    // size, and tells the model how to paginate or shell out.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    const tmp_path = "/tmp/franky_read_too_large.txt";
+    defer deleteTempFile(io, tmp_path);
+
+    // 300 KB file — over the 256 KB without-limit cap.
+    const big = try gpa.alloc(u8, 300 * 1024);
+    defer gpa.free(big);
+    @memset(big, 'a');
+    try writeTempFile(io, tmp_path, big);
+
+    var res = try readFile(gpa, io, tmp_path, 1, null);
+    defer res.deinit(gpa);
+    try testing.expect(res.is_error);
+    const txt = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, txt, "read_too_large") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "offset") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "bash sed -n") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "head -c") != null);
+}
+
+test "read tool: rejects single line larger than per-line cap with bash hint (v1.27.1)" {
+    // Multi-line file under the file cap, but one line at line 3 is
+    // 60 KB — over the 50 KB per-line cap. With limit=10 we'd
+    // otherwise emit that whole line into context. v1.27.1 refuses
+    // with `read_line_too_large` and a `sed -n 'Np' file | head -c …`
+    // hint.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    const tmp_path = "/tmp/franky_read_long_line.txt";
+    defer deleteTempFile(io, tmp_path);
+
+    var contents: std.ArrayList(u8) = .empty;
+    defer contents.deinit(gpa);
+    try contents.appendSlice(gpa, "first\nsecond\n");
+    // 60 KB single line as line 3.
+    const long = try gpa.alloc(u8, 60 * 1024);
+    defer gpa.free(long);
+    @memset(long, 'x');
+    try contents.appendSlice(gpa, long);
+    try contents.append(gpa, '\n');
+    try contents.appendSlice(gpa, "fourth\n");
+    try writeTempFile(io, tmp_path, contents.items);
+
+    // Use limit=10 so we'd otherwise pull line 3 into context.
+    var res = try readFile(gpa, io, tmp_path, 1, 10);
+    defer res.deinit(gpa);
+    try testing.expect(res.is_error);
+    const txt = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, txt, "read_line_too_large") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "line 3") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "bash sed -n '3p'") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "head -c") != null);
+}
+
+test "read tool: per-line cap doesn't fire when offset skips the long line (v1.27.1)" {
+    // Same fixture, but offset=4 so we skip the giant line entirely.
+    // Read should succeed and return only line 4 ("fourth").
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    const tmp_path = "/tmp/franky_read_long_line_skip.txt";
+    defer deleteTempFile(io, tmp_path);
+
+    var contents: std.ArrayList(u8) = .empty;
+    defer contents.deinit(gpa);
+    try contents.appendSlice(gpa, "first\nsecond\n");
+    const long = try gpa.alloc(u8, 60 * 1024);
+    defer gpa.free(long);
+    @memset(long, 'x');
+    try contents.appendSlice(gpa, long);
+    try contents.append(gpa, '\n');
+    try contents.appendSlice(gpa, "fourth\n");
+    try writeTempFile(io, tmp_path, contents.items);
+
+    var res = try readFile(gpa, io, tmp_path, 4, 10);
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    const txt = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, txt, "fourth") != null);
+}
+
+test "read tool: line-cap truncation appends [Showing lines X-Y of Z. Use offset=N+1] hint (v1.28.0)" {
+    // 50-line file, read with limit=10 → emits lines 1-10, then a
+    // continuation hint pointing at offset=11 (so the model can
+    // paginate without guessing).
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    const tmp_path = "/tmp/franky_read_continuation_hint.txt";
+    defer deleteTempFile(io, tmp_path);
+
+    var contents: std.ArrayList(u8) = .empty;
+    defer contents.deinit(gpa);
+    var i: usize = 1;
+    while (i <= 50) : (i += 1) {
+        const ln = try std.fmt.allocPrint(gpa, "line-{d:0>2}\n", .{i});
+        defer gpa.free(ln);
+        try contents.appendSlice(gpa, ln);
+    }
+    try writeTempFile(io, tmp_path, contents.items);
+
+    var res = try readFile(gpa, io, tmp_path, 1, 10);
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    const txt = res.content[0].text.text;
+    // First and last visible lines are present.
+    try testing.expect(std.mem.indexOf(u8, txt, "line-01") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "line-10") != null);
+    // Past-the-cap line is NOT in the visible body.
+    try testing.expect(std.mem.indexOf(u8, txt, "line-11") == null);
+    // Continuation hint with the right offset.
+    try testing.expect(std.mem.indexOf(u8, txt, "[Showing lines 1-10 of 50") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "Use offset=11 to continue") != null);
+}
+
+test "read tool: continuation hint does NOT fire when file ends within the limit (v1.28.0)" {
+    // 5-line file, limit=10 → no hint; we got everything.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    const tmp_path = "/tmp/franky_read_continuation_no_hint.txt";
+    defer deleteTempFile(io, tmp_path);
+
+    try writeTempFile(io, tmp_path, "a\nb\nc\nd\ne\n");
+
+    var res = try readFile(gpa, io, tmp_path, 1, 10);
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    const txt = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, txt, "Use offset=") == null);
+    try testing.expect(std.mem.indexOf(u8, txt, "[Showing lines") == null);
+}
+
+test "read tool: continuation hint with offset > 1 reports correct visible range (v1.28.0)" {
+    // 30-line file, read with offset=11, limit=10 → emits 11-20,
+    // hint points at offset=21.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    const tmp_path = "/tmp/franky_read_continuation_mid.txt";
+    defer deleteTempFile(io, tmp_path);
+
+    var contents: std.ArrayList(u8) = .empty;
+    defer contents.deinit(gpa);
+    var i: usize = 1;
+    while (i <= 30) : (i += 1) {
+        const ln = try std.fmt.allocPrint(gpa, "L{d}\n", .{i});
+        defer gpa.free(ln);
+        try contents.appendSlice(gpa, ln);
+    }
+    try writeTempFile(io, tmp_path, contents.items);
+
+    var res = try readFile(gpa, io, tmp_path, 11, 10);
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    const txt = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, txt, "[Showing lines 11-20 of 30") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "Use offset=21 to continue") != null);
 }

@@ -11,6 +11,7 @@ pub const tools = struct {
     pub const subagent = @import("tools/subagent.zig");
     pub const workspace = @import("tools/workspace.zig");
     pub const common = @import("tools/common.zig");
+    pub const truncate = @import("tools/truncate.zig");
 };
 
 pub const modes = struct {
@@ -61,6 +62,7 @@ test {
     _ = tools.subagent;
     _ = tools.workspace;
     _ = tools.common;
+    _ = tools.truncate;
     _ = modes.print;
     _ = modes.interactive;
     _ = modes.login;

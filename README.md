@@ -728,11 +728,11 @@ calls and fall back to tags-only data.
 ## What's deferred (post-1.0)
 
 The complete deferred-work catalog lives in
-[`franky-spec-v2.md`](franky-spec-v2.md). Highlights:
+[`docs/spec/v2.md`](docs/spec/v2.md). Highlights:
 
 - **`franky-do` Slack-bot** sibling project (post-1.0 per §O).
   Pattern + `--role plan` posture documented in
-  [`docs/sandbox.md`](docs/sandbox.md).
+  [`docs/reference/sandbox.md`](docs/reference/sandbox.md).
 - **`franky-pods` vLLM CLI** sibling project.
 - **Extension Tier-2 / Tier-3** (`.so`/`.dylib` / Wasm). Tier-1
   static-module loading ships; Tier-2/3 need a versioned ABI + sandbox.
@@ -743,7 +743,7 @@ The complete deferred-work catalog lives in
   a correctness gap.
 
 For a complete, dated history of what shipped at each version see the
-"What shipped" table in [`franky-spec-v1.md`](franky-spec-v1.md).
+"What shipped" table in [`docs/spec/v1.md`](docs/spec/v1.md).
 
 ## Troubleshooting
 

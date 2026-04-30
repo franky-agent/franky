@@ -527,7 +527,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     defer ctx.allocator.free(auth_header);
 
     // `http_headers` ownership: the name/value slices below are all either
-    // static strings or `auth_header` (freed by this function). std.http.Client
+    // static strings or `auth_header` (freed by this function). http_mod.Client
     // only borrows them for the duration of fetch().
     var http_headers_buf: [7]std.http.Header = undefined;
     var http_headers_len: usize = 0;
@@ -569,20 +569,19 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 
     // Reuse streamSse by capturing bytes into the Allocating writer, then
     // hand the bytes to runFromSse.
-    var client = std.http.Client{ .allocator = ctx.allocator, .io = ctx.io };
+    var client = http_mod.Client{ .allocator = ctx.allocator, .io = ctx.io };
     defer client.deinit();
 
     // Honor HTTP(S)_PROXY / NO_PROXY when the caller supplied an
     // environ map. Skipping this makes direct calls to `api.anthropic.com`
     // fail with ConnectionRefused behind corporate / sandbox proxies.
     if (ctx.options.environ_map) |env_map| {
-        var proxy_arena = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer proxy_arena.deinit();
-        client.initDefaultProxies(proxy_arena.allocator(), env_map) catch |e| {
+        // v1.25.0 — proxy + FRANKY_CA_BUNDLE in one call.
+        http_mod.setupClientFromEnv(&client, ctx.allocator, ctx.io, env_map) catch |e| {
             try ctx.out.push(ctx.io, .start);
             ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
                 .code = errors.Code.transport,
-                .message = try std.fmt.allocPrint(ctx.allocator, "proxy init failed: {s}", .{@errorName(e)}),
+                .message = try std.fmt.allocPrint(ctx.allocator, "client setup failed: {s}", .{@errorName(e)}),
             } });
             return;
         };

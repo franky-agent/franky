@@ -1566,20 +1566,32 @@ const Markdown = (function () {
     // server-side and never changes for the proxy's lifetime.
     async function loadRole() {
         const el = document.getElementById('role-pill');
+        const mEl = document.getElementById('model-pill');
         if (!el) return;
         try {
             const r = await fetch('/role');
-            if (!r.ok) { el.textContent = 'role: ?'; return; }
+            if (!r.ok) {
+                el.textContent = 'role: ?';
+                if (mEl) mEl.textContent = 'model: ?';
+                return;
+            }
             const data = await r.json();
             const role = data.role || 'plan';
+            const provider = data.provider || '?';
+            const model = data.model || '?';
             el.textContent = 'role: ' + role + (data.sandbox ? ' · sandboxed' : '');
             el.title = (data.description || role) + ' — allowed: ' +
                 ((data.allowed_tools || []).join(', ') || '(none)');
             el.classList.remove(
                 'role-pill-read', 'role-pill-plan', 'role-pill-code', 'role-pill-full');
             el.classList.add('role-pill-' + role);
+            if (mEl) {
+                mEl.textContent = provider + ':' + model;
+                mEl.title = 'provider: ' + provider + ' · model: ' + model;
+            }
         } catch (_) {
             el.textContent = 'role: ?';
+            if (mEl) mEl.textContent = 'model: ?';
         }
     }
 
