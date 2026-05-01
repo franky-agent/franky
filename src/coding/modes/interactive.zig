@@ -247,8 +247,6 @@ fn runInteractive(
     try slash_registry.register(.{ .name = "edit", .description = "Edit and resubmit the last user msg", .handler = interactiveEditHandler });
     try slash_registry.register(.{ .name = "export", .description = "Dump transcript to markdown|json", .handler = interactiveExportHandler });
     try slash_registry.register(.{ .name = "compact", .description = "Summarize and compact the transcript", .handler = interactiveCompactHandler });
-    try slash_registry.register(.{ .name = "login", .description = "OAuth login (see: franky login)", .handler = interactiveLoginHandler });
-    try slash_registry.register(.{ .name = "logout", .description = "Clear cached credentials", .handler = interactiveLogoutHandler });
     try slash_registry.register(.{ .name = "branch", .description = "Fork a new branch at the head", .handler = interactiveBranchHandler });
     try slash_registry.register(.{ .name = "branches", .description = "List branches", .handler = interactiveBranchesHandler });
     try slash_registry.register(.{ .name = "checkout", .description = "Switch active branch", .handler = interactiveCheckoutHandler });
@@ -2543,20 +2541,6 @@ fn interactiveCompactHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_m
     const msg = try std.fmt.allocPrint(ctx.allocator, "compacted {d} messages → 1 summary", .{result.replaced_count});
     defer ctx.allocator.free(msg);
     try ctx.output.appendSlice(ctx.allocator, msg);
-}
-
-fn interactiveLoginHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
-    try ctx.output.appendSlice(
-        ctx.allocator,
-        "in-REPL login not wired; run `franky login --provider <name>` from a separate shell, then restart franky",
-    );
-}
-
-fn interactiveLogoutHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
-    try ctx.output.appendSlice(
-        ctx.allocator,
-        "logout in-REPL not wired; remove the provider's entry from $FRANKY_HOME/auth.json (or delete the file)",
-    );
 }
 
 fn interactiveBranchHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!void {

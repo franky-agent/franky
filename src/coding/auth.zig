@@ -20,13 +20,13 @@
 //! §H.1 requires `0600` on creation and refuses to read a file whose
 //! mode is more permissive on POSIX. This module ships the loader +
 //! the mode check + the precedence rule (`--cli-flag` > env-var >
-//! `auth.json`) as pure-logic helpers; the CLI-glue pass that wires
-//! `resolveProvider` through this module is a follow-up.
+//! `auth.json`) as pure-logic helpers.
 //!
-//! Scope note (v0.7.1): read-side only. Writing `auth.json` (the
-//! OAuth-minting destination) is part of the v0.12.* OAuth
-//! milestones; the shape + mode invariant here is what those later
-//! passes will produce.
+//! franky no longer mints credentials itself: bearer tokens are
+//! produced by an external tool (e.g. `claude setup-token`) and the
+//! resulting record is pasted into `auth.json` by the user. The
+//! `oauth` variant of `ProviderAuthType` is preserved for
+//! round-tripping such externally-minted records.
 
 const std = @import("std");
 
@@ -299,12 +299,12 @@ fn writeJsonString(
     try buf.append(allocator, '"');
 }
 
-/// Build a minted credential record suitable for `Auth.providers.put`
-/// from an OAuth token-exchange result. `now_unix_s` is the caller's
+/// Build a credential record suitable for `Auth.providers.put` from
+/// an externally-minted bearer token. `now_unix_s` is the caller's
 /// clock reading at the moment the token was issued; `expires_in_s`
-/// is the server's reported lifetime. The resulting `expiresAt` is
-/// an ISO-8601 UTC string (seconds precision) — matches the shape
-/// §H.1 specifies.
+/// is the reported lifetime. The resulting `expiresAt` is an
+/// ISO-8601 UTC string (seconds precision) — matches the shape §H.1
+/// specifies.
 pub fn providerFromToken(
     allocator: std.mem.Allocator,
     access_token: []const u8,
@@ -374,7 +374,7 @@ pub fn resolveApiKey(
     return on_disk;
 }
 
-/// Same, for OAuth bearer tokens.
+/// Same, for bearer tokens.
 pub fn resolveAuthToken(
     cli_flag: ?[]const u8,
     env_value: ?[]const u8,

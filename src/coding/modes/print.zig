@@ -981,12 +981,11 @@ pub fn resolveProviderIo(
         break :blk null;
     };
     // v1.23.0 — Gemini credentials. AI Studio API key
-    // (`GEMINI_API_KEY` / `GOOGLE_API_KEY`) goes through
-    // `?key=` query param; OAuth bearer (from `franky login
-    // --provider google-gemini`, stored in auth.json under
-    // "google-gemini") goes through `Authorization: Bearer`.
-    // Resolved separately so the provider streamFn can pick the
-    // right transport.
+    // (`GEMINI_API_KEY` / `GOOGLE_API_KEY`) goes through the
+    // `?key=` query param; an externally-minted bearer token
+    // (stored in auth.json under "google-gemini") goes through
+    // `Authorization: Bearer`. Resolved separately so the provider
+    // streamFn can pick the right transport.
     const gemini_api_key: ?[]const u8 = blk: {
         if (environ.getPosix("GEMINI_API_KEY")) |k| break :blk try a.dupe(u8, k);
         if (environ.getPosix("GOOGLE_API_KEY")) |k| break :blk try a.dupe(u8, k);
@@ -1110,8 +1109,8 @@ pub fn resolveProviderIo(
     if (std.mem.eql(u8, chosen, "google-gemini") or std.mem.eql(u8, chosen, "gemini") or std.mem.eql(u8, chosen, "google")) {
         // v1.23.0 — native Gemini provider. API key from
         // GEMINI_API_KEY / GOOGLE_API_KEY (sent as `?key=`) OR
-        // OAuth bearer from auth.json (sent as
-        // `Authorization: Bearer`). `--api-key` on the CLI
+        // an externally-minted bearer token from auth.json (sent
+        // as `Authorization: Bearer`). `--api-key` on the CLI
         // double-binds to the api-key path so users can pass it
         // ad-hoc.
         const effective_key: ?[]const u8 = gemini_api_key orelse cfg.api_key;
@@ -1119,7 +1118,7 @@ pub fn resolveProviderIo(
         if (effective_key == null and effective_token == null) {
             const msg =
                 "google-gemini provider requires one of: --api-key, GEMINI_API_KEY, GOOGLE_API_KEY, " ++
-                "or `franky login --provider google-gemini` to mint an OAuth token in auth.json\n";
+                "or --auth-token / a bearer-token record in $FRANKY_HOME/auth.json\n";
             return exitWithMessageErr(allocator, msg, 2);
         }
         const model = cfg.model orelse try a.dupe(u8, "gemini-2.5-pro");

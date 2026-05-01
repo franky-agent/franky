@@ -6,7 +6,7 @@ The whole map.
 
 | File | Purpose |
 |---|---|
-| [`spec/v1.md`](spec/v1.md) | **Current shipped behavior — start here.** Architecture (§1-§14), implementation reference (§A-§R), per-version row table (v1.0.0 → current). Every row is ✅. Source code cross-references sections via `§` markers. |
+| [`spec/v1.md`](spec/v1.md) | **Current shipped behavior — start here.** Architecture (§1-§14), implementation reference (§A-§R), per-version row table (v1.0.0 → current). Most rows ✅; rows for features that shipped earlier in v1.x and were later removed carry `❌ removed in vX.Y.Z`. Source code cross-references sections via `§` markers. |
 | [`spec/v0.md`](spec/v0.md) | Frozen v0.* development history. Read for "when and how did feature X land in v0.*?" — append-only from here. |
 | [`spec/v2.md`](spec/v2.md) | Open backlog: deferred follow-ups, sibling projects, post-1.0 ideas. New roadmap work goes here. v1 row notes link in as "see spec/v2.md §X" wherever a deferred item is named. |
 
@@ -21,7 +21,7 @@ The whole map.
 
 | File | Topic |
 |---|---|
-| [`reference/architecture.md`](reference/architecture.md) | High-level system overview. Complementary to spec/v1.md §1-§4. |
+| [`reference/diagnostics.md`](reference/diagnostics.md) | Per-turn anomaly report behind the `/diagnostics` slash command. |
 | [`reference/sandbox.md`](reference/sandbox.md) | Sandbox / `franky-zerobox` setup recipes for `--role code` / `full`. |
 | [`reference/tui-roadmap.md`](reference/tui-roadmap.md) | Open UX/UI work for `--mode interactive`. |
 | [`reference/learning-zig.md`](reference/learning-zig.md) | 12-chapter tutorial that teaches Zig by reading + modifying franky's source. |
@@ -38,7 +38,6 @@ Not consulted day-to-day; kept so `git log --follow` works for old PRs.
 | [`archive/code-analyse.md`](archive/code-analyse.md) | v1.15ish codebase analysis. |
 | [`archive/coverage-report.md`](archive/coverage-report.md) | Test-coverage snapshot (regenerable). |
 | [`archive/session-recording.md`](archive/session-recording.md) | Literal Claude session transcript. |
-| [`archive/blog.md`](archive/blog.md) | Personal essay on building franky. |
 
 ## What about CHANGELOG.md?
 

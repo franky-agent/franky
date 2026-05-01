@@ -59,9 +59,10 @@ pub const Timeouts = registry_mod.Timeouts;
 // that with "Host header does not match CONNECT request". The vendored
 // copy performs the missing TLS handshake on the established tunnel.
 //
-// All franky internals (providers, OAuth client, model index generator)
-// and franky-do's Slack web_api consume this alias, not `std.http.Client`,
-// so the patch is in effect everywhere we make HTTP calls.
+// All franky internals (providers, model index generator) and
+// franky-do's Slack web_api consume this alias, not
+// `std.http.Client`, so the patch is in effect everywhere we make
+// HTTP calls.
 //
 // See https://github.com/ziglang/zig/issues/19878 and PR #23365 for
 // background, and `vendored/http_client.zig` for the patched source.

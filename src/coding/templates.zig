@@ -6,9 +6,8 @@
 //! or `${named.key}` (named, resolved from a caller-supplied map).
 //! Missing placeholders surface as `TemplateError.MissingArg`.
 //!
-//! Skills (§5.8) are templates-with-metadata — loader delivered in
-//! the v0.10.3 follow-up that wires this module into print/
-//! interactive modes.
+//! Skills (§5.8) are templates-with-metadata. Wired into interactive
+//! mode via the `/template` slash handler.
 
 const std = @import("std");
 

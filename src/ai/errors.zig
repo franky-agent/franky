@@ -8,11 +8,11 @@
 //!
 //! §F.2 sub-codes (v1.7.1): tool-specific sub-codes like
 //! `edit_no_match`, `path_escape_workspace`, `bash_timeout` live in
-//! `ErrorDetails.tool_code`; OAuth sub-codes from §Q.6 live in
+//! `ErrorDetails.tool_code`; provider-specific sub-codes live in
 //! `ErrorDetails.provider_code`. At the agent-error level they all
 //! surface as:
 //!   - `.tool_runtime` for tool failures
-//!   - `.auth` for OAuth/credential failures
+//!   - `.auth` for credential failures
 //!   - the matching transport code for network failures
 //!
 //! Tools populate `ToolResult.tool_code` on failure; callers that

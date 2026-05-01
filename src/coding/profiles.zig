@@ -571,7 +571,7 @@ pub const builtin_catalog = [_]Builtin{
     },
     .{
         .name = "gemini",
-        .description = "Google AI Studio Gemini — gemini-2.5-pro via native provider (env: GEMINI_API_KEY; or `franky login --provider google-gemini`)",
+        .description = "Google AI Studio Gemini — gemini-2.5-pro via native provider (env: GEMINI_API_KEY; or --auth-token / auth.json bearer record)",
         .body = builtin_gemini_body,
     },
 };

@@ -131,7 +131,7 @@ pub fn hintForToolError(code: ?[]const u8, message: ?[]const u8) []const u8 {
         return "Provider was slow. Raise --first-byte-timeout-ms / --event-gap-timeout-ms (or set FRANKY_FIRST_BYTE_TIMEOUT_MS / FRANKY_EVENT_GAP_TIMEOUT_MS).";
     }
     if (std.mem.eql(u8, c, "auth") or std.mem.indexOf(u8, m, "credential") != null) {
-        return "Auth failure. Re-run `franky login <provider>` or check $ANTHROPIC_API_KEY / $OPENAI_API_KEY / $GEMINI_API_KEY.";
+        return "Auth failure. Check $ANTHROPIC_API_KEY / $OPENAI_API_KEY / $GEMINI_API_KEY, or pass --auth-token / a bearer-token record in $FRANKY_HOME/auth.json.";
     }
     if (std.mem.eql(u8, c, "rate_limited") or std.mem.eql(u8, c, "rate_limited_hard")) {
         return "Provider rate-limited the request. Back off and retry; check the provider dashboard for quota.";
@@ -1150,7 +1150,7 @@ test "render: tool failure surfaces tool name, code, message, and HINT" {
 
 test "hintForToolError: recognizes canonical codes" {
     try testing.expect(std.mem.indexOf(u8, hintForToolError("timeout", null), "first-byte-timeout") != null);
-    try testing.expect(std.mem.indexOf(u8, hintForToolError("auth", null), "franky login") != null);
+    try testing.expect(std.mem.indexOf(u8, hintForToolError("auth", null), "auth.json") != null);
     try testing.expect(std.mem.indexOf(u8, hintForToolError("rate_limited", null), "rate-limited") != null);
     try testing.expect(std.mem.indexOf(u8, hintForToolError("role_denied", null), "--role") != null);
     try testing.expect(std.mem.indexOf(u8, hintForToolError("path_escape_workspace", null), "workspace") != null);

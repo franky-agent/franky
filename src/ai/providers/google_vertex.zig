@@ -7,10 +7,9 @@
 //!     model path rooted at `/v1/projects/{project}/locations/{region}/
 //!     publishers/google/models/{model}:streamGenerateContent`.
 //!   * Auth: `Authorization: Bearer <access-token>` (from a
-//!     service-account JWT exchange) instead of `?key=API_KEY`.
-//!     §Q.4's JWT-signing + token-exchange flow is a v0.12.*
-//!     milestone; this provider accepts a pre-minted access token
-//!     through `options.auth_token` or `VERTEX_ACCESS_TOKEN` /
+//!     service-account JWT exchange performed externally) instead
+//!     of `?key=API_KEY`. This provider accepts a pre-minted access
+//!     token through `options.auth_token` or `VERTEX_ACCESS_TOKEN` /
 //!     `GOOGLE_CLOUD_ACCESS_TOKEN` env vars (resolved in print mode).
 //!
 //! `project` and `region` come from `options.base_url` when the

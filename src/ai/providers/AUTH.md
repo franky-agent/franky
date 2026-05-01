@@ -144,10 +144,11 @@ order:
 5. **`CLAUDE_CODE_OAUTH_TOKEN`** — sent as `Authorization: Bearer` plus
    the OAuth beta header. The long-lived subscription token from
    `claude setup-token`.
-6. Subscription OAuth credentials from `/login` — the interactive
-   browser flow. Not applicable to franky today; if/when we implement
-   the login flow (§Q), credentials end up stored in a
-   claude-code-compatible location and feed back into this slot.
+6. Subscription OAuth credentials minted by Claude Code's own `/login`
+   flow. Out of scope for franky — the v0.12 / v1.2.* in-tree minting
+   flows were removed in v1.30.0. Users who want to ride a subscription
+   token mint it externally (`claude setup-token`) and feed it through
+   slot 5 above.
 
 If `ANTHROPIC_API_KEY` is set alongside subscription credentials, the
 API key wins (per the docs). Users who want their subscription honoured
@@ -252,8 +253,10 @@ Common failure modes:
 ## What this package does *not* do
 
 - **Token minting / refresh.** We consume tokens that the user already
-  produced (via `claude setup-token` or a gateway). A full OAuth device
-  flow is spec §Q and deferred.
+  produced (via `claude setup-token`, an LLM gateway, or a Google Cloud
+  service-account JWT exchange). The in-tree PKCE / device-code / JWT
+  flows that shipped in v1.2.* were removed in v1.30.0; franky no longer
+  mints, refreshes, or rotates credentials of any kind.
 - **Credential storage.** We never read or write `~/.claude/.credentials.json`
   or the macOS keychain. All credentials flow in via CLI flag or
   environment variable on a per-invocation basis.
@@ -269,5 +272,6 @@ Common failure modes:
   https://code.claude.com/docs/en/authentication
 - Anthropic Messages API reference (endpoint, versioning header):
   https://docs.claude.com/en/api/messages
-- Spec cross-refs: §A.2 (Anthropic wire format), §Q (OAuth — deferred),
-  §5.6 (CLI surface).
+- Spec cross-refs: §A.2 (Anthropic wire format), §Q (OAuth — historical;
+  in-tree flows removed in v1.30.0, see git log for the v0.12 / v1.2.*
+  implementation), §5.6 (CLI surface).

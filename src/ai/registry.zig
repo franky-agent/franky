@@ -87,10 +87,10 @@ pub const Timeouts = struct {
     /// streams. Also observed between the last event callback and EOF.
     event_gap_ms: u32 = 60_000,
 
-    /// Wall-clock budget for a complete request-to-body-ready fetch.
-    /// Under the current buffered-fetch implementation this is the only
-    /// externally observable deadline; per-phase enforcement will land
-    /// when we migrate to streaming reads (tracked in the port log).
+    /// Wall-clock budget for a complete request-to-body-ready fetch
+    /// (sum of `connect_ms` + `upload_ms` + `first_byte_ms`). Per-phase
+    /// enforcement is live via `fetchAttemptPhased`; this sum is the
+    /// outer deadline used by the retry layer between attempts.
     pub fn fetchDeadlineMs(self: Timeouts) u64 {
         return @as(u64, self.connect_ms) + @as(u64, self.upload_ms) + @as(u64, self.first_byte_ms);
     }

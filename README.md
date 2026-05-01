@@ -11,8 +11,10 @@ loop with parallel tool execution, built-in `read` / `write` / `edit` /
 edits, and §R workspace path-safety), session persistence + branching
 on disk, **four run modes** (`print` / `interactive` / `rpc` / `proxy`),
 a built-in web UI served by proxy mode, capability roles, a per-tool
-permission overlay, OAuth login for four providers, and per-phase HTTP
-timeouts. **798 tests** pass at the v1.15.2 cut.
+permission overlay, bearer-token auth (`--auth-token` /
+`ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN`) for subscription /
+gateway flows, and per-phase HTTP timeouts. **908 tests** pass at the
+current cut.
 
 ## Quick start
 
@@ -64,7 +66,7 @@ without network access.
 | **Session persistence** | on (writes to `~/.franky/sessions/<ulid>/`) | default | `--no-session` |
 | **Resume / branching** | new session per run | `--continue` (most recent) or `--resume <id>`; `--fork <name>` / `--checkout <name>` | n/a |
 | **Phase timeouts** | 10 s connect / 120 s upload / 30 s first-byte / 60 s event-gap (10 min first-byte when `--base-url` points at a loopback host) | `--connect-timeout-ms` / `--upload-timeout-ms` / `--first-byte-timeout-ms` / `--event-gap-timeout-ms` (or matching `FRANKY_*_TIMEOUT_MS` env vars) | set field to `0` to disable that phase's watchdog |
-| **OAuth login** | n/a | `franky login <provider>` (anthropic / copilot / gemini / vertex) | log out by clearing `~/.franky/auth.json` |
+| **Bearer-token auth** | API-key path | `--auth-token <token>` (or `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN` env vars). Mint long-lived tokens externally — e.g. `claude setup-token` — and paste the result in. | n/a |
 | **Logging** | warnings + errors → stderr | `--log-level info\|debug\|trace` or `FRANKY_LOG=…` or `FRANKY_DEBUG=1`; route to a file with `--log-file PATH` (or `FRANKY_LOG_FILE`); interactive mode auto-diverts above `warn` to `$FRANKY_HOME/logs/franky-<ts>.log` so the TUI stays usable | `--log-level error` |
 | **Tool subset** | every built-in tool | `--tools read,grep,…` (registry filter) | n/a — pair with `--role` for capability-tier scoping instead |
 | **Skills / templates** | n/a | `--skills <path>`, `--prompts-dir <dir>` (template root, was `--prompts` before v1.11.0) | omit |
@@ -306,19 +308,26 @@ Full list: `franky --help`. Highlights:
 | `FRANKY_CONNECT_TIMEOUT_MS` / `FRANKY_UPLOAD_TIMEOUT_MS` / `FRANKY_FIRST_BYTE_TIMEOUT_MS` / `FRANKY_EVENT_GAP_TIMEOUT_MS` | Override the matching `--*-timeout-ms` flag |
 | `ZEROBOX_ACTIVE` | Set by `scripts/franky-zerobox` to silence the sandbox warning |
 
-### OAuth login
+### Bearer-token auth
 
-Four providers support browser-based OAuth login (see `src/coding/oauth/`):
+Franky no longer ships a built-in OAuth/PKCE/device-code minting flow
+(`franky login` was removed). The runtime still consumes bearer tokens
+in two ways:
 
-```sh
-franky login anthropic    # PKCE flow against console.anthropic.com
-franky login copilot      # GitHub Copilot device-code flow
-franky login gemini       # Google Gemini OAuth
-franky login vertex       # Google Vertex AI service-account
-```
+1. **`--auth-token <token>`** on the CLI, with env-var fallbacks
+   (`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) — the value flows
+   into `Options.auth_token` and the provider sends
+   `Authorization: Bearer <token>` plus the Claude Code fingerprint
+   headers (see `src/ai/providers/AUTH.md`).
+2. **`auth.json` records of `type: "oauth"`** — written by hand or by
+   an external tool, with `accessToken` / `refreshToken` / `expiresAt`
+   in the §H.1 shape. Franky reads the record but does not refresh it.
 
-Tokens land in `$FRANKY_HOME/auth.json` and refresh automatically before
-expiry (§Q.5).
+Long-lived subscription tokens are minted externally — for Claude
+Pro/Max/Team/Enterprise, `claude setup-token` (the official Claude
+Code CLI) prints a one-year token that you paste into
+`--auth-token` or export as `CLAUDE_CODE_OAUTH_TOKEN`. Other providers
+mint tokens via their own tooling.
 
 ### Sandboxing
 
@@ -672,7 +681,7 @@ const grep_tool = franky.coding.tools.grep.tool();
   top; `coding` adds a particular tool/prompt set. You can use any layer
   independently.
 
-## Implementation status (v1.15.2)
+## Implementation status
 
 | Layer | Module | Status |
 |---|---|---|
@@ -681,11 +690,13 @@ const grep_tool = franky.coding.tools.grep.tool();
 | `agent` | low-level loop (sequential + parallel-homogeneous), stateful `Agent` (worker thread + subscribers + steer/followUp drain) | ✅ |
 | `coding` tools | read, write, edit (atomic), bash (cwd-locked + env-denylist + §R), ls, find, grep (regex + gitignore) | ✅ |
 | `coding` modes | print, interactive (TUI), rpc (JSON-RPC), proxy (HTTP/SSE + web UI) | ✅ |
-| `coding` features | session persistence + branching + object-store + compaction, capability roles (§5.10), permission overlay foundation (§5.11), settings/auth/models JSON, OAuth login for 4 providers, Tier-1 extensions | ✅ |
+| `coding` features | session persistence + branching + object-store + compaction, capability roles (§5.10), permission overlay foundation (§5.11), settings/auth/models JSON, bearer-token auth (`--auth-token` + `auth.json` round-trip), Tier-1 extensions | ✅ |
 
-**798 tests** pass at the v1.15.2 cut across one library binary and five
+**908 tests** pass at the current cut across one library binary and the
 integration binaries (`agent_loop`, `agent_class`, `gitignore`,
-`parallel_tools`, `kitchen_sink`).
+`parallel_tools`, `kitchen_sink`). The `franky login` minting flow
+shipped in v1.2.* and was removed in v1.30.0 — bearer tokens are now
+minted externally.
 
 ### Regenerating `models.json`
 

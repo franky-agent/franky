@@ -505,20 +505,17 @@ fn mapFinishReason(s: []const u8) ?types.StopReason {
 pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     // Two auth shapes for the Google Generative Language API:
     //  - API key as `?key=...` query param (the AI Studio key path).
-    //  - OAuth bearer in the `Authorization` header (the
-    //    `franky login --provider google-gemini` path; Google's
-    //    own OAuth-issued access tokens). Detected from
-    //    `auth_token` being present.
-    // If both happen to be set, prefer the OAuth bearer (the
-    // OAuth path is the more privileged one — keys are cheap to
-    // mint, OAuth implies a real Google identity).
+    //  - Bearer token in the `Authorization` header (an externally
+    //    minted Google access token, supplied via `auth_token`).
+    // If both happen to be set, prefer the bearer — it carries a
+    // real Google identity, whereas API keys are cheap to mint.
     const has_api_key = ctx.options.api_key != null and ctx.options.api_key.?.len > 0;
     const has_auth_token = ctx.options.auth_token != null and ctx.options.auth_token.?.len > 0;
     if (!has_api_key and !has_auth_token) {
         try ctx.out.push(ctx.io, .start);
         ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
             .code = errors.Code.auth,
-            .message = try ctx.allocator.dupe(u8, "google-gemini: no credential (set --api-key, GOOGLE_API_KEY / GEMINI_API_KEY, or run `franky login --provider google-gemini`)"),
+            .message = try ctx.allocator.dupe(u8, "google-gemini: no credential (set --api-key, GOOGLE_API_KEY / GEMINI_API_KEY, or pass --auth-token / a bearer-token record in $FRANKY_HOME/auth.json)"),
         } });
         return;
     }
@@ -529,8 +526,9 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     log.log(.debug, "http", "request", "provider=google-gemini model={s} body_bytes={d}", .{ ctx.model.id, body.len });
     log.body(.trace, "http", "request_body", body, 64 * 1024);
 
-    // URL: OAuth path drops the `key=` param (Google's API rejects
-    // the dual-auth combination); API-key path appends `&key=...`.
+    // URL: bearer-token path drops the `key=` param (Google's API
+    // rejects the dual-auth combination); API-key path appends
+    // `&key=...`.
     const url = if (has_auth_token)
         try std.fmt.allocPrint(
             ctx.allocator,

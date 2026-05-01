@@ -2866,7 +2866,7 @@ const ListenSetup = struct {
 };
 
 fn bindLoopback(io: std.Io) ?ListenSetup {
-    // Try a band of high ports (avoid the OAuth listener's range).
+    // Try a band of high ports.
     const from: u16 = 18876;
     const to: u16 = 18900;
     var p = from;

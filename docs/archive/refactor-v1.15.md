@@ -1,5 +1,7 @@
 # Post-v1.0 refactoring decision record
 
+> **Stale snapshot — captured pre-v1.30.0.** `src/coding/oauth/` and `src/coding/modes/login.zig` were deleted in v1.30.0; LOC tables and Option A/B refactor plans for those trees are moot. Kept as historical record.
+
 **Status: open — captured 2026-04-27 at v1.15.2 (798/798 tests).**
 **Companion to:** `refactor.md` (closed v1.3.0 internal refactor history).
 
