@@ -618,14 +618,22 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     // Reuse streamSse by capturing bytes into the Allocating writer, then
     // hand the bytes to runFromSse.
     var client = http_mod.Client{ .allocator = ctx.allocator, .io = ctx.io };
-    defer client.deinit();
+    // v1.29.7 — `setupClientFromEnv` returns a proxy arena that
+    // must outlive the client. Single `defer { … }` block pins
+    // the order: client.deinit() first (uses proxy pointers),
+    // then the arena (frees them).
+    var proxy_arena: ?std.heap.ArenaAllocator = null;
+    defer {
+        client.deinit();
+        if (proxy_arena) |*a| a.deinit();
+    }
 
     // Honor HTTP(S)_PROXY / NO_PROXY when the caller supplied an
     // environ map. Skipping this makes direct calls to `api.anthropic.com`
     // fail with ConnectionRefused behind corporate / sandbox proxies.
     if (ctx.options.environ_map) |env_map| {
         // v1.25.0 — proxy + FRANKY_CA_BUNDLE in one call.
-        http_mod.setupClientFromEnv(&client, ctx.allocator, ctx.io, env_map) catch |e| {
+        proxy_arena = http_mod.setupClientFromEnv(&client, ctx.allocator, ctx.io, env_map) catch |e| {
             try ctx.out.push(ctx.io, .start);
             ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
                 .code = errors.Code.transport,

@@ -79,36 +79,48 @@ pub const Client = @import("vendored/http_client.zig");
 // `/etc/ssl/certs/` rather than appended to
 // `/etc/ssl/certs/ca-certificates.crt`.
 //
-// **v1.29.4 lifetime correction.** Pre-fix, this allocated the
-// proxy struct in a function-scoped `ArenaAllocator` that
-// `defer`-deinited on return — but the vendored Zig Client's
-// `http_proxy` / `https_proxy` fields are pointers into that
+// **v1.29.7 — proper proxy lifetime via caller-owned arena.**
+// History: v1.28.x scoped a `proxy_arena` to this very function
+// and `defer`-deinited it on return — but the vendored Client's
+// `http_proxy` / `https_proxy` fields are pointers INTO that
 // arena (per `vendored/http_client.zig:1331-1334`: "Uses `arena`
 // for a few small allocations that must outlive the client"),
-// so the next request's `connect()` deref'd freed memory. Real-
-// user segfault in franky-do v0.4.7 against an HTTPS_PROXY
-// (Squid via `gateway.docker.internal:3128`); fault address
-// `0xffff936e0040` matched the v1.26.x high-bit user-space UAF
-// pattern the v1.28.1 spec row already framed correctly. The
-// fix passes `allocator` (caller's, long-lived) directly to
-// `initDefaultProxies` instead. Each call leaks ~100 bytes
-// (Proxy struct + host string + optional Basic-auth value) for
-// the lifetime of the process; acceptable until the vendored
-// Client grows a proper Proxy destructor (deferred per
-// `docs/spec/v2.md`).
+// so the next request's `connect()` deref'd freed memory.
+// v1.29.4 routed around the UAF by passing the caller's
+// long-lived allocator straight in — fixing the segfault but
+// leaking ~100 bytes (Proxy struct + host + maybe Basic-auth
+// blob) per call, since nobody tracks when the client is done.
+// v1.29.7 honours the upstream contract literally: this
+// function creates a fresh `ArenaAllocator`, hands its allocator
+// to `initDefaultProxies`, and **returns the arena to the
+// caller**. The caller pairs the arena's deinit with the
+// client's, in that order:
 //
-// CA bundle uses the client's allocator (unchanged).
+//     var client = Client{ .allocator = a, .io = io };
+//     var proxy_arena = try http.setupClientFromEnv(&client, a, io, env_map);
+//     defer {
+//         client.deinit();          // uses proxy pointers (alive)
+//         proxy_arena.deinit();     // then frees them
+//     }
+//
+// Single `defer { ... }` block is intentional — two separate
+// defers would LIFO-order against intent.
+//
+// CA bundle uses the client's allocator (unchanged); the arena
+// is exclusively for the proxy structs.
 
 pub fn setupClientFromEnv(
     client: *Client,
     allocator: std.mem.Allocator,
     io: std.Io,
     environ_map: *const std.process.Environ.Map,
-) anyerror!void {
-    try client.initDefaultProxies(allocator, environ_map);
+) anyerror!std.heap.ArenaAllocator {
+    var proxy_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer proxy_arena.deinit();
+    try client.initDefaultProxies(proxy_arena.allocator(), environ_map);
 
     if (environ_map.get("FRANKY_CA_BUNDLE")) |ca_path| {
-        if (ca_path.len == 0) return;
+        if (ca_path.len == 0) return proxy_arena;
         const now = std.Io.Clock.real.now(io);
         // Force the system-bundle rescan now (the lazy path inside
         // `Client.connect` would otherwise CLOBBER our additions
@@ -125,12 +137,13 @@ pub fn setupClientFromEnv(
             error.Canceled => |ce| return ce,
             else => |other| {
                 log.log(.warn, "http", "ca-bundle", "FRANKY_CA_BUNDLE={s} load failed: {s}", .{ ca_path, @errorName(other) });
-                return;
+                return proxy_arena;
             },
         };
         client.now = now;
         log.log(.info, "http", "ca-bundle", "extended trust store with FRANKY_CA_BUNDLE={s}", .{ca_path});
     }
+    return proxy_arena;
 }
 
 // ─── §G.4 per-phase timeout primitives (v1.8.0) ──────────────────
@@ -1571,4 +1584,63 @@ test "writeTraceFile: monotonic seq across concurrent calls in same ms" {
     var count: usize = 0;
     while (try it.next(io)) |_| count += 1;
     try testing.expectEqual(@as(usize, 5), count);
+}
+
+// ─── v1.29.7 — proxy-arena lifetime regression tests ────────────
+
+test "setupClientFromEnv: returns ArenaAllocator that frees Proxy on deinit (no leak)" {
+    // Pre-v1.29.7, this exercise leaked ~100B per call (Proxy
+    // struct + duped host string). The test allocator's leak
+    // detector would flag those leaks at scope exit. The fix:
+    // setupClientFromEnv returns the arena, caller defers it
+    // alongside client.deinit, all Proxy allocations get freed.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    try env_map.put("https_proxy", "http://proxy.example.com:3128");
+    try env_map.put("http_proxy", "http://proxy.example.com:3128");
+
+    {
+        var client = Client{ .allocator = gpa, .io = io };
+        var proxy_arena = try setupClientFromEnv(&client, gpa, io, &env_map);
+        defer {
+            client.deinit();
+            proxy_arena.deinit();
+        }
+
+        // Both proxy fields populated.
+        try testing.expect(client.http_proxy != null);
+        try testing.expect(client.https_proxy != null);
+        try testing.expectEqual(@as(u16, 3128), client.http_proxy.?.port);
+    }
+    // Scope exited cleanly. testing.allocator's leak detector
+    // would fire at process exit if any Proxy alloc survived;
+    // running this in `zig build test` is the assertion.
+}
+
+test "setupClientFromEnv: empty environ → empty arena that still deinits cleanly" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    // No proxy envs set.
+
+    var client = Client{ .allocator = gpa, .io = io };
+    var proxy_arena = try setupClientFromEnv(&client, gpa, io, &env_map);
+    defer {
+        client.deinit();
+        proxy_arena.deinit();
+    }
+
+    // No proxy configured.
+    try testing.expect(client.http_proxy == null);
+    try testing.expect(client.https_proxy == null);
+    // Arena deinit is still well-defined on the empty case.
 }

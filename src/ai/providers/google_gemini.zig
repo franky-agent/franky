@@ -566,11 +566,17 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     const cancel = ctx.options.cancel orelse unreachable;
 
     var client = http_mod.Client{ .allocator = ctx.allocator, .io = ctx.io };
-    defer client.deinit();
+    // v1.29.7 — proxy arena outlives the client; see anthropic.zig
+    // for the full lifetime rationale.
+    var proxy_arena: ?std.heap.ArenaAllocator = null;
+    defer {
+        client.deinit();
+        if (proxy_arena) |*a| a.deinit();
+    }
 
     if (ctx.options.environ_map) |env_map| {
         // v1.25.0 — proxy + FRANKY_CA_BUNDLE in one call.
-        http_mod.setupClientFromEnv(&client, ctx.allocator, ctx.io, env_map) catch |e| {
+        proxy_arena = http_mod.setupClientFromEnv(&client, ctx.allocator, ctx.io, env_map) catch |e| {
             try ctx.out.push(ctx.io, .start);
             ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
                 .code = errors.Code.transport,
