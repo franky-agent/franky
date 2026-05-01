@@ -17,7 +17,6 @@ pub const tools = struct {
 pub const modes = struct {
     pub const print = @import("modes/print.zig");
     pub const interactive = @import("modes/interactive.zig");
-    pub const login = @import("modes/login.zig");
     pub const rpc = @import("modes/rpc.zig");
     pub const proxy = @import("modes/proxy.zig");
 };
@@ -38,7 +37,6 @@ pub const permissions = @import("permissions.zig");
 pub const settings = @import("settings.zig");
 pub const profiles = @import("profiles.zig");
 pub const auth = @import("auth.zig");
-pub const oauth = @import("oauth/mod.zig");
 pub const models = @import("models.zig");
 pub const models_render = @import("models_render.zig");
 pub const models_fetch = @import("models_fetch.zig");
@@ -66,7 +64,6 @@ test {
     _ = tools.truncate;
     _ = modes.print;
     _ = modes.interactive;
-    _ = modes.login;
     _ = modes.rpc;
     _ = modes.proxy;
     _ = terminal;
@@ -84,7 +81,6 @@ test {
     _ = settings;
     _ = profiles;
     _ = auth;
-    _ = oauth;
     _ = models;
     _ = models_render;
     _ = models_fetch;

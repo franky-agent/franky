@@ -17,13 +17,5 @@ pub fn main(init: std.process.Init) !void {
         try args_list.append(gpa, try gpa.dupe(u8, raw));
     }
 
-    // Subcommand dispatch: `franky login …` runs the OAuth
-    // orchestrator; anything else falls through to the print/
-    // interactive driver via `modes.print.run`.
-    if (args_list.items.len > 1 and std.mem.eql(u8, args_list.items[1], "login")) {
-        try franky.coding.modes.login.run(gpa, io, init.minimal.environ, args_list.items);
-        return;
-    }
-
     try franky.coding.modes.print.run(gpa, io, init.minimal.environ, init.environ_map, args_list.items);
 }

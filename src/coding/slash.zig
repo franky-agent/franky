@@ -134,7 +134,6 @@ pub fn helpHandler(ctx: *Ctx, _: []const []const u8) Error!void {
         \\  /retry         Re-run the last turn
         \\  /edit          Edit the last user message
         \\  /cost          Show accumulated usage
-        \\  /login         Run an OAuth flow (when available)
         \\  /logout        Clear cached credentials
         \\  /quit          Exit
         \\

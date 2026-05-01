@@ -780,7 +780,6 @@ fn paintHelpOverlay(buf: *tui.buffer.Buffer, no_color: bool) void {
         .{ "/diagnostics", "per-turn anomaly report (see docs/reference/diagnostics.md)" },
         .{ "/template NAME", "expand + submit a prompt template" },
         .{ "/clear", "reset the transcript" },
-        .{ "/login / logout", "OAuth flow info" },
         .{ "/quit", "exit franky" },
     };
 
