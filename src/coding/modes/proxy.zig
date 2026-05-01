@@ -65,6 +65,7 @@ const permissions_mod = franky.coding.permissions;
 const session_mod = franky.coding.session;
 const slash_mod = franky.coding.slash;
 const diagnostics_mod = franky.coding.diagnostics;
+const improvement_mod = franky.coding.improvement;
 
 pub const default_port: u16 = 8787;
 // pub const default_host: []const u8 = "127.0.0.1";
@@ -793,6 +794,57 @@ fn thinkingHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Erro
 /// `<franky_home>/diagnostics/<session_id>/<unix_ms>.txt`. Best-
 /// effort — a write failure is reported in the response but does
 /// not fail the command itself.
+fn improveHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
+    const px = proxySlashCtx(ctx);
+    const session = px.session;
+
+    const home_owned = diagnostics_mod.resolveFrankyHome(ctx.allocator, session.environ_map) catch |e| switch (e) {
+        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
+    };
+    defer if (home_owned) |h| ctx.allocator.free(h);
+    const home = home_owned orelse {
+        try ctx.output.appendSlice(
+            ctx.allocator,
+            "/improve: $FRANKY_HOME and $HOME both unset; cannot resolve diagnostics dir.\n",
+        );
+        return;
+    };
+
+    const diag_dir = std.fmt.allocPrint(ctx.allocator, "{s}/diagnostics", .{home}) catch return slash_mod.Error.OutOfMemory;
+    defer ctx.allocator.free(diag_dir);
+    const imp_root = std.fmt.allocPrint(ctx.allocator, "{s}/improvements", .{home}) catch return slash_mod.Error.OutOfMemory;
+    defer ctx.allocator.free(imp_root);
+
+    const result = improvement_mod.runAndPersist(ctx.allocator, session.io, .{
+        .diagnostics_dir = diag_dir,
+        .improvements_root = imp_root,
+        .model_filter = session.cfg.model,
+        .timestamp_ms = ai.stream.nowMillis(),
+    }) catch |e| switch (e) {
+        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
+        else => {
+            const msg = std.fmt.allocPrint(
+                ctx.allocator,
+                "/improve: failed to run analyzer: {s}\n",
+                .{@errorName(e)},
+            ) catch return slash_mod.Error.OutOfMemory;
+            defer ctx.allocator.free(msg);
+            try ctx.output.appendSlice(ctx.allocator, msg);
+            return;
+        },
+    };
+    defer result.deinit(ctx.allocator);
+
+    try ctx.output.appendSlice(ctx.allocator, "```\n");
+    try ctx.output.appendSlice(ctx.allocator, result.rendered);
+    try ctx.output.appendSlice(ctx.allocator, "```\n");
+    if (result.persisted_path) |path| {
+        try ctx.output.appendSlice(ctx.allocator, "\nReport saved to: `");
+        try ctx.output.appendSlice(ctx.allocator, path);
+        try ctx.output.appendSlice(ctx.allocator, "`\n");
+    }
+}
+
 fn diagnosticsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
     const px = proxySlashCtx(ctx);
     const session = px.session;
@@ -1193,6 +1245,7 @@ fn buildProxySlashRegistry(allocator: std.mem.Allocator) !slash_mod.Registry {
     try reg.register(.{ .name = "edit", .description = "Edit the last user message", .handler = editHandler });
     try reg.register(.{ .name = "compact", .description = "Compact older messages into a summary", .handler = compactHandler });
     try reg.register(.{ .name = "diagnostics", .description = "Per-turn diagnostic report (anomalies + trace pointers)", .handler = diagnosticsHandler });
+    try reg.register(.{ .name = "improve", .description = "Cross-session self-improvement report (mines past summaries)", .handler = improveHandler });
     try reg.register(.{ .name = "quit", .description = "Close this browser tab", .handler = quitHandler });
     return reg;
 }

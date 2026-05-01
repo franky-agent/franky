@@ -23,6 +23,7 @@ The whole map.
 | File | Topic |
 |---|---|
 | [`reference/diagnostics.md`](reference/diagnostics.md) | Per-turn anomaly report behind the `/diagnostics` slash command. |
+| [`reference/self-improvement.md`](reference/self-improvement.md) | Cross-session analyzer behind `/improve` and `franky doctor`. Mines `summary.json` files into a feature-request-shaped backlog. |
 | [`reference/spec-management.md`](reference/spec-management.md) | How to manage spec docs over time — research synthesis + applied principles for v1.md / v2.md / archive. |
 | [`reference/sandbox.md`](reference/sandbox.md) | Sandbox / `franky-zerobox` setup recipes for `--role code` / `full`. |
 | [`reference/tui-roadmap.md`](reference/tui-roadmap.md) | Open UX/UI work for `--mode interactive`. |

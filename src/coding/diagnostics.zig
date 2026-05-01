@@ -12,6 +12,7 @@ const ai = struct {
     pub const types = @import("../ai/types.zig");
 };
 const agent = @import("../agent/mod.zig");
+const utils = @import("../ai/utils.zig");
 
 /// Inputs the analyzer needs. All optional fields degrade gracefully
 /// when missing — interactive mode passes only `transcript` and the
@@ -229,6 +230,52 @@ pub const Report = struct {
         for (self.turns.items) |*t| t.deinit(self.allocator);
         self.turns.deinit(self.allocator);
     }
+
+    /// Sum of `tool_call_blocks` across all assistant turns.
+    pub fn totalToolCalls(self: *const Report) u32 {
+        var sum: u32 = 0;
+        for (self.turns.items) |t| sum += t.tool_call_blocks;
+        return sum;
+    }
+
+    /// Sum of failed tool calls (each turn's `tool_failures.items.len`).
+    pub fn totalToolFailures(self: *const Report) u32 {
+        var sum: u32 = 0;
+        for (self.turns.items) |t| sum += @intCast(t.tool_failures.items.len);
+        return sum;
+    }
+
+    /// Count occurrences per `Anomaly` variant. Returns a fixed-size
+    /// slice indexed by the enum's tag integer value — callers can
+    /// `[@intFromEnum(Anomaly.degenerate)]` etc.
+    pub fn anomalyCounts(self: *const Report) [5]u32 {
+        var counts: [5]u32 = .{ 0, 0, 0, 0, 0 };
+        for (self.turns.items) |t| {
+            for (t.anomalies.items) |a| counts[@intFromEnum(a)] += 1;
+        }
+        return counts;
+    }
+
+    /// Sum the per-turn `Diagnostics` token + parts counters across
+    /// the report. Null Diagnostics or null token fields are treated
+    /// as zero — pre-v1.29.0 transcripts have no diagnostics, so
+    /// totals stay 0.
+    pub fn tokenTotals(self: *const Report) TokenTotals {
+        var t: TokenTotals = .{};
+        for (self.turns.items) |turn| {
+            const d = turn.diagnostics orelse continue;
+            t.candidates += d.candidates_tokens orelse 0;
+            t.thoughts += d.thoughts_tokens orelse 0;
+            t.parts_seen += d.parts_seen;
+        }
+        return t;
+    }
+};
+
+pub const TokenTotals = struct {
+    candidates: u64 = 0,
+    thoughts: u64 = 0,
+    parts_seen: u64 = 0,
 };
 
 /// Analyze a transcript. The returned `Report` is owned by the
@@ -717,6 +764,129 @@ pub const PersistResult = struct {
     }
 };
 
+/// Serialize a `Report` to a stable, machine-readable JSON shape.
+/// Used by the cross-session aggregator (`coding/improvement.zig`)
+/// to mine patterns across many sessions without re-running the
+/// per-session analyzer. Schema version is bumped (v2, v3, …) when
+/// fields are renamed or removed; consumers must check
+/// `schema_version` before parsing.
+///
+/// `report_path` is the absolute path to the human-rendered TXT
+/// report this summary corresponds to (i.e. the file `persist`
+/// just wrote). Embedded in the JSON so an aggregator pulling a
+/// finding from `summary.json` can hand the user a direct pointer
+/// to the human-readable detail. `null` when toJson is called
+/// outside `runAndPersist`'s orchestration.
+///
+/// Note: this is a SUMMARY view — the per-turn anomaly detail is
+/// rolled into counts. Callers that need turn-level data should
+/// load the full transcript.json or re-run `analyze`.
+pub fn toJson(
+    allocator: std.mem.Allocator,
+    report: *const Report,
+    opts: Options,
+    report_path: ?[]const u8,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"schema_version\":1,");
+
+    // Identity fields — null when caller didn't supply.
+    try buf.appendSlice(allocator, "\"session_id\":");
+    try writeOptStr(&buf, allocator, opts.session_label);
+    try buf.appendSlice(allocator, ",\"model\":");
+    try writeOptStr(&buf, allocator, opts.model);
+    try buf.appendSlice(allocator, ",\"provider\":");
+    try writeOptStr(&buf, allocator, opts.provider);
+    try buf.appendSlice(allocator, ",\"mode\":");
+    try writeOptStr(&buf, allocator, opts.mode_name);
+
+    // Pointer back to the human-rendered TXT. Aggregator follows
+    // this when surfacing a finding so the user sees the rendered
+    // per-turn detail, not just the rolled-up counts.
+    try buf.appendSlice(allocator, ",\"report_path\":");
+    try writeOptStr(&buf, allocator, report_path);
+
+    // Totals.
+    const tool_calls = report.totalToolCalls();
+    const tool_failures = report.totalToolFailures();
+    try buf.appendSlice(allocator, ",\"totals\":{");
+    try writeIntField(&buf, allocator, "messages", @intCast(report.total_messages));
+    try buf.appendSlice(allocator, ",");
+    try writeIntField(&buf, allocator, "assistant_turns", @intCast(report.total_assistant_turns));
+    try buf.appendSlice(allocator, ",");
+    try writeIntField(&buf, allocator, "tool_calls", @intCast(tool_calls));
+    try buf.appendSlice(allocator, ",");
+    try writeIntField(&buf, allocator, "tool_failures", @intCast(tool_failures));
+    try buf.appendSlice(allocator, ",");
+    try writeIntField(&buf, allocator, "anomalies", @intCast(report.total_anomalies));
+    try buf.appendSlice(allocator, "}");
+
+    // Anomaly histogram.
+    const ac = report.anomalyCounts();
+    try buf.appendSlice(allocator, ",\"anomaly_counts\":{");
+    try writeIntField(&buf, allocator, "degenerate", @intCast(ac[@intFromEnum(Anomaly.degenerate)]));
+    try buf.appendSlice(allocator, ",");
+    try writeIntField(&buf, allocator, "prose_tool_call", @intCast(ac[@intFromEnum(Anomaly.prose_tool_call)]));
+    try buf.appendSlice(allocator, ",");
+    try writeIntField(&buf, allocator, "thinking_budget_exhaustion", @intCast(ac[@intFromEnum(Anomaly.thinking_budget_exhaustion)]));
+    try buf.appendSlice(allocator, ",");
+    try writeIntField(&buf, allocator, "saved_error", @intCast(ac[@intFromEnum(Anomaly.saved_error)]));
+    try buf.appendSlice(allocator, ",");
+    try writeIntField(&buf, allocator, "tool_error", @intCast(ac[@intFromEnum(Anomaly.tool_error)]));
+    try buf.appendSlice(allocator, "}");
+
+    // Token totals.
+    const tt = report.tokenTotals();
+    try buf.appendSlice(allocator, ",\"tokens\":{");
+    try writeIntField(&buf, allocator, "candidates", @intCast(tt.candidates));
+    try buf.appendSlice(allocator, ",");
+    try writeIntField(&buf, allocator, "thoughts", @intCast(tt.thoughts));
+    try buf.appendSlice(allocator, ",");
+    try writeIntField(&buf, allocator, "parts_seen", @intCast(tt.parts_seen));
+    try buf.appendSlice(allocator, "}");
+
+    // Per-failure detail. Each entry: turn_index, tool_name, code, message, hint.
+    try buf.appendSlice(allocator, ",\"tool_failures\":[");
+    var first = true;
+    for (report.turns.items, 0..) |turn, turn_ord| {
+        for (turn.tool_failures.items) |f| {
+            if (!first) try buf.appendSlice(allocator, ",");
+            first = false;
+            try buf.appendSlice(allocator, "{");
+            try writeIntField(&buf, allocator, "turn_index", @intCast(turn_ord));
+            try buf.appendSlice(allocator, ",\"tool_name\":");
+            try utils.appendJsonStr(&buf, allocator, f.tool_name);
+            try buf.appendSlice(allocator, ",\"code\":");
+            try writeOptStr(&buf, allocator, f.code);
+            try buf.appendSlice(allocator, ",\"message\":");
+            try writeOptStr(&buf, allocator, f.message);
+            try buf.appendSlice(allocator, ",\"hint\":");
+            try writeOptStr(&buf, allocator, f.hint);
+            try buf.appendSlice(allocator, "}");
+        }
+    }
+    try buf.appendSlice(allocator, "]}");
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn writeOptStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: ?[]const u8) !void {
+    if (s) |v| {
+        try utils.appendJsonStr(buf, allocator, v);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn writeIntField(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8, n: i64) !void {
+    try buf.append(allocator, '"');
+    try buf.appendSlice(allocator, name);
+    try buf.appendSlice(allocator, "\":");
+    try utils.appendJsonInt(buf, allocator, n);
+}
+
 /// Persist a rendered diagnostics report to
 /// `<franky_home>/diagnostics/<session_id>/<timestamp_ms>.txt`.
 /// Creates the parent dir on demand. Returns the absolute path
@@ -751,6 +921,44 @@ pub fn persist(
     var f = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
     try f.writeStreamingAll(io, rendered);
+
+    return .{ .path = path };
+}
+
+/// Persist the structured `summary.json` to
+/// `<franky_home>/diagnostics/<session_id>/summary.json`. Filename
+/// is deterministic — the latest invocation overwrites the prior.
+/// Same dir as `persist`'s timestamped TXT files; the cross-session
+/// aggregator (`coding/improvement.zig`) reads this file rather
+/// than parsing the human-rendered TXT.
+pub fn persistJson(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    opts: PersistOptions,
+    json: []const u8,
+) !PersistResult {
+    const dir = try std.fmt.allocPrint(
+        allocator,
+        "{s}/diagnostics/{s}",
+        .{ opts.franky_home, opts.session_id },
+    );
+    defer allocator.free(dir);
+
+    std.Io.Dir.cwd().createDirPath(io, dir) catch |e| switch (e) {
+        error.PathAlreadyExists => {},
+        else => return e,
+    };
+
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/summary.json",
+        .{dir},
+    );
+    errdefer allocator.free(path);
+
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, json);
 
     return .{ .path = path };
 }
@@ -795,6 +1003,22 @@ pub fn runAndPersist(
             // text; persisted_path stays null.
             path_owned = null;
         }
+        // Also write the machine-readable summary.json. Failure to
+        // write this is even more best-effort than the TXT — the
+        // user-facing report is what matters; the JSON is an
+        // optional input to the cross-session aggregator and a
+        // missing file there just means that session won't show up
+        // in trend reports until the user re-runs /diagnostics.
+        // Path is deterministic (`<dir>/summary.json`) so we don't
+        // surface it; the result's path slice is freed immediately.
+        // Embed the TXT report path so aggregator findings can
+        // drill back to the human-readable detail.
+        if (toJson(allocator, &report, opts, path_owned)) |json| {
+            defer allocator.free(json);
+            if (persistJson(allocator, io, po, json)) |res| {
+                allocator.free(res.path);
+            } else |_| {}
+        } else |_| {}
     }
     return .{ .rendered = text, .persisted_path = path_owned };
 }
@@ -934,6 +1158,138 @@ test "render: degenerate + prose turn surfaces FLAGS + HINT lines" {
     try testing.expect(std.mem.indexOf(u8, out, "HINT (PROSE_TOOL_CALL):") != null);
     try testing.expect(std.mem.indexOf(u8, out, "/tmp/franky-trace/1777498943846-0001-") != null);
     try testing.expect(std.mem.indexOf(u8, out, "first text:") != null);
+}
+
+// ─── SI-1 — summary.json shape + persist round-trip ────────────────
+
+test "toJson: schema_version + identity fields + zero-counts shape" {
+    const gpa = testing.allocator;
+
+    var msgs: [1]ai.types.Message = .{
+        try mkAssistant(gpa, "ok", .{ .parts_seen = 3 }, .stop),
+    };
+    defer for (msgs[0..]) |*m| m.deinit(gpa);
+
+    var report = try analyze(gpa, .{ .transcript = &msgs });
+    defer report.deinit();
+
+    const json = try toJson(gpa, &report, .{
+        .transcript = &msgs,
+        .session_label = "01JTEST",
+        .model = "gemini-2.5-pro",
+        .provider = "google",
+        .mode_name = "interactive",
+    }, "/abs/path/to/12345.txt");
+    defer gpa.free(json);
+
+    // Spot-check the load-bearing structural pieces. We don't snapshot
+    // the whole JSON because field order may shift between Zig versions
+    // (we control the field order, but a future refactor might).
+    try testing.expect(std.mem.indexOf(u8, json, "\"schema_version\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"session_id\":\"01JTEST\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"model\":\"gemini-2.5-pro\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"provider\":\"google\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"mode\":\"interactive\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"report_path\":\"/abs/path/to/12345.txt\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"messages\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"assistant_turns\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"parts_seen\":3") != null);
+    // Empty failures list rendered as `"tool_failures":[]`.
+    try testing.expect(std.mem.indexOf(u8, json, "\"tool_failures\":[]") != null);
+}
+
+test "toJson: null identity fields render as JSON null" {
+    const gpa = testing.allocator;
+
+    var msgs: [1]ai.types.Message = .{
+        try mkAssistant(gpa, "ok", null, .stop),
+    };
+    defer for (msgs[0..]) |*m| m.deinit(gpa);
+
+    var report = try analyze(gpa, .{ .transcript = &msgs });
+    defer report.deinit();
+
+    // Pass no labels — every identity field is null.
+    const json = try toJson(gpa, &report, .{ .transcript = &msgs }, null);
+    defer gpa.free(json);
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"session_id\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"model\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"provider\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"mode\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"report_path\":null") != null);
+}
+
+test "toJson: anomaly_counts reflects flagged turns" {
+    const gpa = testing.allocator;
+
+    var msgs: [2]ai.types.Message = .{
+        try mkAssistant(gpa, "", .{ .was_degenerate = true, .parts_seen = 0 }, .stop),
+        try mkAssistant(gpa, "call:read{path:foo}", null, .stop),
+    };
+    defer for (msgs[0..]) |*m| m.deinit(gpa);
+
+    var report = try analyze(gpa, .{ .transcript = &msgs });
+    defer report.deinit();
+
+    const json = try toJson(gpa, &report, .{ .transcript = &msgs }, null);
+    defer gpa.free(json);
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"degenerate\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"prose_tool_call\":1") != null);
+}
+
+test "persistJson + runAndPersist: summary.json lands next to <ts>.txt" {
+    const gpa = testing.allocator;
+    var threaded = @import("../test_helpers.zig").threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var msgs: [1]ai.types.Message = .{
+        try mkAssistant(gpa, "ok", .{ .parts_seen = 1 }, .stop),
+    };
+    defer for (msgs[0..]) |*m| m.deinit(gpa);
+
+    const home = "/tmp/franky-diag-summaryjson-test";
+    std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, home) catch {};
+
+    const r = try runAndPersist(gpa, io, .{
+        .transcript = &msgs,
+        .mode_name = "test",
+        .session_label = "01JS",
+        .model = "gemini-2.5-pro",
+    }, .{
+        .franky_home = home,
+        .session_id = "01JS",
+        .timestamp_ms = 7,
+    });
+    defer r.deinit(gpa);
+    try testing.expect(r.persisted_path != null);
+
+    // The summary.json should exist alongside the TXT.
+    const json_path = home ++ "/diagnostics/01JS/summary.json";
+    var f = std.Io.Dir.cwd().openFile(io, json_path, .{}) catch |e| {
+        std.debug.print("failed to open expected summary.json at {s}: {s}\n", .{ json_path, @errorName(e) });
+        return e;
+    };
+    defer f.close(io);
+    const len = try f.length(io);
+    const buf = try gpa.alloc(u8, @intCast(len));
+    defer gpa.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+
+    try testing.expect(std.mem.indexOf(u8, buf, "\"schema_version\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, buf, "\"session_id\":\"01JS\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf, "\"model\":\"gemini-2.5-pro\"") != null);
+    // The TXT report companion lives in the same dir; summary.json
+    // points at it so an aggregator can drill back to detail.
+    const txt_path = home ++ "/diagnostics/01JS/7.txt";
+    try testing.expect(std.mem.indexOf(u8, buf, "\"report_path\":\"" ++ txt_path ++ "\"") != null);
+    // And the file at that path must actually exist on disk —
+    // ordering invariant: persist() runs before persistJson().
+    var txt_f = try std.Io.Dir.cwd().openFile(io, txt_path, .{});
+    txt_f.close(io);
 }
 
 test "persist writes <home>/diagnostics/<sid>/<ts>.txt with rendered content" {

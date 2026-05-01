@@ -37,6 +37,7 @@ const tools_mod = franky.coding.tools;
 const cli_mod = franky.coding.cli;
 const slash_mod = franky.coding.slash;
 const diagnostics_mod = franky.coding.diagnostics;
+const improvement_mod = franky.coding.improvement;
 const templates_mod = franky.coding.templates;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
@@ -251,6 +252,7 @@ fn runInteractive(
     try slash_registry.register(.{ .name = "branches", .description = "List branches", .handler = interactiveBranchesHandler });
     try slash_registry.register(.{ .name = "checkout", .description = "Switch active branch", .handler = interactiveCheckoutHandler });
     try slash_registry.register(.{ .name = "diagnostics", .description = "Per-turn diagnostic report (anomalies + trace pointers)", .handler = interactiveDiagnosticsHandler });
+    try slash_registry.register(.{ .name = "improve", .description = "Cross-session self-improvement report (mines past summaries)", .handler = interactiveImproveHandler });
 
     // ── Extensions runtime ────────────────────────────────────────
     // Tier-1 extensions are compiled in and opt-in via `--extensions
@@ -2090,6 +2092,57 @@ fn interactiveToolHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_m
 /// together. The output stays out of the LLM's transcript by
 /// construction — slash commands write to `ctx.output`
 /// (scrollback), never to `bridge.session.transcript.messages`.
+fn interactiveImproveHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
+    const bridge = bridgeFromCtx(ctx);
+    const cfg = bridge.session.cfg;
+
+    // Resolve $FRANKY_HOME → diagnostics + improvements roots.
+    const home_owned = diagnostics_mod.resolveFrankyHome(ctx.allocator, bridge.session.environ_map) catch |e| switch (e) {
+        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
+    };
+    defer if (home_owned) |h| ctx.allocator.free(h);
+    const home = home_owned orelse {
+        try ctx.output.appendSlice(
+            ctx.allocator,
+            "/improve: $FRANKY_HOME and $HOME both unset; cannot resolve diagnostics dir.\n",
+        );
+        return;
+    };
+
+    const diag_dir = std.fmt.allocPrint(ctx.allocator, "{s}/diagnostics", .{home}) catch return slash_mod.Error.OutOfMemory;
+    defer ctx.allocator.free(diag_dir);
+    const imp_root = std.fmt.allocPrint(ctx.allocator, "{s}/improvements", .{home}) catch return slash_mod.Error.OutOfMemory;
+    defer ctx.allocator.free(imp_root);
+
+    const result = improvement_mod.runAndPersist(ctx.allocator, bridge.session.io, .{
+        .diagnostics_dir = diag_dir,
+        .improvements_root = imp_root,
+        // Filter to the active session's model — most useful default.
+        .model_filter = cfg.model,
+        .timestamp_ms = ai.stream.nowMillis(),
+    }) catch |e| switch (e) {
+        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
+        else => {
+            const msg = std.fmt.allocPrint(
+                ctx.allocator,
+                "/improve: failed to run analyzer: {s}\n",
+                .{@errorName(e)},
+            ) catch return slash_mod.Error.OutOfMemory;
+            defer ctx.allocator.free(msg);
+            try ctx.output.appendSlice(ctx.allocator, msg);
+            return;
+        },
+    };
+    defer result.deinit(ctx.allocator);
+
+    try ctx.output.appendSlice(ctx.allocator, result.rendered);
+    if (result.persisted_path) |path| {
+        try ctx.output.appendSlice(ctx.allocator, "\nReport saved to: ");
+        try ctx.output.appendSlice(ctx.allocator, path);
+        try ctx.output.append(ctx.allocator, '\n');
+    }
+}
+
 fn interactiveDiagnosticsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
     const bridge = bridgeFromCtx(ctx);
     const cfg = bridge.session.cfg;
