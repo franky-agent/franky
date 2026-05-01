@@ -252,6 +252,14 @@ const Session = struct {
     /// `POST /prompt` requests queue here.
     run_mutex: std.Io.Mutex = .init,
 
+    /// Handle to the most recently spawned `/retry` worker thread.
+    /// `retryHandler` stores the handle here (instead of detaching)
+    /// so `Session.deinit` can `join()` and guarantee the thread is
+    /// fully exited before the session memory is freed. Without
+    /// this, the worker's `unlock` was racing with test-time deinit
+    /// and crashing on a freed session pointer in ReleaseFast mode.
+    pending_retry_worker: ?std.Thread = null,
+
     /// Active `/events` subscribers. Capped at `max_subs` so a
     /// runaway client doesn't unbounded-allocate the listener.
     subs: [max_subs]?*SseSubscriber = .{null} ** max_subs,
@@ -278,6 +286,16 @@ const Session = struct {
     events_mutex: std.Io.Mutex = .init,
 
     fn deinit(self: *Session) void {
+        // Join any in-flight /retry worker before freeing the
+        // session: the worker holds `*Session` and dereferences it
+        // (run_mutex, allocator, io) right up until its function
+        // returns. `run_mutex.unlock` releases ownership of the
+        // critical section but the OS still has to unwind the
+        // thread; joining here closes that window.
+        if (self.pending_retry_worker) |t| {
+            t.join();
+            self.pending_retry_worker = null;
+        }
         self.transcript.deinit();
         self.allocator.free(self.system_prompt);
         self.allocator.free(self.session_id);
@@ -995,7 +1013,12 @@ fn retryHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void
         try ctx.output.appendSlice(ctx.allocator, "Could not spawn retry worker.");
         return;
     };
-    t.detach();
+    // Track the worker on the session so `Session.deinit` can join
+    // it. A previous worker (if any) has by definition released the
+    // run_mutex before this dispatch could run — joining its handle
+    // here is non-blocking in the steady state.
+    if (px.session.pending_retry_worker) |prior| prior.join();
+    px.session.pending_retry_worker = t;
 
     px.side_effect = .turn_restarted;
     try ctx.output.appendSlice(ctx.allocator, "Retrying the last turn…");
