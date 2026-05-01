@@ -385,7 +385,7 @@ fn runTurn(
 
     // Build context from messages.
     const llm_messages = try config.convert_to_llm(allocator, transcript.messages.items);
-    if (ai.log.enabled(.trace)) {
+    if (ai.log.enabledForScope(.trace, "message")) {
         for (llm_messages, 0..) |m, i| {
             logMessageTrace("send", i, m);
         }
@@ -509,7 +509,7 @@ fn runTurn(
     }
     // Push a duplicate into the event and keep the original for transcript.
     try out.push(io, .{ .message_end = try dupeMessage(allocator, assistant_msg) });
-    if (ai.log.enabled(.trace)) logMessageTrace("recv", 0, assistant_msg);
+    if (ai.log.enabledForScope(.trace, "message")) logMessageTrace("recv", 0, assistant_msg);
     try transcript.append(assistant_msg);
 
     // Extract tool calls from the assistant message.
@@ -635,7 +635,7 @@ fn runTurn(
         const tr_msg = try makeToolResultMessage(allocator, r);
         try out.push(io, .{ .message_start = .{ .role = .tool_result } });
         try out.push(io, .{ .message_end = try dupeMessage(allocator, tr_msg) });
-        if (ai.log.enabled(.trace)) logMessageTrace("result", 0, tr_msg);
+        if (ai.log.enabledForScope(.trace, "message")) logMessageTrace("result", 0, tr_msg);
         try transcript.append(tr_msg);
     }
 

@@ -18,6 +18,10 @@
 //! related lines (e.g., `"cfg"`, `"session"`, `"tool"`, `"http"`,
 //! `"message"`, `"turn"`). The formatter just renders them verbatim.
 //!
+//! Per-scope overrides (v1.19.0): when `FRANKY_LOG=trace:http,debug` the
+//! global level is `debug` but scope `"http"` gates at `trace`. Configure
+//! via `setScopeLevel()` or the `scope:level` syntax in `FRANKY_LOG`.
+//!
 //! Output format:
 //!
 //!     {ms} {LEVEL} {scope} {event} key=value …
@@ -81,8 +85,51 @@ var state_started_ms: i64 = 0;
 /// Owned by the logger; closed on `deinit` or `init`.
 var state_sink_file: ?std.Io.File = null;
 
+/// v1.19.0 — per-scope level overrides. Up to 16 scopes; a linear scan
+/// is fine for debug-only hot paths. Entries are allocated arena-style
+/// from a fixed backing store so `setScopeLevel` doesn't need an
+/// allocator — scope names live for the lifetime of the logger.
+const MAX_SCOPE_OVERRIDES = 16;
+const ScopeEntry = struct { scope: []const u8, level: Level };
+var scope_overrides: [MAX_SCOPE_OVERRIDES]ScopeEntry = undefined;
+var scope_override_count: usize = 0;
+
+/// v1.19.0 — set a per-scope level override. `scope` is borrowed;
+/// callers must ensure it lives until `deinit()`. Idempotent — if the
+/// scope already has an override, its level is updated in place.
+pub fn setScopeLevel(scope: []const u8, level: Level) void {
+    for (scope_overrides[0..scope_override_count]) |*e| {
+        if (std.mem.eql(u8, e.scope, scope)) {
+            e.level = level;
+            return;
+        }
+    }
+    if (scope_override_count < MAX_SCOPE_OVERRIDES) {
+        scope_overrides[scope_override_count] = .{ .scope = scope, .level = level };
+        scope_override_count += 1;
+    }
+    // Silently ignore when full — diagnostic only, never crash.
+}
+
+/// v1.19.0 — check whether `level` passes the gate for `scope`,
+/// considering any per-scope override. When no override exists, falls
+/// back to the global level (same as `enabled()`).
+pub fn enabledForScope(level: Level, scope: []const u8) bool {
+    if (state_io == null) return false;
+    const effective = for (scope_overrides[0..scope_override_count]) |e| {
+        if (std.mem.eql(u8, e.scope, scope)) break e.level;
+    } else @as(Level, @enumFromInt(state_level.load(.seq_cst)));
+    return @intFromEnum(level) <= @intFromEnum(effective);
+}
+
+/// v1.19.0 — clear all per-scope overrides (called by `init`/`deinit`).
+pub fn resetScopeOverrides() void {
+    scope_override_count = 0;
+}
+
 pub fn init(io: std.Io, level: Level) void {
     closeSinkFile();
+    resetScopeOverrides();
     state_io = io;
     state_level.store(@intFromEnum(level), .seq_cst);
     state_started_ms = nowMs();
@@ -106,6 +153,7 @@ pub fn initWithFile(io: std.Io, level: Level, path: []const u8) !void {
 
 pub fn deinit() void {
     closeSinkFile();
+    resetScopeOverrides();
     state_io = null;
 }
 
@@ -151,7 +199,7 @@ pub fn log(
     comptime fmt: []const u8,
     args: anytype,
 ) void {
-    if (!enabled(level)) return;
+    if (!enabledForScope(level, scope)) return;
     const io = state_io orelse return;
 
     // Format the whole line into a local buffer, then push via
@@ -184,7 +232,7 @@ pub fn body(
     bytes: []const u8,
     max_bytes: usize,
 ) void {
-    if (!enabled(level)) return;
+    if (!enabledForScope(level, scope)) return;
     const io = state_io orelse return;
 
     var hdr_buf: [4096]u8 = undefined;
@@ -283,6 +331,99 @@ test "initWithFile: sets state_sink_file; subsequent init() resets it" {
     try testing.expect(state_sink_file == null);
 
     deinit();
+}
+
+
+test "setScopeLevel/enabledForScope overrides global level" {
+    deinit();
+    var threaded = std.Io.Threaded.init(testing.allocator, .{
+        .argv0 = .empty,
+        .environ = .empty,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Global level = debug, http scope override to trace.
+    init(io, .debug);
+    defer deinit();
+
+    try testing.expect(!enabledForScope(.trace, "http")); // no override yet
+    try testing.expect(!enabledForScope(.trace, "message"));
+
+    setScopeLevel("http", .trace);
+    try testing.expect(enabledForScope(.trace, "http"));
+    try testing.expect(!enabledForScope(.trace, "message")); // still gated by global
+
+    // Global still works as fallback.
+    try testing.expect(enabledForScope(.debug, "http"));
+    try testing.expect(enabledForScope(.debug, "message"));
+    try testing.expect(!enabledForScope(.trace, "message"));
+}
+
+test "setScopeLevel updates existing override in place" {
+    deinit();
+    var threaded = std.Io.Threaded.init(testing.allocator, .{
+        .argv0 = .empty,
+        .environ = .empty,
+    });
+    defer threaded.deinit();
+    init(threaded.io(), .warn);
+    defer deinit();
+
+    setScopeLevel("http", .trace);
+    try testing.expect(enabledForScope(.trace, "http"));
+
+    // Downgrade http to info.
+    setScopeLevel("http", .info);
+    try testing.expect(!enabledForScope(.trace, "http"));
+    try testing.expect(enabledForScope(.info, "http"));
+}
+
+test "resetScopeOverrides clears all overrides" {
+    deinit();
+    var threaded = std.Io.Threaded.init(testing.allocator, .{
+        .argv0 = .empty,
+        .environ = .empty,
+    });
+    defer threaded.deinit();
+    init(threaded.io(), .debug);
+    defer deinit();
+
+    setScopeLevel("http", .trace);
+    setScopeLevel("message", .trace);
+    try testing.expect(enabledForScope(.trace, "http"));
+
+    resetScopeOverrides();
+    try testing.expect(!enabledForScope(.trace, "http"));
+    try testing.expect(!enabledForScope(.trace, "message"));
+}
+
+test "log and body respect per-scope overrides" {
+    deinit();
+    var threaded = std.Io.Threaded.init(testing.allocator, .{
+        .argv0 = .empty,
+        .environ = .empty,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Verify the gate behavior through enabledForScope — log/body
+    // call enabledForScope internally so this validates the same path.
+    init(io, .info);
+    defer deinit();
+
+    // No override yet — trace should not be enabled for http.
+    try testing.expect(!enabledForScope(.trace, "http"));
+
+    setScopeLevel("http", .trace);
+    try testing.expect(enabledForScope(.trace, "http"));
+
+    // message scope still at global=info, so trace should be disabled.
+    try testing.expect(!enabledForScope(.trace, "message"));
+
+    // Verify global fallback still works.
+    try testing.expect(enabledForScope(.info, "http"));
+    try testing.expect(enabledForScope(.info, "message"));
 }
 
 test "initWithFile: returns error.LogFileOpenFailed on un-creatable path" {

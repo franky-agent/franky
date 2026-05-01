@@ -60,6 +60,15 @@ pub fn run(
     environ_map: *std.process.Environ.Map,
     argv: []const []const u8,
 ) !void {
+    // `franky update [--check] [--force] [--repo owner/name]` is a
+    // standalone subcommand — it doesn't share the model/session
+    // surface that `cli_mod.parse` is built around. Dispatch before
+    // any parsing so an out-of-date binary on a sloppy CLI surface
+    // can still upgrade itself.
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "update")) {
+        return runUpdate(allocator, io, environ_map, argv[2..]);
+    }
+
     var cfg = cli_mod.parse(allocator, argv) catch |e| switch (e) {
         error.MissingValue => return exitWithMessage(io, "missing value for flag; see --help\n", 2),
         error.UnknownMode => return exitWithMessage(io, "unknown --mode value; use print\n", 2),
@@ -144,6 +153,12 @@ pub fn run(
         ai.log.init(io, log_level);
     }
     defer ai.log.deinit();
+
+    // v1.19.0 — parse per-scope overrides from --log-level / FRANKY_LOG.
+    {
+        const spec = cfg.log_level orelse environ.getPosix("FRANKY_LOG");
+        if (spec) |s| applyScopeOverrides(s);
+    }
 
     if (cfg.mode == .rpc) {
         const rpc_mode = @import("rpc.zig");
@@ -607,15 +622,48 @@ pub fn resolveAnthropicAlias(input: []const u8) []const u8 {
 
 // ─── log level resolution ────────────────────────────────────────
 
+/// v1.19.0 — extract the bare global level from a spec that may
+/// contain comma-separated `scope:level` entries. Returns null when
+/// the input is only scope overrides with no global level.
+fn extractGlobalLevel(s: []const u8) ?ai.log.Level {
+    var it = std.mem.splitScalar(u8, s, ',');
+    var result: ?ai.log.Level = null;
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        // Skip scope:level entries — they don't set the global level.
+        if (std.mem.indexOfScalar(u8, trimmed, ':')) |_| continue;
+        if (ai.log.Level.fromString(trimmed)) |l| result = l;
+    }
+    return result;
+}
+
+/// v1.19.0 — register per-scope level overrides from a spec string
+/// in the form `scope:level,scope:level,...`. Non-override entries
+/// (bare level names) are silently ignored.
+pub fn applyScopeOverrides(s: []const u8) void {
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const scope = std.mem.trim(u8, trimmed[0..colon], " \t");
+        const level_str = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
+        if (scope.len > 0) {
+            if (ai.log.Level.fromString(level_str)) |l| {
+                ai.log.setScopeLevel(scope, l);
+            }
+        }
+    }
+}
+
 pub fn resolveLogLevel(cfg: *const cli_mod.Config, environ: std.process.Environ) ai.log.Level {
-    // 1. Explicit CLI flag wins.
+    // 1. Explicit CLI flag wins (extract global level from compound spec).
     if (cfg.log_level) |s| {
-        if (ai.log.Level.fromString(s)) |l| return l;
-        // Unknown value: fall through rather than error. Log level is
-        // diagnostic — a typo shouldn't stop a run.
+        if (extractGlobalLevel(s)) |l| return l;
+        if (ai.log.Level.fromString(s)) |l| return l; // backward compat
     }
     // 2. FRANKY_LOG env var.
     if (environ.getPosix("FRANKY_LOG")) |s| {
+        if (extractGlobalLevel(s)) |l| return l;
         if (ai.log.Level.fromString(s)) |l| return l;
     }
     // 3. FRANKY_DEBUG=1 → debug.
@@ -1598,6 +1646,107 @@ fn exitWithMessage(io: std.Io, msg: []const u8, code: u8) !void {
     w.interface.writeAll(msg) catch {};
     w.interface.flush() catch {};
     std.process.exit(code);
+}
+
+const update_usage =
+    \\Usage: franky update [--check] [--force] [--repo owner/name]
+    \\
+    \\Replace the running franky binary with the latest GitHub release.
+    \\
+    \\  --check                Print the latest tag and exit (no replace).
+    \\  --force                Replace even when versions match.
+    \\  --repo owner/name      Override the GitHub repo. Defaults to
+    \\                         $FRANKY_UPDATE_REPO or fr12k/franky.
+    \\
+    \\Env:
+    \\  FRANKY_UPDATE_REPO     owner/name fallback for --repo.
+    \\  FRANKY_UPDATE_BASE_URL Override https://api.github.com (tests).
+    \\
+;
+
+/// Handle `franky update [...]`. Owns its own arena so it doesn't
+/// share lifetime with the main `Config`.
+fn runUpdate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *std.process.Environ.Map,
+    args: []const []const u8,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var opts = franky.coding.update.Options{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--check")) {
+            opts.dry_run = true;
+        } else if (std.mem.eql(u8, a, "--force")) {
+            opts.force = true;
+        } else if (std.mem.eql(u8, a, "--repo")) {
+            i += 1;
+            if (i >= args.len) return exitWithMessage(io, "--repo requires a value (owner/name)\n", 2);
+            const ok = parseRepoSpec(args[i], &opts);
+            if (!ok) return exitWithMessage(io, "--repo expects 'owner/name'\n", 2);
+        } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
+            return writeOut(io, update_usage);
+        } else {
+            const msg = try std.fmt.allocPrint(allocator, "unknown flag: {s}\n", .{a});
+            defer allocator.free(msg);
+            return exitWithMessage(io, msg, 2);
+        }
+    }
+
+    if (!opts.repo_explicit) {
+        if (environ_map.get("FRANKY_UPDATE_REPO")) |env_repo| {
+            if (!parseRepoSpec(env_repo, &opts)) {
+                return exitWithMessage(io, "FRANKY_UPDATE_REPO must be 'owner/name'\n", 2);
+            }
+        }
+    }
+    if (environ_map.get("FRANKY_UPDATE_BASE_URL")) |env_base| {
+        opts.base_url = env_base;
+    }
+
+    const outcome = franky.coding.update.run(arena, io, franky.version, opts) catch |err| {
+        const reason: []const u8 = switch (err) {
+            error.UnsupportedPlatform => "unsupported platform — releases ship only macOS/Linux on amd64/arm64 (+ linux/386)",
+            error.HttpFailure => "failed to reach GitHub releases API",
+            error.ReleaseParseFailed => "could not parse the GitHub releases response",
+            error.AssetNotFound => "no matching binary asset in the latest release",
+            error.ChecksumMissing => "no checksums.txt asset (or our entry was missing)",
+            error.ChecksumMismatch => "checksum mismatch — refusing to replace binary",
+            error.ReplaceFailed => "could not replace the running binary (permissions?)",
+            error.OutOfMemory => "out of memory",
+        };
+        const msg = try std.fmt.allocPrint(allocator, "franky update: {s}\n", .{reason});
+        defer allocator.free(msg);
+        return exitWithMessage(io, msg, 1);
+    };
+
+    switch (outcome) {
+        .up_to_date => |tag| {
+            const msg = try std.fmt.allocPrint(allocator, "franky {s} is already up to date (latest: {s})\n", .{ franky.version, tag });
+            defer allocator.free(msg);
+            return writeOut(io, msg);
+        },
+        .updated => |u| {
+            const verb: []const u8 = if (opts.dry_run) "would update" else "updated";
+            const msg = try std.fmt.allocPrint(allocator, "{s} franky {s} -> {s}\n", .{ verb, u.from, u.to });
+            defer allocator.free(msg);
+            return writeOut(io, msg);
+        },
+    }
+}
+
+fn parseRepoSpec(spec: []const u8, opts: *franky.coding.update.Options) bool {
+    const slash = std.mem.indexOfScalar(u8, spec, '/') orelse return false;
+    if (slash == 0 or slash == spec.len - 1) return false;
+    opts.repo_owner = spec[0..slash];
+    opts.repo_name = spec[slash + 1 ..];
+    opts.repo_explicit = true;
+    return true;
 }
 
 fn exitWithMessageErr(allocator: std.mem.Allocator, msg: []const u8, code: u8) noreturn {

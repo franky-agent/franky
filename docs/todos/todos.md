@@ -32,7 +32,7 @@ Three layers:
 Currently, the LLM loop runs until it reaches the max turns or a certain condition is met. It would be useful to have a way to interrupt the loop gracefully, for example, by sending a specific stop signal. Then the user can intterupt the session and send new instructions without having to wait for the max turns to be reached.
 
 
-# Tool Usage and LLM Interaction Self Improvement
+# Tool Usage and LLM Interaction Self Improvement (DONE)
 
 The agent could analyze the tool usage and LLM interactions after each session to identify patterns and areas for improvement. For example, if the agent notices that certain tool usage were failing frequently, it could analyze the reasons (e.g., incorrect parameters, tool errors) and adjust the tool implementation or to give better feedback to the model. Similarly, if the LLM interactions show that the model is struggling with certain types of instructions or questions, the agent could identify those patterns and adjust its codebase or the way it interacts with the model to improve performance.
 Also use the already existing diagnostics command to store diagnostics data together with the self improvement data.

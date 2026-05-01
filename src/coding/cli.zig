@@ -433,6 +433,7 @@ pub const usage_text: []const u8 =
     \\
     \\USAGE:
     \\  franky [FLAGS] [--] PROMPT...
+    \\  franky update [--check] [--force] [--repo owner/name]
     \\
     \\FLAGS:
     \\  --provider NAME              Provider (faux, anthropic, openai, gateway, google-gemini) [default: faux]
@@ -446,7 +447,12 @@ pub const usage_text: []const u8 =
     \\  --system-prompt TEXT         Override the system prompt
     \\  --append-system-prompt TEXT  Append to the default system prompt
     \\  --thinking LEVEL             off|minimal|low|medium|high|xhigh [default: off]
-    \\  --log-level LEVEL            error|warn|info|debug|trace (stderr logging)
+    \\  --log-level LEVEL            Log level for stderr logging:
+    \\                               error|warn|info|debug|trace.
+    \\                               Per-scope overrides via comma-separated
+    \\                               scope:level pairs (e.g. trace:http,info
+    \\                               — http->trace, all else->info).
+    \\                               env: FRANKY_LOG
     \\  --log-file PATH              Route logs to PATH instead of stderr (essential
     \\                               when pairing --mode interactive with verbose levels;
     \\                               env: FRANKY_LOG_FILE)
@@ -521,6 +527,8 @@ pub const usage_text: []const u8 =
     \\  FRANKY_FIRST_BYTE_TIMEOUT_MS Override --first-byte-timeout-ms
     \\  FRANKY_EVENT_GAP_TIMEOUT_MS  Override --event-gap-timeout-ms
     \\  FRANKY_MAX_TURNS             Override --max-turns
+    \\  FRANKY_UPDATE_REPO           owner/name override for `franky update`
+    \\  FRANKY_UPDATE_BASE_URL       GitHub API base override (tests)
     \\
 ;
 
