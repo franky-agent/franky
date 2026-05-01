@@ -22,7 +22,7 @@ pub const sdk = @import("sdk.zig");
 /// `test_helpers.zig` relatively.
 pub const test_helpers = @import("test_helpers.zig");
 
-pub const version = "2.0.1";
+pub const version = "2.0.2";
 
 test {
     _ = ai;

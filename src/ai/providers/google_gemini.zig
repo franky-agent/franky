@@ -377,46 +377,50 @@ const Driver = struct {
                     for (ps.array.items) |p| {
                         if (p != .object) continue;
                         // Gemini's `Part` proto carries two thinking-related
-                        // fields:
+                        // fields and may co-locate them with a `functionCall`:
                         //   `thought: bool`              — explicit "this is a
                         //                                  thought summary"
                         //   `thoughtSignature: string`   — opaque continuation
-                        //                                  token attached to
-                        //                                  every part of a
-                        //                                  thinking response
-                        // v1.26.4 — treat *either* signal as thinking. Real
-                        // incident: gemini-2.5-pro emitted a long
-                        // self-correcting reasoning monologue as a sequence
-                        // of `text` parts each carrying `thoughtSignature`
-                        // but **without** an explicit `thought: true` flag,
-                        // followed by a `functionCall`. Pre-v1.26.4 we
-                        // routed all those parts to `text_delta`; the web
-                        // UI rendered them as the assistant's answer, which
-                        // confused the user (the model never produced a
-                        // user-facing answer — only a tool call). Post-fix
-                        // they route to `thinking_delta` and surface in the
-                        // dimmed thinking pane where they belong.
-                        const is_thought = blk: {
+                        //                                  token; can attach
+                        //                                  to text, to a
+                        //                                  functionCall, or
+                        //                                  to a part that
+                        //                                  carries both.
+                        //
+                        // v1.26.4 routed text-with-thoughtSignature → thinking_delta
+                        // (gemini-2.5-pro reasoning monologues were rendering
+                        // as the user-facing answer). v2.0.2 follow-up:
+                        // gemini-3.1-pro emits the FIRST part as
+                        // `{functionCall, thoughtSignature}` (no text) and the
+                        // SECOND as `{text:""}` + `finishReason:STOP`. The
+                        // pre-v2.0.2 path saw `is_thought = true` on the
+                        // first part, ran the text branch (which no-op'd
+                        // because there was no `text` key), then `continue`d
+                        // — silently dropping the `functionCall`. The agent
+                        // loop got an empty turn with `STOP` and the user
+                        // saw nothing.
+                        //
+                        // Treat thinking-flag as scoping ONLY the text
+                        // routing. `functionCall` always emits, regardless.
+                        const is_thought_text = blk: {
                             if (p.object.get("thought")) |th| if (th == .bool and th.bool) break :blk true;
                             if (p.object.get("thoughtSignature")) |sig| if (sig == .string and sig.string.len > 0) break :blk true;
                             break :blk false;
                         };
-                        if (is_thought) {
-                            if (p.object.get("text")) |t| if (t == .string) {
+                        if (p.object.get("text")) |t| if (t == .string) {
+                            if (is_thought_text) {
                                 if (t.string.len > 0) self.thinking_seen = true;
                                 try self.out.push(self.io, .{ .thinking_delta = .{
                                     .block_index = 0,
                                     .delta = try self.allocator.dupe(u8, t.string),
                                 } });
-                            };
-                            continue;
-                        }
-                        if (p.object.get("text")) |t| if (t == .string) {
-                            if (t.string.len > 0) self.text_seen = true;
-                            try self.out.push(self.io, .{ .text_delta = .{
-                                .block_index = 0,
-                                .delta = try self.allocator.dupe(u8, t.string),
-                            } });
+                            } else {
+                                if (t.string.len > 0) self.text_seen = true;
+                                try self.out.push(self.io, .{ .text_delta = .{
+                                    .block_index = 0,
+                                    .delta = try self.allocator.dupe(u8, t.string),
+                                } });
+                            }
                         };
                         if (p.object.get("functionCall")) |fc| if (fc == .object) {
                             const name = if (fc.object.get("name")) |n| (if (n == .string) n.string else "") else "";
@@ -855,6 +859,53 @@ test "runFromSse: thoughtSignature parts route to thinking_delta (v1.26.4)" {
     };
     try testing.expect(thinking_bytes > 0);
     try testing.expectEqual(@as(usize, 0), text_bytes);
+}
+
+test "runFromSse: functionCall co-located with thoughtSignature still emits the call (v2.0.2)" {
+    // Regression for the http-trace where gemini-3.1-pro emitted the FIRST
+    // SSE event as a single part containing BOTH `functionCall` and
+    // `thoughtSignature` (no `text` field), then a SECOND event as
+    // `{text:""}` + `finishReason:STOP`. Pre-v2.0.2 the parser short-
+    // circuited on `is_thought` and `continue`d past the functionCall
+    // branch — the agent loop saw no tool calls, no text, and a STOP
+    // finish reason. The proxy/web UI showed nothing at all to the user.
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ch = try Channel.init(gpa, 16);
+    defer ch.deinit();
+    var cancel: stream_mod.Cancel = .{};
+
+    const sse =
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"ls\",\"args\":{}},\"thoughtSignature\":\"opaqueA\"}],\"role\":\"model\"}}]}\n\n" ++
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}\n\n";
+
+    try runFromSse(gpa, io, sse, &ch, &cancel);
+
+    var saw_tool_start = false;
+    var saw_tool_end = false;
+    var tool_name_buf: [32]u8 = undefined;
+    var tool_name_len: usize = 0;
+    while (ch.next(io)) |ev| switch (ev) {
+        .toolcall_start => |t| {
+            saw_tool_start = true;
+            const n = @min(t.name.len, tool_name_buf.len);
+            @memcpy(tool_name_buf[0..n], t.name[0..n]);
+            tool_name_len = n;
+            gpa.free(t.id);
+            gpa.free(t.name);
+        },
+        .toolcall_end => |t| {
+            saw_tool_end = true;
+            gpa.free(t.args_json);
+        },
+        else => ev.deinit(gpa),
+    };
+    try testing.expect(saw_tool_start);
+    try testing.expect(saw_tool_end);
+    try testing.expectEqualStrings("ls", tool_name_buf[0..tool_name_len]);
 }
 
 test "runFromSse: thought=true alone still routes to thinking (v1.26.4)" {
