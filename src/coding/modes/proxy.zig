@@ -879,6 +879,8 @@ fn diagnosticsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Erro
         .session_dir = session_dir,
         .session_label = session.session_id,
         .mode_name = "proxy",
+        .provider = session.cfg.provider,
+        .model = session.cfg.model,
     };
 
     const home_owned = diagnostics_mod.resolveFrankyHome(ctx.allocator, session.environ_map) catch |e| switch (e) {
