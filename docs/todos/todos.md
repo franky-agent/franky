@@ -9,7 +9,7 @@ ending the session. This would make it more flexible and user-friendly. Keep in 
 agent need a way to know that the max turns have been reached, so they can handle it accordingly (e.g., by prompting the user or
 stop) 
 
-# Trace Logging Components
+# Trace Logging Components (DONE)
 
 At the moment when the log-level is set to trace all log messages from all components are logged. How can we set indiviual trace logging for each component like:
 * enable trace logging only for http
@@ -37,7 +37,7 @@ Currently, the LLM loop runs until it reaches the max turns or a certain conditi
 The agent could analyze the tool usage and LLM interactions after each session to identify patterns and areas for improvement. For example, if the agent notices that certain tool usage were failing frequently, it could analyze the reasons (e.g., incorrect parameters, tool errors) and adjust the tool implementation or to give better feedback to the model. Similarly, if the LLM interactions show that the model is struggling with certain types of instructions or questions, the agent could identify those patterns and adjust its codebase or the way it interacts with the model to improve performance.
 Also use the already existing diagnostics command to store diagnostics data together with the self improvement data.
 
-# Google Gemine3 Model Support
+# Google Gemini3 Model Support (DONE)
 
 The conversation with the Gemini3 model caused the following error:
 ```

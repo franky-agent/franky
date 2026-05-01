@@ -38,6 +38,7 @@ const cli_mod = franky.coding.cli;
 const slash_mod = franky.coding.slash;
 const diagnostics_mod = franky.coding.diagnostics;
 const improvement_mod = franky.coding.improvement;
+const skills_mod = franky.coding.skills;
 const templates_mod = franky.coding.templates;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
@@ -253,6 +254,7 @@ fn runInteractive(
     try slash_registry.register(.{ .name = "checkout", .description = "Switch active branch", .handler = interactiveCheckoutHandler });
     try slash_registry.register(.{ .name = "diagnostics", .description = "Per-turn diagnostic report (anomalies + trace pointers)", .handler = interactiveDiagnosticsHandler });
     try slash_registry.register(.{ .name = "improve", .description = "Cross-session self-improvement report (mines past summaries)", .handler = interactiveImproveHandler });
+    try slash_registry.register(.{ .name = "skills", .description = "List loaded skills + which are active for this workspace", .handler = interactiveSkillsHandler });
 
     // ── Extensions runtime ────────────────────────────────────────
     // Tier-1 extensions are compiled in and opt-in via `--extensions
@@ -778,6 +780,8 @@ fn paintHelpOverlay(buf: *tui.buffer.Buffer, no_color: bool) void {
         .{ "/branches", "list branches" },
         .{ "/checkout NAME", "switch active branch" },
         .{ "/diagnostics", "per-turn anomaly report (see docs/reference/diagnostics.md)" },
+        .{ "/improve", "cross-session self-improvement report" },
+        .{ "/skills", "list loaded skills + which are active" },
         .{ "/template NAME", "expand + submit a prompt template" },
         .{ "/clear", "reset the transcript" },
         .{ "/quit", "exit franky" },
@@ -2141,6 +2145,33 @@ fn interactiveImproveHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_m
         try ctx.output.appendSlice(ctx.allocator, path);
         try ctx.output.append(ctx.allocator, '\n');
     }
+}
+
+fn interactiveSkillsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
+    const bridge = bridgeFromCtx(ctx);
+    const cfg = bridge.session.cfg;
+
+    const text = skills_mod.buildListingFromMap(
+        ctx.allocator,
+        bridge.session.io,
+        bridge.session.environ_map,
+        cfg.skills_path,
+        cfg.skills_select_csv,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
+        else => {
+            const msg = std.fmt.allocPrint(
+                ctx.allocator,
+                "/skills: failed to enumerate skills: {s}\n",
+                .{@errorName(e)},
+            ) catch return slash_mod.Error.OutOfMemory;
+            defer ctx.allocator.free(msg);
+            try ctx.output.appendSlice(ctx.allocator, msg);
+            return;
+        },
+    };
+    defer ctx.allocator.free(text);
+    try ctx.output.appendSlice(ctx.allocator, text);
 }
 
 fn interactiveDiagnosticsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {

@@ -129,9 +129,14 @@ pub const Config = struct {
     /// `--tools <list>` — comma-separated tool name subset;
     /// everything else is disabled for this run.
     tools_filter: ?[]const u8 = null,
-    /// `--skills <dir>` — load a skill bundle (§5.8). Multi-value
-    /// future; one path today.
+    /// `--skills <dir>` — extra root scanned for skill `*.md` files
+    /// (highest precedence; shadows `<workspace>/skills/` and
+    /// `$FRANKY_HOME/skills/` on `name` collision). See `coding/skills.zig`.
     skills_path: ?[]const u8 = null,
+    /// `--skill NAME` (repeatable) — force-include the named skill
+    /// regardless of its `auto_apply` glob. Stored as a CSV string
+    /// for simplicity; the loader splits on `,`.
+    skills_select_csv: ?[]const u8 = null,
     /// `--prompts-dir <dir>` — root for `/template <name>` lookups.
     /// Was `--prompts <dir>` until v1.11.0; renamed to free up
     /// `--prompts` for the per-tool permission gate.
@@ -356,6 +361,13 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             cfg.tools_filter = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--skills")) {
             cfg.skills_path = try a.dupe(u8, try take_value(argv, &i, inline_value));
+        } else if (std.mem.eql(u8, name, "--skill")) {
+            const v = try take_value(argv, &i, inline_value);
+            if (cfg.skills_select_csv) |existing| {
+                cfg.skills_select_csv = try std.fmt.allocPrint(a, "{s},{s}", .{ existing, v });
+            } else {
+                cfg.skills_select_csv = try a.dupe(u8, v);
+            }
         } else if (std.mem.eql(u8, name, "--prompts-dir")) {
             cfg.prompts_dir = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--themes") or std.mem.eql(u8, name, "--theme")) {
@@ -489,7 +501,11 @@ pub const usage_text: []const u8 =
     \\  --role NAME                  Capability tier: read|plan|code|full (default plan)
     \\  --export FORMAT              Dump transcript (markdown|json) and exit
     \\  --tools LIST                 Comma-separated tool subset for this run
-    \\  --skills PATH                Load a skill bundle (§5.8)
+    \\  --skills PATH                Extra dir scanned for skill *.md files
+    \\                               (shadows <workspace>/skills/ and
+    \\                               $FRANKY_HOME/skills/). See coding/skills.zig.
+    \\  --skill NAME                 Force-include a named skill regardless of its
+    \\                               auto_apply glob. Repeatable (or comma-sep).
     \\  --prompts-dir DIR            Root for /template <name> lookups
     \\  --theme NAME                 TUI theme (no-op until TUI ships)
     \\  --offline                    Force faux provider even when a key is set

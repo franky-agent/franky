@@ -66,6 +66,7 @@ const session_mod = franky.coding.session;
 const slash_mod = franky.coding.slash;
 const diagnostics_mod = franky.coding.diagnostics;
 const improvement_mod = franky.coding.improvement;
+const skills_mod = franky.coding.skills;
 
 pub const default_port: u16 = 8787;
 // pub const default_host: []const u8 = "127.0.0.1";
@@ -715,6 +716,8 @@ fn helpHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void 
         \\| `/edit` | Edit the last user message in the composer |
         \\| `/compact` | Compact older messages into a summary |
         \\| `/diagnostics` | Per-turn anomaly report — saved to `~/.franky/diagnostics/<sid>/<ts>.txt` (see `docs/reference/diagnostics.md`) |
+        \\| `/improve` | Cross-session self-improvement report (mines past summaries) |
+        \\| `/skills` | List loaded skills + which are active for this workspace |
         \\| `/quit` | Close this browser tab |
         \\
     );
@@ -861,6 +864,36 @@ fn improveHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!vo
         try ctx.output.appendSlice(ctx.allocator, path);
         try ctx.output.appendSlice(ctx.allocator, "`\n");
     }
+}
+
+fn skillsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
+    const px = proxySlashCtx(ctx);
+    const session = px.session;
+
+    const text = skills_mod.buildListingFromMap(
+        ctx.allocator,
+        session.io,
+        session.environ_map,
+        session.cfg.skills_path,
+        session.cfg.skills_select_csv,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
+        else => {
+            const msg = std.fmt.allocPrint(
+                ctx.allocator,
+                "/skills: failed to enumerate skills: {s}\n",
+                .{@errorName(e)},
+            ) catch return slash_mod.Error.OutOfMemory;
+            defer ctx.allocator.free(msg);
+            try ctx.output.appendSlice(ctx.allocator, msg);
+            return;
+        },
+    };
+    defer ctx.allocator.free(text);
+
+    try ctx.output.appendSlice(ctx.allocator, "```\n");
+    try ctx.output.appendSlice(ctx.allocator, text);
+    try ctx.output.appendSlice(ctx.allocator, "```\n");
 }
 
 fn diagnosticsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
@@ -1271,6 +1304,7 @@ fn buildProxySlashRegistry(allocator: std.mem.Allocator) !slash_mod.Registry {
     try reg.register(.{ .name = "compact", .description = "Compact older messages into a summary", .handler = compactHandler });
     try reg.register(.{ .name = "diagnostics", .description = "Per-turn diagnostic report (anomalies + trace pointers)", .handler = diagnosticsHandler });
     try reg.register(.{ .name = "improve", .description = "Cross-session self-improvement report (mines past summaries)", .handler = improveHandler });
+    try reg.register(.{ .name = "skills", .description = "List loaded skills + which are active for this workspace", .handler = skillsHandler });
     try reg.register(.{ .name = "quit", .description = "Close this browser tab", .handler = quitHandler });
     return reg;
 }

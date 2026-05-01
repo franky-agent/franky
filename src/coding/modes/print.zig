@@ -30,6 +30,7 @@ const auth_mod = franky.coding.auth;
 const settings_mod = franky.coding.settings;
 const models_mod = franky.coding.models;
 const branching_mod = franky.coding.branching;
+const skills_mod = franky.coding.skills;
 
 /// Default model when the user didn't pass `--model`. Sonnet 4.6 is
 /// the current cost/latency sweet spot; Opus 4.6 is reachable via
@@ -1586,10 +1587,78 @@ pub fn buildSystemPromptIo(
     }
     defer if (hint_owned) allocator.free(with_hint);
 
-    if (cfg.append_system_prompt) |extra| {
+    // Skills layer (v2.1.0). Each active skill's body is appended
+    // verbatim under `## Active skills`. Activation is deterministic:
+    // explicit `--skill NAME` and/or `auto_apply` glob match against
+    // the workspace tree. Skipped silently when no `io` (pure-logic
+    // path used by tests).
+    var with_skills: []u8 = with_hint;
+    var skills_owned = false;
+    if (io) |ioref| skills_block: {
+        const pwd = environ.getPosix("PWD");
+
+        var workspace_skills_root: ?[]u8 = null;
+        defer if (workspace_skills_root) |b| allocator.free(b);
+        if (pwd) |p| {
+            workspace_skills_root = std.fs.path.join(allocator, &.{ p, "skills" }) catch null;
+        }
+
+        var user_skills_root: ?[]u8 = null;
+        defer if (user_skills_root) |b| allocator.free(b);
+        if (environ.getPosix("FRANKY_HOME")) |h| {
+            user_skills_root = std.fs.path.join(allocator, &.{ h, "skills" }) catch null;
+        } else if (environ.getPosix("HOME")) |h| {
+            user_skills_root = std.fs.path.join(allocator, &.{ h, ".franky", "skills" }) catch null;
+        }
+
+        var loaded = skills_mod.loadAll(allocator, ioref, .{
+            .explicit_root = cfg.skills_path,
+            .workspace_root = workspace_skills_root,
+            .user_root = user_skills_root,
+        }) catch break :skills_block;
+        defer {
+            for (loaded.items) |*s| s.deinit(allocator);
+            loaded.deinit(allocator);
+        }
+        if (loaded.items.len == 0) break :skills_block;
+
+        var explicit_list: std.ArrayList([]const u8) = .empty;
+        defer explicit_list.deinit(allocator);
+        if (cfg.skills_select_csv) |csv| {
+            var it = std.mem.tokenizeScalar(u8, csv, ',');
+            while (it.next()) |tok| {
+                const trimmed = std.mem.trim(u8, tok, " \t");
+                if (trimmed.len > 0) explicit_list.append(allocator, trimmed) catch break :skills_block;
+            }
+        }
+
+        var active = skills_mod.selectActive(
+            allocator,
+            ioref,
+            loaded.items,
+            pwd,
+            explicit_list.items,
+        ) catch break :skills_block;
+        defer active.deinit(allocator);
+        if (active.items.len == 0) break :skills_block;
+
+        const section = skills_mod.renderSection(allocator, loaded.items, active.items) catch break :skills_block;
+        defer allocator.free(section);
+
         const trimmed = std.mem.trimEnd(u8, with_hint, &std.ascii.whitespace);
+        with_skills = std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed, section }) catch break :skills_block;
+        skills_owned = true;
+    }
+    defer if (skills_owned) allocator.free(with_skills);
+
+    if (cfg.append_system_prompt) |extra| {
+        const trimmed = std.mem.trimEnd(u8, with_skills, &std.ascii.whitespace);
         const out = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed, extra });
         return out;
+    }
+    if (skills_owned) {
+        skills_owned = false;
+        return with_skills;
     }
     if (hint_owned) {
         // Transfer ownership of with_hint to the caller.
@@ -2334,6 +2403,90 @@ test "buildSystemPromptIo: missing system.md falls back to default + appends sub
     // agent reverts a sub-agent's correct edits.
     try testing.expect(std.mem.indexOf(u8, out, "ok: true") != null);
     try testing.expect(std.mem.indexOf(u8, out, "trust") != null);
+}
+
+test "buildSystemPromptIo: --skill NAME injects body under Active skills (v2.1.0)" {
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Stage a tiny skill in a tmp dir.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(root);
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, root) catch {};
+    {
+        const path = try std.fmt.allocPrint(gpa, "{s}/demo.md", .{root});
+        defer gpa.free(path);
+        var f = try cwd.createFile(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\---
+            \\name: demo
+            \\description: a demo skill
+            \\---
+            \\WORKSPACE-SPECIFIC GUIDANCE GOES HERE
+            \\
+        );
+    }
+
+    var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+    defer cfg.deinit();
+    cfg.skills_path = try cfg.arena.allocator().dupe(u8, root);
+    cfg.skills_select_csv = try cfg.arena.allocator().dupe(u8, "demo");
+
+    const env: std.process.Environ = .empty;
+    const out = try buildSystemPromptIo(gpa, io, env, &cfg);
+    defer gpa.free(out);
+
+    try testing.expect(std.mem.indexOf(u8, out, "## Active skills") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "### demo") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "WORKSPACE-SPECIFIC GUIDANCE") != null);
+}
+
+test "buildSystemPromptIo: skill stays out when not selected and no auto_apply (v2.1.0)" {
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(root);
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, root) catch {};
+    {
+        const path = try std.fmt.allocPrint(gpa, "{s}/idle.md", .{root});
+        defer gpa.free(path);
+        var f = try cwd.createFile(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\---
+            \\name: idle
+            \\description: should never auto-apply
+            \\---
+            \\IDLE BODY MUST NOT APPEAR
+            \\
+        );
+    }
+
+    var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+    defer cfg.deinit();
+    cfg.skills_path = try cfg.arena.allocator().dupe(u8, root);
+    // No skills_select_csv, no auto_apply on the skill → inactive.
+
+    const env: std.process.Environ = .empty;
+    const out = try buildSystemPromptIo(gpa, io, env, &cfg);
+    defer gpa.free(out);
+
+    try testing.expect(std.mem.indexOf(u8, out, "Active skills") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "IDLE BODY") == null);
 }
 
 // ─── v1.19.0 — settings-layer overlay helper tests ──────────────────

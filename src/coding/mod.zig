@@ -45,6 +45,7 @@ pub const slash = @import("slash.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const improvement = @import("improvement.zig");
 pub const update = @import("update.zig");
+pub const skills = @import("skills.zig");
 pub const templates = @import("templates.zig");
 pub const extensions = @import("extensions.zig");
 pub const extensions_builtin = struct {
@@ -91,6 +92,7 @@ test {
     _ = diagnostics;
     _ = improvement;
     _ = update;
+    _ = skills;
     _ = templates;
     _ = extensions;
     _ = extensions_builtin.catalog;
