@@ -414,18 +414,36 @@ ul.help-cmds .help-cmd-name {
 
 ul.help-cmds .help-cmd-desc { color: var(--muted); }
 
-/* Stop variant of the send button — replaces "Send" while a turn
- * is in flight. Same footprint, contrasting look so the affordance
- * reads as "click to abort". */
-button#send.is-stop {
+/* vN — Abort button in the header. Hidden until the conversation
+ * has at least one message (first send). Visible after that forever.
+ * Pure CSS — no JS state tracking. */
+button#abort-btn {
+    display: none;
     background: transparent;
     color: var(--error-text);
-    border-color: var(--error-border);
+    border: 1px solid var(--error-border);
+    border-radius: 6px;
+    padding: 3px 12px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    margin-left: 8px;
+    line-height: 1.4;
 }
 
-button#send.is-stop:hover:not(:disabled) {
+body:has(#conversation > *) #abort-btn {
+    display: inline-block;
+}
+
+button#abort-btn:hover:not(:disabled) {
     background: var(--error-bg);
     filter: none;
+}
+
+button#abort-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 main#conversation {

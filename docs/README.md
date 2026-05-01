@@ -22,6 +22,7 @@ The whole map.
 | File | Topic |
 |---|---|
 | [`reference/diagnostics.md`](reference/diagnostics.md) | Per-turn anomaly report behind the `/diagnostics` slash command. |
+| [`reference/spec-management.md`](reference/spec-management.md) | How to manage spec docs over time — research synthesis + applied principles for v1.md / v2.md / archive. |
 | [`reference/sandbox.md`](reference/sandbox.md) | Sandbox / `franky-zerobox` setup recipes for `--role code` / `full`. |
 | [`reference/tui-roadmap.md`](reference/tui-roadmap.md) | Open UX/UI work for `--mode interactive`. |
 | [`reference/learning-zig.md`](reference/learning-zig.md) | 12-chapter tutorial that teaches Zig by reading + modifying franky's source. |
@@ -39,8 +40,10 @@ Not consulted day-to-day; kept so `git log --follow` works for old PRs.
 | [`archive/coverage-report.md`](archive/coverage-report.md) | Test-coverage snapshot (regenerable). |
 | [`archive/session-recording.md`](archive/session-recording.md) | Literal Claude session transcript. |
 
-## What about CHANGELOG.md?
+## CHANGELOG.md
 
-There isn't one. Per-release history is the row table in
-`spec/v1.md` (one row per shipped version, with the deltas
-inline). New rows land in the same PR as the change.
+[`CHANGELOG.md`](../CHANGELOG.md) at the repo root carries per-version
+history in [Keep a Changelog](https://keepachangelog.com/) format.
+The implementation-status table at the top of `spec/v1.md` is the
+spec-level view (each row marks current ✅/❌ state); the changelog is
+the chronological view (dates, prose, rationale).

@@ -213,6 +213,11 @@ const Session = struct {
     cfg: *cli_mod.Config,
     environ_map: *std.process.Environ.Map,
     cancel: ai.stream.Cancel = .{},
+    /// vN — graceful stop signal. Set by `POST /interrupt`.
+    /// Unlike `cancel`, this does NOT abort mid-turn; the loop
+    /// finishes the current turn and then exits with an
+    /// `agent_interrupted` event.
+    stop_requested: std.atomic.Value(bool) = .init(false),
     /// v1.19.0 — resolved per-tool-prompt toggle. CLI `--prompts`
     /// wins; otherwise honors settings.json `prompts: bool`.
     prompts_enabled: bool = false,
@@ -1379,6 +1384,15 @@ fn handleConnection(arg: ConnArg) void {
         respondJson(&stream, arg.io, 200, "{\"ok\":true,\"aborted\":true}");
         return;
     }
+    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/interrupt")) {
+        // vN — graceful stop: signal the loop to finish the current
+        // turn and then exit with an `agent_interrupted` event.
+        // Unlike /abort, this preserves the current turn's output.
+        ai.log.log(.info, "proxy", "interrupt", "graceful stop requested via POST /interrupt", .{});
+        arg.session.stop_requested.store(true, .release);
+        respondJson(&stream, arg.io, 200, "{\"ok\":true,\"interrupted\":true}");
+        return;
+    }
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/permission/resolve")) {
         const carry = hdr_buf[hdr_len.consumed..hdr_len.total];
         respondPermissionResolve(arg.session, &stream, arg.io, arg.allocator, req, carry);
@@ -1770,6 +1784,8 @@ fn runOneTurnInternal(
     }
 
     session.cancel = .{};
+    // vN — reset stop-requested flag for this new turn.
+    session.stop_requested.store(false, .release);
     const worker_args: WorkerArgs = .{
         .allocator = allocator,
         .io = io,
@@ -1791,6 +1807,7 @@ fn runOneTurnInternal(
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
+            .stop_requested_fn = proxyStopRequestedFn,
             .stream_options = .{
                 .api_key = session.provider.api_key,
                 .auth_token = session.provider.auth_token,
@@ -1890,6 +1907,16 @@ const WorkerArgs = struct {
 
 fn workerMain(args: WorkerArgs) void {
     agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
+}
+
+/// vN — callback for `loop.Config.stop_requested_fn` in proxy mode.
+/// Checks whether `POST /interrupt` has set the stop-requested flag.
+/// The `userdata` is `&session.session_gates`; we recover the Session
+/// via `@fieldParentPtr`.
+fn proxyStopRequestedFn(userdata: ?*anyopaque) bool {
+    const gates: *permissions_mod.SessionGates = @ptrCast(@alignCast(userdata.?));
+    const session: *Session = @fieldParentPtr("session_gates", gates);
+    return session.stop_requested.load(.acquire);
 }
 
 /// Render one `AgentEvent` as a complete SSE frame. Uses
@@ -3129,10 +3156,10 @@ test "proxy: served app.js wires v1.7.2 activity pill + abort + watchdog" {
     // stays visible regardless of conversation scroll position.
     try testing.expect(std.mem.indexOf(u8, web_app_js, "function setActivity(") != null);
     try testing.expect(std.mem.indexOf(u8, web_index_html, "id=\"activity\"") != null);
-    // Send/Stop button swap.
+    // Send/Stop button swap + Abort button POSTs /interrupt for graceful stop.
     try testing.expect(std.mem.indexOf(u8, web_app_js, "function setStreaming(") != null);
     try testing.expect(std.mem.indexOf(u8, web_app_js, "async function abortTurn()") != null);
-    try testing.expect(std.mem.indexOf(u8, web_app_js, "fetch('/abort'") != null);
+    try testing.expect(std.mem.indexOf(u8, web_app_js, "fetch('/interrupt'") != null);
     // Watchdog — recovers UI state if SSE goes silent mid-stream.
     try testing.expect(std.mem.indexOf(u8, web_app_js, "watchdogTimeoutMs") != null);
     try testing.expect(std.mem.indexOf(u8, web_app_js, "function noteEvent()") != null);

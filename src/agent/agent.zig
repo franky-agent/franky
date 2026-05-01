@@ -87,6 +87,14 @@ pub const Agent = struct {
     pending_followup: std.ArrayList([]u8) = .empty,
     queue_mutex: std.Io.Mutex = .init,
 
+    // ── vN: graceful stop signal ─────────────────────────────────
+    /// When set by `interrupt()`, the loop checks this between
+    /// turns and exits gracefully after the current turn finishes.
+    /// Unlike `cancel`, this does NOT abort mid-turn — the
+    /// assistant's current output and tool results are preserved
+    /// in the transcript.
+    stop_requested: std.atomic.Value(bool) = .init(false),
+
     pub const Config = struct {
         model: ai.types.Model,
         system_prompt: []const u8 = "",
@@ -236,6 +244,19 @@ pub const Agent = struct {
         }
         // Reset cancel flag for future runs.
         self.cancel.flag.store(false, .release);
+        // Also reset stop-requested so a future run doesn't
+        // immediately stop again.
+        self.stop_requested.store(false, .release);
+    }
+
+    /// vN — request a graceful stop after the current turn finishes.
+    /// Unlike `abort()`, this does NOT cancel mid-turn. The current
+    /// assistant response completes (including tool executions) and
+    /// then the loop exits with an `agent_interrupted` event.
+    /// The transcript up to that point is preserved.
+    pub fn interrupt(self: *Agent) void {
+        ai.log.log(.info, "agent", "interrupt", "graceful stop requested, current turn will finish before stopping", .{});
+        self.stop_requested.store(true, .release);
     }
 
     /// Block until the worker exits (run finished naturally or was aborted).
@@ -350,6 +371,9 @@ pub const Agent = struct {
             self.last_error = null;
         }
 
+        // vN — reset stop-requested flag for the new run.
+        self.stop_requested.store(false, .release);
+
         self.is_streaming.store(true, .release);
         self.worker = try std.Thread.spawn(.{}, workerFn, .{self});
     }
@@ -369,6 +393,15 @@ pub const Agent = struct {
 
     fn loopWorkerMain(args: LoopWorkerArgs) void {
         loop_mod.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
+    }
+
+    /// vN — callback for `loop.Config.stop_requested_fn`. Checks
+    /// whether the user has requested a graceful stop via
+    /// `Agent.interrupt()`. Returns true when the loop should exit
+    /// after the current turn.
+    fn stopRequestedFn(userdata: ?*anyopaque) bool {
+        const self: *Agent = @ptrCast(@alignCast(userdata.?));
+        return self.stop_requested.load(.acquire);
     }
 
     fn workerFn(self: *Agent) void {
@@ -428,6 +461,7 @@ pub const Agent = struct {
             .role_denied = gate.role_denied,
             .role_denied_userdata = gate.userdata,
             .reducer_dump_dir = self.reducer_dump_dir,
+            .stop_requested_fn = stopRequestedFn,
         };
 
         const loop_args: LoopWorkerArgs = .{

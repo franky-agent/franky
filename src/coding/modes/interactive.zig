@@ -1034,6 +1034,10 @@ fn runOneTurn(
     }
 
     var cancel: ai.stream.Cancel = .{};
+    // vN — graceful stop signal. Set by a new keybinding (Ctrl-G)
+    // during a turn. Unlike `cancel.fire()`, this lets the current
+    // turn finish before the loop exits with `agent_interrupted`.
+    var stop_requested: std.atomic.Value(bool) = .init(false);
     var ch = try agent.loop.AgentChannel.initWithDrop(
         allocator,
         4096,
@@ -1070,10 +1074,11 @@ fn runOneTurn(
             .tools = session.tools,
             .registry = &session.registry,
             .cancel = &cancel,
-            .hook_userdata = @ptrCast(&session.session_gates),
+            .hook_userdata = @ptrCast(&stop_requested),
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
+            .stop_requested_fn = interactiveStopRequestedFn,
             .stream_options = .{
                 .api_key = session.provider.api_key,
                 .auth_token = session.provider.auth_token,
@@ -1156,6 +1161,16 @@ fn runOneTurn(
                         );
                         try scrollback.appendStyledLine(line, .{
                             .fg = .{ .basic = .red },
+                            .bold = true,
+                        });
+                    },
+                    .agent_interrupted => {
+                        // vN — graceful stop: the current turn finished
+                        // and the loop exited because the user requested
+                        // a stop. Show a subtle indicator.
+                        const line = try allocator.dupe(u8, "⏹ turn stopped gracefully");
+                        try scrollback.appendStyledLine(line, .{
+                            .fg = .{ .basic = .yellow },
                             .bold = true,
                         });
                     },
@@ -1297,6 +1312,14 @@ const WorkerArgs = struct {
 
 fn workerMain(args: WorkerArgs) void {
     agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
+}
+
+/// vN — callback for `loop.Config.stop_requested_fn` in interactive
+/// mode. `userdata` is a pointer to the per-turn `stop_requested`
+/// atomic flag set by the Ctrl-G keybinding.
+fn interactiveStopRequestedFn(userdata: ?*anyopaque) bool {
+    const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(userdata.?));
+    return flag.load(.acquire);
 }
 
 // ─── transcript search (v1.1.2) ────────────────────────────────

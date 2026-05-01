@@ -61,7 +61,7 @@ pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
         .description = "Apply one or more find/replace edits to a file atomically (path-safety enforced).",
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
-        .ctx = @constCast(@ptrCast(ws)),
+        .ctx = @ptrCast(@constCast(ws)),
         .execute = execute,
     };
 }
@@ -82,7 +82,15 @@ fn execute(
     const root = parsed.value;
 
     const user_path = (root.object.get("path") orelse return common.toolError(allocator, "invalid_args", "missing path")).string;
-    const edits_val = root.object.get("edits") orelse return common.toolError(allocator, "invalid_args", "missing edits");
+    var edits_val = root.object.get("edits") orelse return common.toolError(allocator, "invalid_args", "missing edits");
+
+    //some models (e.g. Gemini 3.1 Pro) sometimes emit `edits: {old, new}` instead of `edits: [{old, new}]` — accept both for robustness even though the spec requires an array
+    if (edits_val == .object) {
+        var arr = std.json.Array.init(allocator);
+        try arr.append(edits_val);
+        edits_val = std.json.Value{ .array = arr };
+    }
+
     if (edits_val != .array) return common.toolError(allocator, "invalid_args", "edits must be an array");
 
     var canon_path: ?[]u8 = null;
@@ -340,7 +348,6 @@ fn atomicWrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
 
 var tmp_counter: std.atomic.Value(u32) = .init(0);
 
-
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -482,13 +489,11 @@ test "edit diff renders every line of multi-line old/new (v1.26.3)" {
     try writeTempFile(io, path, before);
 
     const edits = [_]EditOp{.{
-        .old =
-            "const role = data.role || 'plan';\n" ++
+        .old = "const role = data.role || 'plan';\n" ++
             "const provider = data.provider || '?';\n" ++
             "const model = data.model || '?';\n" ++
             "el.textContent = 'role: ' + role + ' · ' + provider + ':' + model;",
-        .new =
-            "const role = data.role || 'plan';\n" ++
+        .new = "const role = data.role || 'plan';\n" ++
             "el.textContent = 'role: ' + role;",
         .replace_all = false,
     }};

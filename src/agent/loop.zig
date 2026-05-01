@@ -39,8 +39,8 @@ pub const ConvertToLlmFn = *const fn (
 ) anyerror![]ai.types.Message;
 
 /// Default convertToLlm: pass-through, with two custom-role rewrites:
-///   - `custom_role == "compaction_summary"` (§E.4.3) is converted to
-///     a plain `user` message whose first text block is prefixed with
+///   - `custom_role == "compaction_summary"` is converted to a plain
+///     `user` message whose first text block is prefixed with
 ///     `"Earlier in this conversation:\n\n"`. The model sees this as
 ///     ordinary context rather than a synthetic role it doesn't know.
 ///   - Any other `.custom` role is filtered out (unknown to the model).
@@ -202,6 +202,12 @@ pub const Config = struct {
     /// stop early. When `null`, the loop uses its default
     /// "no tool calls → stop" rule.
     between_turns: ?BetweenTurnsFn = null,
+    /// vN — optional check function. Called between turns just after
+    /// the `between_turns` hook. Return true to exit the loop gracefully
+    /// (the current turn's output is preserved in the transcript).
+    /// Checks are also made before starting a new LLM call, so a stop
+    /// requested during the between-turns hook is caught promptly.
+    stop_requested_fn: ?*const fn (userdata: ?*anyopaque) bool = null,
     stream_options: ai.registry.StreamOptions = .{},
     /// Hard cap on turn count — guards against infinite loops.
     max_turns: u32 = 100,
@@ -262,6 +268,15 @@ pub fn agentLoop(
             pushAgentError(out, io, allocator, .aborted, "cancelled") catch {};
             return;
         }
+        // vN — check stop-requested BEFORE starting a new LLM call.
+        // This catches a stop that was requested during the
+        // between-turns hook, preventing an unnecessary LLM call.
+        if (config.stop_requested_fn) |check_stop| {
+            if (check_stop(config.hook_userdata)) {
+                emitInterrupted(out, io, allocator) catch {};
+                return;
+            }
+        }
         const keep_going = runTurn(allocator, io, transcript, config, out) catch |err| {
             pushAgentError(out, io, allocator, agentErrorCode(err), @errorName(err)) catch {};
             return;
@@ -272,7 +287,13 @@ pub fn agentLoop(
             // hook returns `true`, the transcript has new
             // user-role messages appended; run another turn.
             if (config.between_turns) |hook| {
-                if (hook(config.hook_userdata, transcript)) continue;
+                if (hook(config.hook_userdata, transcript)) {
+                    // vN — after the between-turns hook appended
+                    // messages, check stop-requested BEFORE the
+                    // next LLM call (the `while` condition jumps
+                    // back to the top where the same check runs).
+                    continue;
+                }
             }
             out.close(io);
             return;
@@ -708,8 +729,9 @@ fn runToolsParallel(
         if (!progress) io.sleep(.fromMilliseconds(1), .awake) catch {};
     }
 
-    // Results appended in source order — deterministic-transcript
-    // invariant from §9.10.
+    // Results appended in source order — preserves the
+    // deterministic-transcript invariant under parallel execution
+    // (see CLAUDE.md "Design invariants").
     for (workers, 0..) |*w, i| {
         const call_res = slot_results[i].?;
         try results.append(allocator, .{
@@ -1090,6 +1112,17 @@ fn pushAgentError(
 ) !void {
     const owned = try allocator.dupe(u8, message);
     out.closeWithFinal(io, .{ .agent_error = .{ .code = code, .message = owned } });
+}
+
+/// vN — emit the graceful interrupt event and close the channel.
+fn emitInterrupted(
+    out: *AgentChannel,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+) !void {
+    _ = allocator;
+    ai.log.log(.info, "loop", "interrupted", "graceful stop after current turn", .{});
+    out.closeWithFinal(io, .{ .agent_interrupted = {} });
 }
 
 /// v1.29.0 — write a JSON snapshot of the reducer's internal

@@ -15,8 +15,8 @@
 //!     another turn.
 //!   - JSON-RPC 2.0 framer round-trip (writeFrame + readFrame +
 //!     parseRequest) on handcrafted bytes.
-//!   - compaction_summary remap through defaultConvertToLlm (§E.4.3
-//!     prefix + .custom → .user).
+//!   - compaction_summary remap through defaultConvertToLlm
+//!     ("Earlier in this conversation:" prefix + .custom → .user).
 //!
 //! Each invariant lives in its own `test` block so regressions are
 //! attributable. The file counts as one integration binary per
@@ -151,7 +151,7 @@ test "kitchen-sink: compaction round checkpoints + replaces span" {
 
 // ─── 3. compaction_summary remaps through defaultConvertToLlm ─────
 
-test "kitchen-sink: compaction_summary → user with §E.4.3 prefix" {
+test "kitchen-sink: compaction_summary → user with conversation-history prefix" {
     const gpa = testing.allocator;
     var c = [_]ai.types.ContentBlock{.{ .text = .{ .text = "user did X then Y" } }};
     const messages = [_]agent_mod.loop.AgentMessage{

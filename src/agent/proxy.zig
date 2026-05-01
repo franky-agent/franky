@@ -131,6 +131,9 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
                 try appendJsonInt(&buf, allocator, @intCast(s));
             }
         },
+        .agent_interrupted => {
+            try buf.appendSlice(allocator, "\"kind\":\"agent_interrupted\"");
+        },
     }
     try buf.append(allocator, '}');
     return try buf.toOwnedSlice(allocator);

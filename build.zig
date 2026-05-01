@@ -81,6 +81,27 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit + integration tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // `zig build check-spec-anchors` — verify every §-anchor referenced
+    // from source resolves to a heading in docs/spec/v{1,2}.md. Catches
+    // dead pointers when sections are renamed or removed (per the
+    // "Cross-references survive when they target stable identifiers"
+    // discipline in docs/reference/spec-management.md).
+    const check_anchors_module = b.createModule(.{
+        .root_source_file = b.path("src/bin/check_spec_anchors.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const check_anchors_exe = b.addExecutable(.{
+        .name = "franky-check-spec-anchors",
+        .root_module = check_anchors_module,
+        .use_llvm = use_llvm,
+        .use_lld = use_lld,
+    });
+    const check_anchors_run = b.addRunArtifact(check_anchors_exe);
+    const anchor_step = b.step("check-spec-anchors", "Verify source §-references resolve to spec headings");
+    anchor_step.dependOn(&check_anchors_run.step);
+    test_step.dependOn(&check_anchors_run.step);
+
     const integration_files = [_][]const u8{
         "test/agent_loop_test.zig",
         "test/agent_class_test.zig",

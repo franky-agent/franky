@@ -92,6 +92,12 @@ pub const AgentEventKind = enum {
     /// thread blocks on a `Condition` until then.
     tool_permission_request,
     turn_end,
+    /// vN — emitted when the loop was interrupted gracefully
+    /// (stop-requested flag set) after the current turn finished.
+    /// Consumers (UI) can use this to show "turn stopped" vs
+    /// "turn ended naturally" vs "turn cancelled". The transcript
+    /// up to this point is preserved; no error is logged.
+    agent_interrupted,
     agent_error,
 };
 
@@ -137,18 +143,19 @@ pub const AgentEvent = union(AgentEventKind) {
         fingerprint: []const u8,
     },
     turn_end: void,
+    agent_interrupted: void,
     agent_error: ai.errors.ErrorDetails,
 
     pub fn isTerminal(self: AgentEvent) bool {
         return switch (self) {
-            .agent_error => true,
+            .agent_error, .agent_interrupted => true,
             else => false,
         };
     }
 
     pub fn deinit(self: AgentEvent, allocator: std.mem.Allocator) void {
         switch (self) {
-            .turn_start, .turn_end => {},
+            .turn_start, .turn_end, .agent_interrupted => {},
             .message_start => |s| if (s.custom_role) |v| allocator.free(v),
             .message_update => |m| switch (m) {
                 .text => |t| allocator.free(t.delta),

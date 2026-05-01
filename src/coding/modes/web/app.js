@@ -197,6 +197,8 @@ const Markdown = (function () {
     const helpCloseBtn = document.getElementById('help-close');
     const helpToggleBtn = document.getElementById('help-toggle');
     const helpCmdsEl = document.getElementById('help-commands');
+    // vN — Abort button in header. Always visible; just POSTs /interrupt.
+    const abortBtn = document.getElementById('abort-btn');
 
     /**
      * State for the in-progress assistant message.
@@ -293,47 +295,29 @@ const Markdown = (function () {
     }
 
     /**
-     * v1.7.2 — flip Send into a Stop button while streaming.
-     * Clicking Stop POSTs `/abort` so the server can fire
-     * `session.cancel`; the resulting `agent_error{code=aborted}`
-     * + `turn_end` events restore the idle UI.
+     * v1.7.2 — track streaming state. The Abort button is always
+     * visible after the first message (ui-driven, no state needed).
+     * POSTs /interrupt for a graceful stop — the current turn
+     * finishes, then the loop emits `agent_interrupted` and stops.
      */
     function setStreaming(streaming) {
         isStreaming = streaming;
-        if (streaming) {
-            sendBtn.textContent = 'Stop';
-            sendBtn.classList.add('is-stop');
-            sendBtn.disabled = false;       // keep clickable so Stop works
-        } else {
-            sendBtn.textContent = 'Send';
-            sendBtn.classList.remove('is-stop');
-            sendBtn.disabled = false;
+        if (!streaming) {
             setActivity(null);
         }
     }
 
+    /**
+     * vN — POST /interrupt to request a graceful stop. Does NOT
+     * reset UI state — the SSE handler for `agent_interrupted` or
+     * `turn_end` handles that once the loop actually stops. This
+     * prevents the race where the UI flips back to "Send" while
+     * the agent is still producing output.
+     */
     async function abortTurn() {
-        // v1.7.9 — reset UI state immediately on user click. The
-        // pre-1.7.9 path waited for an `agent_error{code=aborted}`
-        // SSE event before flipping back to idle, but that ties
-        // the button's recovery to whether a loop is actually
-        // running server-side. If the SSE stream missed the prior
-        // `turn_end` (or the loop already finished), `cancel.fire()`
-        // is a no-op — no follow-up event ever lands and the
-        // button stays wedged in Stop forever. Frank flagged this
-        // after a real conversation where the model had already
-        // replied but the UI insisted it was still responding.
-        // Clicking Stop is an unambiguous intent: drop streaming
-        // state locally first, then best-effort the POST so any
-        // genuinely in-flight loop still gets cancelled.
-        setStreaming(false);
-        hideTurnIndicator();
-        endAssistantMessage();
-        stopStatusLineTimer();
-        setStatusLine('');
         try {
-            await fetch('/abort', { method: 'POST' });
-        } catch (_) { /* best-effort — UI already reset above */ }
+            await fetch('/interrupt', { method: 'POST' });
+        } catch (_) { /* best-effort */ }
     }
 
     /**
@@ -833,6 +817,20 @@ const Markdown = (function () {
             setStatusLine('');
         });
 
+        // vN — graceful interrupt: the loop finished the current
+        // turn cleanly then stopped (user clicked Stop). Transition
+        // back to idle, same as turn_end but without queueing a
+        // follow-up.
+        es.addEventListener('agent_interrupted', (e) => {
+            noteEvent();
+            endAssistantMessage();
+            hideTurnIndicator();
+            setStreaming(false);
+            stopStatusLineTimer();
+            setStatusLine('');
+            input.focus();
+        });
+
         // v1.7.0 — server fires this when the active session
         // changes (via /session/activate or /session/new). Wipe
         // the conversation and rehydrate from the new transcript.
@@ -1053,6 +1051,14 @@ const Markdown = (function () {
         if (!text) return;
         input.value = '';
         submitPrompt(text);
+    });
+
+    // vN — Abort button click handler. Always visible after first
+    // message. Just POSTs /interrupt. Safe at any time — the
+    // server-side handler is idempotent when no turn is in flight.
+    abortBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        abortTurn();
     });
 
     input.addEventListener('keydown', (e) => {
