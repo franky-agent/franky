@@ -204,7 +204,7 @@ pub const Config = struct {
     between_turns: ?BetweenTurnsFn = null,
     stream_options: ai.registry.StreamOptions = .{},
     /// Hard cap on turn count — guards against infinite loops.
-    max_turns: u32 = 50,
+    max_turns: u32 = 100,
     /// v1.16.3 — when true, if the assistant ends a turn with text
     /// content that parses as a recognized tool-call shape (e.g.
     /// `{"name": "X", "parameters": {...}}` or `{"type": "function",
@@ -857,10 +857,10 @@ fn formatToolExecutionError(
 /// improvement over the pre-v1.16.3 bare-error-name behavior.
 fn looksLikeJsonError(name: []const u8) bool {
     const json_markers = [_][]const u8{
-        "SyntaxError",         "UnexpectedToken",
+        "SyntaxError",          "UnexpectedToken",
         "UnexpectedEndOfInput", "InvalidNumber",
-        "InvalidEscape",       "InvalidString",
-        "InvalidCharacter",    "DuplicateField",
+        "InvalidEscape",        "InvalidString",
+        "InvalidCharacter",     "DuplicateField",
         "MissingField",
     };
     for (json_markers) |m| {

@@ -34,6 +34,16 @@ pub const Options = struct {
     session_label: ?[]const u8 = null,
     /// "interactive", "print", "proxy", "rpc" — display only.
     mode_name: ?[]const u8 = null,
+    /// v1.29.6 — display-only provider name (e.g. "google",
+    /// "anthropic", "openai"). Rendered in the header so anyone
+    /// reading the diagnostics knows which provider's quirks to
+    /// suspect (Gemini's thinking-budget exhaustion vs OpenAI's
+    /// tool-call shape, etc.).
+    provider: ?[]const u8 = null,
+    /// v1.29.6 — display-only model id (e.g. "gemini-2.5-pro",
+    /// "claude-sonnet-4-5"). Rendered in the header alongside
+    /// `provider` for the same reason.
+    model: ?[]const u8 = null,
 };
 
 /// Anomaly classes flagged by the per-turn checks. The order
@@ -138,8 +148,32 @@ pub fn hintForToolError(code: ?[]const u8, message: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, c, "path_escape_workspace") or std.mem.indexOf(u8, m, "workspace") != null) {
         return "Path escapes the workspace root. Use a path under the session cwd, or restart from a wider root.";
     }
-    if (std.mem.eql(u8, c, "edit_no_match") or std.mem.indexOf(u8, m, "no match") != null) {
-        return "Edit `old` text didn't match the file. Read the file again to get the current bytes, then retry with the exact match.";
+    // v1.29.6 — split edit_no_match vs edit_ambiguous: the recovery
+    // is the OPPOSITE for the two cases. no_match means the `old`
+    // string isn't in the file at all (often because the model is
+    // working from a stale mental model of the file); ambiguous
+    // means it matches multiple times (and DOES need more context).
+    // Pre-v1.29.6 the no_match hint said "read the file again to
+    // get the current bytes" but Gemini-2.5-pro was interpreting
+    // that as "widen the old string with more surrounding text" —
+    // making it worse, since the bigger guess still doesn't match.
+    if (std.mem.eql(u8, c, "edit_no_match")) {
+        return "Edit `old` not found. DO NOT widen `old` with more context — that won't help if the original guess is wrong. Re-read the file with the `read` tool to get the actual bytes, then copy-paste the exact text into `old`.";
+    }
+    if (std.mem.eql(u8, c, "edit_ambiguous")) {
+        return "Edit `old` matched multiple times. Widen `old` with more surrounding context (e.g. include the line above and below) until it uniquely identifies the target. If a function-/declaration-level match is still ambiguous, split into two edits.";
+    }
+    // Fallback: legacy no-code-match heuristic. Older transcripts
+    // and some sub-agent envelopes carry "no match" in the message
+    // without a structured tool_code.
+    if (std.mem.indexOf(u8, m, "no match") != null) {
+        return "Edit `old` not found. Re-read the file with the `read` tool and copy-paste the exact bytes into `old`; do not widen the search string.";
+    }
+    if (std.mem.eql(u8, c, "write_exists") or std.mem.indexOf(u8, m, "already exists") != null) {
+        return "File already exists. Pass `overwrite: true` to replace, OR use the `edit` tool to make a targeted change instead of rewriting the whole file.";
+    }
+    if (std.mem.eql(u8, c, "invalid_args")) {
+        return "Tool was called with invalid arguments. The error message names the missing/bad field — re-call with the correct shape; check the tool's schema if unsure.";
     }
     if (std.mem.eql(u8, c, "bash_timeout")) {
         return "Bash command exceeded its hard timeout. Pass `timeoutMs` argument explicitly, or split the command.";
@@ -441,10 +475,12 @@ pub fn render(
     {
         const line = try std.fmt.allocPrint(
             allocator,
-            "mode:        {s}\nsession:     {s}\ntrace dir:   {s}\nreducer dir: {s}\ntranscript:  {d} assistant turns / {d} messages\n",
+            "mode:        {s}\nsession:     {s}\nprovider:    {s}\nmodel:       {s}\ntrace dir:   {s}\nreducer dir: {s}\ntranscript:  {d} assistant turns / {d} messages\n",
             .{
                 opts.mode_name orelse "?",
                 opts.session_label orelse "?",
+                opts.provider orelse "?",
+                opts.model orelse "?",
                 opts.http_trace_dir orelse "<unset — pass --http-trace-dir to capture>",
                 opts.session_dir orelse "<unset — interactive mode has no on-disk session>",
                 report.total_assistant_turns,
@@ -1118,9 +1154,50 @@ test "hintForToolError: recognizes canonical codes" {
     try testing.expect(std.mem.indexOf(u8, hintForToolError("rate_limited", null), "rate-limited") != null);
     try testing.expect(std.mem.indexOf(u8, hintForToolError("role_denied", null), "--role") != null);
     try testing.expect(std.mem.indexOf(u8, hintForToolError("path_escape_workspace", null), "workspace") != null);
-    try testing.expect(std.mem.indexOf(u8, hintForToolError("edit_no_match", null), "Read the file again") != null);
     try testing.expect(std.mem.indexOf(u8, hintForToolError("bash_timeout", null), "timeoutMs") != null);
     try testing.expect(std.mem.indexOf(u8, hintForToolError("read_too_large", null), "Paginate") != null);
+}
+
+// v1.29.6 — split edit hints + write_exists + invalid_args.
+test "hintForToolError: edit_no_match steers AWAY from widening" {
+    // Real-user incident: gemini-2.5-pro got `edit_no_match`,
+    // interpreted "Read the file again to get the current bytes"
+    // as "widen the old string with more context" — making it
+    // worse, since the bigger guess still doesn't match. The new
+    // hint explicitly tells the model NOT to widen.
+    const h = hintForToolError("edit_no_match", null);
+    try testing.expect(std.mem.indexOf(u8, h, "DO NOT widen") != null);
+    try testing.expect(std.mem.indexOf(u8, h, "Re-read") != null);
+    try testing.expect(std.mem.indexOf(u8, h, "copy-paste") != null);
+}
+
+test "hintForToolError: edit_ambiguous DOES tell the model to widen" {
+    const h = hintForToolError("edit_ambiguous", null);
+    try testing.expect(std.mem.indexOf(u8, h, "Widen") != null);
+    try testing.expect(std.mem.indexOf(u8, h, "context") != null);
+    // Must NOT say to re-read (the file content is fine; the
+    // problem is just that `old` isn't unique).
+    try testing.expect(std.mem.indexOf(u8, h, "Re-read") == null);
+}
+
+test "hintForToolError: write_exists points at overwrite=true and edit alternative" {
+    const h = hintForToolError("write_exists", null);
+    try testing.expect(std.mem.indexOf(u8, h, "overwrite") != null);
+    try testing.expect(std.mem.indexOf(u8, h, "edit") != null);
+}
+
+test "hintForToolError: invalid_args points at the error message" {
+    const h = hintForToolError("invalid_args", null);
+    try testing.expect(std.mem.indexOf(u8, h, "missing") != null);
+    try testing.expect(std.mem.indexOf(u8, h, "schema") != null);
+}
+
+test "hintForToolError: legacy no-match-in-message fallback still fires" {
+    // Older transcripts and sub-agent envelopes can carry "no
+    // match" in the message without a structured tool_code.
+    const h = hintForToolError(null, "edit failed: old not found, no match in file");
+    try testing.expect(std.mem.indexOf(u8, h, "Re-read") != null);
+    try testing.expect(std.mem.indexOf(u8, h, "do not widen") != null);
 }
 
 test "render: empty transcript prints (no assistant turns yet)" {
@@ -1130,4 +1207,29 @@ test "render: empty transcript prints (no assistant turns yet)" {
     const out = try render(gpa, &report, .{ .transcript = &.{}, .mode_name = "interactive" });
     defer gpa.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "no assistant turns yet") != null);
+}
+
+test "render: header includes provider + model when set" {
+    const gpa = testing.allocator;
+    var report = try analyze(gpa, .{ .transcript = &.{} });
+    defer report.deinit();
+    const out = try render(gpa, &report, .{
+        .transcript = &.{},
+        .mode_name = "franky-do",
+        .provider = "google",
+        .model = "gemini-2.5-pro",
+    });
+    defer gpa.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "provider:    google") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "model:       gemini-2.5-pro") != null);
+}
+
+test "render: header shows '?' when provider/model unset" {
+    const gpa = testing.allocator;
+    var report = try analyze(gpa, .{ .transcript = &.{} });
+    defer report.deinit();
+    const out = try render(gpa, &report, .{ .transcript = &.{}, .mode_name = "interactive" });
+    defer gpa.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "provider:    ?") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "model:       ?") != null);
 }
