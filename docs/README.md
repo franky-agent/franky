@@ -6,10 +6,10 @@ The whole map.
 
 | File | Purpose |
 |---|---|
-| [`spec/v1.md`](spec/v1.md) | **Current shipped behavior — start here.** Architecture (§1-§14), implementation reference (§A-§R), per-version row table (v1.0.0 → current). Most rows ✅; rows for features that shipped earlier in v1.x and were later removed carry `❌ removed in vX.Y.Z`. Source code cross-references sections via `§` markers. |
+| [`spec/v2.md`](spec/v2.md) | **Active v2.x spec — start here for current work.** Open backlog + new v2.x rows. The v2.x line opened 2026-05-01 at 2.0.0. Items in §1–§4 are the carry-over backlog from the v1.x line; new shipped work moves into [`../CHANGELOG.md`](../CHANGELOG.md) under the matching v2.x entry. |
+| [`spec/v1.md`](spec/v1.md) | **Concluded v1 spec — historical reference.** Architecture (§1-§14), implementation reference (§A-§S), per-version row table for v1.0.0 → v1.31.0. Most rows ✅; rows for features that shipped earlier in v1.x and were later removed carry `❌ removed in vX.Y.Z`. Read-only as of 2026-05-01 — edits are limited to factual fixes + `❌` flips when a v1.x feature is later removed. Source code `§` markers continue to point here for v1-introduced subsystems. |
 | [`spec/v0.md`](spec/v0.md) | Frozen v0.* development history. Read for "when and how did feature X land in v0.*?" — append-only from here. |
-| [`spec/v2.md`](spec/v2.md) | Open backlog of v1.x deferred follow-ups: sibling projects, toolchain-blocked items, post-1.0 ideas not large enough to warrant their own spec. v1 row notes link in as "see spec/v2.md §X" wherever a deferred item is named. |
-| [`spec/v3.md`](spec/v3.md) | Open spec for next-major work. Items here imply user-visible UX surface or extend a v1 primitive substantially enough to need spec-level design before implementation. |
+| [`spec/v3.md`](spec/v3.md) | Open spec for next-major work past v2.x. Items here imply user-visible UX surface or extend a v1/v2 primitive substantially enough to need spec-level design before implementation. |
 
 ## design/ — design proposals
 
