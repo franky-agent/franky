@@ -2153,6 +2153,8 @@ fn interactiveDiagnosticsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) sla
         .session_dir = null,
         .session_label = "interactive (in-memory transcript)",
         .mode_name = "interactive",
+        .provider = cfg.provider,
+        .model = cfg.model,
     };
 
     // Resolve $FRANKY_HOME / $HOME/.franky for the persist path.

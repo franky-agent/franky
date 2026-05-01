@@ -45,10 +45,22 @@ pub const parameters_json: []const u8 =
     \\}
 ;
 
+// Anti-widening guidance is in the description (not just the
+// post-hoc hint) so the model sees it before its first call —
+// otherwise `edit_no_match` failures get retried with a wider
+// `old`, which only helps for `edit_ambiguous`.
+const edit_description =
+    "Apply one or more find/replace edits to a file atomically. " ++
+    "If `old` is not found, do NOT widen it with more surrounding " ++
+    "context — re-read the file with the `read` tool and copy-paste " ++
+    "the exact bytes into `old`.";
+
+const edit_description_workspace = edit_description ++ " (path-safety enforced)";
+
 pub fn tool() at.AgentTool {
     return .{
         .name = "edit",
-        .description = "Apply one or more find/replace edits to a file atomically.",
+        .description = edit_description,
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
         .execute = execute,
@@ -58,7 +70,7 @@ pub fn tool() at.AgentTool {
 pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
     return .{
         .name = "edit",
-        .description = "Apply one or more find/replace edits to a file atomically (path-safety enforced).",
+        .description = edit_description_workspace,
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
         .ctx = @ptrCast(@constCast(ws)),
