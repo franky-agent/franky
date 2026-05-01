@@ -58,6 +58,16 @@ pub const Agent = struct {
     /// v1.22.0 — see `Config.tool_gate`. Plain copy from Config
     /// at init time; the userdata pointer stays caller-owned.
     tool_gate: ?ToolGate = null,
+    /// Hard cap on agent-loop turn count. Forwarded to `loop.Config`
+    /// per-run. SDK consumers override the default by setting
+    /// `Agent.Config.max_turns`; mode drivers override via
+    /// `--max-turns` / settings / profile.
+    max_turns: u32 = 50,
+    /// Optional hook fired when the loop reaches `max_turns`. Returns
+    /// `.extend(N)` to bump the cap additively or `.stop` to terminate.
+    /// Without a hook the loop emits `max_turns_exceeded`. Wired the
+    /// same way `tool_gate` is — caller-owned userdata + callback.
+    max_turns_hook: ?MaxTurnsHook = null,
     /// v1.29.0 — directory the agent loop dumps reducer-state
     /// snapshots to when a turn ends with zero content blocks
     /// (see `loop.Config.reducer_dump_dir`). Caller-owned slice
@@ -119,6 +129,18 @@ pub const Agent = struct {
         /// the `agent → coding` one-way layering. `null` keeps
         /// pre-v1.22 semantics (no per-tool gate).
         tool_gate: ?ToolGate = null,
+        /// Hard cap on the agent loop's turn count for every prompt.
+        /// SDK default matches `loop.Config.max_turns` (50). Mode
+        /// drivers may override via CLI / settings / profile before
+        /// constructing the Agent.
+        max_turns: u32 = 50,
+        /// Optional max-turns hook. When the loop hits the cap, this
+        /// callback is invoked; returning `.extend(N)` adds N more
+        /// turns to the cap (additive — credits accumulate). Returning
+        /// `.stop` (or omitting the hook) emits `max_turns_exceeded`
+        /// and closes the channel. Same shape as `tool_gate` — the
+        /// type lives here to preserve the `agent → coding` layering.
+        max_turns_hook: ?MaxTurnsHook = null,
         /// v1.29.0 — see `Agent.reducer_dump_dir`. When set, the
         /// agent loop snapshots reducer state to disk on
         /// degenerate (zero-content) turns. Mode drivers point
@@ -147,6 +169,14 @@ pub const Agent = struct {
         role_denied: ?loop_mod.RoleDeniedFn = null,
     };
 
+    /// Optional max-turns extension callback bundle. Same lifetime
+    /// rules as `ToolGate` — userdata is caller-owned and lives at
+    /// the same address for the agent's lifetime.
+    pub const MaxTurnsHook = struct {
+        userdata: ?*anyopaque = null,
+        on_max_turns: ?loop_mod.OnMaxTurnsFn = null,
+    };
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) !Agent {
         const owned_prompt = try allocator.dupe(u8, config.system_prompt);
         const owned_tools = try allocator.alloc(at.AgentTool, config.tools.len);
@@ -162,6 +192,8 @@ pub const Agent = struct {
             .registry = config.registry,
             .stream_options = config.stream_options,
             .tool_gate = config.tool_gate,
+            .max_turns = config.max_turns,
+            .max_turns_hook = config.max_turns_hook,
             .reducer_dump_dir = config.reducer_dump_dir,
         };
     }
@@ -447,6 +479,7 @@ pub const Agent = struct {
         // so a single hook_userdata pointer doesn't have to
         // service both.
         const gate = self.tool_gate orelse ToolGate{};
+        const max_hook = self.max_turns_hook orelse MaxTurnsHook{};
         const cfg: loop_mod.Config = .{
             .model = self.model,
             .system_prompt = self.system_prompt,
@@ -460,6 +493,9 @@ pub const Agent = struct {
             .before_tool_call_userdata = gate.userdata,
             .role_denied = gate.role_denied,
             .role_denied_userdata = gate.userdata,
+            .max_turns = self.max_turns,
+            .on_max_turns = max_hook.on_max_turns,
+            .on_max_turns_userdata = max_hook.userdata,
             .reducer_dump_dir = self.reducer_dump_dir,
             .stop_requested_fn = stopRequestedFn,
         };

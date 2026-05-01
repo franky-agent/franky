@@ -49,6 +49,12 @@ pub const Code = enum {
     empty_response,
     // caller
     aborted,
+    /// Agent loop reached its `max_turns` cap. The cap is configurable
+    /// via `loop.Config.max_turns`; an `on_max_turns` hook can extend
+    /// it additively. When the hook is absent or returns `.stop`, the
+    /// loop emits this code and closes. SDK consumers detect this to
+    /// surface a "task too complex / extend?" UX.
+    max_turns_exceeded,
     // tool
     tool_arg_validation,
     tool_runtime,
@@ -87,6 +93,7 @@ pub const AgentError = error{
     SafetyRefusal,
     EmptyResponse,
     Aborted,
+    MaxTurnsExceeded,
     ToolArgValidation,
     ToolRuntime,
     ToolBlocked,
@@ -125,6 +132,7 @@ pub const ErrorDetails = struct {
             .safety_refusal => error.SafetyRefusal,
             .empty_response => error.EmptyResponse,
             .aborted => error.Aborted,
+            .max_turns_exceeded => error.MaxTurnsExceeded,
             .tool_arg_validation => error.ToolArgValidation,
             .tool_runtime => error.ToolRuntime,
             .tool_blocked => error.ToolBlocked,

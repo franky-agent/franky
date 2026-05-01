@@ -272,6 +272,7 @@ fn runPrint(
         defer settings.deinit();
         applyBashSettingsOverlay(&bash_state, &settings);
         applyReadSettingsOverlay(&read_ctx, &settings);
+        applyMaxTurnsSettingsOverlay(cfg, &settings);
     }
     var bash_ctx = tools_mod.bash.BashCtx{
         .state = &bash_state,
@@ -488,31 +489,33 @@ fn runPrint(
     // events concurrently. Running inline deadlocks on the 128-event
     // channel cap as soon as a session produces more events than the
     // buffer holds — which, with tool-heavy turns, happens immediately.
+    var loop_cfg: agent.loop.Config = .{
+        .model = model,
+        .system_prompt = system_prompt,
+        .tools = final_tools,
+        .registry = &reg,
+        .cancel = &cancel,
+        .hook_userdata = @ptrCast(&session_gates),
+        .role_denied = permissions_mod.SessionGates.roleDenied,
+        .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
+        .text_tool_call_fallback = cfg.text_tool_call_fallback,
+        .reducer_dump_dir = events_dir_path,
+        .stream_options = .{
+            .api_key = provider_info.api_key,
+            .auth_token = provider_info.auth_token,
+            .base_url = provider_info.base_url,
+            .environ_map = environ_map,
+            .thinking = cfg.thinking,
+            .timeouts = resolveTimeoutsFromMap(cfg, environ_map),
+            .http_trace_dir = resolveHttpTraceDirFromMap(cfg, environ_map),
+        },
+    };
+    if (resolveMaxTurnsFromMap(cfg, environ_map)) |v| loop_cfg.max_turns = v;
     const worker_args: WorkerArgs = .{
         .allocator = allocator,
         .io = io,
         .transcript = &session_state.transcript,
-        .config = .{
-            .model = model,
-            .system_prompt = system_prompt,
-            .tools = final_tools,
-            .registry = &reg,
-            .cancel = &cancel,
-            .hook_userdata = @ptrCast(&session_gates),
-            .role_denied = permissions_mod.SessionGates.roleDenied,
-            .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
-            .text_tool_call_fallback = cfg.text_tool_call_fallback,
-            .reducer_dump_dir = events_dir_path,
-            .stream_options = .{
-                .api_key = provider_info.api_key,
-                .auth_token = provider_info.auth_token,
-                .base_url = provider_info.base_url,
-                .environ_map = environ_map,
-                .thinking = cfg.thinking,
-                .timeouts = resolveTimeoutsFromMap(cfg, environ_map),
-                .http_trace_dir = resolveHttpTraceDirFromMap(cfg, environ_map),
-            },
-        },
+        .config = loop_cfg,
         .ch = &ch,
     };
     const worker = try std.Thread.spawn(.{}, workerMain, .{worker_args});
@@ -662,6 +665,19 @@ pub fn resolveTimeoutsFromMap(
 fn parseEnvMapU32(map: *const std.process.Environ.Map, key: []const u8) ?u32 {
     const v = map.get(key) orelse return null;
     return std.fmt.parseInt(u32, v, 10) catch null;
+}
+
+/// Resolve the agent loop's `max_turns` cap from the CLI flag, env
+/// var, or null (caller falls back to `loop.Config.max_turns`'s
+/// default). Precedence: `--max-turns` > `FRANKY_MAX_TURNS` > unset.
+/// Settings/profile overlay layers in on top of this; see iter 4.
+pub fn resolveMaxTurnsFromMap(
+    cfg: *const cli_mod.Config,
+    environ_map: *const std.process.Environ.Map,
+) ?u32 {
+    if (cfg.max_turns) |v| return v;
+    if (parseEnvMapU32(environ_map, "FRANKY_MAX_TURNS")) |v| return v;
+    return null;
 }
 
 /// v1.13.0 — resolve the log-file destination for this run.
@@ -824,6 +840,19 @@ pub fn resolvePromptsDefault(
 ) bool {
     if (cfg.prompts) return true; // CLI wins.
     return settings.prompts_default orelse false;
+}
+
+/// Backfill `cfg.max_turns` from `settings.max_turns` when the CLI
+/// (or profile, via `applyToCfg` which already ran) didn't set it.
+/// Preserves the precedence chain CLI > profile > settings > env >
+/// default — `resolveMaxTurnsFromMap` then sees a populated `cfg`
+/// before it falls through to the env-var lookup.
+pub fn applyMaxTurnsSettingsOverlay(
+    cfg: *cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) void {
+    if (cfg.max_turns != null) return; // CLI / profile already set it.
+    if (settings.max_turns) |v| cfg.max_turns = v;
 }
 
 /// True when `base_url` parses to a loopback host. Whole-host
@@ -1631,6 +1660,71 @@ test "resolveTimeoutsFromMap: defaults match registry when unset" {
     try testing.expectEqual(@as(u32, 10_000), t.connect_ms);
     try testing.expectEqual(@as(u32, 30_000), t.first_byte_ms);
     try testing.expectEqual(@as(u32, 60_000), t.event_gap_ms);
+}
+
+test "resolveMaxTurnsFromMap: returns null when unset (caller uses default)" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try testing.expectEqual(@as(?u32, null), resolveMaxTurnsFromMap(&cfg, &m));
+}
+
+test "resolveMaxTurnsFromMap: --max-turns wins over env" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{
+        "franky", "--max-turns", "200",
+    });
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try m.put("FRANKY_MAX_TURNS", "5");
+    try testing.expectEqual(@as(?u32, 200), resolveMaxTurnsFromMap(&cfg, &m));
+}
+
+test "resolveMaxTurnsFromMap: env var applies when CLI flag absent" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try m.put("FRANKY_MAX_TURNS", "120");
+    try testing.expectEqual(@as(?u32, 120), resolveMaxTurnsFromMap(&cfg, &m));
+}
+
+test "applyMaxTurnsSettingsOverlay: backfills cfg when CLI/profile didn't set it" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?u32, null), cfg.max_turns);
+
+    var settings = try settings_mod.defaults(testing.allocator);
+    defer settings.deinit();
+    settings.max_turns = 75;
+
+    applyMaxTurnsSettingsOverlay(&cfg, &settings);
+    try testing.expectEqual(@as(?u32, 75), cfg.max_turns);
+}
+
+test "applyMaxTurnsSettingsOverlay: CLI value wins over settings" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{ "franky", "--max-turns", "10" });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?u32, 10), cfg.max_turns);
+
+    var settings = try settings_mod.defaults(testing.allocator);
+    defer settings.deinit();
+    settings.max_turns = 200;
+
+    applyMaxTurnsSettingsOverlay(&cfg, &settings);
+    try testing.expectEqual(@as(?u32, 10), cfg.max_turns);
+}
+
+test "applyMaxTurnsSettingsOverlay: both null leaves cfg null" {
+    var cfg = try cli_mod.parse(testing.allocator, &.{"franky"});
+    defer cfg.deinit();
+
+    var settings = try settings_mod.defaults(testing.allocator);
+    defer settings.deinit();
+
+    applyMaxTurnsSettingsOverlay(&cfg, &settings);
+    try testing.expectEqual(@as(?u32, null), cfg.max_turns);
 }
 
 test "resolveTimeoutsFromMap: --first-byte-timeout-ms wins over env" {

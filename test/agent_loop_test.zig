@@ -360,3 +360,239 @@ test "runtime role gate: tool_call for role-disabled built-in emits role_denied"
     }
     try testing.expect(saw_role_denied);
 }
+
+// ─── max_turns: cap, extension hook, additive credits ─────────────
+
+/// Push N turns into faux, each ending with a tool_call so the loop
+/// has reason to keep going. The agentLoop should hit the cap when
+/// turn_count == max_turns.
+fn pushNTurnsWithToolCall(faux: *faux_mod.FauxProvider, n: u32) !void {
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        try faux.push(.{ .events = &.{
+            .{ .tool_call = .{
+                .id = "call_max_turns",
+                .name = "echo",
+                .args_json = "{\"x\":1}",
+            } },
+            .{ .done = .{ .stop_reason = .tool_use } },
+        } });
+    }
+}
+
+test "agent loop: max_turns cap emits max_turns_exceeded with no hook" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = std.testing.allocator;
+
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+    try pushNTurnsWithToolCall(&faux, 5); // far more turns scripted than cap
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel = ai.stream.Cancel{};
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var ch = try newAgentChannel(gpa);
+    defer ch.deinit();
+
+    const echo_tool = at.AgentTool{
+        .name = "echo",
+        .description = "echo",
+        .parameters_json = "{\"type\":\"object\"}",
+        .execute = echoTool,
+    };
+
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &[_]at.AgentTool{echo_tool},
+        .registry = &reg,
+        .cancel = &cancel,
+        .max_turns = 2,
+    }, &ch);
+
+    var turn_starts: u32 = 0;
+    var max_turns_errors: u32 = 0;
+    var max_turns_msg: ?[]const u8 = null;
+    while (ch.next(io)) |ev| {
+        switch (ev) {
+            .turn_start => turn_starts += 1,
+            .agent_error => |d| {
+                if (d.code == .max_turns_exceeded) {
+                    max_turns_errors += 1;
+                    max_turns_msg = d.message;
+                }
+            },
+            else => {},
+        }
+        ev.deinit(gpa);
+    }
+
+    try testing.expectEqual(@as(u32, 2), turn_starts);
+    try testing.expectEqual(@as(u32, 1), max_turns_errors);
+    // Message should mention the cap that was hit.
+    try testing.expect(max_turns_msg != null);
+}
+
+/// Hook userdata: counts calls; first call extends by 2, second
+/// call returns stop. Simulates the UX where the user says
+/// "yes once, then no" when prompted to extend.
+const ExtendThenStop = struct {
+    calls: u32 = 0,
+    grant: u32 = 2,
+
+    fn cb(userdata: ?*anyopaque, used: u32, cap: u32) loop.MaxTurnsDecision {
+        _ = used;
+        _ = cap;
+        const self: *ExtendThenStop = @ptrCast(@alignCast(userdata.?));
+        self.calls += 1;
+        if (self.calls == 1) return .{ .extend = self.grant };
+        return .stop;
+    }
+};
+
+test "agent loop: max_turns hook .extend(N) is additive across calls" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = std.testing.allocator;
+
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+    try pushNTurnsWithToolCall(&faux, 10);
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel = ai.stream.Cancel{};
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var ch = try newAgentChannel(gpa);
+    defer ch.deinit();
+
+    const echo_tool = at.AgentTool{
+        .name = "echo",
+        .description = "echo",
+        .parameters_json = "{\"type\":\"object\"}",
+        .execute = echoTool,
+    };
+
+    var hook_state = ExtendThenStop{};
+
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &[_]at.AgentTool{echo_tool},
+        .registry = &reg,
+        .cancel = &cancel,
+        .max_turns = 1,
+        .on_max_turns = ExtendThenStop.cb,
+        .on_max_turns_userdata = @ptrCast(&hook_state),
+    }, &ch);
+
+    var turn_starts: u32 = 0;
+    var max_turns_errors: u32 = 0;
+    while (ch.next(io)) |ev| {
+        switch (ev) {
+            .turn_start => turn_starts += 1,
+            .agent_error => |d| {
+                if (d.code == .max_turns_exceeded) max_turns_errors += 1;
+            },
+            else => {},
+        }
+        ev.deinit(gpa);
+    }
+
+    // 1 (initial cap) + 2 (extension) = 3 turns total.
+    try testing.expectEqual(@as(u32, 3), turn_starts);
+    // Hook was called twice: at cap=1 → extend, at cap=3 → stop.
+    try testing.expectEqual(@as(u32, 2), hook_state.calls);
+    try testing.expectEqual(@as(u32, 1), max_turns_errors);
+}
+
+test "agent loop: max_turns hook returning .stop emits max_turns_exceeded immediately" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = std.testing.allocator;
+
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+    try pushNTurnsWithToolCall(&faux, 5);
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel = ai.stream.Cancel{};
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var ch = try newAgentChannel(gpa);
+    defer ch.deinit();
+
+    const echo_tool = at.AgentTool{
+        .name = "echo",
+        .description = "echo",
+        .parameters_json = "{\"type\":\"object\"}",
+        .execute = echoTool,
+    };
+
+    const AlwaysStop = struct {
+        fn cb(userdata: ?*anyopaque, used: u32, cap: u32) loop.MaxTurnsDecision {
+            _ = userdata;
+            _ = used;
+            _ = cap;
+            return .stop;
+        }
+    };
+
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &[_]at.AgentTool{echo_tool},
+        .registry = &reg,
+        .cancel = &cancel,
+        .max_turns = 2,
+        .on_max_turns = AlwaysStop.cb,
+    }, &ch);
+
+    var turn_starts: u32 = 0;
+    var max_turns_errors: u32 = 0;
+    while (ch.next(io)) |ev| {
+        switch (ev) {
+            .turn_start => turn_starts += 1,
+            .agent_error => |d| {
+                if (d.code == .max_turns_exceeded) max_turns_errors += 1;
+            },
+            else => {},
+        }
+        ev.deinit(gpa);
+    }
+
+    try testing.expectEqual(@as(u32, 2), turn_starts);
+    try testing.expectEqual(@as(u32, 1), max_turns_errors);
+}

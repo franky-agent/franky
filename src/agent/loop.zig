@@ -159,6 +159,28 @@ pub const BetweenTurnsFn = *const fn (
     transcript: *Transcript,
 ) bool;
 
+/// Decision returned by `OnMaxTurnsFn` when the loop has reached
+/// its `max_turns` cap. `extend(N)` adds N more turns to the cap
+/// (additive — each call accumulates). `stop` declines to extend;
+/// the loop then emits `max_turns_exceeded` and closes.
+pub const MaxTurnsDecision = union(enum) {
+    stop,
+    extend: u32,
+};
+
+/// Hook fired exactly when the loop's turn counter has caught up
+/// to its current cap. Receives the number of turns consumed and
+/// the cap that was just hit; returns `.extend(N)` to continue or
+/// `.stop` to give up. Mode drivers wire this to whatever UX the
+/// surface allows — interactive prompts the user, RPC/proxy can
+/// surface a `tool_permission_request`-style event, print mode
+/// typically passes null and lets the loop terminate.
+pub const OnMaxTurnsFn = *const fn (
+    userdata: ?*anyopaque,
+    turns_used: u32,
+    current_cap: u32,
+) MaxTurnsDecision;
+
 /// v1.22.0 — per-hook userdata resolver. Returns the hook's
 /// override if set, otherwise the shared `hook_userdata`.
 fn beforeToolCallUserdata(c: *const Config) ?*anyopaque {
@@ -167,6 +189,10 @@ fn beforeToolCallUserdata(c: *const Config) ?*anyopaque {
 
 fn roleDeniedUserdata(c: *const Config) ?*anyopaque {
     return c.role_denied_userdata orelse c.hook_userdata;
+}
+
+fn onMaxTurnsUserdata(c: *const Config) ?*anyopaque {
+    return c.on_max_turns_userdata orelse c.hook_userdata;
 }
 
 pub const Config = struct {
@@ -210,7 +236,19 @@ pub const Config = struct {
     stop_requested_fn: ?*const fn (userdata: ?*anyopaque) bool = null,
     stream_options: ai.registry.StreamOptions = .{},
     /// Hard cap on turn count — guards against infinite loops.
-    max_turns: u32 = 100,
+    /// User-configurable via `--max-turns` (CLI), `Settings.max_turns`,
+    /// the `max_turns` profile field, or the `Agent.Config.max_turns`
+    /// SDK field. When the loop reaches this cap, `on_max_turns` is
+    /// called (if set); without a hook, or when the hook returns
+    /// `.stop`, the loop emits `max_turns_exceeded` and closes.
+    max_turns: u32 = 50,
+    /// Optional hook fired when `turn_count == max_turns`. Returns
+    /// either `.extend(N)` (additive — `max_turns += N`, loop continues)
+    /// or `.stop` (loop emits `max_turns_exceeded` and closes).
+    on_max_turns: ?OnMaxTurnsFn = null,
+    /// Optional per-hook userdata. Falls back to `hook_userdata` when
+    /// null — same pattern as `before_tool_call_userdata` etc.
+    on_max_turns_userdata: ?*anyopaque = null,
     /// v1.16.3 — when true, if the assistant ends a turn with text
     /// content that parses as a recognized tool-call shape (e.g.
     /// `{"name": "X", "parameters": {...}}` or `{"type": "function",
@@ -263,43 +301,75 @@ pub fn agentLoop(
     out: *AgentChannel,
 ) void {
     var turn_count: u32 = 0;
-    while (turn_count < config.max_turns) : (turn_count += 1) {
-        if (config.cancel.isFired()) {
-            pushAgentError(out, io, allocator, .aborted, "cancelled") catch {};
-            return;
-        }
-        // vN — check stop-requested BEFORE starting a new LLM call.
-        // This catches a stop that was requested during the
-        // between-turns hook, preventing an unnecessary LLM call.
-        if (config.stop_requested_fn) |check_stop| {
-            if (check_stop(config.hook_userdata)) {
-                emitInterrupted(out, io, allocator) catch {};
+    var current_cap: u32 = config.max_turns;
+    cap_loop: while (true) {
+        while (turn_count < current_cap) : (turn_count += 1) {
+            if (config.cancel.isFired()) {
+                pushAgentError(out, io, allocator, .aborted, "cancelled") catch {};
+                return;
+            }
+            // vN — check stop-requested BEFORE starting a new LLM call.
+            // This catches a stop that was requested during the
+            // between-turns hook, preventing an unnecessary LLM call.
+            if (config.stop_requested_fn) |check_stop| {
+                if (check_stop(config.hook_userdata)) {
+                    emitInterrupted(out, io, allocator) catch {};
+                    return;
+                }
+            }
+            const keep_going = runTurn(allocator, io, transcript, config, out) catch |err| {
+                pushAgentError(out, io, allocator, agentErrorCode(err), @errorName(err)) catch {};
+                return;
+            };
+            if (!keep_going) {
+                // Natural turn_end — check the between-turns hook
+                // (§4.3 followUp drain) before closing. When the
+                // hook returns `true`, the transcript has new
+                // user-role messages appended; run another turn.
+                if (config.between_turns) |hook| {
+                    if (hook(config.hook_userdata, transcript)) {
+                        // vN — after the between-turns hook appended
+                        // messages, check stop-requested BEFORE the
+                        // next LLM call (the `while` condition jumps
+                        // back to the top where the same check runs).
+                        continue;
+                    }
+                }
+                out.close(io);
                 return;
             }
         }
-        const keep_going = runTurn(allocator, io, transcript, config, out) catch |err| {
-            pushAgentError(out, io, allocator, agentErrorCode(err), @errorName(err)) catch {};
-            return;
-        };
-        if (!keep_going) {
-            // Natural turn_end — check the between-turns hook
-            // (§4.3 followUp drain) before closing. When the
-            // hook returns `true`, the transcript has new
-            // user-role messages appended; run another turn.
-            if (config.between_turns) |hook| {
-                if (hook(config.hook_userdata, transcript)) {
-                    // vN — after the between-turns hook appended
-                    // messages, check stop-requested BEFORE the
-                    // next LLM call (the `while` condition jumps
-                    // back to the top where the same check runs).
-                    continue;
-                }
+        // Cap exhausted. Try the on_max_turns hook for an additive
+        // extension. Without a hook, or when the hook returns
+        // `.stop`, fall through to emit `max_turns_exceeded`.
+        if (config.on_max_turns) |hook| {
+            const decision = hook(onMaxTurnsUserdata(&config), turn_count, current_cap);
+            switch (decision) {
+                .extend => |delta| {
+                    if (delta > 0) {
+                        ai.log.log(.info, "loop", "max_turns_extended", "from={d} delta={d} new_cap={d}", .{ current_cap, delta, current_cap + delta });
+                        current_cap += delta;
+                        continue :cap_loop;
+                    }
+                    // delta == 0 is treated as stop — extending by zero
+                    // would cause an infinite hook-call loop here.
+                },
+                .stop => {},
             }
-            out.close(io);
-            return;
         }
+        break :cap_loop;
     }
-    pushAgentError(out, io, allocator, .internal, "max turn count reached") catch {};
+    const msg = std.fmt.allocPrint(
+        allocator,
+        "max turns ({d}) reached",
+        .{current_cap},
+    ) catch {
+        // Out of memory: still emit the error event with a static fallback.
+        pushAgentError(out, io, allocator, .max_turns_exceeded, "max turns reached") catch {};
+        return;
+    };
+    defer allocator.free(msg);
+    pushAgentError(out, io, allocator, .max_turns_exceeded, msg) catch {};
 }
 
 /// Run one turn. Returns true if the caller should loop again, false to stop.
@@ -1168,6 +1238,7 @@ fn agentErrorCode(e: anyerror) ai.errors.Code {
         error.SafetyRefusal => .safety_refusal,
         error.EmptyResponse => .empty_response,
         error.Aborted => .aborted,
+        error.MaxTurnsExceeded => .max_turns_exceeded,
         error.ToolArgValidation => .tool_arg_validation,
         error.ToolRuntime => .tool_runtime,
         error.ToolBlocked => .tool_blocked,

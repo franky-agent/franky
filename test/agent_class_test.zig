@@ -517,3 +517,168 @@ test "Agent.tool_gate is independent of between_turns userdata" {
     // No tool calls in this conversation → spy should not have fired.
     try testing.expectEqual(@as(u32, 0), spy.invocations.load(.monotonic));
 }
+
+// ─── Agent.Config.max_turns + max_turns_hook ──────────────────────
+
+/// Simple echo tool — returns the args back as text. Used by max_turns
+/// tests to keep the loop going (every turn ends with a tool_call).
+fn echoForMaxTurns(
+    tool: *const at.AgentTool,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    call_id: []const u8,
+    args_json: []const u8,
+    cancel: *ai.stream.Cancel,
+    on_update: at.OnUpdate,
+) anyerror!at.ToolResult {
+    _ = tool;
+    _ = io;
+    _ = call_id;
+    _ = cancel;
+    _ = on_update;
+    const text = try std.fmt.allocPrint(allocator, "got: {s}", .{args_json});
+    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
+    arr[0] = .{ .text = .{ .text = text } };
+    return .{ .content = arr };
+}
+
+const MaxTurnsCounter = struct {
+    turn_starts: std.atomic.Value(u32) = .init(0),
+    max_turns_errors: std.atomic.Value(u32) = .init(0),
+
+    fn onEvent(ud: ?*anyopaque, ev: at.AgentEvent) void {
+        const self: *MaxTurnsCounter = @ptrCast(@alignCast(ud.?));
+        switch (ev) {
+            .turn_start => _ = self.turn_starts.fetchAdd(1, .monotonic),
+            .agent_error => |d| {
+                if (d.code == .max_turns_exceeded) {
+                    _ = self.max_turns_errors.fetchAdd(1, .monotonic);
+                }
+            },
+            else => {},
+        }
+    }
+};
+
+const ExtendOnceUserdata = struct {
+    calls: std.atomic.Value(u32) = .init(0),
+
+    fn cb(userdata: ?*anyopaque, used: u32, cap: u32) franky.agent.loop.MaxTurnsDecision {
+        _ = used;
+        _ = cap;
+        const self: *ExtendOnceUserdata = @ptrCast(@alignCast(userdata.?));
+        const n = self.calls.fetchAdd(1, .monotonic);
+        if (n == 0) return .{ .extend = 2 };
+        return .stop;
+    }
+};
+
+test "Agent.Config.max_turns is honored — emits max_turns_exceeded at the cap" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var faux = ai.providers.faux.FauxProvider.init(gpa);
+    defer faux.deinit();
+    // Push 5 turns, each ending in a tool_call so the loop wants to
+    // keep going; cap=2 should stop it after 2 turns.
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        try faux.push(.{ .events = &.{
+            .{ .tool_call = .{ .id = "c", .name = "echo", .args_json = "{}" } },
+            .{ .done = .{ .stop_reason = .tool_use } },
+        } });
+    }
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    const echo_tool = at.AgentTool{
+        .name = "echo",
+        .description = "echo",
+        .parameters_json = "{\"type\":\"object\"}",
+        .execute = echoForMaxTurns,
+    };
+
+    var agent = try agent_mod.Agent.init(gpa, io, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .registry = &reg,
+        .tools = &[_]at.AgentTool{echo_tool},
+        .max_turns = 2,
+    });
+    defer agent.deinit();
+
+    var counter: MaxTurnsCounter = .{};
+    _ = try agent.subscribe(MaxTurnsCounter.onEvent, @ptrCast(&counter));
+
+    try agent.prompt("go");
+    agent.waitForIdle();
+
+    try testing.expectEqual(@as(u32, 2), counter.turn_starts.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), counter.max_turns_errors.load(.monotonic));
+}
+
+test "Agent.Config.max_turns_hook .extend() is additive (credits accumulate)" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var faux = ai.providers.faux.FauxProvider.init(gpa);
+    defer faux.deinit();
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        try faux.push(.{ .events = &.{
+            .{ .tool_call = .{ .id = "c", .name = "echo", .args_json = "{}" } },
+            .{ .done = .{ .stop_reason = .tool_use } },
+        } });
+    }
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    const echo_tool = at.AgentTool{
+        .name = "echo",
+        .description = "echo",
+        .parameters_json = "{\"type\":\"object\"}",
+        .execute = echoForMaxTurns,
+    };
+
+    var hook_state: ExtendOnceUserdata = .{};
+
+    var agent = try agent_mod.Agent.init(gpa, io, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .registry = &reg,
+        .tools = &[_]at.AgentTool{echo_tool},
+        .max_turns = 1,
+        .max_turns_hook = .{
+            .userdata = @ptrCast(&hook_state),
+            .on_max_turns = ExtendOnceUserdata.cb,
+        },
+    });
+    defer agent.deinit();
+
+    var counter: MaxTurnsCounter = .{};
+    _ = try agent.subscribe(MaxTurnsCounter.onEvent, @ptrCast(&counter));
+
+    try agent.prompt("go");
+    agent.waitForIdle();
+
+    // 1 (initial cap) + 2 (extension) = 3 turns. Hook called twice.
+    try testing.expectEqual(@as(u32, 3), counter.turn_starts.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), hook_state.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), counter.max_turns_errors.load(.monotonic));
+}

@@ -165,6 +165,13 @@ pub const Config = struct {
     /// Default 60_000.
     event_gap_timeout_ms: ?u32 = null,
 
+    /// `--max-turns N` — hard cap on agent-loop turns per prompt.
+    /// Default 50. When the cap is reached, the loop emits
+    /// `agent_error{max_turns_exceeded}` (interactive mode prompts
+    /// the user to extend; other modes terminate). Env fallback:
+    /// `FRANKY_MAX_TURNS`. Settings/profile keys: `max_turns`.
+    max_turns: ?u32 = null,
+
     // ── Per-tool permission gate (Approach A — `permission.md`) ──
     /// `--prompts` — opt in to the per-tool permission gate. When
     /// off (default) the gate isn't installed, preserving v1.10.x
@@ -372,6 +379,9 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
         } else if (std.mem.eql(u8, name, "--event-gap-timeout-ms")) {
             const v = try take_value(argv, &i, inline_value);
             cfg.event_gap_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+        } else if (std.mem.eql(u8, name, "--max-turns")) {
+            const v = try take_value(argv, &i, inline_value);
+            cfg.max_turns = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
         } else if (std.mem.eql(u8, name, "--allow-tools")) {
             cfg.allow_tools_csv = try a.dupe(u8, try take_value(argv, &i, inline_value));
         } else if (std.mem.eql(u8, name, "--deny-tools")) {
@@ -483,6 +493,9 @@ pub const usage_text: []const u8 =
     \\  --first-byte-timeout-ms N    Max wait for first response byte (default 30000;
     \\                               raise for slow local LLMs e.g. Ollama on CPU)
     \\  --event-gap-timeout-ms N     Max gap between SSE events (default 60000)
+    \\  --max-turns N                Cap agent-loop turns per prompt (default 50).
+    \\                               Reaching the cap emits agent_error{max_turns_exceeded};
+    \\                               interactive mode prompts to extend.
     \\  --prompts                    Enable per-tool permission gate (Approach A)
     \\  --yes, -y                    Auto-allow every "ask" decision (CI mode)
     \\  --allow-tools LIST           CSV of tool names or bash:<fingerprint>
@@ -507,6 +520,7 @@ pub const usage_text: []const u8 =
     \\  FRANKY_UPLOAD_TIMEOUT_MS     Override --upload-timeout-ms
     \\  FRANKY_FIRST_BYTE_TIMEOUT_MS Override --first-byte-timeout-ms
     \\  FRANKY_EVENT_GAP_TIMEOUT_MS  Override --event-gap-timeout-ms
+    \\  FRANKY_MAX_TURNS             Override --max-turns
     \\
 ;
 

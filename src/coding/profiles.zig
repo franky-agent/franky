@@ -59,6 +59,10 @@ pub const Profile = struct {
     append_system_prompt: ?[]const u8 = null,
     text_tool_call_fallback: ?bool = null,
     http_trace_dir: ?[]const u8 = null,
+    /// Hard cap on agent-loop turn count. CLI `--max-turns` always
+    /// wins; this is the per-profile default for users who routinely
+    /// run a slow / verbose model and want a higher cap baked in.
+    max_turns: ?u32 = null,
     /// Process-env-var assignments. Applied via `environ_map.put`
     /// before any mode reads timeouts, log vars, or other knobs.
     /// Values support `${VAR}` interpolation against the **caller's
@@ -225,6 +229,7 @@ fn parseProfileObject(
     if (try optString(arena, environ_map, obj, "append_system_prompt")) |v| p.append_system_prompt = v;
     if (optBool(obj, "text_tool_call_fallback")) |v| p.text_tool_call_fallback = v;
     if (try optString(arena, environ_map, obj, "http_trace_dir")) |v| p.http_trace_dir = v;
+    if (optU32(obj, "max_turns")) |v| p.max_turns = v;
 
     if (obj.get("env")) |env_v| if (env_v == .object) {
         var env_map = std.StringHashMap([]const u8).init(arena);
@@ -256,6 +261,14 @@ fn optBool(obj: std.json.ObjectMap, key: []const u8) ?bool {
     const v = lookupField(obj, key) orelse return null;
     if (v != .bool) return null;
     return v.bool;
+}
+
+fn optU32(obj: std.json.ObjectMap, key: []const u8) ?u32 {
+    const v = lookupField(obj, key) orelse return null;
+    if (v != .integer) return null;
+    if (v.integer < 0) return null;
+    if (v.integer > std.math.maxInt(u32)) return null;
+    return @intCast(v.integer);
 }
 
 /// v1.17.1 — accept both `snake_case` and `kebab-case` keys
@@ -410,6 +423,11 @@ pub fn applyToCfg(
     };
     if (!cfg.text_tool_call_fallback) if (profile.text_tool_call_fallback) |v| {
         cfg.text_tool_call_fallback = v;
+    };
+
+    // u32 fields: only apply if cfg's field is still null (CLI didn't set it).
+    if (cfg.max_turns == null) if (profile.max_turns) |v| {
+        cfg.max_turns = v;
     };
 
     // Thinking: only apply if user didn't pass --thinking on CLI.
@@ -976,6 +994,35 @@ test "applyProfile: full cloudflare-style profile from settings.json" {
     try testing.expectEqualStrings("trace", cfg.log_level.?);
     try testing.expectEqual(ait.ThinkingLevel.high, cfg.thinking);
     try testing.expectEqualStrings("1200000", env.get("FRANKY_FIRST_BYTE_TIMEOUT_MS").?);
+}
+
+test "applyToCfg: max_turns flows from profile when CLI didn't set it" {
+    const gpa = testing.allocator;
+    var cfg = try cli.parse(gpa, &.{"franky"});
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?u32, null), cfg.max_turns);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+
+    const profile = Profile{ .max_turns = 75 };
+    try applyToCfg(&cfg, profile, &env);
+
+    try testing.expectEqual(@as(?u32, 75), cfg.max_turns);
+}
+
+test "applyToCfg: CLI max_turns wins over profile" {
+    const gpa = testing.allocator;
+    var cfg = try cli.parse(gpa, &.{ "franky", "--max-turns", "10" });
+    defer cfg.deinit();
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+
+    const profile = Profile{ .max_turns = 200 };
+    try applyToCfg(&cfg, profile, &env);
+
+    try testing.expectEqual(@as(?u32, 10), cfg.max_turns);
 }
 
 test "applyProfile: CLI flags win over profile values" {

@@ -1068,26 +1068,30 @@ fn runOneTurn(
         .allocator = allocator,
         .io = io,
         .transcript = &session.transcript,
-        .config = .{
-            .model = session.modelType(),
-            .system_prompt = session.system_prompt,
-            .tools = session.tools,
-            .registry = &session.registry,
-            .cancel = &cancel,
-            .hook_userdata = @ptrCast(&stop_requested),
-            .role_denied = permissions_mod.SessionGates.roleDenied,
-            .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
-            .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
-            .stop_requested_fn = interactiveStopRequestedFn,
-            .stream_options = .{
-                .api_key = session.provider.api_key,
-                .auth_token = session.provider.auth_token,
-                .base_url = session.provider.base_url,
-                .environ_map = session.environ_map,
-                .thinking = session.cfg.thinking,
-                .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
-                .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
-            },
+        .config = blk: {
+            var lc: agent.loop.Config = .{
+                .model = session.modelType(),
+                .system_prompt = session.system_prompt,
+                .tools = session.tools,
+                .registry = &session.registry,
+                .cancel = &cancel,
+                .hook_userdata = @ptrCast(&stop_requested),
+                .role_denied = permissions_mod.SessionGates.roleDenied,
+                .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
+                .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
+                .stop_requested_fn = interactiveStopRequestedFn,
+                .stream_options = .{
+                    .api_key = session.provider.api_key,
+                    .auth_token = session.provider.auth_token,
+                    .base_url = session.provider.base_url,
+                    .environ_map = session.environ_map,
+                    .thinking = session.cfg.thinking,
+                    .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
+                    .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
+                },
+            };
+            if (print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map)) |v| lc.max_turns = v;
+            break :blk lc;
         },
         .ch = &ch,
     };
@@ -1163,6 +1167,21 @@ fn runOneTurn(
                             .fg = .{ .basic = .red },
                             .bold = true,
                         });
+                        // vN — `max_turns_exceeded` is the one error
+                        // class the user can actually fix mid-session
+                        // by raising the cap. Append a hint line so
+                        // they don't have to dig through --help. The
+                        // mid-session "extend now?" prompt is a v3
+                        // follow-up; for now we surface the knobs.
+                        if (d.code == .max_turns_exceeded) {
+                            const hint = try allocator.dupe(
+                                u8,
+                                "  hint: raise the cap with --max-turns N, FRANKY_MAX_TURNS, or `max_turns` in settings.json / profile",
+                            );
+                            try scrollback.appendStyledLine(hint, .{
+                                .fg = .{ .basic = .yellow },
+                            });
+                        }
                     },
                     .agent_interrupted => {
                         // vN — graceful stop: the current turn finished
@@ -1721,6 +1740,7 @@ const SessionBinding = struct {
             defer settings.deinit();
             try print_mode.applyPermissionsSettingsOverlay(&binding.permission_store, &settings);
             binding.prompts_enabled = print_mode.resolvePromptsDefault(cfg, &settings);
+            print_mode.applyMaxTurnsSettingsOverlay(cfg, &settings);
         }
         if (cfg.yes) binding.permission_store.yes_to_all = true;
         if (cfg.allow_tools_csv) |s| try binding.permission_store.addAllowList(s);

@@ -1,6 +1,6 @@
 //! `zig build check-spec-anchors` — verify every §-anchor referenced
-//! from source code resolves to a heading in `docs/spec/v1.md` or
-//! `docs/spec/v2.md`.
+//! from source code resolves to a heading in `docs/spec/v1.md`,
+//! `docs/spec/v2.md`, or `docs/spec/v3.md`.
 //!
 //! Source code carries inline references like `(§3.3)`, `§A.2`, `§Q.5`
 //! that point at sections of the v1 spec or the v2 backlog. When a
@@ -30,6 +30,7 @@ const std = @import("std");
 
 const v1_path = "docs/spec/v1.md";
 const v2_path = "docs/spec/v2.md";
+const v3_path = "docs/spec/v3.md";
 const source_roots = [_][]const u8{ "src", "test" };
 
 pub fn main(init: std.process.Init) !void {
@@ -39,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
     var anchors: std.StringHashMap(void) = .init(gpa);
     defer freeStringSet(gpa, &anchors);
 
-    inline for (.{ v1_path, v2_path }) |path| {
+    inline for (.{ v1_path, v2_path, v3_path }) |path| {
         collectAnchors(gpa, io, path, &anchors) catch |err| {
             try writeErrFmt(io, "check-spec-anchors: failed to read {s}: {s}\n", .{ path, @errorName(err) });
             std.process.exit(2);
@@ -69,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
     if (missing.items.len == 0) {
         try writeOutFmt(
             io,
-            "spec-anchor check: ok ({d} source refs against {d} anchors in v1.md + v2.md)\n",
+            "spec-anchor check: ok ({d} source refs against {d} anchors in v1.md + v2.md + v3.md)\n",
             .{ refs.count(), anchors.count() },
         );
         return;
@@ -77,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.mem.sort([]const u8, missing.items, {}, lessString);
 
-    try writeErr(io, "spec-anchor check: FAILED — source code references the following §-anchors that do not exist in v1.md or v2.md:\n");
+    try writeErr(io, "spec-anchor check: FAILED — source code references the following §-anchors that do not exist in v1.md, v2.md, or v3.md:\n");
     for (missing.items) |m| {
         try writeErrFmt(io, "  §{s}\n", .{m});
     }

@@ -81,6 +81,11 @@ pub const Settings = struct {
     /// permission overlay (§5.11). CLI `--prompts` still wins.
     prompts_default: ?bool = null,
 
+    /// `max_turns: int` — settings-layer cap on agent-loop turn count
+    /// per prompt. Precedence: CLI `--max-turns` > env `FRANKY_MAX_TURNS`
+    /// > profile `max_turns` > settings `max_turns` > built-in default 50.
+    max_turns: ?u32 = null,
+
     pub fn deinit(self: *Settings) void {
         self.allocator.free(self.default_provider);
         self.allocator.free(self.default_model_anthropic);
@@ -268,6 +273,10 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
 
     if (obj.get("prompts")) |v| if (v == .bool) {
         settings.prompts_default = v.bool;
+    };
+
+    if (obj.get("max_turns")) |v| if (v == .integer and v.integer >= 1 and v.integer <= std.math.maxInt(u32)) {
+        settings.max_turns = @intCast(v.integer);
     };
 }
 

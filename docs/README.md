@@ -8,7 +8,8 @@ The whole map.
 |---|---|
 | [`spec/v1.md`](spec/v1.md) | **Current shipped behavior — start here.** Architecture (§1-§14), implementation reference (§A-§R), per-version row table (v1.0.0 → current). Most rows ✅; rows for features that shipped earlier in v1.x and were later removed carry `❌ removed in vX.Y.Z`. Source code cross-references sections via `§` markers. |
 | [`spec/v0.md`](spec/v0.md) | Frozen v0.* development history. Read for "when and how did feature X land in v0.*?" — append-only from here. |
-| [`spec/v2.md`](spec/v2.md) | Open backlog: deferred follow-ups, sibling projects, post-1.0 ideas. New roadmap work goes here. v1 row notes link in as "see spec/v2.md §X" wherever a deferred item is named. |
+| [`spec/v2.md`](spec/v2.md) | Open backlog of v1.x deferred follow-ups: sibling projects, toolchain-blocked items, post-1.0 ideas not large enough to warrant their own spec. v1 row notes link in as "see spec/v2.md §X" wherever a deferred item is named. |
+| [`spec/v3.md`](spec/v3.md) | Open spec for next-major work. Items here imply user-visible UX surface or extend a v1 primitive substantially enough to need spec-level design before implementation. |
 
 ## design/ — design proposals
 
