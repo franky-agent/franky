@@ -1,0 +1,5 @@
+{"kind":"start"}
+{"kind":"thinking_delta","block_index":0,"delta":"thinking aloud","is_signature":false,"redacted":false}
+{"kind":"thinking_delta","block_index":0,"delta":" more thinking","is_signature":false,"redacted":false}
+{"kind":"diagnostic","finish_reason_raw":"STOP","parts_seen":2}
+{"kind":"done","stop_reason":"stop"}

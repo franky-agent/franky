@@ -1,0 +1,3 @@
+{"kind":"start"}
+{"kind":"diagnostic","parts_seen":0}
+{"kind":"error_ev","code":"empty_response","message":"openai-chat returned stop_reason=stop but emitted no content (parts_seen=0, candidates_tokens=null, thoughts_tokens=null). Likely model regression — re-run with adjusted thinking budget or a format-reminder nudge."}

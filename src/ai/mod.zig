@@ -16,6 +16,7 @@ pub const retry = @import("retry.zig");
 pub const error_map = @import("error_map.zig");
 pub const log = @import("log.zig");
 pub const transform = @import("transform.zig");
+pub const utils = @import("utils.zig");
 pub const providers = struct {
     pub const faux = @import("providers/faux.zig");
     pub const anthropic = @import("providers/anthropic.zig");
@@ -38,6 +39,7 @@ test {
     _ = error_map;
     _ = log;
     _ = transform;
+    _ = utils;
     _ = providers.faux;
     _ = providers.anthropic;
     // Direct import avoids forcing the `providers` aggregator to

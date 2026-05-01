@@ -1,0 +1,7 @@
+{"kind":"start"}
+{"kind":"toolcall_start","block_index":0,"id":"gcall-0","name":"ls"}
+{"kind":"toolcall_delta","block_index":0,"args_delta":"{}"}
+{"kind":"toolcall_end","block_index":0,"args_json":"{}"}
+{"kind":"text_delta","block_index":0,"delta":""}
+{"kind":"diagnostic","finish_reason_raw":"STOP","parts_seen":2}
+{"kind":"done","stop_reason":"stop"}

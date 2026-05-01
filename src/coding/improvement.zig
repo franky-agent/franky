@@ -1047,7 +1047,15 @@ fn renderOneFinding(
         for (f.reference_paths) |path| {
             try appendFmt(buf, allocator, "- {s}\n", .{path});
         }
-        try buf.appendSlice(allocator, "\n");
+        try buf.appendSlice(allocator,
+            \\
+            \\Each diagnostic report above lists the per-turn `trace:` path and
+            \\a `→ fixture:` promotion line. Run `franky fixture <trace>` to
+            \\lock a representative failure as a regression test under
+            \\`test/fixtures/<provider>/<scenario>/`.
+            \\
+            \\
+        );
     }
 
     // Machine-readable evidence block — agents extracting a single

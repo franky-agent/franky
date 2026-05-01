@@ -643,7 +643,11 @@ fn renderTurn(
         try buf.appendSlice(allocator, line);
     }
 
-    // trace_id → trace path hint
+    // trace_id → trace path hint, plus a fixture-promotion shortcut
+    // when both http_trace_dir and the turn carry an anomaly worth
+    // pinning. The promotion line shows up exactly when the bug
+    // signal IS the trace — diagnostic flags without a stored trace
+    // can't be replayed.
     if (t.diagnostics) |d| if (d.trace_id) |tid| {
         if (opts.http_trace_dir) |dir| {
             const line = try std.fmt.allocPrint(
@@ -653,6 +657,16 @@ fn renderTurn(
             );
             defer allocator.free(line);
             try buf.appendSlice(allocator, line);
+
+            if (t.anomalies.items.len > 0) {
+                const fixture_line = try std.fmt.allocPrint(
+                    allocator,
+                    "      → fixture:  franky fixture {s}/{s}-<provider>.txt --name <descriptive>\n",
+                    .{ dir, tid },
+                );
+                defer allocator.free(fixture_line);
+                try buf.appendSlice(allocator, fixture_line);
+            }
         } else {
             const line = try std.fmt.allocPrint(
                 allocator,

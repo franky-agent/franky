@@ -1,0 +1,18 @@
+=== franky http trace ===
+ts_ms: 1700000000000
+seq: 1
+provider: google-gemini
+url: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse
+method: POST
+status: 200
+request_body_bytes: 0
+response_body_bytes: 0
+
+--- request body ---
+
+
+--- response body ---
+data: {"candidates":[{"content":{"parts":[{"text":"thinking aloud","thoughtSignature":"sigA"}]}}]}
+
+data: {"candidates":[{"content":{"parts":[{"text":" more thinking","thoughtSignature":"sigB"}]},"finishReason":"STOP"}]}
+
