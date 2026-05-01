@@ -164,6 +164,22 @@ pub fn applyEdits(
     };
     file.close(io);
 
+    // Empty-file short-circuit. Real-incident pattern (gemini-2.5-pro,
+    // 100-turn proxy session): the model creates a placeholder file
+    // via `write` with empty content, then immediately tries `edit` to
+    // populate it. `indexOf(empty_buf, non_empty_old)` is always null,
+    // and `indexOf(empty_buf, "")` matches at *every* position so the
+    // existing edit_ambiguous check rejects empty `old` too. Either
+    // way the model can't recover by retrying — there ARE no bytes to
+    // match. Steer to `write` directly.
+    if (original.len == 0) {
+        return common.toolError(
+            allocator,
+            "edit_file_empty",
+            "file is empty; use the `write` tool with `overwrite: true` to create initial content",
+        );
+    }
+
     // Apply edits into a growing buffer.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -435,6 +451,25 @@ test "edit replaceAll replaces every occurrence" {
     const got = try readAllAlloc(gpa, io, path);
     defer gpa.free(got);
     try testing.expectEqualStrings("X b X b X\n", got);
+}
+
+test "edit returns edit_file_empty when target file is 0 bytes" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const path = "/tmp/franky_edit_empty_file.txt";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeTempFile(io, path, "");
+    const edits = [_]EditOp{.{ .old = "anything", .new = "x", .replace_all = false }};
+    var res = try applyEdits(gpa, io, path, &edits);
+    defer res.deinit(gpa);
+    try testing.expect(res.is_error);
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "edit_file_empty") != null);
+    // The hint should NOT route through the edit_no_match retry-loop framing.
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "edit_no_match") == null);
 }
 
 test "edit errors when `old` not found" {

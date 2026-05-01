@@ -161,6 +161,9 @@ pub fn hintForToolError(code: ?[]const u8, message: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, c, "edit_no_match")) {
         return "Edit `old` not found. DO NOT widen `old` with more context — that won't help if the original guess is wrong. Re-read the file with the `read` tool to get the actual bytes, then copy-paste the exact text into `old`.";
     }
+    if (std.mem.eql(u8, c, "edit_file_empty")) {
+        return "Target file is empty (0 bytes). The `edit` tool replaces existing content; for an empty file use the `write` tool with `overwrite: true` to create initial content in one call.";
+    }
     if (std.mem.eql(u8, c, "edit_ambiguous")) {
         return "Edit `old` matched multiple times. Widen `old` with more surrounding context (e.g. include the line above and below) until it uniquely identifies the target. If a function-/declaration-level match is still ambiguous, split into two edits.";
     }
