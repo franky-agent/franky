@@ -1,28 +1,17 @@
 {"kind":"start"}
-{"kind":"text_delta","block_index":0,"delta":""}
 {"kind":"thinking_delta","block_index":0,"delta":"Let","is_signature":false,"redacted":false}
-{"kind":"text_delta","block_index":0,"delta":""}
 {"kind":"thinking_delta","block_index":0,"delta":" me start","is_signature":false,"redacted":false}
-{"kind":"text_delta","block_index":0,"delta":""}
 {"kind":"thinking_delta","block_index":0,"delta":" by understanding","is_signature":false,"redacted":false}
-{"kind":"text_delta","block_index":0,"delta":""}
 {"kind":"thinking_delta","block_index":0,"delta":" the code","is_signature":false,"redacted":false}
-{"kind":"text_delta","block_index":0,"delta":""}
 {"kind":"thinking_delta","block_index":0,"delta":"base structure","is_signature":false,"redacted":false}
-{"kind":"text_delta","block_index":0,"delta":""}
 {"kind":"thinking_delta","block_index":0,"delta":" and how","is_signature":false,"redacted":false}
-{"kind":"text_delta","block_index":0,"delta":""}
 {"kind":"thinking_delta","block_index":0,"delta":" logging is","is_signature":false,"redacted":false}
-{"kind":"text_delta","block_index":0,"delta":""}
 {"kind":"thinking_delta","block_index":0,"delta":" currently implemented","is_signature":false,"redacted":false}
-{"kind":"text_delta","block_index":0,"delta":""}
 {"kind":"thinking_delta","block_index":0,"delta":".","is_signature":false,"redacted":false}
-{"kind":"text_delta","block_index":0,"delta":""}
 {"kind":"toolcall_start","block_index":0,"id":"call_n53awuyf","name":"ls"}
 {"kind":"toolcall_delta","block_index":0,"args_delta":"{\"path\":\".\",\"recursive\":true,\"maxDepth\":3}"}
 {"kind":"toolcall_start","block_index":1,"id":"call_x7xu3ctu","name":"find"}
 {"kind":"toolcall_delta","block_index":1,"args_delta":"{\"pattern\":\"**/*.rs\",\"limit\":100}"}
-{"kind":"text_delta","block_index":0,"delta":""}
 {"kind":"usage","input":2092,"output":141,"cache_read":0,"cache_write":0}
 {"kind":"toolcall_end","block_index":0,"args_json":""}
 {"kind":"toolcall_end","block_index":1,"args_json":""}

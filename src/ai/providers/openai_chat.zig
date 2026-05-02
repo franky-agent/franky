@@ -429,9 +429,14 @@ const Driver = struct {
     }
 
     fn handleDelta(self: *Driver, delta: std.json.ObjectMap) !void {
-        // Content fragment.
-        if (delta.get("content")) |cv| if (cv == .string) {
-            if (cv.string.len > 0) self.text_seen = true;
+        // Content fragment — skip empty strings. DeepSeek (and some other
+        // reasoning models) emit `"content":""` on every thinking chunk
+        // alongside the `reasoning` field. Forwarding those as empty
+        // text_delta events produces spurious `message_update` SSE frames
+        // that flip the UI activity indicator to "responding…" during the
+        // thinking phase and waste bandwidth on multi-MB reasoning responses.
+        if (delta.get("content")) |cv| if (cv == .string and cv.string.len > 0) {
+            self.text_seen = true;
             try self.out.push(self.io, .{ .text_delta = .{
                 .block_index = 0,
                 .delta = try self.allocator.dupe(u8, cv.string),
@@ -838,6 +843,57 @@ test "runFromSse: bare `reasoning` field is also accepted" {
         else => ev.deinit(gpa),
     };
     try testing.expectEqual(@as(usize, 3), thinking_bytes); // "hmm"
+}
+
+test "runFromSse: DeepSeek reasoning chunks with empty content do not emit text_delta" {
+    // DeepSeek (and some other reasoning models) send `"content":""` on every
+    // thinking chunk alongside `"reasoning":"..."`. Only the final non-empty
+    // content chunk should produce a text_delta; the empty-content chunks must
+    // not.
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ch = try Channel.init(gpa, 32);
+    defer ch.deinit();
+    var cancel: stream_mod.Cancel = .{};
+
+    const sse =
+        // Thinking chunk 1 — content is empty, reasoning has text.
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning\":\"step one\"},\"finish_reason\":null}]}\n\n" ++
+        // Thinking chunk 2 — same pattern.
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning\":\" step two\"},\"finish_reason\":null}]}\n\n" ++
+        // Content chunk — now content is non-empty, reasoning absent.
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: [DONE]\n\n";
+
+    try runFromSse(gpa, io, sse, &ch, &cancel);
+
+    var text_count: usize = 0;
+    var text_bytes: usize = 0;
+    var thinking_bytes: usize = 0;
+    var done_reason: ?types.StopReason = null;
+    while (ch.next(io)) |ev| switch (ev) {
+        .text_delta => |d| {
+            text_count += 1;
+            text_bytes += d.delta.len;
+            gpa.free(d.delta);
+        },
+        .thinking_delta => |d| {
+            thinking_bytes += d.delta.len;
+            gpa.free(d.delta);
+        },
+        .done => |d| done_reason = d.stop_reason,
+        else => ev.deinit(gpa),
+    };
+    // Only the single non-empty content chunk should produce a text_delta.
+    try testing.expectEqual(@as(usize, 1), text_count);
+    try testing.expectEqual(@as(usize, 6), text_bytes); // "answer"
+    // Both reasoning chunks combined: "step one" + " step two" = 17 bytes.
+    try testing.expectEqual(@as(usize, 17), thinking_bytes);
+    try testing.expectEqual(@as(?types.StopReason, .stop), done_reason);
 }
 
 test "runFromSse: tool-call argument streaming" {
