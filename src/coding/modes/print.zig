@@ -370,34 +370,45 @@ fn runPrint(
         .permissions = if (prompts_enabled) &permission_store else null,
     };
 
+    // v2.5 — preset registry. Populated once at session-init.
+    // SDK consumers can extend before this point by passing a
+    // callback; v2.5 ships built-ins only.
+    var preset_registry = tools_mod.subagent.PresetRegistry.init(allocator);
+    defer preset_registry.deinit();
+    try tools_mod.subagent.registerBuiltinPresets(&preset_registry);
+
+    const subagent_params_json = try tools_mod.subagent.buildParametersJson(
+        allocator, &preset_registry);
+    defer allocator.free(subagent_params_json);
+
     // v1.24.0 — subagent tool. Always available (not subject to
     // role gating itself; the role demotion applies to the
     // SUB-agent's tool set, not whether the parent can spawn one).
-    // `filtered_tools` is the parent tool list the sub-agent
-    // inherits from (minus `subagent` itself, enforced inside the
-    // tool's execute path).
     //
     // v1.28.0 — `parent_session_dir` is populated AFTER
     // `session_state.init` runs (a few sections below), so the
     // sub-agent's transcript is persisted to
     // `<session>/subagents/<call_id>/transcript.json` and the
-    // result includes the path. Closes the v1.24.0 deferred
-    // "wire session_dir through" follow-up. Held as `var` so the
-    // late-bound assignment is allowed.
+    // result includes the path. Held as `var` so the late-bound
+    // assignment is allowed.
     var subagent_ctx = tools_mod.subagent.Ctx{
         .registry = &reg,
         .environ = environ,
         .environ_map = environ_map,
         .parent_tools = filtered_tools,
         .parent_role = active_role,
+        .parent_profile = cfg.profile orelse "",
+        .presets = &preset_registry,
+        .parameters_json_owned = subagent_params_json,
         .permission_store = if (prompts_enabled) &permission_store else null,
         .permission_prompter_slot = null, // print mode has no interactive prompter; sub-agents un-gate
         .parent_session_dir = null,
     };
     const final_tools = blk: {
-        const slice = try allocator.alloc(at.AgentTool, filtered_tools.len + 1);
+        const slice = try allocator.alloc(at.AgentTool, filtered_tools.len + 2);
         @memcpy(slice[0..filtered_tools.len], filtered_tools);
         slice[filtered_tools.len] = tools_mod.subagent.toolWithCtx(&subagent_ctx);
+        slice[filtered_tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(&preset_registry);
         break :blk slice;
     };
     defer allocator.free(final_tools);

@@ -80,41 +80,266 @@ var concurrency_mutex: std.Io.Mutex = .init;
 var concurrency_active: u32 = 0;
 var concurrency_cond: std.Io.Condition = .init;
 
-pub const parameters_json: []const u8 =
-    \\{
-    \\  "type": "object",
-    \\  "required": ["profile", "prompt"],
-    \\  "properties": {
-    \\    "profile": {
-    \\      "type": "string",
-    \\      "description": "Name of a profile defined in settings.json or a built-in (gemini, groq, ollama, …). Resolves provider + model + auth."
-    \\    },
-    \\    "prompt": {
-    \\      "type": "string",
-    \\      "description": "The instruction the sub-agent will run. Self-contained — sub-agent has no access to parent's transcript."
-    \\    },
-    \\    "timeout_ms": {
-    \\      "type": "integer",
-    \\      "minimum": 1000,
-    \\      "maximum": 7200000,
-    \\      "description": "Wall-clock timeout (default 1800000 = 30 min, max 7200000 = 2 h)."
-    \\    },
-    \\    "max_turns": {
-    \\      "type": "integer",
-    \\      "minimum": 1,
-    \\      "description": "Hard cap on agent-loop turns (default 20)."
-    \\    },
-    \\    "role": {
-    \\      "type": "string",
-    \\      "enum": ["read", "plan", "code", "full"],
-    \\      "description": "Capability role (defaults to parent's; demotion only — never higher than parent)."
-    \\    },
-    \\    "system_prompt": {
-    \\      "type": "string",
-    \\      "description": "Optional override for the sub-agent's system prompt."
-    \\    }
-    \\  }
-    \\}
+// ─── preset types ──────────────────────────────────────────────────
+
+pub const SafetyClaims = struct {
+    /// Truncate sub-agent final_text to this many bytes (applied on
+    /// top of the global `final_text_max_bytes` cap — whichever is
+    /// lower wins). Uses the existing truncate primitives.
+    max_result_bytes: ?u32 = null,
+    /// Advisory — declared for future discovery surface / audit.
+    read_only: bool = false,
+    requires_sandbox: bool = false,
+    max_calls_per_minute: ?u32 = null,
+};
+
+pub const Preset = struct {
+    name: []const u8,
+    /// One-line purpose (≤100 chars). Returned by list_subagent_presets.
+    description: []const u8,
+    /// Default profile name. Empty string means "inherit parent profile".
+    default_profile: []const u8,
+    default_role: role_mod.Role,
+    default_system_prompt: []const u8,
+    /// Returns the sub-agent's tool list, selected from `parent_tools`
+    /// (already wired by the mode driver — ReadCtx, BashCtx, etc.).
+    /// Must NOT include the `subagent` tool (depth-1).
+    build_tools: *const fn (
+        allocator: std.mem.Allocator,
+        parent_tools: []const at.AgentTool,
+    ) anyerror![]at.AgentTool,
+    safety: SafetyClaims = .{},
+};
+
+pub const PresetRegistry = struct {
+    allocator: std.mem.Allocator,
+    presets: std.StringArrayHashMapUnmanaged(Preset) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) PresetRegistry {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *PresetRegistry) void {
+        self.presets.deinit(self.allocator);
+    }
+
+    pub fn register(self: *PresetRegistry, p: Preset) !void {
+        const gop = try self.presets.getOrPut(self.allocator, p.name);
+        if (gop.found_existing) {
+            ai.log.log(.warn, "subagent", "preset-registry", "preset '{s}' overrides existing entry", .{p.name});
+        }
+        gop.value_ptr.* = p;
+    }
+
+    pub fn get(self: *const PresetRegistry, name: []const u8) ?Preset {
+        return self.presets.get(name);
+    }
+};
+
+// ─── preset builders ───────────────────────────────────────────────
+
+fn selectTools(
+    allocator: std.mem.Allocator,
+    parent_tools: []const at.AgentTool,
+    names: []const []const u8,
+) ![]at.AgentTool {
+    var out = try allocator.alloc(at.AgentTool, names.len);
+    var n: usize = 0;
+    for (names) |want| {
+        for (parent_tools) |t| {
+            if (std.mem.eql(u8, t.name, want)) {
+                out[n] = t;
+                n += 1;
+                break;
+            }
+        }
+    }
+    return allocator.realloc(out, n);
+}
+
+const research_tool_names = [_][]const u8{ "read", "ls", "find", "grep" };
+const file_ops_tool_names = [_][]const u8{ "read", "write", "edit", "ls" };
+const bash_runner_tool_names = [_][]const u8{ "bash", "ls" };
+
+fn buildResearchTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
+    return selectTools(alloc, parent, &research_tool_names);
+}
+
+fn buildCodeAuditTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
+    return selectTools(alloc, parent, &research_tool_names);
+}
+
+fn buildFileOpsTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
+    return selectTools(alloc, parent, &file_ops_tool_names);
+}
+
+fn buildBashRunnerTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
+    return selectTools(alloc, parent, &bash_runner_tool_names);
+}
+
+pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
+    try reg.register(.{
+        .name = "research",
+        .description = "Reads files, greps for patterns, summarises findings within the workspace.",
+        .default_profile = "gemini",
+        .default_role = .read,
+        .default_system_prompt =
+        \\You are a research sub-agent. Your job is to read, search, and summarise.
+        \\You have read, ls, find, and grep. Do NOT write or modify files.
+        \\When finished, write your final answer as a clear, self-contained summary.
+        ,
+        .build_tools = buildResearchTools,
+        .safety = .{ .read_only = true },
+    });
+    try reg.register(.{
+        .name = "code-audit",
+        .description = "Audits a stated quality or security concern read-only across the workspace.",
+        .default_profile = "gemini",
+        .default_role = .read,
+        .default_system_prompt =
+        \\You are a code-audit sub-agent. Focus on the single concern stated in the prompt.
+        \\You have read, ls, find, and grep. Do NOT write or modify files.
+        \\Report findings as a structured list with file paths and line references.
+        ,
+        .build_tools = buildCodeAuditTools,
+        .safety = .{ .read_only = true },
+    });
+    try reg.register(.{
+        .name = "file-ops",
+        .description = "Performs targeted file edits given clear instructions.",
+        .default_profile = "",
+        .default_role = .plan,
+        .default_system_prompt =
+        \\You are a file-ops sub-agent. Apply the edits described in the prompt exactly.
+        \\You have read, write, edit, and ls. Prefer edit over write for existing files.
+        \\When finished, confirm what you changed.
+        ,
+        .build_tools = buildFileOpsTools,
+    });
+    try reg.register(.{
+        .name = "bash-runner",
+        .description = "Runs a bounded shell task and reports stdout, stderr, and exit code.",
+        .default_profile = "",
+        .default_role = .code,
+        .default_system_prompt =
+        \\You are a bash-runner sub-agent. Execute the shell task described in the prompt.
+        \\You have bash and ls. Keep commands focused and report results clearly.
+        ,
+        .build_tools = buildBashRunnerTools,
+    });
+}
+
+// ─── dynamic parameters_json ───────────────────────────────────────
+
+/// Build the `parameters_json` string for the `subagent` tool from
+/// the registered preset names. Called once at session-init; the
+/// result is stored on `Ctx` and freed by the mode driver.
+pub fn buildParametersJson(
+    allocator: std.mem.Allocator,
+    registry: *const PresetRegistry,
+) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator,
+        \\{"type":"object","required":["preset","prompt"],"properties":{
+        \\"preset":{"type":"string","enum":[
+    );
+    var it = registry.presets.iterator();
+    var first = true;
+    while (it.next()) |entry| {
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.append(allocator, '"');
+        try buf.appendSlice(allocator, entry.key_ptr.*);
+        try buf.append(allocator, '"');
+    }
+    try buf.appendSlice(allocator,
+        \\],"description":"Sub-agent preset. Call list_subagent_presets to see descriptions."},
+        \\"profile":{"type":"string","description":"Optional profile override (model + provider). Defaults to the preset's default_profile."},
+        \\"prompt":{"type":"string","description":"The instruction the sub-agent will run. Self-contained — sub-agent has no access to parent's transcript."},
+        \\"timeout_ms":{"type":"integer","minimum":1000,"maximum":7200000,"description":"Wall-clock timeout (default 1800000 = 30 min, max 7200000 = 2 h)."},
+        \\"max_turns":{"type":"integer","minimum":1,"description":"Hard cap on agent-loop turns (default 20)."},
+        \\"role":{"type":"string","enum":["read","plan","code","full"],"description":"Capability role override (defaults to preset's default_role; demotion only)."},
+        \\"system_prompt":{"type":"string","description":"Optional override for the sub-agent's system prompt."}
+        \\}}
+    );
+    return buf.toOwnedSlice(allocator);
+}
+
+// ─── list_subagent_presets tool ────────────────────────────────────
+
+pub const list_presets_tool_name: []const u8 = "list_subagent_presets";
+
+const list_presets_params_json: []const u8 =
+    \\{"type":"object","properties":{},"required":[]}
+;
+
+pub fn listPresetsToolWithCtx(registry: *const PresetRegistry) at.AgentTool {
+    return .{
+        .name = list_presets_tool_name,
+        .description = "List available sub-agent presets with their purpose, default profile, and default role.",
+        .parameters_json = list_presets_params_json,
+        .execution_mode = .sequential,
+        .ctx = @constCast(@ptrCast(registry)),
+        .execute = executeListPresets,
+    };
+}
+
+fn executeListPresets(
+    self: *const at.AgentTool,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    call_id: []const u8,
+    args_json: []const u8,
+    cancel: *ai.stream.Cancel,
+    on_update: at.OnUpdate,
+) anyerror!at.ToolResult {
+    _ = io;
+    _ = call_id;
+    _ = args_json;
+    _ = cancel;
+    _ = on_update;
+
+    const registry: *const PresetRegistry = @ptrCast(@alignCast(self.ctx.?));
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+
+    var it = registry.presets.iterator();
+    var first = true;
+    while (it.next()) |entry| {
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        const p = entry.value_ptr.*;
+        try buf.appendSlice(allocator, "{\"name\":");
+        try ai.utils.appendJsonStr(&buf, allocator, p.name);
+        try buf.appendSlice(allocator, ",\"description\":");
+        try ai.utils.appendJsonStr(&buf, allocator, p.description);
+        try buf.appendSlice(allocator, ",\"default_profile\":");
+        try ai.utils.appendJsonStr(&buf, allocator, p.default_profile);
+        try buf.appendSlice(allocator, ",\"default_role\":");
+        try ai.utils.appendJsonStr(&buf, allocator, p.default_role.toString());
+        try buf.appendSlice(allocator, ",\"read_only\":");
+        try buf.appendSlice(allocator, if (p.safety.read_only) "true" else "false");
+        try buf.append(allocator, '}');
+    }
+    try buf.append(allocator, ']');
+
+    const text = try buf.toOwnedSlice(allocator);
+    var content = try allocator.alloc(ai.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = text } };
+    return .{ .content = content, .is_error = false };
+}
+
+// ─── static fallback parameters_json (unconfigured tool only) ──────
+
+const parameters_json_unconfigured: []const u8 =
+    \\{"type":"object","required":["preset","prompt"],"properties":{
+    \\"preset":{"type":"string","description":"Sub-agent preset (not yet configured — call list_subagent_presets)."},
+    \\"prompt":{"type":"string","description":"The instruction the sub-agent will run."}
+    \\}}
 ;
 
 /// Configuration handed to `toolWithCtx`. Mode drivers build this
@@ -132,12 +357,24 @@ pub const Ctx = struct {
     /// Mutable env map for `applyProfile` (it's an in-place
     /// overlay). Borrowed.
     environ_map: *std.process.Environ.Map,
-    /// Parent's tools — copied into the sub-agent's tool list
-    /// MINUS the entry whose name == `subagent` (depth-1).
-    /// Borrowed.
+    /// Parent's tools — passed to preset.build_tools so builders
+    /// can filter already-wired tools (ReadCtx, BashCtx, etc.)
+    /// by name. Also used as the fallback tool list when no
+    /// preset registry is set (back-compat). Borrowed.
     parent_tools: []const at.AgentTool,
     /// Parent's role. Sub-agents demote only — promotion errors.
     parent_role: role_mod.Role,
+    /// Profile name the parent session was started with (the
+    /// --profile flag value). Empty string when the parent used
+    /// no profile. Presets with `default_profile = ""` inherit
+    /// this so they use the operator's chosen provider.
+    parent_profile: []const u8 = "",
+    /// Preset registry — frozen at session-init. Presets are
+    /// looked up here on every `subagent` tool call.
+    presets: *const PresetRegistry,
+    /// Dynamic parameters_json built from the registry at session-
+    /// init. Owned by the mode driver; freed after the session ends.
+    parameters_json_owned: []const u8,
     /// Shared `Store` (always-allow / always-deny database) for
     /// permission inheritance per design §3.5. Optional — when
     /// null, sub-agents run without permission gating.
@@ -176,7 +413,7 @@ pub fn tool() at.AgentTool {
     return .{
         .name = tool_name,
         .description = "Spawn an isolated sub-agent with its own model + provider, run it to completion, return the final assistant message. NOT configured — wire via toolWithCtx.",
-        .parameters_json = parameters_json,
+        .parameters_json = parameters_json_unconfigured,
         .execution_mode = .parallel,
         .execute = executeUnconfigured,
     };
@@ -185,8 +422,8 @@ pub fn tool() at.AgentTool {
 pub fn toolWithCtx(ctx: *const Ctx) at.AgentTool {
     return .{
         .name = tool_name,
-        .description = "Spawn an isolated sub-agent with its own model + provider, run it to completion, return the final assistant message. Sub-agents have the parent's tool set minus `subagent` itself; pick a profile from settings.json or built-ins to choose model + provider.",
-        .parameters_json = parameters_json,
+        .description = "Spawn an isolated sub-agent with its own model + tool set, run it to completion, return the final assistant message. Pick a preset to choose the sub-agent's purpose and tools. Call list_subagent_presets to see what is available.",
+        .parameters_json = ctx.parameters_json_owned,
         .execution_mode = .parallel,
         .ctx = @constCast(@ptrCast(ctx)),
         .execute = executeWithCtx,
@@ -238,7 +475,8 @@ fn executeWithCtx(
 // ─── core run ──────────────────────────────────────────────────────
 
 const ParsedArgs = struct {
-    profile: []const u8,
+    preset: []const u8,
+    profile: ?[]const u8,
     prompt: []const u8,
     timeout_ms: u64,
     max_turns: u32,
@@ -246,7 +484,8 @@ const ParsedArgs = struct {
     system_prompt: ?[]const u8,
 
     fn deinit(self: *ParsedArgs, alloc: std.mem.Allocator) void {
-        alloc.free(self.profile);
+        alloc.free(self.preset);
+        if (self.profile) |p| alloc.free(p);
         alloc.free(self.prompt);
         if (self.system_prompt) |s| alloc.free(s);
     }
@@ -254,6 +493,7 @@ const ParsedArgs = struct {
 
 const ErrorKind = enum {
     profile_not_found,
+    preset_not_found,
     role_promotion_denied,
     timeout,
     max_turns_exceeded,
@@ -269,7 +509,8 @@ const ErrorKind = enum {
     fn hint(self: ErrorKind) []const u8 {
         return switch (self) {
             .profile_not_found => "retry with one of the profile names listed in `available_profiles` (or run with --list-profiles to see the catalog)",
-            .role_promotion_denied => "retry with the parent's role or lower; sub-agents can only demote",
+            .preset_not_found => "call list_subagent_presets to see available presets, then retry with a valid preset name",
+            .role_promotion_denied => "the preset's default_role is higher than the parent's role; run franky with a higher --role or pick a preset with a lower default_role",
             .timeout => "summarize the task more or break into smaller steps; partial_text contains what was produced before the timer fired",
             .max_turns_exceeded => "task too complex for the configured max_turns; decompose further or raise max_turns",
             .agent_error => "retry; details in error_message",
@@ -330,7 +571,7 @@ fn runSubagent(
     // Parse args.
     var parsed = parseArgs(allocator, args_json) catch |e| {
         const msg = switch (e) {
-            error.MissingProfile => "missing required field `profile`",
+            error.MissingPreset => "missing required field `preset`; call list_subagent_presets to see available presets",
             error.MissingPrompt => "missing required field `prompt`",
             error.InvalidJson => "args are not valid JSON",
             error.InvalidRole => "role must be one of: read, plan, code, full",
@@ -342,11 +583,26 @@ fn runSubagent(
     };
     defer parsed.deinit(allocator);
 
-    // Resolve role (demotion only).
-    const sub_role = parsed.role orelse ctx.parent_role;
+    // Resolve preset.
+    const preset = ctx.presets.get(parsed.preset) orelse {
+        const msg = std.fmt.allocPrint(
+            allocator,
+            "preset '{s}' is not registered; call list_subagent_presets to see available presets",
+            .{parsed.preset},
+        ) catch unreachable;
+        defer allocator.free(msg);
+        return errorResult(allocator, .preset_not_found, msg, .{});
+    };
+
+    // Resolve role (demotion only; preset default used when not overridden).
+    const sub_role = parsed.role orelse preset.default_role;
     if (sub_role.atLeast(ctx.parent_role) and sub_role != ctx.parent_role) {
-        // sub_role >= parent AND not equal → strictly higher → reject.
-        const msg = std.fmt.allocPrint(allocator, "sub-agent requested role={s} but parent is role={s}; demotion only", .{ sub_role.toString(), ctx.parent_role.toString() }) catch unreachable;
+        // sub_role > parent → reject with actionable hint.
+        const msg = std.fmt.allocPrint(
+            allocator,
+            "preset '{s}' requires role '{s}' or higher but parent role is '{s}'; run franky with --role {s} or choose a different preset",
+            .{ preset.name, sub_role.toString(), ctx.parent_role.toString(), sub_role.toString() },
+        ) catch unreachable;
         defer allocator.free(msg);
         return errorResult(allocator, .role_promotion_denied, msg, .{});
     }
@@ -361,25 +617,35 @@ fn runSubagent(
     var local_env_map = try cloneEnvironMap(allocator, ctx.environ_map);
     defer local_env_map.deinit();
 
-    // Build a fresh cli.Config seeded with parent's environ — apply
-    // the profile to overlay provider/model/api_key/auth_token.
+    // Build a fresh cli.Config seeded with parent's environ. Apply
+    // the effective profile if one is set (preset default or per-call
+    // override). Presets with default_profile="" inherit the parent's
+    // provider via settings/env (same as the parent's own startup).
     var sub_cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
     defer sub_cfg.deinit();
 
-    profiles_mod.applyProfile(&sub_cfg, io, &local_env_map, parsed.profile) catch |e| switch (e) {
-        error.ProfileNotFound => {
-            const list = profiles_mod.listProfiles(allocator, io, &local_env_map) catch null;
-            defer if (list) |l| allocator.free(l);
-            const msg = std.fmt.allocPrint(allocator, "profile '{s}' not found", .{parsed.profile}) catch unreachable;
-            defer allocator.free(msg);
-            return errorResult(allocator, .profile_not_found, msg, .{ .profiles_listing = list });
-        },
-        else => {
-            const msg = std.fmt.allocPrint(allocator, "profile load failed: {s}", .{@errorName(e)}) catch unreachable;
-            defer allocator.free(msg);
-            return errorResult(allocator, .invalid_args, msg, .{});
-        },
+    const effective_profile: []const u8 = blk: {
+        if (parsed.profile) |p| break :blk p;
+        if (preset.default_profile.len > 0) break :blk preset.default_profile;
+        break :blk ctx.parent_profile;
     };
+
+    if (effective_profile.len > 0) {
+        profiles_mod.applyProfile(&sub_cfg, io, &local_env_map, effective_profile) catch |e| switch (e) {
+            error.ProfileNotFound => {
+                const list = profiles_mod.listProfiles(allocator, io, &local_env_map) catch null;
+                defer if (list) |l| allocator.free(l);
+                const msg = std.fmt.allocPrint(allocator, "profile '{s}' not found", .{effective_profile}) catch unreachable;
+                defer allocator.free(msg);
+                return errorResult(allocator, .profile_not_found, msg, .{ .profiles_listing = list });
+            },
+            else => {
+                const msg = std.fmt.allocPrint(allocator, "profile load failed: {s}", .{@errorName(e)}) catch unreachable;
+                defer allocator.free(msg);
+                return errorResult(allocator, .invalid_args, msg, .{});
+            },
+        };
+    }
 
     // Resolve the provider — same path print mode runs at startup.
     const provider_info = print_mod.resolveProviderIo(allocator, io, ctx.environ, &sub_cfg) catch |e| {
@@ -388,8 +654,10 @@ fn runSubagent(
         return errorResult(allocator, .agent_error, msg, .{});
     };
 
-    // Build the sub-agent's tool list — parent's tools MINUS subagent itself.
-    const sub_tools = try buildSubTools(allocator, ctx.parent_tools);
+    // Build the sub-agent's tool list via the preset's builder.
+    // Builders filter from parent_tools (already wired by mode driver)
+    // by tool name, so ReadCtx / BashCtx contexts are preserved.
+    const sub_tools = try preset.build_tools(allocator, ctx.parent_tools);
     defer allocator.free(sub_tools);
 
     // Allocate a fresh RoleGate for the sub-agent (per design §3.5
@@ -419,10 +687,8 @@ fn runSubagent(
         .prompter = live_prompter,
     };
 
-    // System prompt. Override > default. Default is a minimal
-    // sub-agent prompt that explicitly notes the absence of the
-    // `subagent` tool (so the LLM doesn't hallucinate calling it).
-    const sys_prompt = parsed.system_prompt orelse default_subagent_system_prompt;
+    // System prompt: per-call override > preset default.
+    const sys_prompt = parsed.system_prompt orelse preset.default_system_prompt;
 
     // Build the sub-agent.
     const sub_model: ai.types.Model = .{
@@ -476,8 +742,8 @@ fn runSubagent(
 
     // Run the sub-agent. Buffered: we wait until idle and read
     // the final assistant text from its transcript.
-    ai.log.log(.info, "subagent", "spawn", "profile={s} call_id={s} model={s} role={s} timeout_ms={d} max_turns={d}", .{
-        parsed.profile, call_id, provider_info.model_id, sub_role.toString(), parsed.timeout_ms, parsed.max_turns,
+    ai.log.log(.info, "subagent", "spawn", "preset={s} profile={s} call_id={s} model={s} role={s} timeout_ms={d} max_turns={d}", .{
+        preset.name, effective_profile, call_id, provider_info.model_id, sub_role.toString(), parsed.timeout_ms, parsed.max_turns,
     });
     sub_agent.prompt(parsed.prompt) catch |e| {
         supervisor_done.store(true, .release);
@@ -499,7 +765,7 @@ fn runSubagent(
         const persist_args = PersistArgs{
             .parent_session_dir = parent_dir,
             .call_id = call_id,
-            .profile = parsed.profile,
+            .profile = effective_profile,
             .prompt = parsed.prompt,
             .provider = provider_info.provider_name,
             .model = provider_info.model_id,
@@ -540,22 +806,22 @@ fn runSubagent(
     const turn_count = countAssistantTurns(&sub_agent.transcript);
     const tool_call_count = countToolCalls(&sub_agent.transcript);
 
-    // v1.28.0 — cap `final_text` at `final_text_max_bytes` (4 KB
-    // default). The parent agent's context is the resource we're
-    // protecting; a sub-agent that produces a 60 KB monologue
-    // would otherwise injection-flood the parent's transcript.
-    // When truncated, append a one-line hint encouraging the
-    // parent to re-prompt the sub-agent with a more focused
-    // question rather than trying to recover the elided text.
+    // Cap `final_text`. Two limits; whichever is lower wins:
+    //   - global `final_text_max_bytes` (4 KB) — always applied.
+    //   - preset's `safety.max_result_bytes` — opt-in per preset.
+    const effective_cap: usize = if (preset.safety.max_result_bytes) |limit|
+        @min(final_text_max_bytes, @as(usize, limit))
+    else
+        final_text_max_bytes;
     const trunc = truncate_mod.truncateHead(final_text_raw, .{
         .max_lines = std.math.maxInt(usize),
-        .max_bytes = final_text_max_bytes,
+        .max_bytes = effective_cap,
     });
     var capped: std.ArrayList(u8) = .empty;
     defer capped.deinit(allocator);
     try capped.appendSlice(allocator, trunc.content);
     if (trunc.truncated) {
-        const cap_size = try truncate_mod.formatSize(allocator, final_text_max_bytes);
+        const cap_size = try truncate_mod.formatSize(allocator, effective_cap);
         defer allocator.free(cap_size);
         const total_size = try truncate_mod.formatSize(allocator, trunc.total_bytes);
         defer allocator.free(total_size);
@@ -631,7 +897,7 @@ fn sleepMs(ms: u64) void {
 
 const ParseError = error{
     OutOfMemory,
-    MissingProfile,
+    MissingPreset,
     MissingPrompt,
     InvalidJson,
     InvalidRole,
@@ -648,13 +914,14 @@ fn parseArgs(allocator: std.mem.Allocator, args_json: []const u8) ParseError!Par
     if (parsed.value != .object) return error.InvalidJson;
     const obj = parsed.value.object;
 
-    const profile_v = obj.get("profile") orelse return error.MissingProfile;
-    if (profile_v != .string) return error.MissingProfile;
+    const preset_v = obj.get("preset") orelse return error.MissingPreset;
+    if (preset_v != .string) return error.MissingPreset;
     const prompt_v = obj.get("prompt") orelse return error.MissingPrompt;
     if (prompt_v != .string) return error.MissingPrompt;
 
     var out: ParsedArgs = .{
-        .profile = try allocator.dupe(u8, profile_v.string),
+        .preset = try allocator.dupe(u8, preset_v.string),
+        .profile = null,
         .prompt = try allocator.dupe(u8, prompt_v.string),
         .timeout_ms = default_timeout_ms,
         .max_turns = default_max_turns,
@@ -663,6 +930,9 @@ fn parseArgs(allocator: std.mem.Allocator, args_json: []const u8) ParseError!Par
     };
     errdefer out.deinit(allocator);
 
+    if (obj.get("profile")) |v| if (v == .string) {
+        out.profile = try allocator.dupe(u8, v.string);
+    };
     if (obj.get("timeout_ms")) |v| if (v == .integer) {
         const t = v.integer;
         if (t < @as(i64, @intCast(min_timeout_ms)) or t > @as(i64, @intCast(max_timeout_ms))) return error.TimeoutOutOfRange;
@@ -900,20 +1170,6 @@ fn persistSubagentSession(
     try cwd.writeFile(io, .{ .sub_path = meta_path, .data = meta_buf.items });
 }
 
-// ─── default sub-agent system prompt ───────────────────────────────
-
-const default_subagent_system_prompt: []const u8 =
-    \\You are a sub-agent spawned by a parent franky agent. You have a focused
-    \\task and access to the workspace via your tools.
-    \\
-    \\You do NOT have a `subagent` tool — you cannot spawn further sub-agents.
-    \\You operate without access to the parent's transcript or sibling sub-
-    \\agents. Your final assistant message becomes the parent's tool result;
-    \\write it as a clear, self-contained answer to the prompt.
-    \\
-    \\Use your tools focused and intentionally. When you finish, stop calling
-    \\tools and write your final answer.
-;
 
 // ─── tests ─────────────────────────────────────────────────────────
 
@@ -921,9 +1177,10 @@ const testing = std.testing;
 
 test "parseArgs: required fields + defaults" {
     const gpa = testing.allocator;
-    var p = try parseArgs(gpa, "{\"profile\":\"gemini\",\"prompt\":\"hi\"}");
+    var p = try parseArgs(gpa, "{\"preset\":\"research\",\"prompt\":\"hi\"}");
     defer p.deinit(gpa);
-    try testing.expectEqualStrings("gemini", p.profile);
+    try testing.expectEqualStrings("research", p.preset);
+    try testing.expect(p.profile == null);
     try testing.expectEqualStrings("hi", p.prompt);
     try testing.expectEqual(default_timeout_ms, p.timeout_ms);
     try testing.expectEqual(default_max_turns, p.max_turns);
@@ -931,49 +1188,164 @@ test "parseArgs: required fields + defaults" {
     try testing.expect(p.system_prompt == null);
 }
 
+test "parseArgs: optional profile is parsed when present" {
+    const gpa = testing.allocator;
+    var p = try parseArgs(gpa, "{\"preset\":\"research\",\"prompt\":\"hi\",\"profile\":\"groq\"}");
+    defer p.deinit(gpa);
+    try testing.expectEqualStrings("groq", p.profile.?);
+}
+
 test "parseArgs: explicit timeout_ms + max_turns + role" {
     const gpa = testing.allocator;
-    var p = try parseArgs(gpa, "{\"profile\":\"x\",\"prompt\":\"y\",\"timeout_ms\":5000,\"max_turns\":3,\"role\":\"plan\"}");
+    var p = try parseArgs(gpa, "{\"preset\":\"file-ops\",\"prompt\":\"y\",\"timeout_ms\":5000,\"max_turns\":3,\"role\":\"plan\"}");
     defer p.deinit(gpa);
     try testing.expectEqual(@as(u64, 5000), p.timeout_ms);
     try testing.expectEqual(@as(u32, 3), p.max_turns);
     try testing.expectEqual(role_mod.Role.plan, p.role.?);
 }
 
-test "parseArgs: missing profile errors" {
+test "parseArgs: missing preset errors" {
     const gpa = testing.allocator;
-    try testing.expectError(error.MissingProfile, parseArgs(gpa, "{\"prompt\":\"x\"}"));
+    try testing.expectError(error.MissingPreset, parseArgs(gpa, "{\"prompt\":\"x\"}"));
 }
 
 test "parseArgs: missing prompt errors" {
     const gpa = testing.allocator;
-    try testing.expectError(error.MissingPrompt, parseArgs(gpa, "{\"profile\":\"x\"}"));
+    try testing.expectError(error.MissingPrompt, parseArgs(gpa, "{\"preset\":\"research\"}"));
 }
 
 test "parseArgs: timeout out of range errors" {
     const gpa = testing.allocator;
-    try testing.expectError(error.TimeoutOutOfRange, parseArgs(gpa, "{\"profile\":\"x\",\"prompt\":\"y\",\"timeout_ms\":100}"));
-    try testing.expectError(error.TimeoutOutOfRange, parseArgs(gpa, "{\"profile\":\"x\",\"prompt\":\"y\",\"timeout_ms\":99999999}"));
+    try testing.expectError(error.TimeoutOutOfRange, parseArgs(gpa, "{\"preset\":\"research\",\"prompt\":\"y\",\"timeout_ms\":100}"));
+    try testing.expectError(error.TimeoutOutOfRange, parseArgs(gpa, "{\"preset\":\"research\",\"prompt\":\"y\",\"timeout_ms\":99999999}"));
 }
 
 test "parseArgs: invalid role errors" {
     const gpa = testing.allocator;
-    try testing.expectError(error.InvalidRole, parseArgs(gpa, "{\"profile\":\"x\",\"prompt\":\"y\",\"role\":\"superuser\"}"));
+    try testing.expectError(error.InvalidRole, parseArgs(gpa, "{\"preset\":\"research\",\"prompt\":\"y\",\"role\":\"superuser\"}"));
 }
 
-test "buildSubTools: filters out the subagent tool itself" {
+test "PresetRegistry: register + get" {
     const gpa = testing.allocator;
-    const a: at.AgentTool = .{ .name = "read", .description = "", .parameters_json = "{}", .execute = undefined };
-    const b: at.AgentTool = .{ .name = tool_name, .description = "", .parameters_json = "{}", .execute = undefined };
-    const c: at.AgentTool = .{ .name = "bash", .description = "", .parameters_json = "{}", .execute = undefined };
-    const parent = [_]at.AgentTool{ a, b, c };
+    var reg = PresetRegistry.init(gpa);
+    defer reg.deinit();
 
-    const sub = try buildSubTools(gpa, &parent);
+    try reg.register(.{
+        .name = "my-preset",
+        .description = "test preset",
+        .default_profile = "gemini",
+        .default_role = .read,
+        .default_system_prompt = "test",
+        .build_tools = buildResearchTools,
+    });
+    const p = reg.get("my-preset");
+    try testing.expect(p != null);
+    try testing.expectEqualStrings("my-preset", p.?.name);
+    try testing.expect(reg.get("nonexistent") == null);
+}
+
+test "registerBuiltinPresets: populates all four built-ins" {
+    const gpa = testing.allocator;
+    var reg = PresetRegistry.init(gpa);
+    defer reg.deinit();
+    try registerBuiltinPresets(&reg);
+
+    const names = [_][]const u8{ "research", "code-audit", "file-ops", "bash-runner" };
+    for (names) |n| {
+        const p = reg.get(n);
+        try testing.expect(p != null);
+        try testing.expect(p.?.description.len > 0);
+        try testing.expect(p.?.default_system_prompt.len > 0);
+    }
+    try testing.expectEqual(role_mod.Role.read, reg.get("research").?.default_role);
+    try testing.expectEqual(role_mod.Role.read, reg.get("code-audit").?.default_role);
+    try testing.expectEqual(role_mod.Role.plan, reg.get("file-ops").?.default_role);
+    try testing.expectEqual(role_mod.Role.code, reg.get("bash-runner").?.default_role);
+    try testing.expect(reg.get("research").?.safety.read_only);
+    try testing.expect(reg.get("code-audit").?.safety.read_only);
+}
+
+test "buildParametersJson: enum contains all registered preset names" {
+    const gpa = testing.allocator;
+    var reg = PresetRegistry.init(gpa);
+    defer reg.deinit();
+    try registerBuiltinPresets(&reg);
+
+    const params = try buildParametersJson(gpa, &reg);
+    defer gpa.free(params);
+
+    try testing.expect(std.mem.indexOf(u8, params, "\"research\"") != null);
+    try testing.expect(std.mem.indexOf(u8, params, "\"code-audit\"") != null);
+    try testing.expect(std.mem.indexOf(u8, params, "\"file-ops\"") != null);
+    try testing.expect(std.mem.indexOf(u8, params, "\"bash-runner\"") != null);
+    try testing.expect(std.mem.indexOf(u8, params, "\"preset\"") != null);
+    try testing.expect(std.mem.indexOf(u8, params, "\"prompt\"") != null);
+}
+
+test "selectTools: filters by name from parent slice" {
+    const gpa = testing.allocator;
+    const read_t: at.AgentTool = .{ .name = "read", .description = "", .parameters_json = "{}", .execute = undefined };
+    const ls_t: at.AgentTool = .{ .name = "ls", .description = "", .parameters_json = "{}", .execute = undefined };
+    const bash_t: at.AgentTool = .{ .name = "bash", .description = "", .parameters_json = "{}", .execute = undefined };
+    const parent = [_]at.AgentTool{ read_t, ls_t, bash_t };
+
+    const sub = try selectTools(gpa, &parent, &[_][]const u8{ "read", "ls" });
     defer gpa.free(sub);
 
     try testing.expectEqual(@as(usize, 2), sub.len);
     try testing.expectEqualStrings("read", sub[0].name);
-    try testing.expectEqualStrings("bash", sub[1].name);
+    try testing.expectEqualStrings("ls", sub[1].name);
+}
+
+test "research preset build_tools: returns read+ls+find+grep, no bash/write/edit" {
+    const gpa = testing.allocator;
+    const parent = [_]at.AgentTool{
+        .{ .name = "read", .description = "", .parameters_json = "{}", .execute = undefined },
+        .{ .name = "ls", .description = "", .parameters_json = "{}", .execute = undefined },
+        .{ .name = "find", .description = "", .parameters_json = "{}", .execute = undefined },
+        .{ .name = "grep", .description = "", .parameters_json = "{}", .execute = undefined },
+        .{ .name = "bash", .description = "", .parameters_json = "{}", .execute = undefined },
+        .{ .name = "write", .description = "", .parameters_json = "{}", .execute = undefined },
+        .{ .name = "edit", .description = "", .parameters_json = "{}", .execute = undefined },
+    };
+    const tools = try buildResearchTools(gpa, &parent);
+    defer gpa.free(tools);
+
+    try testing.expectEqual(@as(usize, 4), tools.len);
+    const has = struct {
+        fn check(ts: []const at.AgentTool, n: []const u8) bool {
+            for (ts) |t| if (std.mem.eql(u8, t.name, n)) return true;
+            return false;
+        }
+    }.check;
+    try testing.expect(has(tools, "read"));
+    try testing.expect(has(tools, "ls"));
+    try testing.expect(has(tools, "find"));
+    try testing.expect(has(tools, "grep"));
+    try testing.expect(!has(tools, "bash"));
+    try testing.expect(!has(tools, "write"));
+    try testing.expect(!has(tools, "edit"));
+}
+
+test "PresetRegistry: SDK preset overrides built-in with same name" {
+    const gpa = testing.allocator;
+    var reg = PresetRegistry.init(gpa);
+    defer reg.deinit();
+    try registerBuiltinPresets(&reg);
+
+    // Override research with a custom one.
+    try reg.register(.{
+        .name = "research",
+        .description = "custom research",
+        .default_profile = "groq",
+        .default_role = .read,
+        .default_system_prompt = "custom prompt",
+        .build_tools = buildResearchTools,
+    });
+
+    const p = reg.get("research").?;
+    try testing.expectEqualStrings("custom research", p.description);
+    try testing.expectEqualStrings("groq", p.default_profile);
 }
 
 test "ErrorKind hints are non-empty for all variants" {

@@ -613,8 +613,8 @@ fn initSession(
         .stream_fn = ai.providers.google_gemini.streamFn,
     });
 
-    // v1.24.0 — append subagent tool. Same shape as rpc.zig: ctx
-    // and the appended tool slice both live in role_arena.
+    // v1.24.0 — append subagent + list_subagent_presets tools.
+    // v2.5 — preset registry lives in role_arena alongside ctx.
     //
     // v1.28.0 — wire `parent_session_dir` so the sub-agent's
     // transcript persists to
@@ -622,6 +622,13 @@ fn initSession(
     // is duped into role_arena so it lives as long as the session.
     {
         const ra = session.role_arena.allocator();
+
+        const preset_reg = try ra.create(tools_mod.subagent.PresetRegistry);
+        preset_reg.* = tools_mod.subagent.PresetRegistry.init(ra);
+        try tools_mod.subagent.registerBuiltinPresets(preset_reg);
+
+        const params_json = try tools_mod.subagent.buildParametersJson(ra, preset_reg);
+
         const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
         var parent_session_dir: ?[]const u8 = null;
         if (session.parent_dir) |parent| {
@@ -634,6 +641,9 @@ fn initSession(
             .environ_map = environ_map,
             .parent_tools = session.tools,
             .parent_role = session.role_gate.role,
+            .parent_profile = cfg.profile orelse "",
+            .presets = preset_reg,
+            .parameters_json_owned = params_json,
             .permission_store = if (session.prompts_enabled) &session.permission_store else null,
             // v1.24.3 — sub-agents share the parent's live prompter
             // (set per-prompt). The `current_prompter` slot is on
@@ -641,9 +651,10 @@ fn initSession(
             .permission_prompter_slot = &session.current_prompter,
             .parent_session_dir = parent_session_dir,
         };
-        const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 1);
+        const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 2);
         @memcpy(final_tools[0..session.tools.len], session.tools);
         final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
+        final_tools[session.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
         session.tools = final_tools;
     }
 

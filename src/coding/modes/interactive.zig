@@ -1796,9 +1796,17 @@ const SessionBinding = struct {
             .stream_fn = ai.providers.google_gemini.streamFn,
         });
 
-        // v1.24.0 — append subagent tool. ctx + slice in arena.
+        // v1.24.0 — append subagent + list_subagent_presets tools.
+        // v2.5 — preset registry in arena.
         {
             const aa = binding.arena.allocator();
+
+            const preset_reg = try aa.create(tools_mod.subagent.PresetRegistry);
+            preset_reg.* = tools_mod.subagent.PresetRegistry.init(aa);
+            try tools_mod.subagent.registerBuiltinPresets(preset_reg);
+
+            const params_json = try tools_mod.subagent.buildParametersJson(aa, preset_reg);
+
             const subagent_ctx = try aa.create(tools_mod.subagent.Ctx);
             subagent_ctx.* = .{
                 .registry = &binding.registry,
@@ -1806,6 +1814,9 @@ const SessionBinding = struct {
                 .environ_map = environ_map,
                 .parent_tools = binding.tools,
                 .parent_role = binding.role_gate.role,
+                .parent_profile = cfg.profile orelse "",
+                .presets = preset_reg,
+                .parameters_json_owned = params_json,
                 .permission_store = if (binding.prompts_enabled) &binding.permission_store else null,
                 // v1.24.3 — interactive's prompter lives on a per-
                 // turn stack frame, not a session field, so we
@@ -1816,9 +1827,10 @@ const SessionBinding = struct {
                 .permission_prompter_slot = null,
                 .parent_session_dir = null,
             };
-            const final_tools = try aa.alloc(at.AgentTool, binding.tools.len + 1);
+            const final_tools = try aa.alloc(at.AgentTool, binding.tools.len + 2);
             @memcpy(final_tools[0..binding.tools.len], binding.tools);
             final_tools[binding.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
+            final_tools[binding.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
             binding.tools = final_tools;
         }
 

@@ -292,8 +292,8 @@ fn initSession(
         .stream_fn = ai.providers.google_gemini.streamFn,
     });
 
-    // v1.24.0 — append subagent tool to session.tools. ctx + slice
-    // both live in role_arena, which the session owns.
+    // v1.24.0 — append subagent + list_subagent_presets tools.
+    // v2.5 — preset registry lives in role_arena alongside ctx.
     //
     // v1.28.0 — RPC reuses the same synthesized rpc-<startup_ms>
     // dir that bash_state already points at (set via
@@ -305,6 +305,13 @@ fn initSession(
     // persistence is then skipped and the result omits
     // `transcript_path`.
     const ra = session.role_arena.allocator();
+
+    const preset_reg = try ra.create(tools_mod.subagent.PresetRegistry);
+    preset_reg.* = tools_mod.subagent.PresetRegistry.init(ra);
+    try tools_mod.subagent.registerBuiltinPresets(preset_reg);
+
+    const params_json = try tools_mod.subagent.buildParametersJson(ra, preset_reg);
+
     const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
     const parent_session_dir: ?[]const u8 = if (session.bash_state.getSessionDir()) |sd|
         try ra.dupe(u8, sd)
@@ -316,6 +323,9 @@ fn initSession(
         .environ_map = environ_map,
         .parent_tools = session.tools,
         .parent_role = session.role_gate.role,
+        .parent_profile = cfg.profile orelse "",
+        .presets = preset_reg,
+        .parameters_json_owned = params_json,
         .permission_store = if (session.prompts_enabled) &session.permission_store else null,
         // v1.24.3 — pointer-to-slot reads `session.current_prompter`
         // at sub-agent spawn time (parent is mid-prompt then,
@@ -323,9 +333,10 @@ fn initSession(
         .permission_prompter_slot = &session.current_prompter,
         .parent_session_dir = parent_session_dir,
     };
-    const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 1);
+    const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 2);
     @memcpy(final_tools[0..session.tools.len], session.tools);
     final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
+    final_tools[session.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
     session.tools = final_tools;
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg);
