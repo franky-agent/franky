@@ -94,16 +94,63 @@ fn execute(
     const root = parsed.value;
 
     const user_path = (root.object.get("path") orelse return common.toolError(allocator, "invalid_args", "missing path")).string;
-    var edits_val = root.object.get("edits") orelse return common.toolError(allocator, "invalid_args", "missing edits");
+    // Retrieve `edits`, tolerating two model quirks before failing:
+    //   flattened schema: `edits` key absent, `old`/`new` at root level
+    //   double-serialization: `edits` is a JSON string containing the array
+    var edits_val: std.json.Value = blk: {
+        if (root.object.get("edits")) |v| break :blk v;
 
-    //some models (e.g. Gemini 3.1 Pro) sometimes emit `edits: {old, new}` instead of `edits: [{old, new}]` — accept both for robustness even though the spec requires an array
+        // Some models (e.g. certain DeepSeek configs) omit the `edits` key
+        // entirely and put `old`/`new` directly alongside `path`.
+        if (root.object.get("old")) |old_v| {
+            if (root.object.get("new")) |new_v| {
+                if (old_v == .string and new_v == .string) {
+                    var obj: std.json.ObjectMap = .{};
+                    try obj.put(arena.allocator(), "old", old_v);
+                    try obj.put(arena.allocator(), "new", new_v);
+                    var arr = std.json.Array.init(arena.allocator());
+                    try arr.append(.{ .object = obj });
+                    break :blk .{ .array = arr };
+                }
+            }
+        }
+
+        return common.toolError(allocator, "invalid_args", "missing edits");
+    };
+
+    // Some models (e.g. Gemini 3.1 Pro) emit `edits: {old, new}` instead of
+    // `edits: [{old, new}]` — wrap the lone object in an array.
     if (edits_val == .object) {
-        var arr = std.json.Array.init(allocator);
+        var arr = std.json.Array.init(arena.allocator());
         try arr.append(edits_val);
         edits_val = std.json.Value{ .array = arr };
     }
 
-    if (edits_val != .array) return common.toolError(allocator, "invalid_args", "edits must be an array");
+    // Some models (e.g. DeepSeek) double-serialize `edits` as a JSON string
+    // instead of an inline array — parse and re-apply the object→array coercion.
+    if (edits_val == .string) {
+        if (std.json.parseFromSlice(std.json.Value, arena.allocator(), edits_val.string, .{})) |pv| {
+            edits_val = pv.value;
+            if (edits_val == .object) {
+                var arr = std.json.Array.init(arena.allocator());
+                try arr.append(edits_val);
+                edits_val = std.json.Value{ .array = arr };
+            }
+        } else |_| {}
+    }
+
+    if (edits_val != .array) {
+        const type_str: []const u8 = switch (edits_val) {
+            .null => "null",
+            .bool => "boolean",
+            .integer, .float, .number_string => "number",
+            .string => "string",
+            .object => "object",
+            .array => "array",
+        };
+        const msg = try std.fmt.allocPrint(arena.allocator(), "edits must be an array (got {s})", .{type_str});
+        return common.toolError(allocator, "invalid_args", msg);
+    }
 
     var canon_path: ?[]u8 = null;
     defer if (canon_path) |p| allocator.free(p);
@@ -623,4 +670,70 @@ test "edit diff renders empty new as `(empty)` sentinel" {
     try testing.expect(!res.is_error);
     const summary = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, summary, "+(empty)") != null);
+}
+
+// ─── execute-level tests (args_json parsing recovery paths) ───────
+
+fn callTool(gpa: std.mem.Allocator, io: std.Io, args_json: []const u8) !at.ToolResult {
+    const t = tool();
+    var cancel: ai.stream.Cancel = .{};
+    return t.execute(&t, gpa, io, "", args_json, &cancel, .{});
+}
+
+test "execute: string-encoded edits (DeepSeek double-serialization)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const path = "/tmp/franky_edit_str_edits.txt";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeTempFile(io, path, "hello world\n");
+    var res = try callTool(gpa, io,
+        \\{"path":"/tmp/franky_edit_str_edits.txt","edits":"[{\"old\":\"hello\",\"new\":\"goodbye\"}]"}
+    );
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    const got = try readAllAlloc(gpa, io, path);
+    defer gpa.free(got);
+    try testing.expectEqualStrings("goodbye world\n", got);
+}
+
+test "execute: flattened old/new at top level (missing edits key)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const path = "/tmp/franky_edit_flat.txt";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeTempFile(io, path, "the quick brown fox\n");
+    var res = try callTool(gpa, io,
+        \\{"path":"/tmp/franky_edit_flat.txt","old":"brown","new":"red"}
+    );
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    const got = try readAllAlloc(gpa, io, path);
+    defer gpa.free(got);
+    try testing.expectEqualStrings("the quick red fox\n", got);
+}
+
+test "execute: wrong edits type includes type name in error" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const path = "/tmp/franky_edit_bad_type.txt";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeTempFile(io, path, "something\n");
+    var res = try callTool(gpa, io,
+        \\{"path":"/tmp/franky_edit_bad_type.txt","edits":42}
+    );
+    defer res.deinit(gpa);
+    try testing.expect(res.is_error);
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "got number") != null);
 }

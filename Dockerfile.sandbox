@@ -1,10 +1,19 @@
 FROM docker/sandbox-templates:claude-code
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
 USER root
-RUN sudo apt-get update && sudo apt-get install -y wget gnupg podman xz-utils tcpdump
+#  Install libbtrfs-dev libgpgme-dev needed by podman for https://github.com/containifyci/engine-ci 
+RUN sudo apt-get update && sudo apt-get install -y wget gnupg podman xz-utils tcpdump libbtrfs-dev libgpgme-dev
 RUN wget https://ziglang.org/builds/zig-aarch64-linux-0.17.0-dev.87+9b177a7d2.tar.xz && \
     tar -xf zig-aarch64-linux-0.17.0-dev.87+9b177a7d2.tar.xz -C /usr/local/bin --strip-components=1 && \
     rm zig-aarch64-linux-0.17.0-dev.87+9b177a7d2.tar.xz
 USER agent
 RUN go install golang.org/x/vuln/cmd/govulncheck@latest
+# Will install franky and settings from the Github Repository in the future.
+# COPY --chown=agent:agent franky /usr/local/bin/franky
+# COPY --chown=agent:agent settings.json /home/agent/.franky/settings.json
+# RUN wget https://github.com/fr12k/franky/releases/download/v0.13.0/franky_${TARGETOS}_${TARGETARCH}${TARGETVARIANT} && \
+#     mv franky_${TARGETOS}_${TARGETARCH}${TARGETVARIANT} /usr/local/bin/franky
 ENV ZIG_LOCAL_CACHE_DIR=/tmp/zig-cache
 ENV ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache

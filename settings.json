@@ -1,5 +1,20 @@
 {
     "profiles": {
+        "cerebras": {
+            "provider": "gateway",
+            "model": "qwen-3-235b-a22b-instruct-2507",
+            "base-url": "https://api.cerebras.ai/v1/chat/completions",
+            "api-key-env": "CEREBRAS_API_KEY",
+            "ask-tools": "all",
+            "role": "full",
+            "prompts": true,
+            "log-level": "trace",
+            "http-trace-dir": "${HOME}/.franky/log-trace",
+            "thinking": "xhigh",
+            "env": {
+                "FRANKY_FIRST_BYTE_TIMEOUT_MS": "300000"
+            }
+        },
         "cloudflare-gemma": {
             "provider": "gateway",
             "model": "@cf/moonshotai/kimi-k2.6",
@@ -50,6 +65,21 @@
             "base-url": "https://ollama.com/v1/chat/completions",
             "model": "deepseek-v4-flash:cloud",
             "api-key-env": "OLLAMA_KEY",
+            "role": "full",
+            "ask-tools": "all",
+            "prompts": true,
+            "log-level": "trace",
+            "http-trace-dir": "${HOME}/.franky/log-trace",
+            "thinking": "xhigh",
+            "env": {
+                "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
+            }
+        },
+        "openrouter-owl-alpha": {
+            "provider": "gateway",
+            "base-url": "https://openrouter.ai/api/v1/chat/completions",
+            "model": "openrouter/owl-alpha",
+            "api-key-env": "OPENROUTER_KEY",
             "role": "full",
             "ask-tools": "all",
             "prompts": true,
