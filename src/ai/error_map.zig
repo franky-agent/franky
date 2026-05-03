@@ -20,7 +20,7 @@ pub const Provider = enum {
     anthropic,
     openai,
     /// Generic OpenAI-compatible gateway. Same shape as `openai`; the
-    /// distinction lets future tweaks (e.g. Groq's `x_groq.error`
+    /// distinction lets future tweaks (e.g.
     /// extension, Cerebras's `error.type` variants) go through a
     /// dedicated branch without churning the main OpenAI path.
     openai_gateway,

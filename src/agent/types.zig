@@ -120,6 +120,7 @@ pub const AgentEvent = union(AgentEventKind) {
     tool_execution_start: struct {
         call_id: []const u8,
         name: []const u8,
+        args_json: []const u8,
     },
     tool_execution_update: struct {
         call_id: []const u8,
@@ -169,6 +170,7 @@ pub const AgentEvent = union(AgentEventKind) {
             .tool_execution_start => |s| {
                 allocator.free(s.call_id);
                 allocator.free(s.name);
+                allocator.free(s.args_json);
             },
             .tool_execution_update => |u| {
                 allocator.free(u.call_id);
@@ -201,6 +203,7 @@ test "AgentEvent.deinit round-trips" {
         .tool_execution_start = .{
             .call_id = try gpa.dupe(u8, "id-1"),
             .name = try gpa.dupe(u8, "read"),
+            .args_json = try gpa.dupe(u8, "{}"),
         },
     };
     ev.deinit(gpa);

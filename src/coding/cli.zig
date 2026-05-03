@@ -35,7 +35,7 @@ pub const Config = struct {
     /// Anthropic provider. See src/ai/providers/AUTH.md.
     auth_token: ?[]const u8 = null,
     /// Endpoint override for OpenAI-compatible gateways (§A.6):
-    /// Ollama, LM Studio, vLLM, Groq, Cerebras, OpenRouter, xAI,
+    /// Ollama, LM Studio, vLLM, Cerebras, OpenRouter, xAI,
     /// Fireworks, HuggingFace TGI, etc. Pair with
     /// `--provider gateway`.
     base_url: ?[]const u8 = null,
@@ -456,7 +456,7 @@ pub const usage_text: []const u8 =
     \\  --auth-token TOKEN           OAuth / JWT bearer; env: ANTHROPIC_AUTH_TOKEN,
     \\                               CLAUDE_CODE_OAUTH_TOKEN
     \\  --base-url URL               Endpoint override for OpenAI-compatible
-    \\                               gateways (Ollama, LM Studio, vLLM, Groq, …)
+    \\                               gateways (Ollama, LM Studio, vLLM, …)
     \\                               — pair with --provider gateway
     \\  --system-prompt TEXT         Override the system prompt
     \\  --append-system-prompt TEXT  Append to the default system prompt
@@ -485,7 +485,7 @@ pub const usage_text: []const u8 =
     \\  --profile NAME               Apply the named bundle of flag defaults from
     \\                               <settings.json>.profiles.NAME before the rest of the
     \\                               argv walk. CLI flags still win. See v2 spec §5.
-    \\                               Built-ins: cloudflare-gemma, cloudflare-llama, groq,
+    \\                               Built-ins: cloudflare-gemma, cloudflare-llama,
     \\                               cerebras, openrouter, ollama, lm-studio.
     \\  --list-profiles              Print every available profile (built-in + user) and exit.
     \\  --save-profile NAME          Materialize the named built-in preset into

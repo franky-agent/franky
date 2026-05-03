@@ -332,6 +332,9 @@ fn initSession(
         // so the slot holds the live prompter).
         .permission_prompter_slot = &session.current_prompter,
         .parent_session_dir = parent_session_dir,
+        // v2.6 — forward sub-agent events as JSON-RPC `event` notifications.
+        .progress_fn = subagentProgressForward,
+        .progress_userdata = session,
     };
     const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 2);
     @memcpy(final_tools[0..session.tools.len], session.tools);
@@ -345,6 +348,45 @@ fn initSession(
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     const fp: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try fp.runSync(ctx.io, ctx.context, ctx.out);
+}
+
+// ─── v2.6 — sub-agent progress forwarding ────────────────────────
+//
+// Called from the sub-agent's worker thread. Encodes a
+// `tool_execution_update` event and emits it as a JSON-RPC
+// `event` notification on stdout (matching the pattern the
+// `runPrompt` drain loop uses for every other event).
+fn subagentProgressForward(
+    userdata: ?*anyopaque,
+    call_id: []const u8,
+    update_json: []const u8,
+) void {
+    const session: *Session = @ptrCast(@alignCast(userdata.?));
+    const allocator = session.allocator;
+    const io = session.io;
+
+    const owned_call_id = allocator.dupe(u8, call_id) catch return;
+    const owned_update = allocator.dupe(u8, update_json) catch {
+        allocator.free(owned_call_id);
+        return;
+    };
+    const ev: at.AgentEvent = .{ .tool_execution_update = .{
+        .call_id = owned_call_id,
+        .update_json = owned_update,
+    } };
+    defer ev.deinit(allocator);
+
+    const payload = agent.proxy.encodeEventJson(allocator, ev) catch return;
+    defer allocator.free(payload);
+
+    const notif = std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"event\",\"params\":{s}}}",
+        .{payload},
+    ) catch return;
+    defer allocator.free(notif);
+
+    writeFrameToStdout(io, std.Io.File.stdout(), notif) catch {};
 }
 
 fn dispatchOne(

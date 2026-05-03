@@ -12,7 +12,7 @@
 //!   - every name matching `FRANKY_SECRET_*`
 //!   - provider key names: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 //!     `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`,
-//!     `GROQ_API_KEY`, `XAI_API_KEY`, `AZURE_OPENAI_API_KEY`
+//!     `XAI_API_KEY`, `AZURE_OPENAI_API_KEY`
 //!   - cloud creds: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 //!     `AWS_SESSION_TOKEN`, `GOOGLE_APPLICATION_CREDENTIALS`
 //!   - user-supplied extras (from future settings.json)
@@ -29,7 +29,6 @@ pub const default_exact_denylist = [_][]const u8{
     "GOOGLE_API_KEY",
     "GEMINI_API_KEY",
     "MISTRAL_API_KEY",
-    "GROQ_API_KEY",
     "XAI_API_KEY",
     "AZURE_OPENAI_API_KEY",
     "AWS_ACCESS_KEY_ID",

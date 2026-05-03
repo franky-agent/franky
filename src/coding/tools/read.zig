@@ -14,6 +14,7 @@ const at = @import("../../agent/types.zig");
 const workspace_mod = @import("workspace.zig");
 const common = @import("common.zig");
 const truncate_mod = @import("truncate.zig");
+const ls_mod = @import("ls.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -204,6 +205,19 @@ pub fn readFileWithCap(
     max_bytes_cap: usize,
 ) !at.ToolResult {
     const cwd = std.Io.Dir.cwd();
+
+    // If the path is a directory, fall back to a flat ls rather than
+    // returning an error. Some models (e.g. DeepSeek, Gemma) call read
+    // on directory paths and expect a listing. Probing with openDir is
+    // platform-safe: openFile on a directory succeeds on Linux but
+    // fails at read time (pread returns EISDIR), so we check eagerly.
+    if (cwd.openDir(io, path, .{})) |d| {
+        var dir = d;
+        dir.close(io);
+        var cancel = ai.stream.Cancel{};
+        return ls_mod.listPath(allocator, io, path, false, ls_mod.default_max_depth, false, &cancel);
+    } else |_| {}
+
     var file = cwd.openFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return common.toolError(allocator, "file_not_found", "file does not exist"),
         error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", "cannot read file"),
@@ -663,6 +677,28 @@ test "read tool: line-cap truncation appends [Showing lines X-Y of Z. Use offset
     // Continuation hint with the right offset.
     try testing.expect(std.mem.indexOf(u8, txt, "[Showing lines 1-10 of 50") != null);
     try testing.expect(std.mem.indexOf(u8, txt, "Use offset=11 to continue") != null);
+}
+
+test "read tool: directory path falls back to ls output" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const tmp_dir = "/tmp/franky_read_dir_test";
+    _ = std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, tmp_dir);
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, tmp_dir ++ "/hello.txt", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "hi\n");
+    }
+
+    var res = try readFile(gpa, io, tmp_dir, 1, null);
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "hello.txt") != null);
 }
 
 test "read tool: continuation hint does NOT fire when file ends within the limit (v1.28.0)" {

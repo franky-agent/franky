@@ -19,6 +19,7 @@
 //   - Italic:         *text* or _text_
 //   - Links:          [text](url) — http(s)/mailto/relative only
 //   - Lists:          - item / * item / 1. item
+//   - Tables:         GFM pipe tables (header row + separator row)
 //   - Paragraphs:     anything else, joined by blank lines
 //
 // XSS posture: HTML-escape **before** any markdown pattern runs so
@@ -81,6 +82,12 @@ const Markdown = (function () {
     function isUlItem(line)    { return /^\s*[-*]\s+/.test(line); }
     function isOlItem(line)    { return /^\s*\d+\.\s+/.test(line); }
     function isFenceOpen(line) { return /^```/.test(line); }
+    function isTableRow(line)  { return /^\s*\|/.test(line); }
+    // A separator row contains only |, -, :, and spaces — e.g. |---|:---:|
+    function isTableSep(line)  { return /^\s*\|[\s\-:|]+\|[\s\-:|]*$/.test(line); }
+    function parseTableCells(line) {
+        return line.trim().replace(/^\||\|$/g, '').split('|').map(function (c) { return c.trim(); });
+    }
 
     function render(text) {
         if (!text) return '';
@@ -141,6 +148,32 @@ const Markdown = (function () {
                 continue;
             }
 
+            // GFM table — header row followed by a separator row.
+            if (isTableRow(line) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+                const headers = parseTableCells(line);
+                i += 2; // consume header + separator
+                const rows = [];
+                while (i < lines.length && isTableRow(lines[i]) && !isTableSep(lines[i])) {
+                    rows.push(parseTableCells(lines[i]));
+                    i += 1;
+                }
+                let tbl = '<table><thead><tr>';
+                for (const h of headers) tbl += '<th>' + inline(h) + '</th>';
+                tbl += '</tr></thead>';
+                if (rows.length > 0) {
+                    tbl += '<tbody>';
+                    for (const row of rows) {
+                        tbl += '<tr>';
+                        for (const cell of row) tbl += '<td>' + inline(cell) + '</td>';
+                        tbl += '</tr>';
+                    }
+                    tbl += '</tbody>';
+                }
+                tbl += '</table>';
+                out.push(tbl);
+                continue;
+            }
+
             // Blank line — paragraph separator.
             if (line.trim() === '') {
                 i += 1;
@@ -154,7 +187,8 @@ const Markdown = (function () {
                 && !isFenceOpen(lines[i])
                 && !isHeading(lines[i])
                 && !isUlItem(lines[i])
-                && !isOlItem(lines[i])) {
+                && !isOlItem(lines[i])
+                && !isTableRow(lines[i])) {
                 para.push(lines[i]);
                 i += 1;
             }
@@ -584,6 +618,9 @@ const Markdown = (function () {
             if (nameEl) nameEl.textContent = name;
             const status = card.el.querySelector('.tool-status');
             if (status) status.textContent = 'running…';
+            // v2.6 — pending cards also need the subagent panel.
+            if (name === 'subagent') attachSubagentPanel(card.el);
+            else attachResultPanel(card.el);
             toolCards.set(callId, card.el);
             scrollToBottom();
             return;
@@ -603,12 +640,18 @@ const Markdown = (function () {
         args.className = 'tool-args';
         el.appendChild(head);
         el.appendChild(args);
+
+        // v2.6 — subagent tool gets an expandable progress panel;
+        // regular tools get a result panel. Mutually exclusive.
+        if (name === 'subagent') attachSubagentPanel(el);
+        else attachResultPanel(el);
+
         conversation.appendChild(el);
         toolCards.set(callId, el);
         scrollToBottom();
     }
 
-    function endToolCall(callId, isError, toolCode) {
+    function endToolCall(callId, isError, toolCode, resultText) {
         const el = toolCards.get(callId);
         if (!el) return;
         toolCards.delete(callId);
@@ -617,6 +660,37 @@ const Markdown = (function () {
         if (status) status.textContent = denied ? 'denied (role)' : isError ? 'error' : 'done';
         if (isError) el.classList.add('is-error');
         if (denied) el.classList.add('is-role-denied');
+
+        const toggle = el.querySelector('.tool-result-toggle');
+
+        // For subagent cards: append result as a final entry in the
+        // shared progress log so there is only one panel + one button.
+        const saLog = el.querySelector('.subagent-log');
+        if (saLog) {
+            if (resultText) {
+                const entry = document.createElement('div');
+                entry.className = 'subagent-entry' + (isError ? ' sa-error' : '');
+                entry.textContent = (isError ? '⚠ ' : '✓ ') + resultText;
+                saLog.appendChild(entry);
+            }
+            if (isError && toggle) {
+                toggle.setAttribute('aria-expanded', 'true');
+                toggle.textContent = '▼';
+                saLog.removeAttribute('hidden');
+            }
+            return;
+        }
+
+        // Regular tool cards: populate the dedicated result log.
+        const panel = el.querySelector('.tool-result-log');
+        if (panel && resultText) {
+            panel.textContent = resultText;
+            if (isError && toggle) {
+                toggle.setAttribute('aria-expanded', 'true');
+                toggle.textContent = '▼';
+                panel.removeAttribute('hidden');
+            }
+        }
     }
 
     // v1.11.4 — permission-prompt modal. Renders an inline card
@@ -689,6 +763,157 @@ const Markdown = (function () {
 
         conversation.appendChild(el);
         scrollToBottom();
+    }
+
+    // ── v2.6 helpers ─────────────────────────────────────────────
+
+    /// Escape HTML special characters for safe DOM insertion.
+    function escHtml(s) {
+        return String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    /// Wire up the collapsible result panel on every tool card.
+    /// Populated and optionally expanded by endToolCall.
+    function attachResultPanel(el) {
+        const head = el.querySelector('.tool-head');
+
+        const panel = document.createElement('div');
+        panel.className = 'tool-result-log';
+        panel.setAttribute('hidden', '');
+        el.appendChild(panel);
+
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'tool-result-toggle';
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.textContent = '▶';
+        toggle.addEventListener('click', () => {
+            const expanded = toggle.getAttribute('aria-expanded') === 'true';
+            if (expanded) {
+                toggle.setAttribute('aria-expanded', 'false');
+                toggle.textContent = '▶';
+                panel.setAttribute('hidden', '');
+            } else {
+                toggle.setAttribute('aria-expanded', 'true');
+                toggle.textContent = '▼';
+                panel.removeAttribute('hidden');
+            }
+        });
+        if (head) head.appendChild(toggle);
+    }
+
+    /// Wire up the collapsible sub-agent progress panel on a tool card.
+    /// Called from startToolCall for both fresh cards and claimed
+    /// pending cards (streaming providers open a pending card before
+    /// tool_execution_start fires, so both paths must call this).
+    function attachSubagentPanel(el) {
+        el.classList.add('tool-card-subagent');
+
+        const head = el.querySelector('.tool-head');
+
+        const log = document.createElement('div');
+        log.className = 'subagent-log';
+        log.setAttribute('hidden', '');
+        el.appendChild(log);
+
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'tool-result-toggle';
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.textContent = '▶';
+        toggle.addEventListener('click', () => {
+            const expanded = toggle.getAttribute('aria-expanded') === 'true';
+            if (expanded) {
+                toggle.setAttribute('aria-expanded', 'false');
+                toggle.textContent = '▶';
+                log.setAttribute('hidden', '');
+            } else {
+                toggle.setAttribute('aria-expanded', 'true');
+                toggle.textContent = '▼';
+                log.removeAttribute('hidden');
+            }
+        });
+        if (head) head.appendChild(toggle);
+
+        el._saTools = new Map();
+    }
+
+    /// Append one sub-agent progress entry to the subagent log panel.
+    function appendSubagentEntry(card, log, upd) {
+        const kind = upd.kind;
+        let el = null;
+
+        if (kind === 'turn_start' || kind === 'turn_end') {
+            return; // no-op — turn counter removed per UX feedback
+
+        } else if (kind === 'tool_start') {
+            el = document.createElement('div');
+            el.className = 'subagent-entry';
+            const argsHtml = upd.args
+                ? ' <span class="sa-args">' + escHtml(upd.args) + '</span>'
+                : '';
+            el.innerHTML = '→ ' + escHtml(upd.name || '') + argsHtml +
+                ' <span class="sa-status">running</span>';
+            if (!card._saTools) card._saTools = new Map();
+            card._saTools.set(upd.cid, el);
+
+        } else if (kind === 'tool_end') {
+            if (!card._saTools) return;
+            const entry = card._saTools.get(upd.cid);
+            if (entry) {
+                const statusEl = entry.querySelector('.sa-status');
+                if (statusEl) {
+                    if (upd.ok === false) {
+                        statusEl.textContent = 'error';
+                        statusEl.classList.add('is-error');
+                    } else {
+                        statusEl.textContent = 'done';
+                        statusEl.classList.add('done');
+                    }
+                }
+            }
+            return; // no new element to append
+
+        } else if (kind === 'error') {
+            el = document.createElement('div');
+            el.className = 'subagent-entry sa-error';
+            el.textContent = '⚠ ' + (upd.msg || 'error');
+            // Auto-expand panel on error if currently collapsed.
+            const toggle = card.querySelector('.tool-result-toggle');
+            if (toggle && toggle.getAttribute('aria-expanded') !== 'true') {
+                toggle.setAttribute('aria-expanded', 'true');
+                toggle.textContent = '▼';
+                log.removeAttribute('hidden');
+            }
+
+        } else if (kind === 'text_delta') {
+            el = document.createElement('div');
+            el.className = 'subagent-entry';
+            const preview = (upd.delta || '').slice(0, 60);
+            el.style.opacity = '0.6';
+            el.style.fontSize = '11px';
+            el.textContent = '› ' + preview + (upd.delta && upd.delta.length > 60 ? '…' : '');
+
+        } else if (kind === 'thinking_delta') {
+            el = document.createElement('div');
+            el.className = 'subagent-entry';
+            const preview = (upd.delta || '').slice(0, 60);
+            el.style.opacity = '0.5';
+            el.style.fontSize = '11px';
+            el.style.fontStyle = 'italic';
+            el.textContent = '› (thinking) ' + preview + (upd.delta && upd.delta.length > 60 ? '…' : '');
+        }
+
+        if (el) {
+            log.appendChild(el);
+            // Auto-scroll the log if already near the bottom.
+            const atBottom = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight < 80;
+            if (atBottom) scrollToBottom();
+        }
     }
 
     // ── EventSource wiring ───────────────────────────────────────
@@ -778,11 +1003,31 @@ const Markdown = (function () {
             noteEvent();
             const data = parseData(e.data);
             if (!data) return;
-            endToolCall(data.callId, !!data.isError, data.toolCode || null);
+            endToolCall(data.callId, !!data.isError, data.toolCode || null, data.resultText || '');
             // After a tool completes the loop usually starts the
             // next assistant turn — show "thinking…" until the
             // next message_start arrives.
             setActivity('thinking…');
+        });
+
+        // v2.6 — sub-agent progress updates. The server wraps each
+        // sub-agent structural event in a `tool_execution_update`
+        // event keyed by the parent subagent call's callId. The
+        // payload's `update` field contains the sub-agent JSON blob.
+        es.addEventListener('tool_execution_update', (e) => {
+            noteEvent();
+            const data = parseData(e.data);
+            if (!data || !data.callId) return;
+            const card = toolCards.get(data.callId);
+            if (!card || !card.classList.contains('tool-card-subagent')) return;
+            const log = card.querySelector('.subagent-log');
+            if (!log) return;
+            let upd;
+            try {
+                upd = typeof data.update === 'string' ? JSON.parse(data.update) : data.update;
+            } catch (_) { return; }
+            if (!upd) return;
+            appendSubagentEntry(card, log, upd);
         });
 
         // v1.11.4 — pause-and-prompt permission overlay. Server
@@ -871,6 +1116,26 @@ const Markdown = (function () {
         // broadcasts `event: ping` every 15s while a turn is
         // running.
         es.addEventListener('ping', () => { noteEvent(); });
+
+        // v1.16.0 — the server fires `replay_gap` when a reconnecting
+        // client's Last-Event-ID is older than the oldest ring entry
+        // (ring overflow, typically from a large thinking-delta burst).
+        // For completed turns: wipe the pane and rehydrate from the
+        // persisted transcript so the user sees the full conversation.
+        // For in-flight turns: warn that some streamed content was lost
+        // and let the current stream continue from wherever it resumes.
+        es.addEventListener('replay_gap', async () => {
+            noteEvent();
+            if (!isStreaming) {
+                clearConversation();
+                await rehydrate();
+            } else {
+                appendSystemMessage('',
+                    '_Some streamed content was lost during reconnect. ' +
+                    'The response will continue from where it reconnected._',
+                    false);
+            }
+        });
 
         return es;
     }

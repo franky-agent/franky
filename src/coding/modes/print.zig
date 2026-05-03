@@ -1590,6 +1590,17 @@ pub fn buildSystemPromptIo(
     }
     defer if (base_owned) allocator.free(base);
 
+    // v2.4.0 — inject the real working directory so the model
+    // doesn't hallucinate its own cwd before checking with pwd.
+    // Prepend "Current folder: <pwd>" as the very first line.
+    if (environ.getPosix("PWD")) |pwd| {
+        const trimmed = std.mem.trimEnd(u8, base, &std.ascii.whitespace);
+        const inj = try std.fmt.allocPrint(allocator, "Current folder: {s}\n\n{s}", .{ pwd, trimmed });
+        allocator.free(base);
+        base = inj;
+        // base_owned remains true (we just replaced the buffer)
+    }
+
     // v1.24.1 — append a concise subagent hint when we're using
     // the built-in default prompt. Skipped for disk-loaded prompts
     // (operator chose their own wording — don't muck with it).
@@ -2153,7 +2164,11 @@ fn runDoctorSubcommand(
     };
     defer if (session_dir_arg == null and session_id != null) allocator.free(session_dir);
 
-    // Load transcript.
+    // Load session header (provider + model) and transcript.
+    const header = session_mod.readSessionHeader(allocator, io, session_dir) catch |err|
+        return exitFmtErr(allocator, io, "doctor: cannot load session header from {s}: {s}\n", .{ session_dir, @errorName(err) }, 1);
+    defer session_mod.freeSessionHeader(allocator, header);
+
     var transcript = session_mod.readTranscript(allocator, io, session_dir) catch |err|
         return exitFmtErr(allocator, io, "doctor: cannot load transcript from {s}: {s}\n", .{ session_dir, @errorName(err) }, 1);
     defer transcript.deinit();
@@ -2164,6 +2179,8 @@ fn runDoctorSubcommand(
         .session_dir = session_dir,
         .session_label = session_id,
         .mode_name = "print",
+        .provider = if (header.provider.len > 0) header.provider else null,
+        .model = if (header.model.len > 0) header.model else null,
     };
 
     const persist_opts: ?diagnostics_mod.PersistOptions = if (!no_persist) blk: {

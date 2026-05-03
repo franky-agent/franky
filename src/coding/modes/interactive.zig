@@ -191,6 +191,14 @@ fn runInteractive(
     var scrollback = Scrollback.init(allocator);
     defer scrollback.deinit();
 
+    // ── Preset registry (shared with SessionBinding) ────────────────
+    // Created here so it lives across extension init and SessionBinding
+    // init. Extensions register custom presets via ext_manager, then
+    // SessionBinding registers built-in presets and wires the subagent
+    // tool.
+    var preset_registry = tools_mod.subagent.PresetRegistry.init(allocator);
+    defer preset_registry.deinit();
+
     // Reserve session-level state identical to print mode so
     // --resume / --session / provider lookup / tool selection all
     // keep working. The `SessionBinding` encapsulates what would
@@ -200,7 +208,7 @@ fn runInteractive(
     // the registry stores `&session.faux` as an opaque userdata
     // pointer, so the struct must not move after init.
     var session: SessionBinding = undefined;
-    try SessionBinding.init(&session, allocator, io, environ, environ_map, cfg);
+    try SessionBinding.init(&session, allocator, io, environ, environ_map, cfg, &preset_registry);
     defer session.deinit();
 
     // Note: `--log-per-session` is a no-op in interactive mode.
@@ -1677,6 +1685,7 @@ const SessionBinding = struct {
         environ: std.process.Environ,
         environ_map: *std.process.Environ.Map,
         cfg: *cli_mod.Config,
+        preset_registry: *tools_mod.subagent.PresetRegistry,
     ) !void {
         binding.* = .{
             .allocator = allocator,
@@ -1797,16 +1806,15 @@ const SessionBinding = struct {
             .stream_fn = ai.providers.google_gemini.streamFn,
         });
 
-        // v1.24.0 — append subagent + list_subagent_presets tools.
-        // v2.5 — preset registry in arena.
+        // v2.5 — subagent + list_subagent_presets tools.
+        // Extensions may have already registered custom presets
+        // (via ext_manager.presets). Register built-in presets now,
+        // then build the combined parameters JSON from the arena.
         {
             const aa = binding.arena.allocator();
+            try tools_mod.subagent.registerBuiltinPresets(preset_registry);
 
-            const preset_reg = try aa.create(tools_mod.subagent.PresetRegistry);
-            preset_reg.* = tools_mod.subagent.PresetRegistry.init(aa);
-            try tools_mod.subagent.registerBuiltinPresets(preset_reg);
-
-            const params_json = try tools_mod.subagent.buildParametersJson(aa, preset_reg);
+            const params_json = try tools_mod.subagent.buildParametersJson(aa, preset_registry);
 
             const subagent_ctx = try aa.create(tools_mod.subagent.Ctx);
             subagent_ctx.* = .{
@@ -1816,7 +1824,7 @@ const SessionBinding = struct {
                 .parent_tools = binding.tools,
                 .parent_role = binding.role_gate.role,
                 .parent_profile = cfg.profile orelse "",
-                .presets = preset_reg,
+                .presets = preset_registry,
                 .parameters_json_owned = params_json,
                 .permission_store = if (binding.prompts_enabled) &binding.permission_store else null,
                 // v1.24.3 — interactive's prompter lives on a per-
@@ -1831,7 +1839,7 @@ const SessionBinding = struct {
             const final_tools = try aa.alloc(at.AgentTool, binding.tools.len + 2);
             @memcpy(final_tools[0..binding.tools.len], binding.tools);
             final_tools[binding.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-            final_tools[binding.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
+            final_tools[binding.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_registry);
             binding.tools = final_tools;
         }
 

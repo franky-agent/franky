@@ -507,6 +507,14 @@ fn runTurn(
             ai.log.log(.debug, "loop", "text_tool_fallback_failed", "err={s}", .{@errorName(e)});
         };
     }
+    // Unconditional DSML-in-thinking scan: DeepSeek via Ollama embeds tool
+    // calls inside reasoning_content (thinking blocks) using DSML markup
+    // instead of the standard tool_calls[] array.  The DSML tag format is
+    // specific enough (Unicode fullwidth vbars) that false positives are
+    // impossible in practice so no opt-in flag is needed.
+    maybeApplyDsmlThinkingFallback(allocator, &assistant_msg, config.tools) catch |e| {
+        ai.log.log(.debug, "loop", "dsml_thinking_fallback_failed", "err={s}", .{@errorName(e)});
+    };
     // Push a duplicate into the event and keep the original for transcript.
     try out.push(io, .{ .message_end = try dupeMessage(allocator, assistant_msg) });
     if (ai.log.enabledForScope(.trace, "message")) logMessageTrace("recv", 0, assistant_msg);
@@ -568,7 +576,7 @@ fn runTurn(
                 }
                 break :blk try makeErrorResult(allocator, "unknown tool");
             };
-            try pushToolStart(out, io, allocator, tc.id, tc.name);
+            try pushToolStart(out, io, allocator, tc.id, tc.name, tc.arguments_json);
             try pushToolEnd(out, io, allocator, tc.id, null, r);
             try results.append(allocator, .{ .call_id = tc.id, .result = r, .terminate = false });
             continue;
@@ -581,14 +589,14 @@ fn runTurn(
             if (dec.block) {
                 const reason = dec.reason_text orelse "blocked by beforeToolCall";
                 const r = try makeErrorResult(allocator, reason);
-                try pushToolStart(out, io, allocator, tc.id, tool_def.name);
+                try pushToolStart(out, io, allocator, tc.id, tool_def.name, tc.arguments_json);
                 try pushToolEnd(out, io, allocator, tc.id, tool_def, r);
                 try results.append(allocator, .{ .call_id = tc.id, .result = r, .terminate = false });
                 continue;
             }
         }
 
-        try pushToolStart(out, io, allocator, tc.id, tool_def.name);
+        try pushToolStart(out, io, allocator, tc.id, tool_def.name, tc.arguments_json);
 
         const on_update: at.OnUpdate = .{};
         var call_res = tool_def.execute(
@@ -733,7 +741,7 @@ fn runToolsParallel(
     // signal that a given call_id is in flight.
     for (tool_calls) |tc| {
         const tool_def = findTool(config.tools, tc.name).?;
-        try pushToolStart(out, io, allocator, tc.id, tool_def.name);
+        try pushToolStart(out, io, allocator, tc.id, tool_def.name, tc.arguments_json);
     }
 
     // Spawn one thread per non-vetoed call.
@@ -842,10 +850,12 @@ fn pushToolStart(
     allocator: std.mem.Allocator,
     call_id: []const u8,
     name: []const u8,
+    args_json: []const u8,
 ) !void {
     try out.push(io, .{ .tool_execution_start = .{
         .call_id = try allocator.dupe(u8, call_id),
         .name = try allocator.dupe(u8, name),
+        .args_json = try allocator.dupe(u8, args_json),
     } });
 }
 
@@ -969,6 +979,40 @@ fn looksLikeJsonError(name: []const u8) bool {
 // where 64-bit atomic RMW isn't a single-instruction primitive.
 // 4 billion synthetic ids per process is plenty.
 var synth_tool_id_seq: std.atomic.Value(u32) = .init(0);
+
+/// DeepSeek via Ollama embeds tool calls inside the `reasoning_content`
+/// field, which arrives as a thinking block rather than a structured
+/// `tool_calls[]` array. Scan every thinking block for DSML markup; if
+/// found, append a new tool_call block to `msg`. Idempotent: skips when
+/// the message already carries a tool_call block.
+fn maybeApplyDsmlThinkingFallback(
+    allocator: std.mem.Allocator,
+    msg: *AgentMessage,
+    tools: []const at.AgentTool,
+) !void {
+    for (msg.content) |cb| switch (cb) {
+        .tool_call => return,
+        else => {},
+    };
+    for (msg.content) |cb| switch (cb) {
+        .thinking => |th| {
+            const extracted = (try extractDsmlToolCall(allocator, th.thinking, tools)) orelse continue;
+            msg.content = try allocator.realloc(msg.content, msg.content.len + 1);
+            const seq = synth_tool_id_seq.fetchAdd(1, .monotonic);
+            const id = try std.fmt.allocPrint(allocator, "txtcall_{x:0>8}", .{seq});
+            msg.content[msg.content.len - 1] = .{ .tool_call = .{
+                .id = id,
+                .name = extracted.name,
+                .arguments_json = extracted.args,
+            } };
+            ai.log.log(.debug, "loop", "dsml_thinking_fallback_hit", "name={s} args_bytes={d}", .{
+                extracted.name, extracted.args.len,
+            });
+            return;
+        },
+        else => {},
+    };
+}
 
 /// Inspect `msg`. If it carries text content that parses as a
 /// recognized tool-call shape AND the named tool is in `tools`,
@@ -1737,6 +1781,61 @@ test "extractDsmlToolCall: tool name not in registry → null" {
         "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"x\" string=\"true\">y\n";
     const result = try extractDsmlToolCall(gpa, text, &tools);
     try testing.expect(result == null);
+}
+
+test "maybeApplyDsmlThinkingFallback: extracts tool call from thinking block" {
+    // Simulates DeepSeek via Ollama: DSML tool call embedded in reasoning_content
+    // which arrives as a thinking block with no separate tool_calls[] array.
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+
+    const dsml =
+        "Some reasoning about what to do next.\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls>\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cinvoke name=\"read\">\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"path\" string=\"true\">src/foo.zig\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9cinvoke>\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls>\n";
+
+    const thinking_text = try gpa.dupe(u8, dsml);
+    var content_blocks = try gpa.alloc(ai.types.ContentBlock, 1);
+    content_blocks[0] = .{ .thinking = .{ .thinking = thinking_text } };
+
+    var msg = AgentMessage{
+        .role = .assistant,
+        .content = content_blocks,
+        .timestamp = 0,
+    };
+    defer msg.deinit(gpa);
+
+    try maybeApplyDsmlThinkingFallback(gpa, &msg, &tools);
+
+    try testing.expectEqual(@as(usize, 2), msg.content.len);
+    try testing.expect(msg.content[0] == .thinking);
+    try testing.expect(msg.content[1] == .tool_call);
+    try testing.expectEqualStrings("read", msg.content[1].tool_call.name);
+    const args = msg.content[1].tool_call.arguments_json;
+    try testing.expect(std.mem.indexOf(u8, args, "src/foo.zig") != null);
+}
+
+test "maybeApplyDsmlThinkingFallback: skips when tool_call already present" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+
+    const existing_id = try gpa.dupe(u8, "existing");
+    const existing_name = try gpa.dupe(u8, "read");
+    const existing_args = try gpa.dupe(u8, "{}");
+    var content_blocks = try gpa.alloc(ai.types.ContentBlock, 1);
+    content_blocks[0] = .{ .tool_call = .{ .id = existing_id, .name = existing_name, .arguments_json = existing_args } };
+
+    var msg = AgentMessage{ .role = .assistant, .content = content_blocks, .timestamp = 0 };
+    defer msg.deinit(gpa);
+
+    try maybeApplyDsmlThinkingFallback(gpa, &msg, &tools);
+
+    // Still just the one existing tool_call — fallback is idempotent.
+    try testing.expectEqual(@as(usize, 1), msg.content.len);
+    try testing.expect(msg.content[0] == .tool_call);
 }
 
 test "maybeApplyTextToolCallFallback: leaves message untouched when no match" {

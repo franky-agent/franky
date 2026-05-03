@@ -239,7 +239,8 @@ pub fn grepTree(
 ) !at.ToolResult {
     const root_dir = std.Io.Dir.cwd().openDir(io, cwd, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return common.toolError(allocator, "file_not_found", cwd),
-        error.NotDir => return common.toolError(allocator, "not_a_directory", cwd),
+        // path is a file, not a directory — grep it directly.
+        error.NotDir => return grepSingleFile(allocator, io, cwd, matcher, context_before, context_after, max_matches, cancel),
         error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", cwd),
         else => return common.toolError(allocator, "open_failed", @errorName(err)),
     };
@@ -340,6 +341,86 @@ pub fn grepTree(
             "Some lines truncated to {d} chars. Use the read tool to see full lines",
             .{truncate_mod.grep_max_line_length},
         );
+        defer allocator.free(msg);
+        if (notices.items.len > 0) try notices.appendSlice(allocator, ". ");
+        try notices.appendSlice(allocator, msg);
+    }
+
+    var final: std.ArrayList(u8) = .empty;
+    defer final.deinit(allocator);
+    try final.appendSlice(allocator, trunc.content);
+    if (notices.items.len > 0) {
+        if (final.items.len > 0 and final.items[final.items.len - 1] != '\n') try final.append(allocator, '\n');
+        try final.append(allocator, '\n');
+        try final.append(allocator, '[');
+        try final.appendSlice(allocator, notices.items);
+        try final.appendSlice(allocator, "]\n");
+    }
+
+    const text = try allocator.dupe(u8, final.items);
+    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
+    arr[0] = .{ .text = .{ .text = text } };
+    return .{ .content = arr };
+}
+
+/// Grep a single file path directly (used when `path` points to a file,
+/// not a directory). Gitignore and filesGlob are not applied — the
+/// caller already named the file explicitly.
+fn grepSingleFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file_path: []const u8,
+    matcher: *const Matcher,
+    context_before: usize,
+    context_after: usize,
+    max_matches: usize,
+    cancel: *ai.stream.Cancel,
+) !at.ToolResult {
+    if (cancel.isFired()) return common.toolError(allocator, "aborted", "cancelled");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var total: usize = 0;
+    var any_line_truncated: bool = false;
+
+    var cwd_dir = std.Io.Dir.cwd();
+    grepFile(
+        allocator,
+        io,
+        &cwd_dir,
+        file_path,
+        matcher,
+        context_before,
+        context_after,
+        max_matches,
+        &total,
+        &out,
+        &any_line_truncated,
+    ) catch |e| switch (e) {
+        error.FileNotFound => return common.toolError(allocator, "file_not_found", file_path),
+        error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", file_path),
+        else => return common.toolError(allocator, "read_failed", @errorName(e)),
+    };
+
+    const trunc = truncate_mod.truncateHead(out.items, .{
+        .max_lines = std.math.maxInt(usize),
+        .max_bytes = truncate_mod.default_max_bytes,
+    });
+
+    var notices: std.ArrayList(u8) = .empty;
+    defer notices.deinit(allocator);
+    if (trunc.truncated and trunc.truncated_by == .bytes) {
+        const cap = try truncate_mod.formatSize(allocator, trunc.max_bytes);
+        defer allocator.free(cap);
+        const msg = try std.fmt.allocPrint(allocator,
+            "{s} byte limit reached; use a narrower pattern", .{cap});
+        defer allocator.free(msg);
+        try notices.appendSlice(allocator, msg);
+    }
+    if (any_line_truncated) {
+        const msg = try std.fmt.allocPrint(allocator,
+            "Some lines truncated to {d} chars. Use the read tool to see full lines",
+            .{truncate_mod.grep_max_line_length});
         defer allocator.free(msg);
         if (notices.items.len > 0) try notices.appendSlice(allocator, ". ");
         try notices.appendSlice(allocator, msg);
@@ -816,6 +897,37 @@ test "grep tool: respectGitignore drops ignored matches (v1.26.2 regression)" {
     const text2 = res2.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text2, "visible.txt") != null);
     try testing.expect(std.mem.indexOf(u8, text2, "cache/leak.txt") != null);
+}
+
+test "grep tool: path pointing to a single file works" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_grep_single_file";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/src.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "fn saveBuiltin() void {}\nfn other() void {}\n");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    const args = try std.fmt.allocPrint(gpa,
+        \\{{"pattern":"fn saveBuiltin","path":"{s}/src.zig","regex":false}}
+    , .{base});
+    defer gpa.free(args);
+    const t = tool();
+    var res = try t.execute(&t, gpa, io, "call-sf", args, &cancel, .{});
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "fn saveBuiltin") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "fn other") == null);
 }
 
 test "grep tool: hard-skips .git directory regardless of respectGitignore" {

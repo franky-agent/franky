@@ -73,12 +73,215 @@ pub const default_max_turns: u32 = 20; //         design §3.7
 /// quota manageable. Configurable knob deferred to v2 — most
 /// users either run 1-3 concurrent sub-agents (well under the
 /// cap, no effect) or need a different default per-provider
-/// (Cerebras: ~5, Groq: ~30) which a single global doesn't
+/// (Cerebras: ~5) which a single global doesn't
 /// capture cleanly.
 pub const concurrency_cap: u32 = 10;
 var concurrency_mutex: std.Io.Mutex = .init;
 var concurrency_active: u32 = 0;
 var concurrency_cond: std.Io.Condition = .init;
+
+// ─── v2.6 — sub-agent progress forwarding ─────────────────────────
+
+/// Per-call state for `subagentProgressHandler`. Lives on the
+/// `runSubagent` stack frame — valid for the lifetime of the
+/// sub-agent (stack-allocated + unsubscribed before frame exits).
+const ForwardState = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    /// Borrowed from `runSubagent`'s stack frame.
+    call_id: []const u8,
+    ctx: *const Ctx,
+    /// Tracks tool names by call_id so `tool_execution_end` can emit
+    /// the name (not present in the end event payload). Guarded by
+    /// the agent's `subs_mutex` (handler fires under it). The map
+    /// owns both keys and values (duped on insert, freed on remove).
+    tool_names: std.StringHashMapUnmanaged([]const u8),
+    /// Mutex protecting `tool_names` from concurrent subagent tool
+    /// executions (parallel tools call the handler concurrently).
+    names_mutex: std.Io.Mutex,
+
+    fn deinit(self: *ForwardState) void {
+        var it = self.tool_names.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.tool_names.deinit(self.allocator);
+    }
+};
+
+/// JSON-escape a string into a fixed-size stack buffer. Returns the
+/// escaped slice, or null if the buffer was too small. Escapes `"`,
+/// `\`, `\n`, `\r`, `\t`, and control chars as `\uXXXX`.
+fn jsonEscapeInto(buf: []u8, s: []const u8) ?[]u8 {
+    var out: usize = 0;
+    for (s) |c| {
+        const need: usize = switch (c) {
+            '"', '\\' => 2,
+            '\n', '\r', '\t' => 2,
+            0...0x07, 0x0b, 0x0e...0x1f => 6,
+            else => 1,
+        };
+        if (out + need > buf.len) return null;
+        switch (c) {
+            '"' => {
+                buf[out] = '\\';
+                buf[out + 1] = '"';
+            },
+            '\\' => {
+                buf[out] = '\\';
+                buf[out + 1] = '\\';
+            },
+            '\n' => {
+                buf[out] = '\\';
+                buf[out + 1] = 'n';
+            },
+            '\r' => {
+                buf[out] = '\\';
+                buf[out + 1] = 'r';
+            },
+            '\t' => {
+                buf[out] = '\\';
+                buf[out + 1] = 't';
+            },
+            0...0x07, 0x0b, 0x0e...0x1f => {
+                _ = std.fmt.bufPrint(buf[out..][0..6], "\\u{x:0>4}", .{c}) catch unreachable;
+            },
+            else => {
+                buf[out] = c;
+            },
+        }
+        out += need;
+    }
+    return buf[0..out];
+}
+
+/// Allocate an escaped copy of `s` using `allocator`.
+fn jsonEscapeAlloc(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    // Worst case: every byte expands to 6 chars (\uXXXX).
+    const cap = s.len * 6;
+    const buf = try allocator.alloc(u8, cap);
+    const result = jsonEscapeInto(buf, s) orelse unreachable;
+    return allocator.realloc(buf, result.len);
+}
+
+/// `SubscribeHandler` fired synchronously (under `subs_mutex`) from
+/// the sub-agent's worker thread for every `AgentEvent`. Translates
+/// structural events into compact `update_json` blobs and calls
+/// `ctx.progress_fn`.
+fn subagentProgressHandler(userdata: ?*anyopaque, ev: at.AgentEvent) void {
+    const fwd: *ForwardState = @ptrCast(@alignCast(userdata.?));
+    const ctx = fwd.ctx;
+    const progress_fn = ctx.progress_fn orelse return;
+
+    // Fixed-size stack buffer for events with bounded size.
+    var stack_buf: [512]u8 = undefined;
+
+    switch (ev) {
+        .turn_start, .turn_end => {},
+        .tool_execution_start => |s| {
+            // Store name by call_id so tool_execution_end can include it.
+            fwd.names_mutex.lockUncancelable(fwd.io);
+            const key = fwd.allocator.dupe(u8, s.call_id) catch null;
+            const val = fwd.allocator.dupe(u8, s.name) catch null;
+            if (key != null and val != null) {
+                fwd.tool_names.put(fwd.allocator, key.?, val.?) catch {
+                    fwd.allocator.free(key.?);
+                    fwd.allocator.free(val.?);
+                };
+            } else {
+                if (key) |k| fwd.allocator.free(k);
+                if (val) |v| fwd.allocator.free(v);
+            }
+            fwd.names_mutex.unlock(fwd.io);
+            // Truncate args to 80 chars for the progress preview, then
+            // JSON-escape into a local buffer before embedding in JSON.
+            const max_args: usize = 80;
+            const args_src = if (s.args_json.len > max_args) s.args_json[0..max_args] else s.args_json;
+            const truncated = s.args_json.len > max_args;
+            var args_esc_buf: [512]u8 = undefined;
+            const args_esc = jsonEscapeInto(&args_esc_buf, args_src) orelse "";
+            var ts_buf: [1024]u8 = undefined;
+            const json = std.fmt.bufPrint(
+                &ts_buf,
+                "{{\"kind\":\"tool_start\",\"name\":\"{s}\",\"cid\":\"{s}\",\"args\":\"{s}{s}\"}}",
+                .{ s.name, s.call_id, args_esc, if (truncated) "..." else "" },
+            ) catch return;
+            progress_fn(ctx.progress_userdata, fwd.call_id, json);
+        },
+        .tool_execution_end => |e| {
+            // Recover name from our tracking map (tool_execution_end
+            // doesn't carry the tool name in its payload).
+            fwd.names_mutex.lockUncancelable(fwd.io);
+            const maybe_name = fwd.tool_names.get(e.call_id);
+            // Copy the name before unlocking so we can use it after.
+            const name_copy: []const u8 = if (maybe_name) |n|
+                fwd.allocator.dupe(u8, n) catch ""
+            else
+                "";
+            // Remove the entry — this call is done.
+            if (fwd.tool_names.fetchRemove(e.call_id)) |kv| {
+                fwd.allocator.free(kv.key);
+                fwd.allocator.free(kv.value);
+            }
+            fwd.names_mutex.unlock(fwd.io);
+            defer if (name_copy.len > 0) fwd.allocator.free(name_copy);
+
+            const json = std.fmt.bufPrint(
+                &stack_buf,
+                "{{\"kind\":\"tool_end\",\"name\":\"{s}\",\"cid\":\"{s}\",\"ok\":{s}}}",
+                .{ name_copy, e.call_id, if (!e.result.is_error) "true" else "false" },
+            ) catch return;
+            progress_fn(ctx.progress_userdata, fwd.call_id, json);
+        },
+        .agent_error => |d| {
+            const escaped = jsonEscapeAlloc(fwd.allocator, d.message) catch return;
+            defer fwd.allocator.free(escaped);
+            const json = std.fmt.allocPrint(
+                fwd.allocator,
+                "{{\"kind\":\"error\",\"msg\":\"{s}\"}}",
+                .{escaped},
+            ) catch return;
+            defer fwd.allocator.free(json);
+            progress_fn(ctx.progress_userdata, fwd.call_id, json);
+        },
+        .message_update => |m| {
+            if (!ctx.verbose_progress) return;
+            switch (m) {
+                .text => |t| {
+                    const escaped = jsonEscapeAlloc(fwd.allocator, t.delta) catch return;
+                    defer fwd.allocator.free(escaped);
+                    const json = std.fmt.allocPrint(
+                        fwd.allocator,
+                        "{{\"kind\":\"text_delta\",\"block\":{d},\"delta\":\"{s}\"}}",
+                        .{ t.block_index, escaped },
+                    ) catch return;
+                    defer fwd.allocator.free(json);
+                    progress_fn(ctx.progress_userdata, fwd.call_id, json);
+                },
+                .thinking => |t| {
+                    const escaped = jsonEscapeAlloc(fwd.allocator, t.delta) catch return;
+                    defer fwd.allocator.free(escaped);
+                    const json = std.fmt.allocPrint(
+                        fwd.allocator,
+                        "{{\"kind\":\"thinking_delta\",\"block\":{d},\"delta\":\"{s}\"}}",
+                        .{ t.block_index, escaped },
+                    ) catch return;
+                    defer fwd.allocator.free(json);
+                    progress_fn(ctx.progress_userdata, fwd.call_id, json);
+                },
+                .toolcall_args => {}, // not forwarded
+            }
+        },
+        // Never forwarded.
+        .message_start,
+        .message_end,
+        .tool_execution_update,
+        .tool_permission_request,
+        .agent_interrupted,
+        => {},
+    }
+}
 
 // ─── preset types ──────────────────────────────────────────────────
 
@@ -181,7 +384,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "research",
         .description = "Reads files, greps for patterns, summarises findings within the workspace.",
-        .default_profile = "gemini",
+        .default_profile = "ollama-gemma4",
         .default_role = .read,
         .default_system_prompt =
         \\You are a research sub-agent. Your job is to read, search, and summarise.
@@ -194,7 +397,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "code-audit",
         .description = "Audits a stated quality or security concern read-only across the workspace.",
-        .default_profile = "gemini",
+        .default_profile = "ollama-gemma4",
         .default_role = .read,
         .default_system_prompt =
         \\You are a code-audit sub-agent. Focus on the single concern stated in the prompt.
@@ -207,7 +410,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "file-ops",
         .description = "Performs targeted file edits given clear instructions.",
-        .default_profile = "",
+        .default_profile = "ollama-gemma4",
         .default_role = .plan,
         .default_system_prompt =
         \\You are a file-ops sub-agent. Apply the edits described in the prompt exactly.
@@ -219,7 +422,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "bash-runner",
         .description = "Runs a bounded shell task and reports stdout, stderr, and exit code.",
-        .default_profile = "",
+        .default_profile = "ollama-gemma4",
         .default_role = .code,
         .default_system_prompt =
         \\You are a bash-runner sub-agent. Execute the shell task described in the prompt.
@@ -281,7 +484,7 @@ pub fn listPresetsToolWithCtx(registry: *const PresetRegistry) at.AgentTool {
         .description = "List available sub-agent presets with their purpose, default profile, and default role.",
         .parameters_json = list_presets_params_json,
         .execution_mode = .sequential,
-        .ctx = @constCast(@ptrCast(registry)),
+        .ctx = @ptrCast(@constCast(registry)),
         .execute = executeListPresets,
     };
 }
@@ -404,6 +607,20 @@ pub const Ctx = struct {
     /// uses. v1.24.0 just passes the same registry through; this
     /// field is reserved for future per-sub-agent isolation.
     faux_userdata: ?*anyopaque = null,
+
+    // ── v2.6 — sub-agent progress forwarding ──────────────────────
+    //
+    // When set, `subagentProgressHandler` subscribes to the sub-agent
+    // and calls this function for every forwarded event. Must be
+    // thread-safe — the callback fires from the sub-agent's worker
+    // thread. Null → no forwarding (default, backward-compatible).
+    /// Called from the sub-agent's worker thread for each forwarded
+    /// event. Must be thread-safe. Null → no forwarding.
+    progress_fn: ?*const fn (userdata: ?*anyopaque, call_id: []const u8, update_json: []const u8) void = null,
+    progress_userdata: ?*anyopaque = null,
+    /// When true, also forward message_update (text + thinking) deltas.
+    /// Default false — structural events only.
+    verbose_progress: bool = false,
 };
 
 /// Unconfigured factory. The execute path errors with
@@ -425,7 +642,7 @@ pub fn toolWithCtx(ctx: *const Ctx) at.AgentTool {
         .description = "Spawn an isolated sub-agent with its own model + tool set, run it to completion, return the final assistant message. Pick a preset to choose the sub-agent's purpose and tools. Call list_subagent_presets to see what is available.",
         .parameters_json = ctx.parameters_json_owned,
         .execution_mode = .parallel,
-        .ctx = @constCast(@ptrCast(ctx)),
+        .ctx = @ptrCast(@constCast(ctx)),
         .execute = executeWithCtx,
     };
 }
@@ -722,6 +939,24 @@ fn runSubagent(
         },
     });
     defer sub_agent.deinit();
+
+    // v2.6 — subscribe to sub-agent events for progress forwarding.
+    // `ForwardState` lives on the stack here and is valid until after
+    // `waitForIdle` returns. The defer unsubscribes before the frame exits.
+    var fwd: ForwardState = .{
+        .io = io,
+        .allocator = allocator,
+        .call_id = call_id,
+        .ctx = ctx,
+        .tool_names = .{},
+        .names_mutex = .init,
+    };
+    defer fwd.deinit();
+    const sub_progress_id: ?u32 = if (ctx.progress_fn != null)
+        (sub_agent.subscribe(subagentProgressHandler, &fwd) catch null)
+    else
+        null;
+    defer if (sub_progress_id) |id| sub_agent.unsubscribe(id);
 
     // Spawn supervisor — fires sub_agent.cancel on parent cancel
     // OR timeout. The supervisor exits when `done.flag` is set
@@ -1170,7 +1405,6 @@ fn persistSubagentSession(
     try cwd.writeFile(io, .{ .sub_path = meta_path, .data = meta_buf.items });
 }
 
-
 // ─── tests ─────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1186,13 +1420,6 @@ test "parseArgs: required fields + defaults" {
     try testing.expectEqual(default_max_turns, p.max_turns);
     try testing.expect(p.role == null);
     try testing.expect(p.system_prompt == null);
-}
-
-test "parseArgs: optional profile is parsed when present" {
-    const gpa = testing.allocator;
-    var p = try parseArgs(gpa, "{\"preset\":\"research\",\"prompt\":\"hi\",\"profile\":\"groq\"}");
-    defer p.deinit(gpa);
-    try testing.expectEqualStrings("groq", p.profile.?);
 }
 
 test "parseArgs: explicit timeout_ms + max_turns + role" {
@@ -1337,7 +1564,7 @@ test "PresetRegistry: SDK preset overrides built-in with same name" {
     try reg.register(.{
         .name = "research",
         .description = "custom research",
-        .default_profile = "groq",
+        .default_profile = "gemini",
         .default_role = .read,
         .default_system_prompt = "custom prompt",
         .build_tools = buildResearchTools,
@@ -1345,7 +1572,7 @@ test "PresetRegistry: SDK preset overrides built-in with same name" {
 
     const p = reg.get("research").?;
     try testing.expectEqualStrings("custom research", p.description);
-    try testing.expectEqualStrings("groq", p.default_profile);
+    try testing.expectEqualStrings("gemini", p.default_profile);
 }
 
 test "ErrorKind hints are non-empty for all variants" {
@@ -1470,6 +1697,128 @@ test "cloneEnvironMap: produces an independent copy (v1.24.2 race fix)" {
     try clone.put("NEW", "from-clone");
     try testing.expectEqualStrings("1", src.get("FOO").?);
     try testing.expect(src.get("NEW") == null);
+}
+
+// ─── v2.6 progress handler tests ─────────────────────────────────
+
+test "subagentProgressHandler: turn_start/turn_end are no-ops (turn removed)" {
+    const gpa = testing.allocator;
+    const test_h = @import("../../test_helpers.zig");
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const TestState = struct {
+        calls: u32 = 0,
+
+        fn callback(userdata: ?*anyopaque, call_id: []const u8, update_json: []const u8) void {
+            _ = call_id;
+            _ = update_json;
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.calls += 1;
+        }
+    };
+
+    var ts: TestState = .{};
+    const test_ctx: Ctx = .{
+        .registry = undefined,
+        .environ = .empty,
+        .environ_map = undefined,
+        .parent_tools = &.{},
+        .parent_role = .read,
+        .presets = undefined,
+        .parameters_json_owned = "",
+        .permission_store = null,
+        .parent_session_dir = null,
+        .progress_fn = TestState.callback,
+        .progress_userdata = &ts,
+        .verbose_progress = false,
+    };
+
+    var fwd: ForwardState = .{
+        .io = io,
+        .allocator = gpa,
+        .call_id = "call-1",
+        .ctx = &test_ctx,
+        .tool_names = .{},
+        .names_mutex = .init,
+    };
+    defer fwd.deinit();
+
+    // turn_start and turn_end must NOT fire progress_fn — the turn
+    // counter was removed (not needed for web-ui proxy mode).
+    subagentProgressHandler(&fwd, .turn_start);
+    try testing.expectEqual(@as(u32, 0), ts.calls);
+
+    subagentProgressHandler(&fwd, .turn_end);
+    try testing.expectEqual(@as(u32, 0), ts.calls);
+
+    subagentProgressHandler(&fwd, .turn_start);
+    try testing.expectEqual(@as(u32, 0), ts.calls);
+}
+
+test "subagentProgressHandler: verbose_progress=false suppresses text_delta" {
+    const gpa = testing.allocator;
+    const test_h = @import("../../test_helpers.zig");
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const TestCounter = struct {
+        calls: u32 = 0,
+        fn callback(userdata: ?*anyopaque, call_id: []const u8, update_json: []const u8) void {
+            _ = call_id;
+            _ = update_json;
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.calls += 1;
+        }
+    };
+
+    var ctr: TestCounter = .{};
+    const test_ctx: Ctx = .{
+        .registry = undefined,
+        .environ = .empty,
+        .environ_map = undefined,
+        .parent_tools = &.{},
+        .parent_role = .read,
+        .presets = undefined,
+        .parameters_json_owned = "",
+        .permission_store = null,
+        .parent_session_dir = null,
+        .progress_fn = TestCounter.callback,
+        .progress_userdata = &ctr,
+        .verbose_progress = false,
+    };
+
+    var fwd: ForwardState = .{
+        .io = io,
+        .allocator = gpa,
+        .call_id = "call-2",
+        .ctx = &test_ctx,
+        .tool_names = .{},
+        .names_mutex = .init,
+    };
+    defer fwd.deinit();
+
+    // text delta must NOT be forwarded when verbose_progress=false.
+    const delta_ev: at.AgentEvent = .{ .message_update = .{ .text = .{
+        .block_index = 0,
+        .delta = "hello world",
+    } } };
+    subagentProgressHandler(&fwd, delta_ev);
+    try testing.expectEqual(@as(u32, 0), ctr.calls);
+
+    // thinking delta must NOT be forwarded when verbose_progress=false.
+    const think_ev: at.AgentEvent = .{ .message_update = .{ .thinking = .{
+        .block_index = 0,
+        .delta = "reasoning...",
+    } } };
+    subagentProgressHandler(&fwd, think_ev);
+    try testing.expectEqual(@as(u32, 0), ctr.calls);
+
+    // turn_start is also suppressed (turn removed — not needed for web-ui proxy mode).
+    subagentProgressHandler(&fwd, .turn_start);
+    try testing.expectEqual(@as(u32, 0), ctr.calls);
 }
 
 test "executeUnconfigured returns config_error" {

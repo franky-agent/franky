@@ -160,13 +160,13 @@ const max_subs: usize = 32;
 /// frame; **not** keepalive `ping`s) is stamped with a monotonic
 /// id and stashed in the ring so a reconnecting `/events`
 /// subscriber with a `Last-Event-ID` header can catch up via
-/// replay before going live. 256 ≈ 5 typical agent turns of
-/// headroom — well over any realistic disconnect-to-reconnect
-/// gap. When a reconnect's `last_id` is older than the oldest
-/// surviving ring entry, the listener emits a synthetic
+/// replay before going live. 4096 covers models that emit large
+/// thinking-delta bursts (3000+ deltas observed with DeepSeek
+/// v4-flash:cloud). When a reconnect's `last_id` is older than
+/// the oldest surviving ring entry, the listener emits a synthetic
 /// `replay_gap` event so the client can fall back to a full page
 /// reload via `GET /transcript` (v1.6.1) for completed turns.
-const replay_ring_capacity: usize = 256;
+const replay_ring_capacity: usize = 4096;
 
 /// One slot in the replay ring. `id` is the SSE event id we
 /// stamped; `frame` is the fully-rendered SSE frame ready to
@@ -421,7 +421,7 @@ const Session = struct {
         };
 
         // `id` is u64 but replay_ring is indexed by usize. The
-        // modulus is bounded by replay_ring_capacity (256), so the
+        // modulus is bounded by replay_ring_capacity, so the
         // narrow cast is always safe.
         const slot: usize = @intCast(id % replay_ring_capacity);
         if (self.replay_ring[slot]) |old| {
@@ -650,6 +650,9 @@ fn initSession(
             // the session struct so its address is stable.
             .permission_prompter_slot = &session.current_prompter,
             .parent_session_dir = parent_session_dir,
+            // v2.6 — forward sub-agent events to SSE subscribers.
+            .progress_fn = subagentProgressForward,
+            .progress_userdata = session,
         };
         const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 2);
         @memcpy(final_tools[0..session.tools.len], session.tools);
@@ -1448,6 +1451,41 @@ fn computeTitle(transcript: *const agent.loop.Transcript) []const u8 {
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     const fp: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try fp.runSync(ctx.io, ctx.context, ctx.out);
+}
+
+// ─── v2.6 — sub-agent progress forwarding ────────────────────────
+//
+// Called from the sub-agent's worker thread for each forwarded event.
+// Must only call `broadcastEvent` (mutex-protected) — must not touch
+// any other session state.
+fn subagentProgressForward(
+    userdata: ?*anyopaque,
+    call_id: []const u8,
+    update_json: []const u8,
+) void {
+    const session: *Session = @ptrCast(@alignCast(userdata.?));
+    const allocator = session.allocator;
+
+    // Build a tool_execution_update AgentEvent and render it as an
+    // SSE frame, then broadcast. Use allocPrint for the event's
+    // owned strings (deinit'd by AgentEvent.deinit).
+    const owned_call_id = allocator.dupe(u8, call_id) catch return;
+    const owned_update = allocator.dupe(u8, update_json) catch {
+        allocator.free(owned_call_id);
+        return;
+    };
+    const ev: at.AgentEvent = .{ .tool_execution_update = .{
+        .call_id = owned_call_id,
+        .update_json = owned_update,
+    } };
+    const frame = renderFrame(allocator, ev) catch {
+        ev.deinit(allocator);
+        return;
+    };
+    defer allocator.free(frame);
+    ev.deinit(allocator);
+
+    session.broadcastEvent(allocator, frame);
 }
 
 // ─── connection handling ─────────────────────────────────────────
@@ -4765,4 +4803,76 @@ test "proxy: GET /events with too-old Last-Event-ID emits replay_gap" {
     // events, oldest = 11, so missed_to = 10.
     try testing.expect(std.mem.indexOf(u8, captured.items, "\"missed_from\":2") != null);
     try testing.expect(std.mem.indexOf(u8, captured.items, "\"missed_to\":10") != null);
+}
+
+test "broadcastEvent: concurrent calls from two threads produce no duplicate or skipped ids" {
+    // Spec §3.5 — broadcastEvent must hold events_mutex for the full
+    // duration of stamp + ring-write + fan-out so concurrent calls from
+    // multiple sub-agent threads cannot interleave frames or issue the
+    // same id twice.
+    //
+    // We spawn two threads each calling broadcastEvent N times and then
+    // assert:
+    //   (a) next_event_id == 2*N + 1  — no id was issued twice or skipped
+    //   (b) the ring holds exactly the ids {1..2*N}  — no duplicates
+    //   (c) each stored frame's embedded "id: N\n" prefix matches its
+    //       .id field  — no frame was assembled from parts of two
+    //       interleaved broadcasts
+
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
+
+    const N: usize = 100; // broadcasts per thread; 2*N << replay_ring_capacity
+    const frame_body = "event: concurrent\ndata: {}\n\n";
+
+    const Worker = struct {
+        fn run(session: *Session, alloc: std.mem.Allocator) void {
+            var i: usize = 0;
+            while (i < N) : (i += 1) {
+                session.broadcastEvent(alloc, frame_body);
+            }
+        }
+    };
+
+    const t1 = try std.Thread.spawn(.{}, Worker.run, .{ &ts.session, gpa });
+    const t2 = try std.Thread.spawn(.{}, Worker.run, .{ &ts.session, gpa });
+    t1.join();
+    t2.join();
+
+    // (a) Both threads completed without issuing the same id twice.
+    try testing.expectEqual(@as(u64, 2 * N + 1), ts.session.next_event_id);
+
+    // (b) + (c) Scan the ring and collect all ids. With 2*N = 200 events
+    // and a ring capacity of 4096, there is no eviction — every event
+    // survives in the ring.
+    var seen: [2 * N + 1]bool = .{false} ** (2 * N + 1);
+    var found: usize = 0;
+
+    for (ts.session.replay_ring) |maybe_entry| {
+        const entry = maybe_entry orelse continue;
+
+        // Each id must be in the expected range.
+        try testing.expect(entry.id >= 1 and entry.id <= 2 * N);
+        // No id may appear twice in the ring.
+        try testing.expect(!seen[entry.id]);
+        seen[entry.id] = true;
+        found += 1;
+
+        // The frame must begin with the matching "id: N\n" stamp so we
+        // know the id and the frame body belong to the same broadcast call
+        // and were not assembled from pieces of two interleaved calls.
+        var prefix_buf: [32]u8 = undefined;
+        const expected_prefix = try std.fmt.bufPrint(&prefix_buf, "id: {d}\n", .{entry.id});
+        try testing.expect(std.mem.startsWith(u8, entry.frame, expected_prefix));
+    }
+
+    // Every id from 1 to 2*N must be present — no id was skipped.
+    try testing.expectEqual(2 * N, found);
+    for (seen[1..]) |s| try testing.expect(s);
 }

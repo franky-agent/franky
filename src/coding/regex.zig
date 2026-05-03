@@ -7,6 +7,7 @@
 //!     escape sequences           \. \* \+ \? \( \) \[ \] \| \\ \^ \$
 //!                                \n \t \r \0
 //!     shorthand classes          \d \D \w \W \s \S
+//!     word boundary              \b \B
 //!     wildcard                   .             (any byte except LF)
 //!     anchors                    ^ $           (pos == 0, pos == len)
 //!     character class            [abc] [^abc] [a-z] [\w\s]
@@ -69,6 +70,10 @@ pub const Op = union(enum) {
     jump: i32,
     /// Successful match — stop execution.
     match,
+    /// Zero-width word-boundary assertion (\b).
+    word_boundary,
+    /// Zero-width non-word-boundary assertion (\B).
+    word_boundary_neg,
 };
 
 pub const SplitArgs = struct { a: i32, b: i32 };
@@ -178,6 +183,18 @@ fn exec(
         },
         .start_anchor => if (pos != 0) false else exec(program, classes, opts, ip + 1, input, pos, budget, depth + 1, max_depth),
         .end_anchor => if (pos != input.len) false else exec(program, classes, opts, ip + 1, input, pos, budget, depth + 1, max_depth),
+        .word_boundary => blk: {
+            const before = pos > 0 and isWordByte(input[pos - 1]);
+            const after  = pos < input.len and isWordByte(input[pos]);
+            if (before == after) break :blk false;
+            break :blk exec(program, classes, opts, ip + 1, input, pos, budget, depth + 1, max_depth);
+        },
+        .word_boundary_neg => blk: {
+            const before = pos > 0 and isWordByte(input[pos - 1]);
+            const after  = pos < input.len and isWordByte(input[pos]);
+            if (before != after) break :blk false;
+            break :blk exec(program, classes, opts, ip + 1, input, pos, budget, depth + 1, max_depth);
+        },
         .split => |s| blk: {
             const na = @as(i64, @intCast(ip)) + @as(i64, s.a);
             const nb = @as(i64, @intCast(ip)) + @as(i64, s.b);
@@ -197,6 +214,10 @@ fn exec(
     };
 }
 
+fn isWordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
 // ─── AST ──────────────────────────────────────────────────────────────
 
 const Node = union(enum) {
@@ -211,6 +232,8 @@ const Node = union(enum) {
     star: *Node,
     plus: *Node,
     question: *Node,
+    word_boundary,
+    word_boundary_neg,
 };
 
 // ─── Parser ───────────────────────────────────────────────────────────
@@ -367,6 +390,8 @@ const Parser = struct {
             'W' => try self.shorthandClassNode(.word, true),
             's' => try self.shorthandClassNode(.space, false),
             'S' => try self.shorthandClassNode(.space, true),
+            'b' => Node.word_boundary,
+            'B' => Node.word_boundary_neg,
             'n' => Node{ .lit = '\n' },
             't' => Node{ .lit = '\t' },
             'r' => Node{ .lit = '\r' },
@@ -539,6 +564,8 @@ fn compileNode(prog: *std.ArrayList(Op), alloc: std.mem.Allocator, node: *const 
         .class_idx => |i| try emit(prog, alloc, .{ .class = i }),
         .start_anchor => try emit(prog, alloc, .start_anchor),
         .end_anchor => try emit(prog, alloc, .end_anchor),
+        .word_boundary => try emit(prog, alloc, .word_boundary),
+        .word_boundary_neg => try emit(prog, alloc, .word_boundary_neg),
         .seq => |nodes| for (nodes) |*n| try compileNode(prog, alloc, n),
         .alt => |branches| {
             // alt(a, b, c) lowered right-associatively:
@@ -827,6 +854,24 @@ test "regex: error — trailing garbage" {
     const err = compileOpts(testing.allocator, "foo)", .{}, &report);
     try testing.expectError(CompileError.TrailingGarbage, err);
     try testing.expectEqual(@as(usize, 3), report.pos);
+}
+
+test "regex: word boundary \\b" {
+    // Basic word-boundary assertions.
+    try expectMatch("\\bfoo\\b", "foo");
+    try expectMatch("\\bfoo\\b", "a foo b");
+    try expectNoMatch("\\bfoo\\b", "foobar");
+    try expectNoMatch("\\bfoo\\b", "barfoo");
+    try expectNoMatch("\\bfoo\\b", "barfoobar");
+    // At start/end of string.
+    try expectMatch("\\bfoo", "foobar");
+    try expectMatch("foo\\b", "barfoo");
+    // Typical real-world use: whole-word identifier.
+    try expectMatch("pub const Preset\\b", "pub const Preset = enum {");
+    try expectNoMatch("pub const Preset\\b", "pub const PresetXtra = enum {");
+    // \B — non-word boundary.
+    try expectMatch("\\Boo\\B", "foobar");
+    try expectNoMatch("\\Bfoo\\B", "foo");
 }
 
 test "regex: UTF-8 byte-safe (bytes pass through)" {

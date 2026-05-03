@@ -238,7 +238,7 @@ pub fn applyEdits(
     for (edits, 0..) |ed, idx| {
         const found = std.mem.indexOf(u8, buf.items, ed.old);
         if (found == null) {
-            const msg = try std.fmt.allocPrint(allocator, "edit {d}: `old` not found", .{idx});
+            const msg = try buildNoMatchMsg(allocator, idx, ed.old, buf.items);
             defer allocator.free(msg);
             return common.toolError(allocator, "edit_no_match", msg);
         }
@@ -364,6 +364,44 @@ fn emitLine(
     const s = try std.fmt.allocPrint(allocator, "  [{d}] {c}{s}\n", .{ edit_index, sign, line });
     defer allocator.free(s);
     try summary.appendSlice(allocator, s);
+}
+
+fn buildNoMatchMsg(
+    allocator: std.mem.Allocator,
+    idx: usize,
+    old: []const u8,
+    file_content: []const u8,
+) ![]u8 {
+    // Detect over-escaped backslashes: a model reading a Zig file with
+    // multiline-string lines (`\\foo`) sometimes emits them with doubled
+    // backslashes in the edit `old`, causing a mismatch.  Try collapsing
+    // every `\\` pair to `\` and see if that matches.
+    const deescaped = try collapseBackslashPairs(allocator, old);
+    defer allocator.free(deescaped);
+    if (deescaped.len < old.len and std.mem.indexOf(u8, file_content, deescaped) != null) {
+        return std.fmt.allocPrint(
+            allocator,
+            "edit {d}: `old` not found — backslash over-escaping detected (match found after collapsing double-backslash pairs); re-read the file with the `read` tool and copy-paste exact bytes",
+            .{idx},
+        );
+    }
+    return std.fmt.allocPrint(allocator, "edit {d}: `old` not found", .{idx});
+}
+
+fn collapseBackslashPairs(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (i + 1 < s.len and s[i] == '\\' and s[i + 1] == '\\') {
+            try out.append(allocator, '\\');
+            i += 2;
+        } else {
+            try out.append(allocator, s[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn replaceOnce(
@@ -718,6 +756,51 @@ test "execute: flattened old/new at top level (missing edits key)" {
     const got = try readAllAlloc(gpa, io, path);
     defer gpa.free(got);
     try testing.expectEqualStrings("the quick red fox\n", got);
+}
+
+test "edit_no_match hints at over-escaped backslashes when applicable" {
+    // Zig multiline-string lines start with `\\` (two literal backslashes).
+    // A model sometimes over-escapes these to `\\\\` (four backslashes) in
+    // the `old` field. The resulting mismatch is confusing; detect it and
+    // give a targeted hint.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const path = "/tmp/franky_edit_backslash_hint.txt";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // File has Zig multiline-string lines: each starts with two backslashes.
+    try writeTempFile(io, path, "    \\\\foo bar\n    \\\\baz qux\n");
+
+    // Model sends `old` with doubled backslashes (four backslashes per line).
+    const edits = [_]EditOp{.{ .old = "    \\\\\\\\foo bar\n    \\\\\\\\baz qux", .new = "replaced", .replace_all = false }};
+    var res = try applyEdits(gpa, io, path, &edits);
+    defer res.deinit(gpa);
+    try testing.expect(res.is_error);
+    const msg = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, msg, "edit_no_match") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "over-escaping") != null);
+}
+
+test "edit_no_match generic message when no backslash hint applies" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const path = "/tmp/franky_edit_nohint.txt";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeTempFile(io, path, "hello world\n");
+    const edits = [_]EditOp{.{ .old = "completely absent", .new = "x", .replace_all = false }};
+    var res = try applyEdits(gpa, io, path, &edits);
+    defer res.deinit(gpa);
+    try testing.expect(res.is_error);
+    const msg = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, msg, "edit_no_match") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "over-escaping") == null);
 }
 
 test "execute: wrong edits type includes type name in error" {

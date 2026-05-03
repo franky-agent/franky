@@ -592,6 +592,28 @@ main#conversation {
 .message .content strong { font-weight: 600; }
 .message .content em     { font-style: italic; }
 
+.message .content table {
+    border-collapse: collapse;
+    margin: 6px 0 10px 0;
+    font-size: 13px;
+    display: block;
+    overflow-x: auto;
+    max-width: 100%;
+}
+
+.message .content th,
+.message .content td {
+    border: 1px solid var(--border);
+    padding: 4px 10px;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.message .content th {
+    background: var(--user-bg);
+    font-weight: 600;
+}
+
 .thinking {
     font-style: italic;
     color: var(--muted);
@@ -622,8 +644,8 @@ main#conversation {
 }
 
 .tool-card .tool-args {
-    color: var(--text);
-    white-space: pre-wrap;
+    color: var(--text);                                                                                                                                    
+    white-space: pre-wrap;                                                                                                                                 
     word-break: break-all;
 }
 
@@ -631,6 +653,74 @@ main#conversation {
     border-color: var(--error-border);
     background: var(--error-bg);
 }
+
+/* v2.6 — sub-agent progress panel. Collapsible log of structural
+ * events (tool_start/end, errors, final result) emitted by the
+ * sub-agent while the parent waits for its result.
+ * Uses the shared .tool-result-toggle button so the card has
+ * exactly one toggle for both progress and result. */
+.subagent-log {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--tool-border);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+/* display: flex above would override the hidden attribute's display:none.
+ * This rule restores the expected collapse behaviour. */
+.subagent-log[hidden] { display: none; }
+
+.subagent-entry {
+    font-size: 11.5px;
+    color: var(--muted);
+}
+
+.subagent-entry .sa-args {
+    margin-left: 4px;
+    opacity: 0.6;
+    max-width: 40ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+    vertical-align: bottom;
+}
+.subagent-entry .sa-status { margin-left: 4px; }
+.subagent-entry .sa-status.done  { color: var(--accent); }
+.subagent-entry .sa-status.is-error { color: var(--error-border); }
+.subagent-entry.sa-error { color: var(--error-border); }
+
+/* Collapsible result panel on every tool card. Toggle button sits
+ * inline in the tool-head; panel expands below. Auto-expands on
+ * error (JS sets aria-expanded=true and removes hidden). */
+.tool-result-toggle {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 10px;
+    margin-left: 6px;
+    padding: 0;
+}
+
+.tool-result-log {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--tool-border);
+    font-size: 11.5px;
+    color: var(--muted);
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 200px;
+    overflow-y: auto;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+}
+
+.tool-result-log[hidden] { display: none; }
 
 /* Role-denied subcode styling. Warning-tone (not red) so users
  * distinguish "your role can't run this" from a real tool failure. */

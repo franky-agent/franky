@@ -12,14 +12,14 @@
 //! credential is present, the openai_chat stream fn skips the
 //! `Authorization` header — suitable for local gateways (Ollama, LM
 //! Studio, vLLM) that accept anonymous traffic. For remote
-//! gateways (Groq, Cerebras, OpenRouter, xAI, Fireworks, …) pass
+//! gateways (Cerebras, OpenRouter, xAI, Fireworks, …) pass
 //! `--api-key $VENDOR_KEY` and the shared path serializes the bearer
 //! as usual.
 //!
 //! Known per-vendor quirks documented in §A.6 and addressed here:
 //!
 //! - Some gateways omit `stream_options.include_usage` support and
-//!   either emit usage in a vendor extension field (Groq's `x_groq`)
+//!   either emit usage in a vendor extension field
 //!   or skip it entirely. The `runFromSse` driver ignores unknown
 //!   top-level fields, so both shapes work without changes.
 //! - Some gateways return tool-call `arguments` as an **object**

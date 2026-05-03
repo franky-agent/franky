@@ -502,14 +502,6 @@ const builtin_cloudflare_llama_body =
     \\}
 ;
 
-const builtin_groq_body =
-    \\{
-    \\  "provider": "gateway",
-    \\  "base_url": "https://api.groq.com/openai/v1/chat/completions",
-    \\  "api_key_env": "GROQ_API_KEY"
-    \\}
-;
-
 const builtin_cerebras_body =
     \\{
     \\  "provider": "gateway",
@@ -561,11 +553,6 @@ pub const builtin_catalog = [_]Builtin{
         .name = "cloudflare-llama",
         .description = "Cloudflare Workers AI — Llama-3.3-70b with --text-tool-call-fallback (env: CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN)",
         .body = builtin_cloudflare_llama_body,
-    },
-    .{
-        .name = "groq",
-        .description = "Groq — high-speed inference gateway (env: GROQ_API_KEY)",
-        .body = builtin_groq_body,
     },
     .{
         .name = "cerebras",
@@ -1194,7 +1181,7 @@ test "parseMode: covers all variants" {
 test "getBuiltinBody: known names resolve, unknown returns null" {
     try testing.expect(getBuiltinBody("cloudflare-gemma") != null);
     try testing.expect(getBuiltinBody("cloudflare-llama") != null);
-    try testing.expect(getBuiltinBody("groq") != null);
+    try testing.expect(getBuiltinBody("gemini") != null);
     try testing.expect(getBuiltinBody("ollama") != null);
     try testing.expect(getBuiltinBody("nonexistent") == null);
 }
@@ -1255,7 +1242,7 @@ test "saveBuiltin: writes preset to fresh settings.json" {
     defer env.deinit();
     try env.put("FRANKY_HOME", dir_path);
 
-    try saveBuiltin(gpa, io, &env, "groq");
+    try saveBuiltin(gpa, io, &env, "gemini");
 
     // Read it back and verify.
     const settings_path = try std.fs.path.join(gpa, &.{ dir_path, "settings.json" });
@@ -1267,8 +1254,8 @@ test "saveBuiltin: writes preset to fresh settings.json" {
     defer gpa.free(buf);
     _ = try f.readPositionalAll(io, buf, 0);
 
-    try testing.expect(std.mem.indexOf(u8, buf, "\"groq\"") != null);
-    try testing.expect(std.mem.indexOf(u8, buf, "GROQ_API_KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, buf, "\"gemini\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf, "GEMINI_API_KEY") != null);
 }
 
 test "saveBuiltin: refuses to overwrite an existing profile of the same name" {
@@ -1287,9 +1274,9 @@ test "saveBuiltin: refuses to overwrite an existing profile of the same name" {
     try env.put("FRANKY_HOME", dir_path);
 
     // Save once → success.
-    try saveBuiltin(gpa, io, &env, "groq");
+    try saveBuiltin(gpa, io, &env, "gemini");
     // Save again → ProfileAlreadyExists.
-    try testing.expectError(error.ProfileAlreadyExists, saveBuiltin(gpa, io, &env, "groq"));
+    try testing.expectError(error.ProfileAlreadyExists, saveBuiltin(gpa, io, &env, "gemini"));
 }
 
 test "saveBuiltin: unknown built-in returns UnknownBuiltin" {

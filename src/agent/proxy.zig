@@ -94,6 +94,8 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
             try appendJsonStr(&buf, allocator, s.call_id);
             try buf.appendSlice(allocator, ",\"name\":");
             try appendJsonStr(&buf, allocator, s.name);
+            try buf.appendSlice(allocator, ",\"argsJson\":");
+            try appendJsonStr(&buf, allocator, s.args_json);
         },
         .tool_execution_update => |u| {
             try buf.appendSlice(allocator, "\"kind\":\"tool_execution_update\",\"callId\":");
@@ -110,6 +112,15 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
                 try buf.appendSlice(allocator, ",\"toolCode\":");
                 try appendJsonStr(&buf, allocator, code);
             }
+            // Concatenate all text content blocks into resultText so the
+            // web UI can display the tool output in a collapsible panel.
+            try buf.appendSlice(allocator, ",\"resultText\":");
+            var combined: std.ArrayListUnmanaged(u8) = .empty;
+            defer combined.deinit(allocator);
+            for (e.result.content) |cb| {
+                if (cb == .text) try combined.appendSlice(allocator, cb.text.text);
+            }
+            try appendJsonStr(&buf, allocator, combined.items);
         },
         .tool_permission_request => |r| {
             try buf.appendSlice(allocator, "\"kind\":\"tool_permission_request\",\"callId\":");
@@ -217,6 +228,7 @@ test "encodeEventJson: tool_execution_start + end" {
     const start_json = try encodeEventJson(gpa, .{ .tool_execution_start = .{
         .call_id = "c-7",
         .name = "read",
+        .args_json = "{\"path\":\"src/foo.zig\"}",
     } });
     defer gpa.free(start_json);
     try testing.expect(std.mem.indexOf(u8, start_json, "\"callId\":\"c-7\"") != null);
