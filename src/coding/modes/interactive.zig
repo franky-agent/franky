@@ -263,6 +263,7 @@ fn runInteractive(
     // `Host` view. On unknown names we surface a warning line into
     // the scrollback so the user sees the typo.
     var ext_manager = extensions_mod.Manager.init(allocator);
+    ext_manager.presets = &preset_registry;
     defer ext_manager.deinit();
     if (cfg.extensions) |csv| {
         const names = try extensions_mod.Manager.parseOptIn(allocator, csv);

@@ -998,8 +998,11 @@ fn maybeApplyTextToolCallFallback(
 
     const text = msg.content[text_idx.?].text.text;
 
-    // Try to extract a tool-call from the text.
-    const extracted = (try extractTextToolCall(allocator, text, tools)) orelse return;
+    // Try JSON-shaped tool call first, then DeepSeek DSML markup as fallback.
+    const extracted =
+        (try extractTextToolCall(allocator, text, tools)) orelse
+        (try extractDsmlToolCall(allocator, text, tools)) orelse
+        return;
 
     // Replace the text block with a tool_call block. Free the old
     // text bytes; ownership of `extracted.name` / `extracted.args`
@@ -1114,6 +1117,135 @@ fn stripToolCallWrappers(text: []const u8) []const u8 {
     }
 
     return s;
+}
+
+// ─── DSML tool-call parser ────────────────────────────────────────────────────
+//
+// DeepSeek V3.2 / V4 embed tool invocations as markup in the assistant's text
+// output rather than as structured `tool_calls[]` JSON.  The delimiter is
+// U+FF5C FULLWIDTH VERTICAL LINE, giving tags like:
+//
+//   <｜DSML｜tool_calls>
+//   <｜DSML｜invoke name="read">
+//   <｜DSML｜parameter name="path" string="true">/path/to/file
+//
+// `extractDsmlToolCall` detects this shape, converts the first <invoke> block
+// into an ExtractedToolCall, and leaves the JSON/wrapper path as a fallback.
+
+/// U+FF5C FULLWIDTH VERTICAL LINE (UTF-8: 0xEF 0xBD 0x9C).
+const dsml_vbar = "\xef\xbd\x9c";
+/// Common prefix for all DSML tags: "<｜DSML｜"
+const dsml_open = "<" ++ dsml_vbar ++ "DSML" ++ dsml_vbar;
+const dsml_invoke_tag = dsml_open ++ "invoke ";
+const dsml_param_tag = dsml_open ++ "parameter ";
+
+/// Parses the first DSML `<invoke>` block found in `text`.
+/// Returns null when no DSML markup is present or the tool name is not in `tools`.
+fn extractDsmlToolCall(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    tools: []const at.AgentTool,
+) !?ExtractedToolCall {
+    if (std.mem.indexOf(u8, text, dsml_open) == null) return null;
+
+    const invoke_pos = std.mem.indexOf(u8, text, dsml_invoke_tag) orelse return null;
+    const after_kw = text[invoke_pos + dsml_invoke_tag.len..];
+
+    const name = dsmlAttr(after_kw, "name") orelse return null;
+
+    var matched = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name, name)) { matched = true; break; }
+    }
+    if (!matched) return null;
+
+    const gt = std.mem.indexOf(u8, after_kw, ">") orelse return null;
+    const param_region = after_kw[gt + 1..];
+
+    // Build JSON args object from parameter tags.
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '{');
+
+    var pos: usize = 0;
+    var first = true;
+    while (std.mem.indexOfPos(u8, param_region, pos, dsml_param_tag)) |pstart| {
+        const rest = param_region[pstart + dsml_param_tag.len..];
+        const pname = dsmlAttr(rest, "name") orelse { pos = pstart + 1; continue; };
+        const ptype = dsmlParamType(rest);
+        const pgt = std.mem.indexOf(u8, rest, ">") orelse { pos = pstart + 1; continue; };
+        const val_s = pgt + 1;
+        const val_e = if (std.mem.indexOf(u8, rest[val_s..], dsml_open)) |n| val_s + n else rest.len;
+        const raw = std.mem.trim(u8, rest[val_s..val_e], " \t\n\r");
+
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.append(allocator, '"');
+        try dsmlJsonStr(&buf, allocator, pname);
+        try buf.appendSlice(allocator, "\":");
+        switch (ptype) {
+            .string => {
+                try buf.append(allocator, '"');
+                try dsmlJsonStr(&buf, allocator, raw);
+                try buf.append(allocator, '"');
+            },
+            else => try buf.appendSlice(allocator, raw),
+        }
+        pos = pstart + dsml_param_tag.len + val_e;
+    }
+    try buf.append(allocator, '}');
+
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    return .{ .name = owned_name, .args = try buf.toOwnedSlice(allocator) };
+}
+
+/// Extract the value of `attr="..."` from an attribute string.
+/// Requires `attr` to appear at position 0 or preceded by whitespace.
+fn dsmlAttr(s: []const u8, attr: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, s, i, attr)) |p| {
+        const ok = p == 0 or s[p - 1] == ' ' or s[p - 1] == '\t';
+        if (ok) {
+            const tail = s[p + attr.len..];
+            if (tail.len >= 2 and tail[0] == '=' and tail[1] == '"') {
+                const vs = p + attr.len + 2;
+                const ve = std.mem.indexOfPos(u8, s, vs, "\"") orelse return null;
+                return s[vs..ve];
+            }
+        }
+        i = p + 1;
+    }
+    return null;
+}
+
+const DsmlParamType = enum { string, number, boolean, object, array };
+
+fn dsmlParamType(rest: []const u8) DsmlParamType {
+    const end = std.mem.indexOf(u8, rest, ">") orelse rest.len;
+    const attrs = rest[0..end];
+    if (std.mem.indexOf(u8, attrs, "number=\"true\"") != null) return .number;
+    if (std.mem.indexOf(u8, attrs, "boolean=\"true\"") != null) return .boolean;
+    if (std.mem.indexOf(u8, attrs, "object=\"true\"") != null) return .object;
+    if (std.mem.indexOf(u8, attrs, "array=\"true\"") != null) return .array;
+    return .string;
+}
+
+/// Append `s` as a JSON string body (no surrounding quotes) with proper escaping.
+fn dsmlJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '"' => try buf.appendSlice(allocator, "\\\""),
+        '\\' => try buf.appendSlice(allocator, "\\\\"),
+        '\t' => try buf.appendSlice(allocator, "\\t"),
+        '\n' => try buf.appendSlice(allocator, "\\n"),
+        '\r' => try buf.appendSlice(allocator, "\\r"),
+        0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+            var esc: [6]u8 = undefined;
+            const n = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
+            try buf.appendSlice(allocator, n);
+        },
+        else => try buf.append(allocator, c),
+    };
 }
 
 fn makeRoleDeniedResult(
@@ -1543,6 +1675,68 @@ test "maybeApplyTextToolCallFallback: rewrites text → tool_call" {
     try testing.expectEqualStrings("read", msg.content[0].tool_call.name);
     try testing.expect(std.mem.indexOf(u8, msg.content[0].tool_call.arguments_json, "x.zig") != null);
     try testing.expect(std.mem.startsWith(u8, msg.content[0].tool_call.id, "txtcall_"));
+}
+
+test "extractDsmlToolCall: single string parameter" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const text =
+        "<\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls>\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cinvoke name=\"read\">\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"path\" string=\"true\">/some/file.zig\n";
+    const result = (try extractDsmlToolCall(gpa, text, &tools)).?;
+    defer gpa.free(result.name);
+    defer gpa.free(result.args);
+    try testing.expectEqualStrings("read", result.name);
+    try testing.expectEqualStrings("{\"path\":\"/some/file.zig\"}", result.args);
+}
+
+test "extractDsmlToolCall: multiple parameters mixed types" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("write")};
+    const text =
+        "<\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls>\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cinvoke name=\"write\">\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"path\" string=\"true\">/out.txt\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"overwrite\" boolean=\"true\">true\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"count\" number=\"true\">42\n";
+    const result = (try extractDsmlToolCall(gpa, text, &tools)).?;
+    defer gpa.free(result.name);
+    defer gpa.free(result.args);
+    try testing.expectEqualStrings("write", result.name);
+    try testing.expectEqualStrings(
+        "{\"path\":\"/out.txt\",\"overwrite\":true,\"count\":42}",
+        result.args,
+    );
+}
+
+test "extractDsmlToolCall: string value with special chars is JSON-escaped" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("echo")};
+    const text =
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cinvoke name=\"echo\">\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"msg\" string=\"true\">say \"hi\"\n";
+    const result = (try extractDsmlToolCall(gpa, text, &tools)).?;
+    defer gpa.free(result.name);
+    defer gpa.free(result.args);
+    try testing.expectEqualStrings("{\"msg\":\"say \\\"hi\\\"\"}", result.args);
+}
+
+test "extractDsmlToolCall: no DSML markup → null" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const result = try extractDsmlToolCall(gpa, "Sure, I'll help.", &tools);
+    try testing.expect(result == null);
+}
+
+test "extractDsmlToolCall: tool name not in registry → null" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const text =
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cinvoke name=\"unknown_tool\">\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"x\" string=\"true\">y\n";
+    const result = try extractDsmlToolCall(gpa, text, &tools);
+    try testing.expect(result == null);
 }
 
 test "maybeApplyTextToolCallFallback: leaves message untouched when no match" {

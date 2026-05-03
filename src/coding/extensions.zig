@@ -16,6 +16,7 @@
 const std = @import("std");
 const at = @import("../agent/types.zig");
 const slash = @import("slash.zig");
+const subagent_mod = @import("tools/subagent.zig");
 
 pub const ExtError = error{
     NameConflict,
@@ -44,11 +45,12 @@ pub const Extension = struct {
 pub const Host = struct {
     allocator: std.mem.Allocator,
     slash_registry: *slash.Registry,
-    /// Tools contributed by extensions; the caller merges these
-    /// with the built-in tool set before constructing the agent
-    /// loop's config.
+    /// Tools contributed by extensions; merged with the built-in set
+    /// before constructing the agent loop's config.
     tools: *std.ArrayList(at.AgentTool),
     subscriptions: *std.ArrayList(Subscription),
+    /// Preset registry — null when the caller hasn't wired one in yet.
+    presets: ?*subagent_mod.PresetRegistry,
 
     pub fn registerCommand(self: *Host, name: []const u8, handler: slash.Handler, desc: []const u8) !void {
         try self.slash_registry.register(.{
@@ -65,6 +67,10 @@ pub const Host = struct {
     pub fn subscribe(self: *Host, on_event: OnEvent, userdata: ?*anyopaque) !void {
         try self.subscriptions.append(self.allocator, .{ .userdata = userdata, .on_event = on_event });
     }
+
+    pub fn registerPreset(self: *Host, p: subagent_mod.Preset) !void {
+        if (self.presets) |reg| try reg.register(p);
+    }
 };
 
 pub const Manager = struct {
@@ -72,6 +78,9 @@ pub const Manager = struct {
     extensions: std.ArrayList(Extension) = .empty,
     host_tools: std.ArrayList(at.AgentTool) = .empty,
     host_subs: std.ArrayList(Subscription) = .empty,
+    /// Optional preset registry — set by the caller before registering
+    /// extensions that use `registerPreset`.
+    presets: ?*subagent_mod.PresetRegistry = null,
 
     pub fn init(allocator: std.mem.Allocator) Manager {
         return .{ .allocator = allocator };
@@ -102,6 +111,7 @@ pub const Manager = struct {
                 .slash_registry = slash_registry,
                 .tools = &self.host_tools,
                 .subscriptions = &self.host_subs,
+                .presets = self.presets,
             };
             try fnptr(stored, &host);
         }

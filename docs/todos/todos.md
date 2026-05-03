@@ -1,4 +1,4 @@
-# DeepSeek DSML Tool calls — Analysis & Implementation Plan
+# DeepSeek DSML Tool calls — Analysis & Implementation Plan (DONE)
 
 ## Context
 
@@ -18,3 +18,4 @@ Here's what I'll do:
 <｜DSML｜tool_calls>
 <｜DSML｜invoke name="read">
 <｜DSML｜parameter name="path" string="true">/some/file.zig
+```
