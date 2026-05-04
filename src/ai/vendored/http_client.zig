@@ -351,7 +351,10 @@ pub const Connection = struct {
                     .closing = false,
                     .protocol = .tls,
                 },
-                // TODO data race here on ca_bundle if the user sets `now` to null
+                // `client.now` is initialized by `ensureCaBundle` before any
+                // TLS connection is created. After initialization it is
+                // immutable; bundle reads/writes during verification remain
+                // guarded by `client.ca_bundle_lock` inside tls.Client.
                 .client = std.crypto.tls.Client.init(
                     &tls.connection.stream_reader.interface,
                     &tls.connection.stream_writer.interface,
@@ -1431,6 +1434,7 @@ pub const basic_authorization = struct {
 
 pub const ConnectTcpError = error{
     TlsInitializationFailed,
+    CertificateBundleLoadFailure,
 } || Allocator.Error || HostName.ConnectError || Io.Cancelable;
 
 /// Reuses a `Connection` if one matching `host` and `port` is already open.
@@ -1463,6 +1467,8 @@ pub fn connectTcpOptions(client: *Client, options: ConnectTcpOptions) ConnectTcp
 
     const proxied_host = options.proxied_host orelse host;
     const proxied_port = options.proxied_port orelse port;
+
+    if (protocol == .tls) try client.ensureCaBundle();
 
     if (try client.connection_pool.findConnection(io, .{
         .host = proxied_host,
@@ -1656,6 +1662,8 @@ pub fn connectProxied(
             owns_plain = false;
             tunnel_log.log(.trace, "http", "tunnel.plain_freed", "plain_addr=0x{x}", .{plain_addr});
 
+            try client.ensureCaBundle();
+
             const tls = Connection.Tls.create(client, proxied_host, proxied_port, tcp_stream) catch |err| switch (err) {
                 error.OutOfMemory => |e| {
                     tunnel_log.log(.warn, "http", "tunnel.tls_create_oom", "host={s}", .{proxied_host.bytes});
@@ -1711,6 +1719,45 @@ pub fn connectProxied(
         tunnel_log.log(.warn, "http", "tunnel.unsupported", "host={s} port={d}", .{ proxied_host.bytes, proxied_port });
         return error.TunnelNotSupported;
     };
+}
+
+fn ensureCaBundle(client: *Client) (Io.Cancelable || error{CertificateBundleLoadFailure})!void {
+    if (disable_tls) unreachable;
+    const io = client.io;
+
+    {
+        try client.ca_bundle_lock.lockShared(io);
+        defer client.ca_bundle_lock.unlockShared(io);
+        if (client.now != null) return;
+    }
+
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(client.allocator);
+    const now = Io.Clock.real.now(io);
+    bundle.rescan(client.allocator, io, now) catch |err| switch (err) {
+        error.Canceled => |e| return e,
+        else => return error.CertificateBundleLoadFailure,
+    };
+
+    try client.ca_bundle_lock.lock(io);
+    defer client.ca_bundle_lock.unlock(io);
+
+    // Another thread may have initialized the bundle while this thread was
+    // scanning the filesystem. In that case, discard our temporary bundle so
+    // `now` remains write-once and `client.ca_bundle` is not swapped out from
+    // underneath in-flight TLS verification.
+    if (client.now != null) return;
+
+    setCaBundleInitialized(client, &bundle, now);
+}
+
+fn setCaBundleInitialized(
+    client: *Client,
+    bundle: *std.crypto.Certificate.Bundle,
+    now: Io.Timestamp,
+) void {
+    std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, bundle);
+    client.now = now;
 }
 
 pub const ConnectError = ConnectTcpError || RequestError;
@@ -1811,8 +1858,6 @@ pub fn request(
     uri: Uri,
     options: RequestOptions,
 ) RequestError!Request {
-    const io = client.io;
-
     if (std.debug.runtime_safety) {
         for (options.extra_headers) |header| {
             assert(header.name.len != 0);
@@ -1829,25 +1874,7 @@ pub fn request(
 
     const protocol = Protocol.fromUri(uri) orelse return error.UnsupportedUriScheme;
 
-    if (protocol == .tls) tls: {
-        if (disable_tls) unreachable;
-        {
-            try client.ca_bundle_lock.lockShared(io);
-            defer client.ca_bundle_lock.unlockShared(io);
-            if (client.now != null) break :tls;
-        }
-        var bundle: std.crypto.Certificate.Bundle = .empty;
-        defer bundle.deinit(client.allocator);
-        const now = Io.Clock.real.now(io);
-        bundle.rescan(client.allocator, io, now) catch |err| switch (err) {
-            error.Canceled => |e| return e,
-            else => return error.CertificateBundleLoadFailure,
-        };
-        try client.ca_bundle_lock.lock(io);
-        defer client.ca_bundle_lock.unlock(io);
-        client.now = now;
-        std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
-    }
+    if (protocol == .tls) try client.ensureCaBundle();
 
     const connection = options.connection orelse c: {
         var host_name_buffer: [HostName.max_len]u8 = undefined;
@@ -1987,6 +2014,76 @@ pub fn fetch(client: *Client, options: FetchOptions) FetchError!FetchResult {
     };
 
     return .{ .status = response.head.status };
+}
+
+const ca_bundle_test = struct {
+    const WorkerArgs = struct {
+        client: *Client,
+        io: Io,
+        acquired: *std.atomic.Value(bool),
+        release: *std.atomic.Value(bool),
+    };
+
+    fn holdSharedLock(args: WorkerArgs) void {
+        args.client.ca_bundle_lock.lockUncancelable(args.io);
+        args.acquired.store(true, .release);
+        while (!args.release.load(.acquire)) {
+            std.Thread.yield() catch {};
+        }
+        args.client.ca_bundle_lock.unlock(args.io);
+    }
+};
+
+test "CA bundle publish waits for shared TLS verification readers" {
+    if (disable_tls) return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{
+        .argv0 = .empty,
+        .environ = .empty,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client = Client{ .allocator = testing.allocator, .io = io };
+    defer client.deinit();
+
+    var reader_acquired: std.atomic.Value(bool) = .init(false);
+    var release_reader: std.atomic.Value(bool) = .init(false);
+    const reader = try std.Thread.spawn(.{}, ca_bundle_test.holdSharedLock, .{ca_bundle_test.WorkerArgs{
+        .client = &client,
+        .io = io,
+        .acquired = &reader_acquired,
+        .release = &release_reader,
+    }});
+    defer reader.join();
+
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(testing.allocator);
+
+    const Setter = struct {
+        fn run(c: *Client, b: *std.crypto.Certificate.Bundle, timestamp: Io.Timestamp) void {
+            c.ca_bundle_lock.lockUncancelable(c.io);
+            defer c.ca_bundle_lock.unlock(c.io);
+            setCaBundleInitialized(c, b, timestamp);
+        }
+    };
+    while (!reader_acquired.load(.acquire)) {
+        std.Thread.yield() catch {};
+    }
+
+    const want_now = Io.Timestamp.fromNanoseconds(123 * std.time.ns_per_s);
+    const setter = try std.Thread.spawn(.{}, Setter.run, .{ &client, &bundle, want_now });
+
+    // If publishing did not honor the exclusive CA-bundle lock, this value
+    // would become non-null while the simulated TLS verifier still holds the
+    // shared lock.
+    std.Thread.yield() catch {};
+    try testing.expectEqual(@as(?Io.Timestamp, null), client.now);
+
+    release_reader.store(true, .release);
+    setter.join();
+
+    try testing.expectEqual(want_now, client.now.?);
 }
 
 test {
