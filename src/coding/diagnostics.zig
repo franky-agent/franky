@@ -138,7 +138,7 @@ pub fn hintForToolError(code: ?[]const u8, message: ?[]const u8) []const u8 {
         return "Provider rate-limited the request. Back off and retry; check the provider dashboard for quota.";
     }
     if (std.mem.eql(u8, c, "transport") or std.mem.indexOf(u8, m, "connection") != null) {
-        return "Network/transport failure. Check $HTTPS_PROXY / $FRANKY_CA_BUNDLE; try `--http-trace-dir` to capture the failed request.";
+        return "Network/transport failure. Check $HTTPS_PROXY; try `--http-trace-dir` to capture the failed request.";
     }
     if (std.mem.eql(u8, c, "role_denied")) {
         return "Tool blocked by capability role. Restart with a higher --role (read < plan < code < full); /role is read-only.";

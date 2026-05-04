@@ -304,6 +304,9 @@ fn runPrint(
         .state = &bash_state,
         .workspace = if (workspace_state) |*ws| ws else null,
     };
+    var web_search_ctx = tools_mod.web_search.WebSearchCtx{
+        .environ_map = environ_map,
+    };
 
     // ── Tool registration ──────────────────────────────────────────
     // When a workspace root is known, each path-taking tool routes
@@ -319,6 +322,8 @@ fn runPrint(
         tools_mod.ls.toolWithWorkspace(ws),
         tools_mod.find.toolWithWorkspace(ws),
         tools_mod.grep.toolWithWorkspace(ws),
+        tools_mod.web_search.searchToolWithCtx(&web_search_ctx),
+        tools_mod.web_search.fetchToolWithCtx(&web_search_ctx),
     } else [_]at.AgentTool{
         tools_mod.read.tool(),
         tools_mod.write.tool(),
@@ -327,6 +332,8 @@ fn runPrint(
         tools_mod.ls.tool(),
         tools_mod.find.tool(),
         tools_mod.grep.tool(),
+        tools_mod.web_search.searchToolWithCtx(&web_search_ctx),
+        tools_mod.web_search.fetchToolWithCtx(&web_search_ctx),
     };
 
     const active_role = if (cfg.role) |s|

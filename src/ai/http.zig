@@ -68,17 +68,11 @@ pub const Timeouts = registry_mod.Timeouts;
 // background, and `vendored/http_client.zig` for the patched source.
 pub const Client = @import("vendored/http_client.zig");
 
-// ─── client setup (v1.25.0) ──────────────────────────────────────
+// ─── client setup ────────────────────────────────────────────────
 //
-// `setupClientFromEnv` consolidates proxy + CA-bundle extension
-// for any `Client` we hand out. Each provider streamFn
-// previously did `initDefaultProxies` inline; v1.25.0 also honors
-// `FRANKY_CA_BUNDLE` (path to a PEM file with extra root certs)
-// for environments where Zig's `rescanLinux` doesn't pick up the
-// trust bundle the operator needs — typically corp / sandbox
-// MITM proxies whose CA was installed as a per-cert .pem in
-// `/etc/ssl/certs/` rather than appended to
-// `/etc/ssl/certs/ca-certificates.crt`.
+// `setupClientFromEnv` consolidates proxy setup for any `Client`
+// we hand out. Each provider streamFn previously called
+// `initDefaultProxies` inline; this centralises it.
 //
 // **v1.29.7 — proper proxy lifetime via caller-owned arena.**
 // History: v1.28.x scoped a `proxy_arena` to this very function
@@ -98,7 +92,7 @@ pub const Client = @import("vendored/http_client.zig");
 // client's, in that order:
 //
 //     var client = Client{ .allocator = a, .io = io };
-//     var proxy_arena = try http.setupClientFromEnv(&client, a, io, env_map);
+//     var proxy_arena = try http.setupClientFromEnv(&client, a, env_map);
 //     defer {
 //         client.deinit();          // uses proxy pointers (alive)
 //         proxy_arena.deinit();     // then frees them
@@ -106,44 +100,15 @@ pub const Client = @import("vendored/http_client.zig");
 //
 // Single `defer { ... }` block is intentional — two separate
 // defers would LIFO-order against intent.
-//
-// CA bundle uses the client's allocator (unchanged); the arena
-// is exclusively for the proxy structs.
 
 pub fn setupClientFromEnv(
     client: *Client,
     allocator: std.mem.Allocator,
-    io: std.Io,
     environ_map: *const std.process.Environ.Map,
 ) anyerror!std.heap.ArenaAllocator {
     var proxy_arena = std.heap.ArenaAllocator.init(allocator);
     errdefer proxy_arena.deinit();
     try client.initDefaultProxies(proxy_arena.allocator(), environ_map);
-
-    if (environ_map.get("FRANKY_CA_BUNDLE")) |ca_path| {
-        if (ca_path.len == 0) return proxy_arena;
-        const now = std.Io.Clock.real.now(io);
-        // Force the system-bundle rescan now (the lazy path inside
-        // `Client.connect` would otherwise CLOBBER our additions
-        // because `rescanLinux` calls `clearRetainingCapacity()`
-        // first). Then append the operator's extra CAs. Then
-        // mark `client.now` so the lazy rescan is skipped.
-        client.ca_bundle.rescan(allocator, io, now) catch |e| switch (e) {
-            error.Canceled => |ce| return ce,
-            else => |other| {
-                log.log(.warn, "http", "ca-bundle", "system rescan failed: {s} (proceeding with extra CAs only)", .{@errorName(other)});
-            },
-        };
-        client.ca_bundle.addCertsFromFilePathAbsolute(allocator, io, now, ca_path) catch |e| switch (e) {
-            error.Canceled => |ce| return ce,
-            else => |other| {
-                log.log(.warn, "http", "ca-bundle", "FRANKY_CA_BUNDLE={s} load failed: {s}", .{ ca_path, @errorName(other) });
-                return proxy_arena;
-            },
-        };
-        client.now = now;
-        log.log(.info, "http", "ca-bundle", "extended trust store with FRANKY_CA_BUNDLE={s}", .{ca_path});
-    }
     return proxy_arena;
 }
 
@@ -1607,7 +1572,7 @@ test "setupClientFromEnv: returns ArenaAllocator that frees Proxy on deinit (no 
 
     {
         var client = Client{ .allocator = gpa, .io = io };
-        var proxy_arena = try setupClientFromEnv(&client, gpa, io, &env_map);
+        var proxy_arena = try setupClientFromEnv(&client, gpa, &env_map);
         defer {
             client.deinit();
             proxy_arena.deinit();
@@ -1634,7 +1599,7 @@ test "setupClientFromEnv: empty environ → empty arena that still deinits clean
     // No proxy envs set.
 
     var client = Client{ .allocator = gpa, .io = io };
-    var proxy_arena = try setupClientFromEnv(&client, gpa, io, &env_map);
+    var proxy_arena = try setupClientFromEnv(&client, gpa, &env_map);
     defer {
         client.deinit();
         proxy_arena.deinit();

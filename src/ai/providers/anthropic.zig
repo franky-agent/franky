@@ -632,8 +632,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     // environ map. Skipping this makes direct calls to `api.anthropic.com`
     // fail with ConnectionRefused behind corporate / sandbox proxies.
     if (ctx.options.environ_map) |env_map| {
-        // v1.25.0 — proxy + FRANKY_CA_BUNDLE in one call.
-        proxy_arena = http_mod.setupClientFromEnv(&client, ctx.allocator, ctx.io, env_map) catch |e| {
+        proxy_arena = http_mod.setupClientFromEnv(&client, ctx.allocator, env_map) catch |e| {
             try ctx.out.push(ctx.io, .start);
             ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
                 .code = errors.Code.transport,

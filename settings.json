@@ -90,7 +90,7 @@
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             }
         },
-        "openrouter-owl-alpha": {
+        "openrouter": {
             "provider": "gateway",
             "base-url": "https://openrouter.ai/api/v1/chat/completions",
             "model": "openrouter/owl-alpha",
@@ -206,6 +206,20 @@
             "env": {
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000",
                 "FRANKY_CA_BUNDLE": "/etc/ssl/certs/proxy-ca.pem"
+            }
+        },
+        "openai": {
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "api-key-env": "OPENAI_API_KEY",
+            "role": "full",
+            "ask-tools": "all",
+            "prompts": true,
+            "log-level": "trace",
+            "http-trace-dir": "${HOME}/.franky/log-trace",
+            "thinking": "xhigh",
+            "env": {
+                "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             }
         }
     }
