@@ -248,6 +248,7 @@ const Session = struct {
     /// print mode's v1.27.2 behavior). Address is stable for the
     /// session's lifetime — referenced by `tools_mod.bash.toolWithState`.
     bash_state: tools_mod.bash.SessionBashState,
+    web_search_ctx: tools_mod.web_search.WebSearchCtx = .{},
 
     /// Single-flight gate around the agent loop. Concurrent
     /// `POST /prompt` requests queue here.
@@ -495,6 +496,8 @@ fn initSession(
         tools_mod.ls.tool(),
         tools_mod.find.tool(),
         tools_mod.grep.tool(),
+        tools_mod.web_search.searchTool(),
+        tools_mod.web_search.fetchTool(),
     };
     const filtered = try role_mod.filterTools(role_arena.allocator(), &all_tools, role_gate.set);
 
@@ -541,6 +544,7 @@ fn initSession(
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
         .prompts_enabled = prompts_enabled,
     };
+    session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.session_gates = .{
         .role = &session.role_gate,
         .permissions = if (session.prompts_enabled) &session.permission_store else null,
@@ -573,6 +577,8 @@ fn initSession(
             tools_mod.ls.tool(),
             tools_mod.find.tool(),
             tools_mod.grep.tool(),
+            tools_mod.web_search.searchToolWithCtx(&session.web_search_ctx),
+            tools_mod.web_search.fetchToolWithCtx(&session.web_search_ctx),
         };
         session.tools = try role_mod.filterTools(session.role_arena.allocator(), &all_tools_with_state, session.role_gate.set);
     }
@@ -2948,6 +2954,8 @@ fn initSessionForTestWithDir(
         tools_mod.ls.tool(),
         tools_mod.find.tool(),
         tools_mod.grep.tool(),
+        tools_mod.web_search.searchTool(),
+        tools_mod.web_search.fetchTool(),
     };
     // Honor cfg.role so tests can drive non-default roles. Defaults
     // to `.full` to keep the existing fixtures' behavior.
@@ -2990,6 +2998,7 @@ fn initSessionForTestWithDir(
         .created_at_ms = ai.stream.nowMillis(),
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
     };
+    session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.session_gates = .{ .role = &session.role_gate };
     errdefer session.registry.deinit();
     errdefer session.faux.deinit();

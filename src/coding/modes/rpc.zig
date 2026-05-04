@@ -127,6 +127,7 @@ const Session = struct {
     /// neither env var is set. Address stable for the rpc process's
     /// lifetime — referenced by `bash.toolWithState`.
     bash_state: tools_mod.bash.SessionBashState,
+    web_search_ctx: tools_mod.web_search.WebSearchCtx = .{},
 
     fn deinit(self: *Session) void {
         self.transcript.deinit();
@@ -162,6 +163,8 @@ fn initSession(
         tools_mod.ls.tool(),
         tools_mod.find.tool(),
         tools_mod.grep.tool(),
+        tools_mod.web_search.searchTool(),
+        tools_mod.web_search.fetchTool(),
     };
     const filtered = try role_mod.filterTools(role_arena.allocator(), &all_tools, role_gate.set);
     // v1.24.0 — subagent wiring deferred until after permission_store
@@ -207,6 +210,7 @@ fn initSession(
         .prompts_enabled = prompts_enabled,
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
     };
+    session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.session_gates = .{
         .role = &session.role_gate,
         .permissions = if (session.prompts_enabled) &session.permission_store else null,
@@ -259,6 +263,8 @@ fn initSession(
             tools_mod.ls.tool(),
             tools_mod.find.tool(),
             tools_mod.grep.tool(),
+            tools_mod.web_search.searchToolWithCtx(&session.web_search_ctx),
+            tools_mod.web_search.fetchToolWithCtx(&session.web_search_ctx),
         };
         session.tools = try role_mod.filterTools(session.role_arena.allocator(), &all_tools_with_state, session.role_gate.set);
     }

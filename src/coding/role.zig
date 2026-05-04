@@ -78,6 +78,8 @@ const tool_table = [_]ToolEntry{
     .{ .name = "ls", .min_role = .read },
     .{ .name = "find", .min_role = .read },
     .{ .name = "grep", .min_role = .read },
+    .{ .name = "web_search", .min_role = .read },
+    .{ .name = "web_fetch", .min_role = .read },
     .{ .name = "write", .min_role = .plan },
     .{ .name = "edit", .min_role = .plan },
     .{ .name = "bash", .min_role = .code },

@@ -41,7 +41,7 @@ tool: ls error
 [file_not_found] /Users/adam/Developer/franky-do
 ```
 
-# Tool result Panel (Done | Needs Verification)
+# Tool result Panel (Done)
 
 Use the same style then for the sub-agent tools panel
 
@@ -71,7 +71,7 @@ tool: grep error
 [grep_bad_regex] invalid escape sequence at position 16 in pattern pub fn register\b\ (use regex=false for literal substring search)
 ```
 
-# Add websearch tool using Ollama Web Search
+# Add websearch tool using Ollama Web Search (D4one)
 
 Consider also support for other web search api's. Ollama is just the first provider.
 

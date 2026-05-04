@@ -1664,6 +1664,7 @@ const SessionBinding = struct {
     workspace: ?tools_mod.workspace.Workspace = null,
     bash_state: tools_mod.bash.SessionBashState = undefined,
     bash_ctx: tools_mod.bash.BashCtx = .{},
+    web_search_ctx: tools_mod.web_search.WebSearchCtx = .{},
     /// v1.19.0 — ReadCtx for the read tool (workspace + settings
     /// overlay). Stable address: tool ctx pointers reference it.
     read_ctx: tools_mod.read.ReadCtx = .{},
@@ -1722,9 +1723,10 @@ const SessionBinding = struct {
             .state = &binding.bash_state,
             .workspace = if (binding.workspace) |*ws| ws else null,
         };
+        binding.web_search_ctx = .{ .environ_map = environ_map };
         // Path-taking tools get workspace routing when PWD is known;
         // read additionally carries the settings-layer ReadCtx.
-        const all_tools: [7]at.AgentTool = if (binding.workspace) |*ws| .{
+        const all_tools: [9]at.AgentTool = if (binding.workspace) |*ws| .{
             tools_mod.read.toolWithCtx(&binding.read_ctx),
             tools_mod.write.toolWithWorkspace(ws),
             tools_mod.edit.toolWithWorkspace(ws),
@@ -1732,6 +1734,8 @@ const SessionBinding = struct {
             tools_mod.ls.toolWithWorkspace(ws),
             tools_mod.find.toolWithWorkspace(ws),
             tools_mod.grep.toolWithWorkspace(ws),
+            tools_mod.web_search.searchToolWithCtx(&binding.web_search_ctx),
+            tools_mod.web_search.fetchToolWithCtx(&binding.web_search_ctx),
         } else .{
             tools_mod.read.tool(),
             tools_mod.write.tool(),
@@ -1740,6 +1744,8 @@ const SessionBinding = struct {
             tools_mod.ls.tool(),
             tools_mod.find.tool(),
             tools_mod.grep.tool(),
+            tools_mod.web_search.searchToolWithCtx(&binding.web_search_ctx),
+            tools_mod.web_search.fetchToolWithCtx(&binding.web_search_ctx),
         };
 
         const active_role = if (cfg.role) |s|

@@ -181,19 +181,26 @@ const Markdown = (function () {
             }
 
             // Paragraph — collect contiguous non-block lines.
+            // Note: isTableRow lines are intentionally NOT excluded here.
+            // A pipe-line that has no separator following it (e.g. a
+            // streaming table header that hasn't received its `|---|` row
+            // yet) would otherwise stall `i` forever: the table handler
+            // skips it (no sep) and the paragraph inner loop also skips it
+            // (!isTableRow), leaving para empty and i unmoved → busy-loop.
             const para = [];
             while (i < lines.length
                 && lines[i].trim() !== ''
                 && !isFenceOpen(lines[i])
                 && !isHeading(lines[i])
                 && !isUlItem(lines[i])
-                && !isOlItem(lines[i])
-                && !isTableRow(lines[i])) {
+                && !isOlItem(lines[i])) {
                 para.push(lines[i]);
                 i += 1;
             }
             if (para.length > 0) {
                 out.push('<p>' + inline(para.join('\n')).replace(/\n/g, '<br>') + '</p>');
+            } else {
+                i += 1; // safety: nothing matched — advance past the stuck line
             }
         }
 
