@@ -60,6 +60,21 @@
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             }
         },
+        "ollama-home": {
+            "provider": "gateway",
+            "base-url": "http://192.168.1.107:11434/v1/chat/completions",
+            "model": "gemma4:latest",
+            "api-key": "ollama",
+            "ask-tools": "all",
+            "role": "full",
+            "prompts": true,
+            "log-level": "trace",
+            "http-trace-dir": "${HOME}/.franky/log-trace",
+            "thinking": "xhigh",
+            "env": {
+                "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
+            }
+        },
         "mistral": {
             "provider": "gateway",
             "base-url": "https://api.mistral.ai/v1/chat/completions",

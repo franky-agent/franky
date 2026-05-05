@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Wireframe — Subagent Panel Options</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e; --accent: #2f81f7;
+    --error: #f85149; --green: #3fb950; --warn: #d29922;
+    --tool-bg: #1c2128; --tool-border: #30363d;
+}
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 13px; background: #080c10; color: var(--text); min-height: 100vh; }
+
+/* ── Tab nav ── */
+.tab-bar { display: flex; gap: 2px; padding: 16px 16px 0; background: #080c10; }
+.tab { padding: 8px 20px; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 12px; font-weight: 600; background: var(--panel); color: var(--muted); border: 1px solid var(--border); border-bottom: none; transition: background 120ms; }
+.tab.active { background: var(--bg); color: var(--text); border-bottom: 1px solid var(--bg); margin-bottom: -1px; z-index: 1; }
+.option-label { padding: 8px 16px 0; font-size: 11px; color: var(--muted); background: #080c10; }
+
+/* ── Shared chrome ── */
+.demo { display: none; border: 1px solid var(--border); border-radius: 0 6px 6px 6px; margin: 0 16px 32px; overflow: hidden; height: 560px; flex-direction: column; background: var(--bg); position: relative; }
+.demo.active { display: flex; }
+header.chrome { display: flex; align-items: center; gap: 10px; padding: 0 14px; height: 42px; background: var(--panel); border-bottom: 1px solid var(--border); flex-shrink: 0; font-size: 12px; }
+header.chrome h1 { font-size: 14px; font-weight: 700; }
+.pill { font-size: 10px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); }
+.pill.live { color: var(--accent); border-color: var(--accent); }
+.pill.full { color: var(--error); border-color: var(--error); }
+.spacer { flex: 1; }
+.layout { flex: 1; display: flex; min-height: 0; }
+
+/* ── Left sidebar (shared) ── */
+.left-sidebar { width: 200px; flex: 0 0 200px; border-right: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; font-size: 12px; }
+.sidebar-head { padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 10px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+.session-item { padding: 6px 10px; color: var(--muted); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-item.active { background: rgba(47,129,247,0.1); color: var(--text); border-left: 2px solid var(--accent); padding-left: 8px; }
+
+/* ── Main pane (shared) ── */
+.main-pane { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+.conversation { flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.msg-user { align-self: flex-end; max-width: 70%; background: rgba(47,129,247,0.12); border: 1px solid rgba(47,129,247,0.25); border-radius: 8px; padding: 8px 12px; }
+.msg-asst { max-width: 90%; }
+.msg-role { font-size: 10px; color: var(--muted); margin-bottom: 3px; }
+.msg-bubble { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; line-height: 1.6; }
+.tool-card { border: 1px solid var(--tool-border); border-radius: 5px; background: var(--tool-bg); padding: 6px 10px; font-size: 11.5px; margin-top: 4px; }
+.tool-head { display: flex; gap: 6px; align-items: center; }
+.t-name { font-weight: 600; }
+.t-args { color: var(--muted); font-size: 10.5px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: monospace; }
+.t-status.done { color: var(--green); }
+.t-status.err { color: var(--error); }
+.composer-wrap { padding: 8px 12px; border-top: 1px solid var(--border); background: var(--panel); display: flex; gap: 8px; }
+.composer-wrap textarea { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 5px; color: var(--text); font: inherit; font-size: 12px; padding: 6px 10px; resize: none; }
+.composer-wrap button { padding: 0 14px; background: var(--accent); color: #fff; font: inherit; font-size: 12px; font-weight: 600; border: none; border-radius: 5px; cursor: pointer; }
+
+/* ── Shared subagent section chrome ── */
+.sa-section { border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
+.sa-head { display: flex; align-items: center; gap: 6px; padding: 6px 10px; cursor: pointer; background: var(--panel); user-select: none; }
+.sa-head:hover { background: rgba(255,255,255,0.03); }
+.sa-toggle { font-size: 9px; color: var(--muted); width: 9px; }
+.sa-title { flex: 1; font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sa-badge { font-size: 10px; padding: 1px 6px; border-radius: 10px; font-weight: 600; flex-shrink: 0; }
+.sa-badge.done { background: rgba(63,185,80,0.1); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+.sa-badge.err  { background: rgba(248,81,73,0.1);  color: var(--error); border: 1px solid rgba(248,81,73,0.3); }
+.sa-badge.run  { background: rgba(47,129,247,0.1);  color: var(--accent); border: 1px solid rgba(47,129,247,0.3); }
+.sa-body { padding: 8px; display: flex; flex-direction: column; gap: 5px; border-top: 1px solid var(--border); background: var(--bg); }
+.sa-body[hidden] { display: none; }
+.sa-text { font-size: 12px; line-height: 1.6; color: var(--text); }
+.sa-text p { margin-bottom: 4px; } .sa-text p:last-child { margin-bottom: 0; }
+.sa-thinking { border-left: 2px solid var(--border); padding: 4px 8px; background: var(--panel); border-radius: 0 3px 3px 0; }
+.sa-thinking-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); cursor: pointer; display: flex; align-items: center; gap: 3px; }
+.sa-thinking-content { font-size: 11px; color: var(--muted); font-style: italic; margin-top: 3px; line-height: 1.5; }
+.sa-tool { font-size: 11px; border: 1px solid var(--tool-border); border-radius: 3px; background: var(--tool-bg); padding: 4px 8px; display: flex; align-items: center; gap: 5px; }
+.sa-tool .arr { color: var(--muted); }
+.sa-tool .tn { font-weight: 600; }
+.sa-tool .ta { color: var(--muted); font-size: 10px; font-family: monospace; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sa-tool .ts { font-size: 10px; flex-shrink: 0; }
+.sa-tool .ts.done { color: var(--green); } .sa-tool .ts.err { color: var(--error); } .sa-tool .ts.run { color: var(--accent); }
+
+/* ═══════════════════════════════════════════════════════════════
+   OPTION A — Wide fixed panel (500px), always visible
+   ═══════════════════════════════════════════════════════════════ */
+#demo-a .sa-panel {
+    width: 500px;
+    flex: 0 0 500px;
+    border-left: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+}
+#demo-a .sa-panel-head { display: flex; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); gap: 6px; flex-shrink: 0; }
+#demo-a .sa-panel-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; flex: 1; }
+#demo-a .sa-panel-body { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+#demo-a .sa-body { max-height: none; overflow-y: visible; }
+/* Size toggle button */
+#demo-a .size-btn { font-size: 10px; padding: 2px 8px; background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 4px; cursor: pointer; }
+#demo-a .size-btn:hover { color: var(--text); border-color: var(--accent); }
+#demo-a.narrow .sa-panel { width: 340px; flex-basis: 340px; }
+
+/* ═══════════════════════════════════════════════════════════════
+   OPTION B — Compact list panel + full overlay on click
+   ═══════════════════════════════════════════════════════════════ */
+#demo-b .sa-panel {
+    width: 220px;
+    flex: 0 0 220px;
+    border-left: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+}
+#demo-b .sa-panel-head { display: flex; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); gap: 6px; flex-shrink: 0; }
+#demo-b .sa-panel-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; flex: 1; }
+#demo-b .sa-panel-body { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+/* Compact list rows — no body, just clickable headers */
+#demo-b .sa-section-compact { border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
+#demo-b .sa-head-compact { display: flex; align-items: center; gap: 6px; padding: 7px 10px; cursor: pointer; background: var(--panel); user-select: none; transition: background 80ms; }
+#demo-b .sa-head-compact:hover { background: rgba(47,129,247,0.08); }
+#demo-b .sa-head-compact .sa-title { font-size: 12px; font-weight: 600; flex: 1; }
+#demo-b .expand-hint { font-size: 10px; color: var(--muted); margin-left: auto; margin-right: 4px; }
+
+/* Overlay */
+.overlay-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.overlay-backdrop[hidden] { display: none; }
+.overlay-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    width: 80%; height: 80%;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.6);
+}
+.overlay-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0; }
+.overlay-head h2 { font-size: 14px; font-weight: 600; flex: 1; }
+.overlay-close { background: transparent; border: none; color: var(--muted); font-size: 20px; cursor: pointer; line-height: 1; }
+.overlay-close:hover { color: var(--text); }
+.overlay-body { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+/* Full-size content inside overlay */
+.overlay-sa-text { font-size: 13px; line-height: 1.7; color: var(--text); }
+.overlay-sa-text p { margin-bottom: 8px; }
+.overlay-sa-thinking { border-left: 3px solid var(--border); padding: 8px 12px; background: var(--panel); border-radius: 0 4px 4px 0; }
+.overlay-sa-thinking .label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 4px; }
+.overlay-sa-thinking .content { font-size: 12px; color: var(--muted); font-style: italic; line-height: 1.6; }
+.overlay-sa-tool { font-size: 12px; border: 1px solid var(--tool-border); border-radius: 4px; background: var(--tool-bg); padding: 7px 12px; display: flex; align-items: center; gap: 8px; }
+.overlay-sa-tool .arr { color: var(--muted); }
+.overlay-sa-tool .tn { font-weight: 600; font-size: 13px; }
+.overlay-sa-tool .ta { color: var(--muted); font-size: 11px; font-family: monospace; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.overlay-sa-tool .ts { font-size: 11px; flex-shrink: 0; }
+.overlay-sa-tool .ts.done { color: var(--green); } .overlay-sa-tool .ts.err { color: var(--error); }
+
+/* ═══════════════════════════════════════════════════════════════
+   OPTION C — Resizable split pane (drag handle)
+   ═══════════════════════════════════════════════════════════════ */
+#demo-c .layout { position: relative; }
+#demo-c .sa-panel {
+    width: 420px;
+    flex: 0 0 420px;
+    border-left: 1px solid var(--border);
+    background: var(--panel);
+    display: flex; flex-direction: column;
+    position: relative;
+    transition: none;
+}
+#demo-c .sa-panel-head { display: flex; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); gap: 6px; flex-shrink: 0; }
+#demo-c .sa-panel-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; flex: 1; }
+#demo-c .sa-panel-body { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+#demo-c .sa-body { max-height: none; }
+
+/* Drag handle */
+.drag-handle {
+    position: absolute;
+    left: -4px; top: 0; bottom: 0;
+    width: 8px;
+    cursor: col-resize;
+    z-index: 10;
+    display: flex; align-items: center; justify-content: center;
+}
+.drag-handle::after {
+    content: '';
+    width: 3px; height: 32px;
+    background: var(--border);
+    border-radius: 2px;
+    transition: background 120ms, height 120ms;
+}
+.drag-handle:hover::after { background: var(--accent); height: 48px; }
+
+/* Maximize button */
+.max-btn { font-size: 11px; padding: 2px 8px; background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 4px; cursor: pointer; display: flex; align-items: center; gap: 4px; }
+.max-btn:hover { color: var(--text); border-color: var(--accent); }
+#demo-c.maximized .sa-panel { width: 100%; flex-basis: 100%; }
+#demo-c.maximized .main-pane { display: none; }
+#demo-c.maximized .left-sidebar { display: none; }
+#demo-c.maximized .max-btn { background: rgba(47,129,247,0.1); color: var(--accent); border-color: var(--accent); }
+.drag-size-hint { font-size: 9px; color: var(--muted); text-align: center; padding: 3px 0; opacity: 0.6; }
+</style>
+</head>
+<body>
+
+<div class="tab-bar">
+    <div class="tab active" onclick="showTab('a')">A — Wide fixed panel</div>
+    <div class="tab"        onclick="showTab('b')">B — Compact list + overlay</div>
+    <div class="tab"        onclick="showTab('c')">C — Resizable split</div>
+</div>
+<div class="option-label" id="label-a">340 → 500px fixed width. Fits more text inline. Toggle "compact/wide" in the panel header.</div>
+<div class="option-label" id="label-b" hidden>Narrow 220px list panel shows only title + badge. Click any section to open a full overlay with all content.</div>
+<div class="option-label" id="label-c" hidden>420px default, drag the left edge to resize freely, or click ⤢ to take over the full pane.</div>
+
+<!-- ══════════════ OPTION A ══════════════ -->
+<div id="demo-a" class="demo active narrow">
+    <header class="chrome">
+        <h1>franky</h1>
+        <span class="pill live">live</span>
+        <span class="pill full">role: full</span>
+        <span style="font-size:11px;color:var(--muted);font-family:monospace;">gateway:deepseek-v4  596s · in 18 624 / out 651</span>
+        <div class="spacer"></div>
+        <span style="font-size:11px;color:var(--muted);">⏹ Abort</span>
+    </header>
+    <div class="layout">
+        <div class="left-sidebar">
+            <div class="sidebar-head">Conversations</div>
+            <div class="session-item active">Lets make a plan to work on #…</div>
+            <div class="session-item">Lets make a plan to work on #…</div>
+            <div class="session-item">Hi analyze the codebase.</div>
+        </div>
+        <div class="main-pane">
+            <div class="conversation">
+                <div class="msg-user">Lets make a plan to work on # impl…</div>
+                <div class="msg-asst">
+                    <div class="msg-role">assistant</div>
+                    <div class="msg-bubble">
+                        <p>The build succeeds and the test suite passes.</p>
+                        <p>Let me now verify the final state of all changes by doing a quick review of what each modified file looks like at the key points.</p>
+                        <div class="tool-card"><div class="tool-head"><span class="t-name">read</span><span class="t-args">/Users/frankittermann/github/franky/src/coding/modes/proxy.zig</span><span class="t-status done">✓ done</span></div></div>
+                        <div class="tool-card"><div class="tool-head"><span class="t-name">read</span><span class="t-args">/Users/frankittermann/github/franky/src/coding/modes/web/index.html</span><span class="t-status done">✓ done</span></div></div>
+                    </div>
+                </div>
+                <div class="msg-asst">
+                    <div class="msg-role">assistant</div>
+                    <div class="msg-bubble">All changes are in place. Let me verify by listing the new files in the web directory and confirm the build is clean.</div>
+                </div>
+            </div>
+            <div class="composer-wrap">
+                <textarea rows="2" placeholder="Type a message…"></textarea>
+                <button>Send</button>
+            </div>
+        </div>
+
+        <!-- RIGHT PANEL: wide fixed -->
+        <div class="sa-panel">
+            <div class="sa-panel-head">
+                <span class="sa-panel-title">Sub-agents</span>
+                <button class="size-btn" onclick="document.getElementById('demo-a').classList.toggle('narrow')" id="a-size-btn">compact ↔ wide</button>
+                <button style="background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:15px;line-height:1;">×</button>
+            </div>
+            <div class="sa-panel-body">
+
+                <!-- Section 1: done, expanded -->
+                <div class="sa-section">
+                    <div class="sa-head" onclick="toggleSec(this)">
+                        <span class="sa-toggle">▼</span>
+                        <span class="sa-title">research</span>
+                        <span class="sa-badge done">done</span>
+                    </div>
+                    <div class="sa-body">
+                        <div class="sa-thinking">
+                            <div class="sa-thinking-label" onclick="toggleThink(this)"><span>▶</span> thinking</div>
+                            <div class="sa-thinking-content" hidden>Let me carefully audit the web_search tool and how it integrates with the existing tool infrastructure…</div>
+                        </div>
+                        <div class="sa-text"><p>I'll start by reading the relevant source files to understand the current structure.</p></div>
+                        <div class="sa-tool"><span class="arr">→</span><span class="tn">read</span><span class="ta">src/coding/tools/web_search.zig</span><span class="ts done">done</span></div>
+                        <div class="sa-tool"><span class="arr">→</span><span class="tn">grep</span><span class="ta">pattern:"filterTools" path:src/coding/role.zig</span><span class="ts done">done</span></div>
+                        <div class="sa-tool"><span class="arr">→</span><span class="tn">grep</span><span class="ta">pattern:"web_search" path:src/coding/modes</span><span class="ts done">done</span></div>
+                        <div class="sa-text">
+                            <p>Found the issue: <code>web_search</code> and <code>web_fetch</code> are missing from <code>tool_table</code> in <code>role.zig</code>. The <code>filterTools</code> function silently drops any tool name not in that table.</p>
+                            <p>Fix: add both entries with <code>min_role = .read</code> — they are read-only network operations.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Section 2: done, collapsed -->
+                <div class="sa-section">
+                    <div class="sa-head" onclick="toggleSec(this)">
+                        <span class="sa-toggle">▶</span>
+                        <span class="sa-title">research</span>
+                        <span class="sa-badge done">done</span>
+                    </div>
+                    <div class="sa-body" hidden>
+                        <div class="sa-text"><p>Verified the role table fix applies cleanly. No test regressions.</p></div>
+                        <div class="sa-tool"><span class="arr">→</span><span class="tn">bash</span><span class="ta">zig build test --summary all</span><span class="ts done">done</span></div>
+                        <div class="sa-tool"><span class="arr">→</span><span class="tn">web_fetch</span><span class="ta">https://ollama.com/api/search?q=zig</span><span class="ts err">error</span></div>
+                        <div class="sa-tool"><span class="arr">→</span><span class="tn">web_fetch</span><span class="ta">https://docs.anthropic.com/tool-use</span><span class="ts err">error</span></div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ══════════════ OPTION B ══════════════ -->
+<div id="demo-b" class="demo">
+    <header class="chrome">
+        <h1>franky</h1>
+        <span class="pill live">live</span>
+        <span class="pill full">role: full</span>
+        <span style="font-size:11px;color:var(--muted);font-family:monospace;">gateway:deepseek-v4  596s · in 18 624 / out 651</span>
+        <div class="spacer"></div>
+        <span style="font-size:11px;color:var(--muted);">⏹ Abort</span>
+    </header>
+    <div class="layout" style="position:relative;">
+        <div class="left-sidebar">
+            <div class="sidebar-head">Conversations</div>
+            <div class="session-item active">Lets make a plan to work on #…</div>
+            <div class="session-item">Lets make a plan to work on #…</div>
+            <div class="session-item">Hi analyze the codebase.</div>
+        </div>
+        <div class="main-pane">
+            <div class="conversation">
+                <div class="msg-user">Lets make a plan to work on # impl…</div>
+                <div class="msg-asst">
+                    <div class="msg-role">assistant</div>
+                    <div class="msg-bubble">
+                        <p>The build succeeds. Let me verify the final state of each modified file.</p>
+                        <div class="tool-card"><div class="tool-head"><span class="t-name">read</span><span class="t-args">/Users/frankittermann/github/franky/src/coding/modes/proxy.zig</span><span class="t-status done">✓ done</span></div></div>
+                        <div class="tool-card"><div class="tool-head"><span class="t-name">subagent</span><span class="t-args">preset: research — "Audit web_search tool integration"</span><span class="t-status done">✓ done</span></div></div>
+                        <div class="tool-card"><div class="tool-head"><span class="t-name">subagent</span><span class="t-args">preset: research — "Verify role table entries"</span><span class="t-status done">✓ done</span></div></div>
+                    </div>
+                </div>
+            </div>
+            <div class="composer-wrap">
+                <textarea rows="2" placeholder="Type a message…"></textarea>
+                <button>Send</button>
+            </div>
+        </div>
+
+        <!-- RIGHT PANEL: compact list -->
+        <div class="sa-panel">
+            <div class="sa-panel-head">
+                <span class="sa-panel-title">Sub-agents</span>
+                <span style="font-size:10px;color:var(--muted);">2 done</span>
+            </div>
+            <div class="sa-panel-body">
+                <div class="sa-section-compact">
+                    <div class="sa-head-compact" onclick="openOverlay('research-1')">
+                        <span class="sa-title">research</span>
+                        <span class="expand-hint">open ↗</span>
+                        <span class="sa-badge done">done</span>
+                    </div>
+                </div>
+                <div class="sa-section-compact">
+                    <div class="sa-head-compact" onclick="openOverlay('research-2')">
+                        <span class="sa-title">research</span>
+                        <span class="expand-hint">open ↗</span>
+                        <span class="sa-badge done">done</span>
+                    </div>
+                </div>
+                <div style="font-size:11px;color:var(--muted);padding:4px 2px;opacity:0.7;">Click any row to view full conversation</div>
+            </div>
+        </div>
+
+        <!-- Overlay -->
+        <div class="overlay-backdrop" id="overlay" hidden onclick="closeOverlay(event)">
+            <div class="overlay-card" onclick="event.stopPropagation()">
+                <div class="overlay-head">
+                    <span class="sa-badge done" style="font-size:11px;padding:2px 8px;">done</span>
+                    <h2>research — Audit web_search tool integration</h2>
+                    <button class="overlay-close" onclick="closeOverlay()">×</button>
+                </div>
+                <div class="overlay-body">
+                    <div class="overlay-sa-thinking">
+                        <div class="label">thinking</div>
+                        <div class="content">Let me carefully audit the web_search tool and how it integrates with the existing tool infrastructure in role.zig. I need to check if the tool names are registered in the filter table…</div>
+                    </div>
+                    <div class="overlay-sa-text"><p>I'll start by reading the relevant source files to understand the current structure.</p></div>
+                    <div class="overlay-sa-tool"><span class="arr">→</span><span class="tn">read</span><span class="ta">src/coding/tools/web_search.zig</span><span class="ts done">✓ done</span></div>
+                    <div class="overlay-sa-tool"><span class="arr">→</span><span class="tn">grep</span><span class="ta">pattern:"filterTools" path:src/coding/role.zig</span><span class="ts done">✓ done</span></div>
+                    <div class="overlay-sa-tool"><span class="arr">→</span><span class="tn">grep</span><span class="ta">pattern:"web_search" path:src/coding/modes</span><span class="ts done">✓ done</span></div>
+                    <div class="overlay-sa-tool"><span class="arr">→</span><span class="tn">web_fetch</span><span class="ta">https://ollama.com/api/search?q=zig+tool+registration</span><span class="ts err">✗ error</span></div>
+                    <div class="overlay-sa-text">
+                        <p>Found the issue: <code>web_search</code> and <code>web_fetch</code> are missing from <code>tool_table</code> in <code>role.zig</code> (line 76–84). The <code>filterTools</code> function at line 156 drops any tool whose name isn't in that table — returning <code>false</code> for unknown names rather than allowing them through.</p>
+                        <p><strong>Fix:</strong> add two entries to <code>tool_table</code> with <code>min_role = .read</code>:</p>
+                        <p><code>.{ .name = "web_search", .min_role = .read },</code><br><code>.{ .name = "web_fetch",  .min_role = .read },</code></p>
+                        <p>These are read-only network operations — no local filesystem writes — so <code>.read</code> is the correct minimum role.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ══════════════ OPTION C ══════════════ -->
+<div id="demo-c" class="demo">
+    <header class="chrome">
+        <h1>franky</h1>
+        <span class="pill live">live</span>
+        <span class="pill full">role: full</span>
+        <span style="font-size:11px;color:var(--muted);font-family:monospace;">gateway:deepseek-v4  596s · in 18 624 / out 651</span>
+        <div class="spacer"></div>
+        <span style="font-size:11px;color:var(--muted);">⏹ Abort</span>
+    </header>
+    <div class="layout">
+        <div class="left-sidebar" id="c-left">
+            <div class="sidebar-head">Conversations</div>
+            <div class="session-item active">Lets make a plan to work on #…</div>
+            <div class="session-item">Lets make a plan to work on #…</div>
+        </div>
+        <div class="main-pane" id="c-main">
+            <div class="conversation">
+                <div class="msg-user">Lets make a plan to work on # impl…</div>
+                <div class="msg-asst">
+                    <div class="msg-role">assistant</div>
+                    <div class="msg-bubble">
+                        <p>The build succeeds and all 1018 tests pass.</p>
+                        <div class="tool-card"><div class="tool-head"><span class="t-name">subagent</span><span class="t-args">preset: research</span><span class="t-status done">✓ done</span></div></div>
+                    </div>
+                </div>
+            </div>
+            <div class="composer-wrap">
+                <textarea rows="2" placeholder="Type a message…"></textarea>
+                <button>Send</button>
+            </div>
+        </div>
+
+        <!-- RIGHT PANEL: resizable -->
+        <div class="sa-panel" id="c-panel">
+            <div class="drag-handle" id="drag-handle" title="Drag to resize"></div>
+            <div class="sa-panel-head">
+                <span class="sa-panel-title">Sub-agents</span>
+                <div class="drag-size-hint">← drag to resize</div>
+                <button class="max-btn" onclick="toggleMax()" id="max-btn">⤢ expand</button>
+                <button style="background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:15px;line-height:1;margin-left:4px;">×</button>
+            </div>
+            <div class="sa-panel-body">
+                <div class="sa-section">
+                    <div class="sa-head" onclick="toggleSec(this)">
+                        <span class="sa-toggle">▼</span>
+                        <span class="sa-title">research</span>
+                        <span class="sa-badge done">done</span>
+                    </div>
+                    <div class="sa-body">
+                        <div class="sa-thinking">
+                            <div class="sa-thinking-label" onclick="toggleThink(this)"><span>▶</span> thinking</div>
+                            <div class="sa-thinking-content" hidden>Let me audit the web_search integration carefully…</div>
+                        </div>
+                        <div class="sa-text"><p>Reading the relevant source files first.</p></div>
+                        <div class="sa-tool"><span class="arr">→</span><span class="tn">read</span><span class="ta">src/coding/tools/web_search.zig</span><span class="ts done">done</span></div>
+                        <div class="sa-tool"><span class="arr">→</span><span class="tn">grep</span><span class="ta">pattern:"filterTools" path:src/coding/role.zig</span><span class="ts done">done</span></div>
+                        <div class="sa-tool"><span class="arr">→</span><span class="tn">web_fetch</span><span class="ta">https://ollama.com/api/search?q=zig</span><span class="ts err">error</span></div>
+                        <div class="sa-text">
+                            <p>Found the issue: <code>web_search</code> and <code>web_fetch</code> are missing from <code>tool_table</code> in <code>role.zig</code>. <code>filterTools</code> silently drops unknown tool names.</p>
+                            <p><strong>Fix:</strong> add both with <code>min_role = .read</code>. They are read-only network operations and belong at the read level alongside <code>grep</code> and <code>find</code>.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+// ── Tab switching ──
+function showTab(t) {
+    document.querySelectorAll('.tab').forEach((el, i) => el.classList.toggle('active', ['a','b','c'][i] === t));
+    document.querySelectorAll('.demo').forEach(el => el.classList.toggle('active', el.id === 'demo-' + t));
+    ['a','b','c'].forEach(x => document.getElementById('label-' + x).hidden = x !== t);
+}
+
+// ── Section toggle (shared) ──
+function toggleSec(head) {
+    const body = head.nextElementSibling;
+    const tog = head.querySelector('.sa-toggle');
+    const open = !body.hasAttribute('hidden');
+    if (open) { body.setAttribute('hidden',''); tog.textContent='▶'; }
+    else       { body.removeAttribute('hidden'); tog.textContent='▼'; }
+}
+function toggleThink(label) {
+    const c = label.nextElementSibling;
+    const a = label.querySelector('span');
+    if (!c) return;
+    if (c.hasAttribute('hidden')) { c.removeAttribute('hidden'); a.textContent='▼'; }
+    else { c.setAttribute('hidden',''); a.textContent='▶'; }
+}
+
+// ── Option B: overlay ──
+function openOverlay(id) { document.getElementById('overlay').removeAttribute('hidden'); }
+function closeOverlay(e) {
+    if (!e || e.target === document.getElementById('overlay'))
+        document.getElementById('overlay').setAttribute('hidden','');
+}
+
+// ── Option C: maximize ──
+function toggleMax() {
+    const demo = document.getElementById('demo-c');
+    const btn  = document.getElementById('max-btn');
+    const max  = demo.classList.toggle('maximized');
+    btn.textContent = max ? '⤡ collapse' : '⤢ expand';
+}
+
+// ── Option C: drag to resize ──
+(function() {
+    const handle = document.getElementById('drag-handle');
+    if (!handle) return;
+    const panel  = document.getElementById('c-panel');
+    const layout = panel.parentElement;
+    let dragging = false, startX = 0, startW = 0;
+
+    handle.addEventListener('mousedown', e => {
+        dragging = true; startX = e.clientX; startW = panel.offsetWidth;
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+        e.preventDefault();
+    });
+    document.addEventListener('mousemove', e => {
+        if (!dragging) return;
+        const delta = startX - e.clientX;
+        const newW = Math.max(240, Math.min(layout.offsetWidth - 300, startW + delta));
+        panel.style.width = newW + 'px';
+        panel.style.flexBasis = newW + 'px';
+    });
+    document.addEventListener('mouseup', () => {
+        if (!dragging) return;
+        dragging = false;
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+    });
+})();
+</script>
+</body>
+</html>

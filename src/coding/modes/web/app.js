@@ -101,7 +101,7 @@ const Markdown = (function () {
             // Code fence — consume until closing ``` (or EOF, mid-stream).
             if (isFenceOpen(line)) {
                 const langRaw = line.slice(3).trim();
-                const langClass = langRaw ? ' class="lang-' + escapeAttr(langRaw) + '"' : '';
+                const langClass = langRaw ? ' class="language-' + escapeAttr(langRaw) + '"' : '';
                 const codeLines = [];
                 i += 1;
                 while (i < lines.length && !isFenceOpen(lines[i])) {
@@ -109,7 +109,7 @@ const Markdown = (function () {
                     i += 1;
                 }
                 if (i < lines.length) i += 1; // skip the closing fence
-                out.push('<pre><code' + langClass + '>' + escapeHtml(codeLines.join('\n')) + '</code></pre>');
+                out.push('<pre' + langClass + '><code' + langClass + '>' + escapeHtml(codeLines.join('\n')) + '</code></pre>');
                 continue;
             }
 
@@ -210,6 +210,25 @@ const Markdown = (function () {
     return { render: render, sanitizeUrl: sanitizeUrl, escapeHtml: escapeHtml };
 })();
 
+// ─── Prism syntax highlighting (v1.30.0) ──────────────────────
+//
+// Runs Prism.highlightElement on every <code> block inside the
+// given DOM container. Called after Markdown.render output is
+// set as innerHTML so syntax colours apply over the plain
+// monospace rendering.
+//
+// Prism is loaded from /prism.js before app.js runs, so the
+// global Prism object is available here. The language class
+// (e.g. `lang-python`) is set by the Markdown renderer from
+// the code fence info string.
+function highlightCodeBlocks(container) {
+    if (typeof Prism === 'undefined') return;
+    const codes = container.querySelectorAll('pre code[class^="language-"]');
+    for (const el of codes) {
+        Prism.highlightElement(el);
+    }
+}
+
 (function () {
     'use strict';
 
@@ -240,6 +259,19 @@ const Markdown = (function () {
     const helpCmdsEl = document.getElementById('help-commands');
     // vN — Abort button in header. Always visible; just POSTs /interrupt.
     const abortBtn = document.getElementById('abort-btn');
+    // v2.7 — subagent panel (right-side drawer)
+    const subagentPanelEl      = document.getElementById('subagent-panel');
+    const subagentPanelBody    = document.getElementById('subagent-panel-body');
+    const subagentPanelClose   = document.getElementById('sa-panel-close');
+    const subagentPanelSubtitle = document.getElementById('sa-panel-subtitle');
+    const subagentPanelBtn     = document.getElementById('sa-panel-btn');
+    // v2.7 — overlay refs
+    const saOverlayEl       = document.getElementById('sa-overlay');
+    const saOverlayBackdrop = document.getElementById('sa-overlay-backdrop');
+    const saOverlayClose    = document.getElementById('sa-overlay-close');
+    const saOverlayBody     = document.getElementById('sa-overlay-body');
+    const saOverlayBadge    = saOverlayEl.querySelector('.sa-overlay-badge');
+    const saOverlayTitle    = saOverlayEl.querySelector('.sa-overlay-title');
 
     /**
      * State for the in-progress assistant message.
@@ -266,6 +298,11 @@ const Markdown = (function () {
 
     /** call_id → tool-card element. Keeps tool start/end paired. */
     const toolCards = new Map();
+
+    // v2.7 — per-subagent-call section state. callId → state object.
+    // Survives across turns; cleared by clearConversation().
+    const subagentSections = new Map();
+    let currentOverlayCallId = null; // null = overlay closed
 
     /**
      * v1.6.2 — tool cards that opened from streaming `toolcall_args`
@@ -436,6 +473,7 @@ const Markdown = (function () {
             const c = document.createElement('span');
             c.className = 'content';
             c.innerHTML = Markdown.render(mainText);
+            highlightCodeBlocks(c);
             el.appendChild(c);
         }
         conversation.appendChild(el);
@@ -521,16 +559,9 @@ const Markdown = (function () {
         // Re-render content as the concatenation of all block deltas in
         // index order. This keeps multi-block messages stable even if
         // deltas arrive interleaved.
-        const ordered = [...active.blocks.entries()]
-            .sort((a, b) => a[0] - b[0])
-            .map(([, t]) => t)
-            .join('');
-        // Markdown render — Markdown.render escapes HTML internally so
-        // setting innerHTML is safe (no `<script>` from the model can
-        // reach the DOM). Mid-stream code fences with no closing ```
-        // still render as a code block (the parser treats EOF as the
-        // close), so partial markdown looks right while streaming.
+        const ordered = joinOrderedBlocks(active.blocks);
         active.contentEl.innerHTML = Markdown.render(ordered);
+        if (ordered.includes('```')) highlightCodeBlocks(active.contentEl);
         scrollToBottom();
     }
 
@@ -544,11 +575,7 @@ const Markdown = (function () {
         }
         const prev = active.thinkingBlocks.get(blockIndex) || '';
         active.thinkingBlocks.set(blockIndex, prev + delta);
-        const ordered = [...active.thinkingBlocks.entries()]
-            .sort((a, b) => a[0] - b[0])
-            .map(([, t]) => t)
-            .join('');
-        active.thinkingEl.textContent = ordered;
+        active.thinkingEl.textContent = joinOrderedBlocks(active.thinkingBlocks);
         scrollToBottom();
     }
 
@@ -608,7 +635,7 @@ const Markdown = (function () {
         scrollToBottom();
     }
 
-    function startToolCall(callId, name) {
+    function startToolCall(callId, name, argsJson) {
         // Tools render between assistant messages, so close out any
         // active assistant bubble first — the next message_start will
         // open a new one. `endAssistantMessage` also drains streaming
@@ -625,9 +652,13 @@ const Markdown = (function () {
             if (nameEl) nameEl.textContent = name;
             const status = card.el.querySelector('.tool-status');
             if (status) status.textContent = 'running…';
-            // v2.6 — pending cards also need the subagent panel.
-            if (name === 'subagent') attachSubagentPanel(card.el);
-            else attachResultPanel(card.el);
+            if (name === 'subagent') {
+                attachSubagentPanel(card.el, callId);
+                createSubagentSection(callId, argsJson || '');
+                openSubagentPanel();
+            } else {
+                attachResultPanel(card.el);
+            }
             toolCards.set(callId, card.el);
             scrollToBottom();
             return;
@@ -648,10 +679,13 @@ const Markdown = (function () {
         el.appendChild(head);
         el.appendChild(args);
 
-        // v2.6 — subagent tool gets an expandable progress panel;
-        // regular tools get a result panel. Mutually exclusive.
-        if (name === 'subagent') attachSubagentPanel(el);
-        else attachResultPanel(el);
+        if (name === 'subagent') {
+            attachSubagentPanel(el, callId);
+            createSubagentSection(callId, argsJson || '');
+            openSubagentPanel();
+        } else {
+            attachResultPanel(el);
+        }
 
         conversation.appendChild(el);
         toolCards.set(callId, el);
@@ -659,6 +693,7 @@ const Markdown = (function () {
     }
 
     function endToolCall(callId, isError, toolCode, resultText) {
+        finalizeSubagentSection(callId, isError);
         const el = toolCards.get(callId);
         if (!el) return;
         toolCards.delete(callId);
@@ -774,13 +809,21 @@ const Markdown = (function () {
 
     // ── v2.6 helpers ─────────────────────────────────────────────
 
-    /// Escape HTML special characters for safe DOM insertion.
     function escHtml(s) {
         return String(s)
             .replace(/&/g, '&amp;')
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;');
+    }
+
+    function joinOrderedBlocks(m) {
+        return [...m.entries()].sort((a, b) => a[0] - b[0]).map(([, t]) => t).join('');
+    }
+
+    function setBadge(el, label, extraClass) {
+        el.className = 'sa-badge' + (extraClass ? ' ' + extraClass : '') + ' ' + label;
+        el.textContent = label;
     }
 
     /// Wire up the collapsible result panel on every tool card.
@@ -817,8 +860,20 @@ const Markdown = (function () {
     /// Called from startToolCall for both fresh cards and claimed
     /// pending cards (streaming providers open a pending card before
     /// tool_execution_start fires, so both paths must call this).
-    function attachSubagentPanel(el) {
+    function attachSubagentPanel(el, callId) {
         el.classList.add('tool-card-subagent');
+
+        // ↗ overlay-open button in the card corner
+        const openBtn = document.createElement('button');
+        openBtn.type = 'button';
+        openBtn.className = 'sa-card-open';
+        openBtn.textContent = '↗';
+        openBtn.title = 'Open full sub-agent conversation';
+        openBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            openSubagentOverlay(callId);
+        });
+        el.appendChild(openBtn);
 
         const head = el.querySelector('.tool-head');
 
@@ -923,6 +978,285 @@ const Markdown = (function () {
         }
     }
 
+    // ── v2.7 — subagent panel helpers ────────────────────────────
+
+    function openSubagentPanel() {
+        if (!subagentPanelEl) return;
+        subagentPanelEl.removeAttribute('hidden');
+        if (subagentPanelBtn) subagentPanelBtn.removeAttribute('hidden');
+        updateSubagentPanelSubtitle();
+    }
+
+    function closeSubagentPanel() {
+        if (subagentPanelEl) subagentPanelEl.setAttribute('hidden', '');
+    }
+
+    function updateSubagentPanelSubtitle() {
+        if (!subagentPanelSubtitle) return;
+        const running = [...subagentSections.values()].filter(s => !s.done).length;
+        subagentPanelSubtitle.textContent = running > 0 ? running + ' running' : '';
+    }
+
+    // ── v2.7 — overlay open/close ─────────────────────────────────
+
+    function openSubagentOverlay(callId) {
+        const state = subagentSections.get(callId);
+        if (!state || !saOverlayEl) return;
+        currentOverlayCallId = callId;
+
+        setBadge(saOverlayBadge, state.done ? (state.isError ? 'error' : 'done') : 'running', 'sa-overlay-badge');
+        saOverlayTitle.textContent = state.preset;
+
+        saOverlayBody.innerHTML = '';
+        // Clear live-update overlay refs before re-rendering
+        state._overlayTextEl = null;
+        state._overlayThinkingEl = null;
+        state._overlayThinkingArrow = null;
+        state._overlayToolEls = null;
+        renderSubagentOverlayContent(state);
+
+        saOverlayEl.removeAttribute('hidden');
+        document.body.style.overflow = 'hidden';
+    }
+
+    function closeSubagentOverlay() {
+        if (!saOverlayEl) return;
+        saOverlayEl.setAttribute('hidden', '');
+        currentOverlayCallId = null;
+        document.body.style.overflow = '';
+    }
+
+    // ── v2.7 — overlay content rendering ─────────────────────────
+
+    function buildOverlayThinkingEl(text, done) {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'sa-thinking';
+        const label = document.createElement('div');
+        label.className = 'sa-thinking-label';
+        const arrow = document.createElement('span');
+        arrow.textContent = done ? '▶' : '▼';
+        label.append(arrow, document.createTextNode(' thinking'));
+        const content = document.createElement('div');
+        content.className = 'sa-thinking-content';
+        content.textContent = text;
+        if (done) content.setAttribute('hidden', '');
+        label.addEventListener('click', () => {
+            const open = !content.hasAttribute('hidden');
+            if (open) { content.setAttribute('hidden', ''); arrow.textContent = '▶'; }
+            else       { content.removeAttribute('hidden');  arrow.textContent = '▼'; }
+        });
+        wrapper.append(label, content);
+        return wrapper;
+    }
+
+    function buildOverlayEventEl(ev) {
+        if (ev.kind === 'tool_start') {
+            const el = document.createElement('div');
+            el.className = 'sa-tool-entry';
+            el.innerHTML =
+                '<span class="sa-tool-arrow">→</span>' +
+                '<span class="sa-tool-name">' + escHtml(ev.name || '') + '</span>' +
+                '<span class="sa-tool-args">'  + escHtml(ev.args || '') + '</span>' +
+                '<span class="sa-tool-status running">running</span>';
+            return el;
+        }
+        if (ev.kind === 'error') {
+            const el = document.createElement('div');
+            el.className = 'sa-text';
+            el.style.color = 'var(--error-border)';
+            el.textContent = '⚠ ' + (ev.msg || 'error');
+            return el;
+        }
+        return null; // tool_end is a mutation, not a new element
+    }
+
+    function renderSubagentOverlayContent(state) {
+        if (state.thinkingBlocks.size > 0) {
+            const block = buildOverlayThinkingEl(joinOrderedBlocks(state.thinkingBlocks), state.done);
+            saOverlayBody.appendChild(block);
+            state._overlayThinkingEl    = block.querySelector('.sa-thinking-content');
+            state._overlayThinkingArrow = block.querySelector('.sa-thinking-label span');
+        }
+
+        if (state.textBlocks.size > 0) {
+            const el = document.createElement('div');
+            el.className = 'sa-text';
+            const ordered = joinOrderedBlocks(state.textBlocks);
+            el.innerHTML = Markdown.render(ordered);
+            if (ordered.includes('```')) highlightCodeBlocks(el);
+            saOverlayBody.appendChild(el);
+            state._overlayTextEl = el;
+        }
+
+        for (const ev of state.eventLog) {
+            if (ev.kind === 'tool_end') {
+                if (state._overlayToolEls) {
+                    const startEl = state._overlayToolEls.get(ev.cid);
+                    if (startEl) {
+                        const s = startEl.querySelector('.sa-tool-status');
+                        if (s) {
+                            const ok = ev.ok !== false;
+                            s.className = 'sa-tool-status ' + (ok ? 'done' : 'error');
+                            s.textContent = ok ? 'done' : 'error';
+                        }
+                    }
+                }
+                continue;
+            }
+            const el = buildOverlayEventEl(ev);
+            if (!el) continue;
+            saOverlayBody.appendChild(el);
+            if (ev.kind === 'tool_start') {
+                if (!state._overlayToolEls) state._overlayToolEls = new Map();
+                state._overlayToolEls.set(ev.cid, el);
+            }
+        }
+    }
+
+    // ── v2.7 — compact panel section (replaces expanded section) ──
+
+    function createSubagentSection(callId, argsJson) {
+        if (!subagentPanelEl) return null;
+
+        let preset = 'subagent';
+        try {
+            const args = JSON.parse(argsJson || '{}');
+            if (args.preset) preset = args.preset;
+        } catch (_) {}
+
+        const rowEl = document.createElement('div');
+        rowEl.className = 'sa-row';
+
+        const titleEl = document.createElement('span');
+        titleEl.className = 'sa-row-title';
+        titleEl.textContent = preset;
+
+        const openHint = document.createElement('span');
+        openHint.className = 'sa-row-open';
+        openHint.textContent = '↗';
+
+        const badgeEl = document.createElement('span');
+        badgeEl.className = 'sa-badge running';
+        badgeEl.textContent = 'running';
+
+        rowEl.append(titleEl, openHint, badgeEl);
+        rowEl.addEventListener('click', () => openSubagentOverlay(callId));
+        subagentPanelBody.appendChild(rowEl);
+
+        const state = {
+            preset,
+            rowEl, badgeEl,
+            textBlocks: new Map(),
+            thinkingBlocks: new Map(),
+            eventLog: [],
+            done: false,
+            isError: false,
+            // Overlay DOM refs — set when overlay is open for this callId
+            _overlayTextEl: null,
+            _overlayThinkingEl: null,
+            _overlayThinkingArrow: null,
+            _overlayToolEls: null,
+        };
+        subagentSections.set(callId, state);
+        return state;
+    }
+
+    function appendSubagentPanelEvent(callId, upd) {
+        const state = subagentSections.get(callId);
+        if (!state) return;
+        const kind = upd.kind;
+
+        if (kind === 'text_delta') {
+            const bi = upd.block ?? 0;
+            state.textBlocks.set(bi, (state.textBlocks.get(bi) || '') + (upd.delta || ''));
+            if (currentOverlayCallId === callId && saOverlayBody) {
+                if (!state._overlayTextEl) {
+                    state._overlayTextEl = document.createElement('div');
+                    state._overlayTextEl.className = 'sa-text';
+                    saOverlayBody.appendChild(state._overlayTextEl);
+                }
+                const ordered = joinOrderedBlocks(state.textBlocks);
+                state._overlayTextEl.innerHTML = Markdown.render(ordered);
+            }
+
+        } else if (kind === 'thinking_delta') {
+            const bi = upd.block ?? 0;
+            state.thinkingBlocks.set(bi, (state.thinkingBlocks.get(bi) || '') + (upd.delta || ''));
+            if (currentOverlayCallId === callId && saOverlayBody) {
+                const ordered = joinOrderedBlocks(state.thinkingBlocks);
+                if (!state._overlayThinkingEl) {
+                    const block = buildOverlayThinkingEl(ordered, false);
+                    saOverlayBody.insertBefore(block, saOverlayBody.firstChild);
+                    state._overlayThinkingEl    = block.querySelector('.sa-thinking-content');
+                    state._overlayThinkingArrow = block.querySelector('.sa-thinking-label span');
+                } else {
+                    state._overlayThinkingEl.textContent = ordered;
+                    state._overlayThinkingEl.removeAttribute('hidden');
+                    if (state._overlayThinkingArrow) state._overlayThinkingArrow.textContent = '▼';
+                }
+            }
+
+        } else if (kind === 'tool_start') {
+            const entry = { kind: 'tool_start', name: upd.name, cid: upd.cid, args: upd.args };
+            state.eventLog.push(entry);
+            if (currentOverlayCallId === callId && saOverlayBody) {
+                const el = buildOverlayEventEl(entry);
+                if (el) {
+                    saOverlayBody.appendChild(el);
+                    if (!state._overlayToolEls) state._overlayToolEls = new Map();
+                    state._overlayToolEls.set(upd.cid, el);
+                }
+            }
+
+        } else if (kind === 'tool_end') {
+            state.eventLog.push({ kind: 'tool_end', cid: upd.cid, ok: upd.ok });
+            if (currentOverlayCallId === callId && state._overlayToolEls) {
+                const el = state._overlayToolEls.get(upd.cid);
+                if (el) {
+                    const s = el.querySelector('.sa-tool-status');
+                    if (s) {
+                        const ok = upd.ok !== false;
+                        s.className = 'sa-tool-status ' + (ok ? 'done' : 'error');
+                        s.textContent = ok ? 'done' : 'error';
+                    }
+                }
+            }
+
+        } else if (kind === 'error') {
+            state.eventLog.push({ kind: 'error', msg: upd.msg });
+            if (currentOverlayCallId === callId && saOverlayBody) {
+                const el = buildOverlayEventEl({ kind: 'error', msg: upd.msg });
+                if (el) saOverlayBody.appendChild(el);
+            }
+        }
+
+        if (kind !== 'tool_end' && currentOverlayCallId === callId && saOverlayBody) {
+            const atBottom = saOverlayBody.scrollHeight
+                - saOverlayBody.scrollTop - saOverlayBody.clientHeight < 80;
+            if (atBottom) saOverlayBody.scrollTop = saOverlayBody.scrollHeight;
+        }
+    }
+
+    function finalizeSubagentSection(callId, isError) {
+        const state = subagentSections.get(callId);
+        if (!state) return;
+        state.done = true;
+        state.isError = isError;
+
+        const label = isError ? 'error' : 'done';
+        setBadge(state.badgeEl, label);
+        if (currentOverlayCallId === callId)
+            setBadge(saOverlayBadge, label, 'sa-overlay-badge');
+
+        // Collapse thinking in overlay if open
+        if (currentOverlayCallId === callId && state._overlayThinkingEl) {
+            state._overlayThinkingEl.setAttribute('hidden', '');
+            if (state._overlayThinkingArrow) state._overlayThinkingArrow.textContent = '▶';
+        }
+
+        updateSubagentPanelSubtitle();
+    }
+
     // ── EventSource wiring ───────────────────────────────────────
 
     function connect() {
@@ -1002,7 +1336,7 @@ const Markdown = (function () {
             noteEvent();
             const data = parseData(e.data);
             if (!data) return;
-            startToolCall(data.callId, data.name || 'tool');
+            startToolCall(data.callId, data.name || 'tool', data.argsJson || '');
             setActivity('running: ' + (data.name || 'tool'));
         });
 
@@ -1035,6 +1369,7 @@ const Markdown = (function () {
             } catch (_) { return; }
             if (!upd) return;
             appendSubagentEntry(card, log, upd);
+            appendSubagentPanelEvent(data.callId, upd);
         });
 
         // v1.11.4 — pause-and-prompt permission overlay. Server
@@ -1215,6 +1550,7 @@ const Markdown = (function () {
         const content = document.createElement('span');
         content.className = 'content';
         content.innerHTML = Markdown.render(outputMd || '');
+        highlightCodeBlocks(content);
         el.appendChild(content);
 
         conversation.appendChild(el);
@@ -1654,6 +1990,11 @@ const Markdown = (function () {
     // Global ?-key opens help; Esc closes it. Skip when the user
     // is mid-typing in the textarea (so "?" inserts normally).
     document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && currentOverlayCallId !== null) {
+            e.preventDefault();
+            closeSubagentOverlay();
+            return;
+        }
         if (e.key === 'Escape' && helpOverlayEl && !helpOverlayEl.hidden) {
             e.preventDefault();
             hideHelp();
@@ -1736,6 +2077,11 @@ const Markdown = (function () {
         active = { el: null, contentEl: null, blocks: new Map(), thinkingEl: null, thinkingBlocks: new Map(), toolArgs: new Map() };
         toolCards.clear();
         pendingToolCards.length = 0;
+        closeSubagentOverlay();
+        subagentSections.clear();
+        if (subagentPanelBody) subagentPanelBody.innerHTML = '';
+        if (subagentPanelEl) subagentPanelEl.setAttribute('hidden', '');
+        if (subagentPanelBtn) subagentPanelBtn.setAttribute('hidden', '');
         hideTurnIndicator();
         setStreaming(false);                // v1.7.2 (replaces v1.7.1 plumbing)
         stopStatusLineTimer();              // v1.7.7
@@ -1778,6 +2124,12 @@ const Markdown = (function () {
             document.body.classList.toggle('sidebar-collapsed');
         });
     }
+    if (subagentPanelClose) subagentPanelClose.addEventListener('click', closeSubagentPanel);
+    if (subagentPanelBtn)   subagentPanelBtn.addEventListener('click', openSubagentPanel);
+    if (saOverlayClose) saOverlayClose.addEventListener('click', closeSubagentOverlay);
+    if (saOverlayBackdrop) saOverlayBackdrop.addEventListener('click', (e) => {
+        if (e.target === saOverlayBackdrop) closeSubagentOverlay();
+    });
 
     /**
      * v1.6.1 — fetch /transcript and replay each persisted message

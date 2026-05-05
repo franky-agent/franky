@@ -569,6 +569,16 @@ main#conversation {
     line-height: 1.5;
 }
 
+/* Syntax-highlighted blocks use Prism's theme for colors,
+ * but inherit our padding/border/radius so the card layout is
+ * consistent with the rest of the UI. The background override
+ * below gives highlighted blocks the darker code-panel tint
+ * from the dark theme instead of the message-bubble background. */
+.message .content pre[class*="language-"] {
+    background: #2d2d2d;
+    border-color: var(--border);
+}
+
 .message .content pre code {
     background: transparent;
     border: 0;
@@ -576,6 +586,13 @@ main#conversation {
     font-size: inherit;
     color: var(--text);
     white-space: pre;
+}
+
+/* Syntax-highlighted <code> inherits Prism's theme colors;
+ * override the explicit background Prism sets so rounded corners
+ * inside the pre look right. */
+.message .content pre code[class*="language-"] {
+    background: transparent;
 }
 
 .message .content a {
@@ -693,6 +710,152 @@ main#conversation {
 .subagent-entry .sa-status.done  { color: var(--accent); }
 .subagent-entry .sa-status.is-error { color: var(--error-border); }
 .subagent-entry.sa-error { color: var(--error-border); }
+
+/* v2.7 — right-side subagent panel ──────────────────────────────── */
+
+aside#subagent-panel {
+    width: 220px;
+    flex: 0 0 220px;
+    border-left: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transition: width 120ms ease, flex-basis 120ms ease;
+}
+aside#subagent-panel[hidden] { display: none; }
+
+.sa-panel-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+.sa-panel-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    flex: 1;
+}
+.sa-panel-subtitle { font-size: 10px; color: var(--muted); }
+button#sa-panel-close {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    padding: 0 2px;
+}
+button#sa-panel-close:hover { color: var(--text); }
+button#sa-panel-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 4px;
+    padding: 3px 8px;
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+button#sa-panel-btn:hover { color: var(--text); border-color: var(--accent); }
+#subagent-panel-body {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.sa-badge {
+    font-size: 10px;
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-weight: 600;
+    flex-shrink: 0;
+}
+.sa-badge.running { background: rgba(88,166,255,0.15); color: var(--accent);       border: 1px solid rgba(88,166,255,0.3); }
+.sa-badge.done    { background: rgba(63,185,80,0.1);   color: #3fb950;             border: 1px solid rgba(63,185,80,0.3); }
+.sa-badge.error   { background: rgba(248,81,73,0.1);   color: var(--error-border); border: 1px solid rgba(248,81,73,0.3); }
+
+/* Thinking block */
+.sa-thinking {
+    border-left: 2px solid var(--border);
+    border-radius: 0 4px 4px 0;
+    background: var(--panel);
+    padding: 5px 8px;
+}
+.sa-thinking-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    user-select: none;
+}
+.sa-thinking-content {
+    font-size: 11.5px;
+    color: var(--muted);
+    font-style: italic;
+    line-height: 1.5;
+    margin-top: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* Text + tool entries */
+.sa-text { font-size: 12.5px; line-height: 1.6; color: var(--text); }
+.sa-text p { margin-bottom: 6px; }
+.sa-text p:last-child { margin-bottom: 0; }
+.sa-text pre {
+    font-size: 11px;
+    overflow-x: auto;
+    padding: 6px 8px;
+    background: var(--panel);
+    border-radius: 4px;
+    border: 1px solid var(--border);
+}
+.sa-text code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+    font-size: 11px;
+    background: rgba(255,255,255,0.06);
+    padding: 1px 4px;
+    border-radius: 3px;
+}
+.sa-tool-entry {
+    font-size: 11.5px;
+    border: 1px solid var(--tool-border);
+    border-radius: 4px;
+    background: var(--tool-bg);
+    padding: 5px 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.sa-tool-entry .sa-tool-arrow { color: var(--muted); }
+.sa-tool-entry .sa-tool-name  { font-weight: 600; }
+.sa-tool-entry .sa-tool-args  {
+    color: var(--muted);
+    font-size: 10.5px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.sa-tool-entry .sa-tool-status { font-size: 10.5px; flex-shrink: 0; }
+.sa-tool-entry .sa-tool-status.done    { color: #3fb950; }
+.sa-tool-entry .sa-tool-status.error   { color: var(--error-border); }
+.sa-tool-entry .sa-tool-status.running { color: var(--accent); }
 
 /* Collapsible result panel on every tool card. Toggle button sits
  * inline in the tool-head; panel expands below. Auto-expands on
@@ -942,3 +1105,107 @@ button#send:disabled {
 button#send:hover:not(:disabled) {
     filter: brightness(1.08);
 }
+
+/* v2.7 overlay variant — compact panel row */
+.sa-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    cursor: pointer;
+    background: var(--panel);
+    user-select: none;
+    transition: background 80ms;
+}
+.sa-row:hover { background: rgba(47,129,247,0.06); border-color: var(--accent); }
+.sa-row-title { flex: 1; font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sa-row-open  { font-size: 10px; color: var(--muted); flex-shrink: 0; }
+.sa-row:hover .sa-row-open { color: var(--accent); }
+
+/* ↗ open-overlay button on the inline tool card */
+.tool-card { position: relative; }
+.sa-card-open {
+    position: absolute;
+    top: 6px; right: 8px;
+    font-size: 11px;
+    color: var(--muted);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+    opacity: 0;
+    transition: opacity 80ms;
+}
+.tool-card:hover .sa-card-open { opacity: 1; }
+.tool-card-subagent .sa-card-open { opacity: 0.5; }
+.tool-card-subagent:hover .sa-card-open { opacity: 1; color: var(--accent); }
+
+/* v2.7 — full overlay */
+#sa-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+}
+#sa-overlay[hidden] { display: none; }
+.sa-overlay-backdrop {
+    width: 100%; height: 100%;
+    background: rgba(0,0,0,0.65);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.sa-overlay-card {
+    width: 80vw;
+    height: 80vh;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.5);
+}
+.sa-overlay-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    flex-shrink: 0;
+}
+.sa-overlay-title {
+    flex: 1;
+    font-size: 14px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.sa-overlay-close {
+    background: transparent; border: none;
+    color: var(--muted); font-size: 20px;
+    line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.sa-overlay-close:hover { color: var(--text); }
+.sa-overlay-body {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.sa-overlay-body .sa-thinking {
+    border-left: 3px solid var(--border);
+    padding: 8px 12px;
+    border-radius: 0 4px 4px 0;
+}
+.sa-overlay-body .sa-thinking-content { font-size: 12.5px; margin-top: 6px; }
+.sa-overlay-body .sa-text { font-size: 13.5px; line-height: 1.7; }
+.sa-overlay-body .sa-text p { margin-bottom: 8px; }
+.sa-overlay-body .sa-tool-entry { font-size: 12px; padding: 7px 12px; }
+.sa-overlay-body .sa-tool-entry .sa-tool-args { font-size: 11px; }

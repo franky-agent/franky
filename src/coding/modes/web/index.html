@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>franky</title>
     <link rel="stylesheet" href="/style.css">
+    <link rel="stylesheet" href="/prism-tomorrow.css">
 </head>
 <body>
     <header>
@@ -18,6 +19,7 @@
             <span class="activity-label">idle</span>
         </span>
         <span id="status-line" class="status-line" aria-live="polite"></span>
+        <button id="sa-panel-btn" type="button" hidden title="Show sub-agent activity">⚙</button>
         <button id="abort-btn" type="button" aria-label="Abort the current turn gracefully" title="Abort (graceful interrupt)">⏹ Abort</button>
         <button id="help-toggle" type="button" aria-label="Show help" title="Help (?)">?</button>
     </header>
@@ -73,7 +75,28 @@
                 </form>
             </div>
         </div>
+        <aside id="subagent-panel" aria-label="Sub-agent activity" hidden>
+            <div class="sa-panel-head">
+                <span class="sa-panel-title">Sub-agents</span>
+                <span class="sa-panel-subtitle" id="sa-panel-subtitle"></span>
+                <button id="sa-panel-close" type="button" aria-label="Close sub-agent panel">×</button>
+            </div>
+            <div id="subagent-panel-body"></div>
+        </aside>
     </div>
+    <div id="sa-overlay" hidden aria-modal="true" role="dialog" aria-label="Sub-agent conversation">
+        <div class="sa-overlay-backdrop" id="sa-overlay-backdrop">
+            <div class="sa-overlay-card">
+                <div class="sa-overlay-head">
+                    <span class="sa-badge sa-overlay-badge">running</span>
+                    <span class="sa-overlay-title"></span>
+                    <button class="sa-overlay-close" id="sa-overlay-close" aria-label="Close">×</button>
+                </div>
+                <div class="sa-overlay-body" id="sa-overlay-body"></div>
+            </div>
+        </div>
+    </div>
+    <script src="/prism.js"></script>
     <script src="/app.js"></script>
 </body>
 </html>

@@ -360,7 +360,7 @@ fn selectTools(
     return allocator.realloc(out, n);
 }
 
-const research_tool_names = [_][]const u8{ "read", "ls", "find", "grep" };
+const research_tool_names = [_][]const u8{ "read", "ls", "find", "grep", "web_search", "web_fetch" };
 const file_ops_tool_names = [_][]const u8{ "read", "write", "edit", "ls" };
 const bash_runner_tool_names = [_][]const u8{ "bash", "ls" };
 

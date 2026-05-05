@@ -655,8 +655,113 @@ Reference: docs/reference/diagnostics.md
 ```
 
 
-# Implement code highlighting in web-ui
+# Implement code highlighting in web-ui (done)
 
 The rendered code blocks in the web UI should have syntax highlighting for better readability. This can be achieved by integrating a syntax highlighting library.
 
 Do a research for what is already available in the used dependencies or what dependency can be added with minimal overhead. Implement the syntax highlighting for code blocks in the web UI, ensuring that it supports multiple programming languages and is visually appealing.
+
+# Lets add a new subagent Panel (done)
+
+The panel should be shown on the right similar to the session panel in the web-ui (proxy mode)
+and show the full subagent conversation similar to the normal agent ui. Just collapsablle.
+
+# Subagent timouts are not configurable
+
+I started the franky process with `FRANKY_FIRST_BYTE_TIMEOUT_MS=120000 ./zig-out/bin/franky --first-byte-timeout-ms 120000 --profile ollama-deepseek-flash --mode proxy --role full --yes` but
+the subagent was reported timeout after 30000ms instead
+
+```
+⚠ first-byte timeout: provider didn't respond within 30000ms; raise --first-byte-timeout-ms (or set FRANKY_FIRST_BYTE_TIMEOUT_MS) for slow models
+⚠ {"ok":false,"error_kind":"agent_error","error_message":"sub-agent failed: timeout — first-byte timeout: provider didn't respond within 30000ms; raise --first-byte-timeout-ms (or set FRANKY_FIRST_BYTE_TIMEOUT_MS) for slow models","hint":"retry; details in error_message","partial_text":"Now let me read all the tool files:","turn_count":3}
+```
+
+settings.json snippet
+```
+"ollama-deepseek-flash": {
+    "provider": "gateway",
+    "base-url": "https://ollama.com/v1/chat/completions",
+    "model": "deepseek-v4-flash:cloud",
+    "api-key-env": "OLLAMA_KEY",
+    "role": "full",
+    "ask-tools": "all",
+    "prompts": true,
+    "log-level": "trace",
+    "http-trace-dir": "${HOME}/.franky/log-trace",
+    "thinking": "xhigh",
+    "env": {
+        "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
+    }
+},
+```
+
+# The subagent tool panel shows thinkinkg deltas
+
+The subagent tool panel (in the main panel) shows thkining delta that shouldn't be there.
+
+
+```
+(thinking) Let
+› (thinking) me systematically
+› (thinking) analyze the
+› (thinking) memory management
+› (thinking) patterns in
+› (thinking) the requested
+› (thinking) files
+› (thinking) . I
+› (thinking) 'll start
+› (thinking) by reading
+› (thinking) the files
+› (thinking) and searching
+› (thinking) for relevant
+› (thinking) patterns.
+› I
+› 'll start
+› by reading
+› the
+› files
+› and searching
+› for patterns
+› systematically.
+→ ls {"path":"/Users/frankittermann/github/franky/src","recursive":true,"maxDepth":3} done
+› (thinking) Let
+› (thinking) me start
+› (thinking) by
+› (thinking) reading all
+› (thinking) the requested
+› (thinking) files.
+→ ls {"path":"/Users/frankittermann/github/franky/src/coding/tools"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/agent/agent.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/agent/types.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/permissions.zig"} done
+› (thinking) Let
+› (thinking) me now
+› (thinking) read all
+› (thinking) the tool
+› (thinking) files,
+› (thinking) the channel
+› (thinking) file
+› (thinking) , and
+› (thinking) continue
+› (thinking) analyzing
+› (thinking) patterns
+› (thinking) .
+› Now let
+› me read
+› all the
+› tool files
+› :
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/common.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/bash.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/read.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/write.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/edit.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/grep.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/ls.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/find.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/subagent.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/web_search.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/web_fetch.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/truncate.zig"} done
+→ read {"path":"/Users/frankittermann/github/franky/src/coding/tools/workspace.zig"} done
+```

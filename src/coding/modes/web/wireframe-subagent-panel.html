@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Wireframe — Subagent Panel</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --error: #f85149;
+    --warn: #d29922;
+    --tool-bg: #1c2128;
+    --tool-border: #30363d;
+    --thinking-bg: #161b22;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 13px;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* ── Header ──────────────────────────────────────────────────── */
+header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 12px;
+    height: 44px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+header h1 { font-size: 14px; font-weight: 700; margin-right: 4px; }
+.pill {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+}
+.pill.live { color: #3fb950; border-color: #3fb950; }
+.header-spacer { flex: 1; }
+.activity { font-size: 11px; color: var(--accent); display: flex; align-items: center; gap: 5px; }
+.activity-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+/* ─ subagent panel header button ─ */
+#sa-panel-btn {
+    font-size: 11px;
+    padding: 3px 10px;
+    background: rgba(88,166,255,0.12);
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+#sa-panel-btn .badge {
+    background: var(--accent);
+    color: #0d1117;
+    font-size: 10px;
+    font-weight: 700;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+}
+
+/* ── Layout ──────────────────────────────────────────────────── */
+#layout {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+}
+
+/* ── Left Sidebar ────────────────────────────────────────────── */
+aside#sidebar {
+    width: 220px;
+    flex: 0 0 220px;
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+.sidebar-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+}
+.sidebar-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+.new-btn { font-size: 11px; color: var(--accent); border: 1px solid var(--border); background: transparent; border-radius: 4px; padding: 2px 8px; cursor: pointer; }
+.session-list { flex: 1; overflow-y: auto; padding: 6px; }
+.session-item {
+    padding: 7px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.session-item.active { background: rgba(88,166,255,0.12); color: var(--text); }
+.session-item:hover:not(.active) { background: rgba(255,255,255,0.04); }
+
+/* ── Main Pane ───────────────────────────────────────────────── */
+#main-pane {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+}
+#conversation {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.message { max-width: 720px; width: 100%; }
+.message.user { align-self: flex-end; max-width: 580px; }
+.message-bubble {
+    padding: 10px 14px;
+    border-radius: 8px;
+    line-height: 1.6;
+}
+.message.user .message-bubble {
+    background: rgba(88,166,255,0.15);
+    border: 1px solid rgba(88,166,255,0.3);
+}
+.message.assistant .message-bubble {
+    background: var(--panel);
+    border: 1px solid var(--border);
+}
+.message-role { font-size: 10px; color: var(--muted); margin-bottom: 4px; }
+.tool-card {
+    border: 1px solid var(--tool-border);
+    border-radius: 6px;
+    background: var(--tool-bg);
+    padding: 8px 12px;
+    font-size: 12px;
+    margin-top: 6px;
+}
+.tool-head { display: flex; align-items: center; gap: 8px; }
+.tool-name { font-weight: 600; font-size: 12px; }
+.tool-args { color: var(--muted); font-size: 11px; font-family: monospace; }
+.tool-status { margin-left: auto; font-size: 11px; }
+.tool-status.done { color: #3fb950; }
+.tool-status.running { color: var(--accent); }
+
+#composer-wrap {
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+}
+#composer {
+    display: flex;
+    gap: 8px;
+}
+textarea {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    padding: 8px 12px;
+    resize: none;
+    line-height: 1.5;
+}
+button[type=submit] {
+    padding: 0 16px;
+    background: var(--accent);
+    color: #0d1117;
+    font: inherit;
+    font-weight: 600;
+    font-size: 12px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+/* ── Subagent Panel (RIGHT) ──────────────────────────────────── */
+aside#subagent-panel {
+    width: 340px;
+    flex: 0 0 340px;
+    border-left: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transition: width 120ms ease, flex-basis 120ms ease;
+}
+aside#subagent-panel.collapsed {
+    width: 0;
+    flex-basis: 0;
+    border-left: 0;
+}
+.sa-panel-head {
+    display: flex;
+    align-items: center;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    gap: 6px;
+    flex-shrink: 0;
+}
+.sa-panel-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    flex: 1;
+}
+.sa-panel-subtitle {
+    font-size: 10px;
+    color: var(--muted);
+}
+.sa-panel-close {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    padding: 0 2px;
+}
+.sa-panel-close:hover { color: var(--text); }
+
+#subagent-panel-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* ── Per-call section ────────────────────────────────────────── */
+.sa-section {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    background: var(--bg);
+}
+.sa-section-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 10px;
+    cursor: pointer;
+    background: var(--panel);
+    user-select: none;
+}
+.sa-section-head:hover { background: rgba(255,255,255,0.03); }
+.sa-toggle { font-size: 9px; color: var(--muted); width: 10px; flex-shrink: 0; }
+.sa-section-title { flex: 1; font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sa-badge {
+    font-size: 10px;
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-weight: 600;
+    flex-shrink: 0;
+}
+.sa-badge.running { background: rgba(88,166,255,0.15); color: var(--accent); border: 1px solid rgba(88,166,255,0.3); }
+.sa-badge.done    { background: rgba(63,185,80,0.1);   color: #3fb950;      border: 1px solid rgba(63,185,80,0.3); }
+.sa-badge.error   { background: rgba(248,81,73,0.1);   color: var(--error); border: 1px solid rgba(248,81,73,0.3); }
+
+.sa-section-body {
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 55vh;
+    overflow-y: auto;
+    border-top: 1px solid var(--border);
+}
+.sa-section-body.hidden { display: none; }
+
+/* Thinking block */
+.sa-thinking {
+    font-size: 11.5px;
+    color: var(--muted);
+    font-style: italic;
+    padding: 6px 10px;
+    border-left: 2px solid var(--border);
+    background: var(--thinking-bg);
+    border-radius: 0 4px 4px 0;
+    line-height: 1.5;
+}
+.sa-thinking-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--muted);
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+}
+
+/* Text content */
+.sa-text {
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--text);
+}
+.sa-text p { margin-bottom: 6px; }
+.sa-text p:last-child { margin-bottom: 0; }
+.sa-text code {
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    background: rgba(255,255,255,0.06);
+    padding: 1px 4px;
+    border-radius: 3px;
+}
+
+/* Tool entry in panel */
+.sa-tool {
+    font-size: 11.5px;
+    border: 1px solid var(--tool-border);
+    border-radius: 4px;
+    background: var(--tool-bg);
+    padding: 5px 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.sa-tool-arrow { color: var(--muted); }
+.sa-tool-name  { font-weight: 600; }
+.sa-tool-args  { color: var(--muted); font-size: 10.5px; font-family: monospace; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sa-tool-status { font-size: 10.5px; flex-shrink: 0; }
+.sa-tool-status.done  { color: #3fb950; }
+.sa-tool-status.error { color: var(--error); }
+.sa-tool-status.running { color: var(--accent); }
+
+/* Divider between message segments */
+.sa-divider {
+    height: 1px;
+    background: var(--border);
+    opacity: 0.5;
+    margin: 2px 0;
+}
+
+/* Annotation labels */
+.sa-label {
+    font-size: 10px;
+    color: var(--muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    opacity: 0.7;
+}
+
+/* Wireframe annotation overlay */
+.annotation {
+    position: absolute;
+    background: rgba(88,166,255,0.12);
+    border: 1px dashed rgba(88,166,255,0.5);
+    border-radius: 4px;
+    color: var(--accent);
+    font-size: 10px;
+    padding: 2px 6px;
+    pointer-events: none;
+    white-space: nowrap;
+}
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+    <button style="background:transparent;border:none;color:var(--muted);font-size:16px;cursor:pointer;">☰</button>
+    <h1>franky</h1>
+    <span class="pill live">live</span>
+    <span class="pill">role: plan</span>
+    <span class="pill">claude-sonnet-4-6</span>
+    <div class="header-spacer"></div>
+    <div class="activity">
+        <div class="activity-dot"></div>
+        <span>responding…</span>
+    </div>
+    <!-- Header button: appears when ≥1 subagent is/was active this session -->
+    <button id="sa-panel-btn" onclick="togglePanel()">
+        ⚙ Sub-agents
+        <span class="badge">2</span>
+    </button>
+    <button style="background:transparent;border:none;color:var(--muted);cursor:pointer;padding:3px 8px;">⏹ Abort</button>
+    <button style="background:transparent;border:none;color:var(--muted);cursor:pointer;padding:3px 8px;">?</button>
+</header>
+
+<!-- LAYOUT -->
+<div id="layout">
+
+    <!-- LEFT: sessions sidebar -->
+    <aside id="sidebar">
+        <div class="sidebar-head">
+            <span class="sidebar-title">Conversations</span>
+            <button class="new-btn">+ New</button>
+        </div>
+        <div class="session-list">
+            <div class="session-item active">Refactor auth module</div>
+            <div class="session-item">Add search endpoint</div>
+            <div class="session-item">Fix CI pipeline</div>
+            <div class="session-item">Review PR #42</div>
+        </div>
+    </aside>
+
+    <!-- CENTER: main conversation -->
+    <div id="main-pane">
+        <div id="conversation">
+
+            <!-- User message -->
+            <div class="message user">
+                <div class="message-role">you</div>
+                <div class="message-bubble">
+                    Refactor the auth module and run the tests. Use parallel sub-agents if it helps.
+                </div>
+            </div>
+
+            <!-- Assistant response -->
+            <div class="message assistant">
+                <div class="message-role">assistant</div>
+                <div class="message-bubble">
+                    <p>I'll split this into two parallel sub-agents — one to audit the existing auth code and one to check the test suite — then apply the refactor based on their findings.</p>
+
+                    <!-- Tool card: subagent 1 -->
+                    <div class="tool-card">
+                        <div class="tool-head">
+                            <span class="tool-name">subagent</span>
+                            <span class="tool-args">preset: code-audit · "Audit auth module"</span>
+                            <span class="tool-status done">✓ done</span>
+                        </div>
+                    </div>
+
+                    <!-- Tool card: subagent 2 (still running) -->
+                    <div class="tool-card">
+                        <div class="tool-head">
+                            <span class="tool-name">subagent</span>
+                            <span class="tool-args">preset: bash-runner · "Run test suite"</span>
+                            <span class="tool-status running">● running</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Composer -->
+        <div id="composer-wrap">
+            <form id="composer" onsubmit="return false;">
+                <textarea rows="2" placeholder="Type a message… (Enter to send, Shift-Enter for newline, / for commands)"></textarea>
+                <button type="submit">Send</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- RIGHT: subagent panel -->
+    <aside id="subagent-panel">
+        <div class="sa-panel-head">
+            <span class="sa-panel-title">Sub-agents</span>
+            <span class="sa-panel-subtitle">2 active</span>
+            <button class="sa-panel-close" onclick="togglePanel()" title="Close panel">×</button>
+        </div>
+        <div id="subagent-panel-body">
+
+            <!-- ── Section 1: completed ── -->
+            <div class="sa-section">
+                <div class="sa-section-head" onclick="toggleSection(this)">
+                    <span class="sa-toggle">▼</span>
+                    <span class="sa-section-title">code-audit</span>
+                    <span class="sa-badge done">done</span>
+                </div>
+                <div class="sa-section-body" id="sec1">
+
+                    <!-- thinking block (collapsed) -->
+                    <div class="sa-thinking">
+                        <div class="sa-thinking-label" onclick="toggleThinking(this)">
+                            <span>▶</span> thinking
+                        </div>
+                        <div class="sa-thinking-content" style="display:none;">
+                            Let me carefully read the auth module files before suggesting changes. I should look at the token handling, session management, and middleware chain…
+                        </div>
+                    </div>
+
+                    <!-- text segment -->
+                    <div class="sa-text">
+                        <p>I'll start by reading the auth module files.</p>
+                    </div>
+
+                    <!-- tool call -->
+                    <div class="sa-tool">
+                        <span class="sa-tool-arrow">→</span>
+                        <span class="sa-tool-name">read</span>
+                        <span class="sa-tool-args">src/auth/middleware.zig</span>
+                        <span class="sa-tool-status done">done</span>
+                    </div>
+                    <div class="sa-tool">
+                        <span class="sa-tool-arrow">→</span>
+                        <span class="sa-tool-name">read</span>
+                        <span class="sa-tool-args">src/auth/session.zig</span>
+                        <span class="sa-tool-status done">done</span>
+                    </div>
+                    <div class="sa-tool">
+                        <span class="sa-tool-arrow">→</span>
+                        <span class="sa-tool-name">grep</span>
+                        <span class="sa-tool-args">pattern: "token_validate" path: src/auth</span>
+                        <span class="sa-tool-status done">done</span>
+                    </div>
+
+                    <div class="sa-divider"></div>
+
+                    <!-- final summary text -->
+                    <div class="sa-text">
+                        <p>Found 3 issues in the auth module:</p>
+                        <p>1. <code>token_validate</code> in <code>session.zig:142</code> doesn't handle expired tokens — falls through to a silent null return.<br>
+                        2. Middleware chain in <code>middleware.zig</code> calls <code>allocator.free</code> on a stack-allocated slice.<br>
+                        3. No rate-limit check before <code>hashPassword</code>.</p>
+                    </div>
+
+                </div>
+            </div>
+
+            <!-- ── Section 2: running ── -->
+            <div class="sa-section">
+                <div class="sa-section-head" onclick="toggleSection(this)">
+                    <span class="sa-toggle">▼</span>
+                    <span class="sa-section-title">bash-runner</span>
+                    <span class="sa-badge running">running</span>
+                </div>
+                <div class="sa-section-body" id="sec2">
+
+                    <!-- thinking (visible, streaming) -->
+                    <div class="sa-thinking">
+                        <div class="sa-thinking-label" onclick="toggleThinking(this)">
+                            <span>▼</span> thinking
+                        </div>
+                        <div class="sa-thinking-content">
+                            I need to first check what test runner is configured, then run the auth-specific tests to see the baseline pass/fail state before the refactor…
+                        </div>
+                    </div>
+
+                    <!-- text -->
+                    <div class="sa-text">
+                        <p>Let me check the test configuration first, then run the auth tests.</p>
+                    </div>
+
+                    <!-- tool calls -->
+                    <div class="sa-tool">
+                        <span class="sa-tool-arrow">→</span>
+                        <span class="sa-tool-name">bash</span>
+                        <span class="sa-tool-args">zig build test --filter auth 2>&1 | tail -20</span>
+                        <span class="sa-tool-status done">done</span>
+                    </div>
+
+                    <!-- streaming text (cursor blink = in progress) -->
+                    <div class="sa-text" style="display:flex;align-items:baseline;gap:3px;">
+                        <span>Tests pass: 14/14. Checking coverage…</span>
+                        <span style="display:inline-block;width:7px;height:13px;background:var(--accent);animation:pulse 0.9s infinite;border-radius:1px;"></span>
+                    </div>
+
+                </div>
+            </div>
+
+        </div><!-- /subagent-panel-body -->
+    </aside>
+
+</div><!-- /layout -->
+
+<script>
+function togglePanel() {
+    const panel = document.getElementById('subagent-panel');
+    panel.classList.toggle('collapsed');
+}
+
+function toggleSection(head) {
+    const body = head.nextElementSibling;
+    const toggle = head.querySelector('.sa-toggle');
+    const isOpen = !body.classList.contains('hidden');
+    if (isOpen) {
+        body.classList.add('hidden');
+        toggle.textContent = '▶';
+    } else {
+        body.classList.remove('hidden');
+        toggle.textContent = '▼';
+    }
+}
+
+function toggleThinking(label) {
+    const content = label.nextElementSibling;
+    const arrow = label.querySelector('span');
+    if (!content) return;
+    const visible = content.style.display !== 'none';
+    content.style.display = visible ? 'none' : '';
+    arrow.textContent = visible ? '▶' : '▼';
+}
+</script>
+
+</body>
+</html>

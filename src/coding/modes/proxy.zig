@@ -81,6 +81,8 @@ pub const default_host: []const u8 = "0.0.0.0";
 const web_index_html = @embedFile("web/index.html");
 const web_app_js = @embedFile("web/app.js");
 const web_style_css = @embedFile("web/style.css");
+const web_prism_js = @embedFile("web/prism.js");
+const web_prism_css = @embedFile("web/prism-tomorrow.css");
 
 pub const RunError = error{
     BindFailed,
@@ -659,6 +661,8 @@ fn initSession(
             // v2.6 — forward sub-agent events to SSE subscribers.
             .progress_fn = subagentProgressForward,
             .progress_userdata = session,
+            // v2.7 — enable full text/thinking deltas for the panel.
+            .verbose_progress = true,
         };
         const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 2);
         @memcpy(final_tools[0..session.tools.len], session.tools);
@@ -1614,6 +1618,14 @@ fn handleConnection(arg: ConnArg) void {
         }
         if (std.mem.eql(u8, req.path, "/style.css")) {
             respondAsset(&stream, arg.io, web_style_css, "text/css; charset=utf-8");
+            return;
+        }
+        if (std.mem.eql(u8, req.path, "/prism.js")) {
+            respondAsset(&stream, arg.io, web_prism_js, "text/javascript; charset=utf-8");
+            return;
+        }
+        if (std.mem.eql(u8, req.path, "/prism-tomorrow.css")) {
+            respondAsset(&stream, arg.io, web_prism_css, "text/css; charset=utf-8");
             return;
         }
     }
