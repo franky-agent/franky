@@ -1734,8 +1734,8 @@ const SessionBinding = struct {
             tools_mod.ls.toolWithWorkspace(ws),
             tools_mod.find.toolWithWorkspace(ws),
             tools_mod.grep.toolWithWorkspace(ws),
-            tools_mod.web_search.searchToolWithCtx(&binding.web_search_ctx),
-            tools_mod.web_search.fetchToolWithCtx(&binding.web_search_ctx),
+            tools_mod.web_search.toolWithCtx(&binding.web_search_ctx),
+            tools_mod.web_fetch.toolWithCtx(&binding.web_search_ctx),
         } else .{
             tools_mod.read.tool(),
             tools_mod.write.tool(),
@@ -1744,8 +1744,8 @@ const SessionBinding = struct {
             tools_mod.ls.tool(),
             tools_mod.find.tool(),
             tools_mod.grep.tool(),
-            tools_mod.web_search.searchToolWithCtx(&binding.web_search_ctx),
-            tools_mod.web_search.fetchToolWithCtx(&binding.web_search_ctx),
+            tools_mod.web_search.toolWithCtx(&binding.web_search_ctx),
+            tools_mod.web_fetch.toolWithCtx(&binding.web_search_ctx),
         };
 
         const active_role = if (cfg.role) |s|

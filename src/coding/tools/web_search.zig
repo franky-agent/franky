@@ -1,14 +1,13 @@
-//! web_search + web_fetch tools.
+//! web_search tool.
 //!
-//! Two tools backed by a pluggable provider:
-//!   `web_search` — POST query → ranked results (title, url, snippet)
-//!   `web_fetch`  — POST url   → page title + content
+//! POST query → ranked results (title, url, snippet). The companion
+//! `web_fetch` tool lives in `web_fetch.zig` and reuses this module's
+//! `Provider`, `WebSearchCtx`, and HTTP helpers.
 //!
 //! Provider abstraction — add a new one by:
 //!   1. Extending the `Provider` enum.
-//!   2. Adding a branch to `endpoint`, `envKeyName`, and
-//!      `buildSearchBody` / `buildFetchBody` / `parseSearchBody` /
-//!      `parseFetchBody`.
+//!   2. Adding a branch to `searchEndpoint` (here) and
+//!      `fetchEndpoint` (in `web_fetch.zig`), plus `envKeyName`.
 //!   All providers share the same HTTP transport (`doPost`).
 //!
 //! Currently implemented:
@@ -38,13 +37,7 @@ fn searchEndpoint(p: Provider) []const u8 {
     };
 }
 
-fn fetchEndpoint(p: Provider) []const u8 {
-    return switch (p) {
-        .ollama => "https://ollama.com/api/web_fetch",
-    };
-}
-
-fn envKeyName(p: Provider) []const u8 {
+pub fn envKeyName(p: Provider) []const u8 {
     return switch (p) {
         .ollama => "OLLAMA_API_KEY",
     };
@@ -62,9 +55,9 @@ pub const WebSearchCtx = struct {
     environ_map: ?*const std.process.Environ.Map = null,
 };
 
-// ─── parameters schemas ──────────────────────────────────────────
+// ─── parameters schema ───────────────────────────────────────────
 
-pub const search_parameters_json: []const u8 =
+pub const parameters_json: []const u8 =
     \\{
     \\  "type": "object",
     \\  "required": ["query"],
@@ -76,58 +69,26 @@ pub const search_parameters_json: []const u8 =
     \\}
 ;
 
-pub const fetch_parameters_json: []const u8 =
-    \\{
-    \\  "type": "object",
-    \\  "required": ["url"],
-    \\  "properties": {
-    \\    "url": {"type": "string"}
-    \\  },
-    \\  "additionalProperties": false
-    \\}
-;
-
 // ─── tool factories ──────────────────────────────────────────────
 
-pub fn searchTool() at.AgentTool {
+pub fn tool() at.AgentTool {
     return .{
         .name = "web_search",
         .description = "Search the web for current information. Returns ranked results with titles, URLs and content snippets.",
-        .parameters_json = search_parameters_json,
+        .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .execute = executeSearch,
     };
 }
 
-pub fn searchToolWithCtx(ctx: *const WebSearchCtx) at.AgentTool {
+pub fn toolWithCtx(ctx: *const WebSearchCtx) at.AgentTool {
     return .{
         .name = "web_search",
         .description = "Search the web for current information. Returns ranked results with titles, URLs and content snippets.",
-        .parameters_json = search_parameters_json,
+        .parameters_json = parameters_json,
         .execution_mode = .parallel,
-        .ctx = @constCast(@ptrCast(ctx)),
+        .ctx = @ptrCast(@constCast(ctx)),
         .execute = executeSearch,
-    };
-}
-
-pub fn fetchTool() at.AgentTool {
-    return .{
-        .name = "web_fetch",
-        .description = "Fetch the full content of a web page by URL. Returns the page title and main text.",
-        .parameters_json = fetch_parameters_json,
-        .execution_mode = .parallel,
-        .execute = executeFetch,
-    };
-}
-
-pub fn fetchToolWithCtx(ctx: *const WebSearchCtx) at.AgentTool {
-    return .{
-        .name = "web_fetch",
-        .description = "Fetch the full content of a web page by URL. Returns the page title and main text.",
-        .parameters_json = fetch_parameters_json,
-        .execution_mode = .parallel,
-        .ctx = @constCast(@ptrCast(ctx)),
-        .execute = executeFetch,
     };
 }
 
@@ -181,50 +142,12 @@ fn executeSearch(
     return parseSearchResponse(allocator, resp, query);
 }
 
-fn executeFetch(
-    self: *const at.AgentTool,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    _: []const u8,
-    args_json: []const u8,
-    cancel: *ai.stream.Cancel,
-    _: at.OnUpdate,
-) anyerror!at.ToolResult {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), args_json, .{});
-    const root = parsed.value;
-
-    const url_v = root.object.get("url") orelse
-        return common.toolError(allocator, "invalid_args", "missing url");
-    if (url_v != .string) return common.toolError(allocator, "invalid_args", "url must be a string");
-    const url = url_v.string;
-
-    const ctx = ctxFromSelf(self);
-    const provider: Provider = if (ctx) |c| c.provider else .ollama;
-    const api_key = resolveApiKey(ctx, provider);
-    const environ_map: ?*const std.process.Environ.Map = if (ctx) |c| c.environ_map else null;
-
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(allocator);
-    try body.appendSlice(allocator, "{\"url\":");
-    try utils.appendJsonStr(&body, allocator, url);
-    try body.append(allocator, '}');
-
-    const resp = doPost(allocator, io, cancel, fetchEndpoint(provider), api_key, body.items, environ_map) catch |e|
-        return httpError(allocator, "web_fetch", e);
-    defer allocator.free(resp);
-
-    return parseFetchResponse(allocator, resp, url);
-}
-
-// ─── HTTP transport ───────────────────────────────────────────────
+// ─── HTTP transport (shared with web_fetch) ──────────────────────
 
 /// POST `body` to `url` with optional Bearer auth. Returns the owned
 /// response body on success; propagates transport errors to caller.
 /// Caller frees the returned slice.
-fn doPost(
+pub fn doPost(
     allocator: std.mem.Allocator,
     io: std.Io,
     cancel: *ai.stream.Cancel,
@@ -337,73 +260,41 @@ fn parseSearchResponse(
     return makeTextResult(allocator, out.items);
 }
 
-fn parseFetchResponse(
-    allocator: std.mem.Allocator,
-    body: []const u8,
-    url: []const u8,
-) !at.ToolResult {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
+// ─── helpers (shared with web_fetch) ─────────────────────────────
 
-    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), body, .{}) catch
-        return common.toolError(allocator, "web_fetch_parse", "invalid JSON response from provider");
-
-    const root = parsed.value;
-    if (root != .object)
-        return common.toolError(allocator, "web_fetch_parse", "unexpected response shape");
-
-    const title = strField(root, "title");
-    const content = strField(root, "content");
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-
-    {
-        const hdr = try std.fmt.allocPrint(allocator, "Page: {s}\nTitle: {s}\n\n", .{ url, title });
-        defer allocator.free(hdr);
-        try out.appendSlice(allocator, hdr);
-    }
-    try out.appendSlice(allocator, content);
-    if (content.len > 0 and content[content.len - 1] != '\n') try out.append(allocator, '\n');
-
-    return makeTextResult(allocator, out.items);
-}
-
-// ─── helpers ─────────────────────────────────────────────────────
-
-fn ctxFromSelf(self: *const at.AgentTool) ?*const WebSearchCtx {
+pub fn ctxFromSelf(self: *const at.AgentTool) ?*const WebSearchCtx {
     const raw = self.ctx orelse return null;
     return @ptrCast(@alignCast(raw));
 }
 
-fn resolveApiKey(ctx: ?*const WebSearchCtx, provider: Provider) ?[]const u8 {
+pub fn resolveApiKey(ctx: ?*const WebSearchCtx, provider: Provider) ?[]const u8 {
     const c = ctx orelse return null;
     if (c.api_key) |k| return k;
     if (c.environ_map) |em| if (em.get(envKeyName(provider))) |k| return k;
     return null;
 }
 
-fn strField(v: std.json.Value, key: []const u8) []const u8 {
+pub fn strField(v: std.json.Value, key: []const u8) []const u8 {
     const f = v.object.get(key) orelse return "";
     return if (f == .string) f.string else "";
 }
 
-fn makeTextResult(allocator: std.mem.Allocator, text: []const u8) !at.ToolResult {
+pub fn makeTextResult(allocator: std.mem.Allocator, text: []const u8) !at.ToolResult {
     const owned = try allocator.dupe(u8, text);
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = owned } };
     return .{ .content = arr };
 }
 
-fn httpError(allocator: std.mem.Allocator, tool: []const u8, e: anyerror) !at.ToolResult {
+pub fn httpError(allocator: std.mem.Allocator, code: []const u8, e: anyerror) !at.ToolResult {
     const msg: []const u8 = switch (e) {
         error.Unauthorized => "unauthorized — set OLLAMA_API_KEY or pass --web-search-api-key",
         error.RateLimited => "rate limited — back off and retry",
         error.Timeout => "request timed out",
         error.ApiKeyTooLong => "API key exceeds 256 bytes",
-        else => return common.toolError(allocator, tool, @errorName(e)),
+        else => return common.toolError(allocator, code, @errorName(e)),
     };
-    return common.toolError(allocator, tool, msg);
+    return common.toolError(allocator, code, msg);
 }
 
 // ─── tests ───────────────────────────────────────────────────────
@@ -445,19 +336,6 @@ test "parseSearchResponse: invalid JSON returns error result" {
     try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "web_search_parse") != null);
 }
 
-test "parseFetchResponse: formats title and content" {
-    const gpa = testing.allocator;
-    const body =
-        \\{"title":"Ollama","content":"Ollama is an open-source tool.","links":["https://ollama.com"]}
-    ;
-    var res = try parseFetchResponse(gpa, body, "https://ollama.com");
-    defer res.deinit(gpa);
-    try testing.expect(!res.is_error);
-    const text = res.content[0].text.text;
-    try testing.expect(std.mem.indexOf(u8, text, "Title: Ollama") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "Ollama is an open-source tool.") != null);
-}
-
 test "resolveApiKey: prefers ctx.api_key over env" {
     var env_map = std.process.Environ.Map.init(testing.allocator);
     defer env_map.deinit();
@@ -481,15 +359,9 @@ test "resolveApiKey: returns null when neither is set" {
     try testing.expect(resolveApiKey(&ctx, .ollama) == null);
 }
 
-test "searchTool: name and schema are correct" {
-    const t = searchTool();
+test "tool: name and schema are correct" {
+    const t = tool();
     try testing.expectEqualStrings("web_search", t.name);
     try testing.expect(std.mem.indexOf(u8, t.parameters_json, "\"query\"") != null);
     try testing.expect(std.mem.indexOf(u8, t.parameters_json, "max_results") != null);
-}
-
-test "fetchTool: name and schema are correct" {
-    const t = fetchTool();
-    try testing.expectEqualStrings("web_fetch", t.name);
-    try testing.expect(std.mem.indexOf(u8, t.parameters_json, "\"url\"") != null);
 }

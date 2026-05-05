@@ -163,8 +163,8 @@ fn initSession(
         tools_mod.ls.tool(),
         tools_mod.find.tool(),
         tools_mod.grep.tool(),
-        tools_mod.web_search.searchTool(),
-        tools_mod.web_search.fetchTool(),
+        tools_mod.web_search.tool(),
+        tools_mod.web_fetch.tool(),
     };
     const filtered = try role_mod.filterTools(role_arena.allocator(), &all_tools, role_gate.set);
     // v1.24.0 — subagent wiring deferred until after permission_store
@@ -263,8 +263,8 @@ fn initSession(
             tools_mod.ls.tool(),
             tools_mod.find.tool(),
             tools_mod.grep.tool(),
-            tools_mod.web_search.searchToolWithCtx(&session.web_search_ctx),
-            tools_mod.web_search.fetchToolWithCtx(&session.web_search_ctx),
+            tools_mod.web_search.toolWithCtx(&session.web_search_ctx),
+            tools_mod.web_fetch.toolWithCtx(&session.web_search_ctx),
         };
         session.tools = try role_mod.filterTools(session.role_arena.allocator(), &all_tools_with_state, session.role_gate.set);
     }

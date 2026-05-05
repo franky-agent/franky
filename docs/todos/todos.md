@@ -653,3 +653,10 @@ stderr=>>>build cache is required, but could not be located: GOCACHE …
 Summary: 16 anomaly across 100 turns
 Reference: docs/reference/diagnostics.md
 ```
+
+
+# Implement code highlighting in web-ui
+
+The rendered code blocks in the web UI should have syntax highlighting for better readability. This can be achieved by integrating a syntax highlighting library.
+
+Do a research for what is already available in the used dependencies or what dependency can be added with minimal overhead. Implement the syntax highlighting for code blocks in the web UI, ensuring that it supports multiple programming languages and is visually appealing.

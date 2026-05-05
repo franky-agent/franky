@@ -10,6 +10,7 @@ pub const tools = struct {
     pub const grep = @import("tools/grep.zig");
     pub const subagent = @import("tools/subagent.zig");
     pub const web_search = @import("tools/web_search.zig");
+    pub const web_fetch = @import("tools/web_fetch.zig");
     pub const workspace = @import("tools/workspace.zig");
     pub const common = @import("tools/common.zig");
     pub const truncate = @import("tools/truncate.zig");
@@ -64,6 +65,8 @@ test {
     _ = tools.find;
     _ = tools.grep;
     _ = tools.subagent;
+    _ = tools.web_search;
+    _ = tools.web_fetch;
     _ = tools.workspace;
     _ = tools.common;
     _ = tools.truncate;
