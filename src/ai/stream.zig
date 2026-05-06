@@ -508,6 +508,7 @@ pub const Reducer = struct {
                 const red = self.thinking_redacted.items[ref.index];
                 if (raw.items.len == 0 and sig == null and !red) continue;
                 const owned_text = try allocator.dupe(u8, raw.items);
+                errdefer allocator.free(owned_text);
                 const owned_sig = if (sig) |v| try allocator.dupe(u8, v) else null;
                 try content.append(allocator, .{ .thinking = .{
                     .thinking = owned_text,
@@ -518,7 +519,9 @@ pub const Reducer = struct {
             .tool_call => {
                 const tc = self.tool_calls.items[ref.index];
                 const owned_id = try allocator.dupe(u8, tc.id);
+                errdefer allocator.free(owned_id);
                 const owned_name = try allocator.dupe(u8, tc.name);
+                errdefer allocator.free(owned_name);
                 const owned_args = try allocator.dupe(u8, tc.args.items);
                 try content.append(allocator, .{ .tool_call = .{
                     .id = owned_id,
@@ -529,9 +532,13 @@ pub const Reducer = struct {
         };
 
         const owned_err = if (self.error_message) |m| try allocator.dupe(u8, m) else null;
+        errdefer if (owned_err) |s| allocator.free(s);
         const owned_provider = if (provider) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (owned_provider) |s| allocator.free(s);
         const owned_model = if (model) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (owned_model) |s| allocator.free(s);
         const owned_api = if (api) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (owned_api) |s| allocator.free(s);
 
         // v1.29.0 — attach diagnostics. `was_degenerate` fires when
         // finalize is about to ship an assistant message with zero
@@ -553,9 +560,17 @@ pub const Reducer = struct {
             break :blk null;
         } else diag;
 
-        return .{
+        const content_slice = try content.toOwnedSlice(allocator);
+        errdefer {
+            for (content_slice) |cb| cb.deinit(allocator);
+            allocator.free(content_slice);
+        }
+
+        // Build message as local so errdefer can clean up
+        // if any of the later fields fail.
+        var msg: types.Message = .{
             .role = .assistant,
-            .content = try content.toOwnedSlice(allocator),
+            .content = content_slice,
             .timestamp = nowMillis(),
             .stop_reason = self.stop_reason orelse .stop,
             .usage = self.usage,
@@ -565,6 +580,8 @@ pub const Reducer = struct {
             .api = owned_api,
             .diagnostics = diag_attached,
         };
+        errdefer msg.deinit(allocator);
+        return msg;
     }
 };
 

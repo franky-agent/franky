@@ -79,9 +79,15 @@ pub fn transformForApi(
             else => try content.append(allocator, try cb.dupe(allocator)),
         };
 
-        try out.append(allocator, .{
+        const content_slice = try content.toOwnedSlice(allocator);
+        errdefer {
+            for (content_slice) |cb| cb.deinit(allocator);
+            allocator.free(content_slice);
+        }
+
+        var msg: types.Message = .{
             .role = m.role,
-            .content = try content.toOwnedSlice(allocator),
+            .content = content_slice,
             .timestamp = m.timestamp,
             .stop_reason = m.stop_reason,
             .usage = m.usage,
@@ -92,7 +98,9 @@ pub fn transformForApi(
             .tool_call_id = if (m.tool_call_id) |s| try allocator.dupe(u8, s) else null,
             .is_error = m.is_error,
             .custom_role = if (m.custom_role) |s| try allocator.dupe(u8, s) else null,
-        });
+        };
+        errdefer msg.deinit(allocator);
+        try out.append(allocator, msg);
     }
     return try out.toOwnedSlice(allocator);
 }

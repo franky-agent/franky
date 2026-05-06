@@ -9,6 +9,21 @@ pub fn build(b: *std.Build) void {
     // opts back in with -Duse-lld=true.
     const use_llvm = b.option(bool, "use-llvm", "Use the LLVM backend (default: target-dependent)");
     const use_lld_opt = b.option(bool, "use-lld", "Use LLD for linking (default: false on macOS, target-dependent elsewhere)");
+
+    // ── Profiler — optional rdtsc-based profiling (§H.4) ────────────
+    // Enabled with `zig build -Denable-profiler=true`. Adds ~200 ms
+    // startup calibration and writes `franky-profile.json` (Trace Event
+    // Format) on exit. Mocked to zero-overhead stubs when disabled.
+    const enable_profiler = b.option(bool, "enable-profiler",
+        "Enable the rdtsc-based profiler (~200 ms calibration, Trace Event dump)") orelse false;
+    const profiler_module = b.createModule(.{
+        .root_source_file = if (enable_profiler)
+            b.path("lib/profiler/profiler.zig")
+        else
+            b.path("lib/profiler/profiler_mock.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const use_lld: ?bool = if (target.result.os.tag == .macos and use_lld_opt == null)
         false
     else
@@ -23,6 +38,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    franky_module.addImport("profiler", profiler_module);
 
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/bin/main.zig"),
@@ -30,6 +46,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_module.addImport("franky", franky_module);
+    exe_module.addImport("profiler", profiler_module);
 
     const exe = b.addExecutable(.{
         .name = "franky",
@@ -91,6 +108,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    test_module.addImport("profiler", profiler_module);
     const unit_tests = b.addTest(.{
         .name = "franky-test",
         .root_module = test_module,

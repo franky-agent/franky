@@ -144,12 +144,19 @@ pub const ErrorDetails = struct {
     /// Deep-copy the details struct (and owned strings) into `allocator`.
     /// Returned ErrorDetails owns its strings from that allocator.
     pub fn dupe(self: ErrorDetails, allocator: std.mem.Allocator) !ErrorDetails {
+        const msg = try allocator.dupe(u8, self.message);
+        errdefer allocator.free(msg);
+        const tc = try dupeOpt(allocator, self.tool_code);
+        errdefer if (tc) |s| allocator.free(s);
+        const pc = try dupeOpt(allocator, self.provider_code);
+        errdefer if (pc) |s| allocator.free(s);
+        const pm = try dupeOpt(allocator, self.provider_message);
         return .{
             .code = self.code,
-            .message = try allocator.dupe(u8, self.message),
-            .tool_code = try dupeOpt(allocator, self.tool_code),
-            .provider_code = try dupeOpt(allocator, self.provider_code),
-            .provider_message = try dupeOpt(allocator, self.provider_message),
+            .message = msg,
+            .tool_code = tc,
+            .provider_code = pc,
+            .provider_message = pm,
             .http_status = self.http_status,
             .retry_after_ms = self.retry_after_ms,
         };

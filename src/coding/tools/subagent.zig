@@ -926,6 +926,7 @@ fn runSubagent(
             .api_key = provider_info.api_key,
             .auth_token = provider_info.auth_token,
             .base_url = provider_info.base_url,
+            .timeouts = print_mod.resolveTimeoutsFromMap(&sub_cfg, &local_env_map),
             // Use the per-call cloned env so the sub-agent's HTTP
             // client sees the profile's `env: {}` block (e.g.
             // FRANKY_FIRST_BYTE_TIMEOUT_MS overrides) without
@@ -963,6 +964,7 @@ fn runSubagent(
     // by the main thread after `waitForIdle` returns.
     var supervisor_done = std.atomic.Value(bool).init(false);
     const supervisor_args = SupervisorArgs{
+        .io = io,
         .parent_cancel = parent_cancel,
         .sub_cancel = &sub_agent.cancel,
         .timeout_ms = parsed.timeout_ms,
@@ -1097,6 +1099,7 @@ pub const final_text_max_bytes: usize = 4 * 1024;
 // ─── supervisor ────────────────────────────────────────────────────
 
 const SupervisorArgs = struct {
+    io: std.Io,
     parent_cancel: *ai.stream.Cancel,
     sub_cancel: *ai.stream.Cancel,
     timeout_ms: u64,
@@ -1111,22 +1114,16 @@ fn supervisorMain(args: SupervisorArgs) void {
             args.sub_cancel.fire();
             return;
         }
-        sleepMs(50);
+        // Poll at 1-second granularity — 50 ms was far too aggressive and
+        // with a 6-8 way fan-out of concurrent sub-agents, each polling loop
+        // (especially the non-libc fallback which busy-waits) consumed ~100%
+        // of a CPU core per supervisor.  1-second wake-ups are adequate for
+        // timeout detection on sub-agent runs that last minutes.
+        args.io.sleep(.fromMilliseconds(1000), .awake) catch {};
     }
 }
 
-fn sleepMs(ms: u64) void {
-    if (@import("builtin").link_libc) {
-        const sec: i64 = @intCast(ms / 1000);
-        const nsec: i64 = @intCast((ms % 1000) * std.time.ns_per_ms);
-        const ts = std.c.timespec{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
-        _ = std.c.nanosleep(&ts, null);
-        return;
-    }
-    const start = ai.stream.nowMillis();
-    const deadline = start + @as(i64, @intCast(ms));
-    while (ai.stream.nowMillis() < deadline) {}
-}
+
 
 // ─── arg parsing ───────────────────────────────────────────────────
 
@@ -1658,7 +1655,7 @@ test "concurrency cap: 11 simultaneous acquires never exceed the cap (v1.24.4)" 
             // Hold the slot briefly so the cap actually has a
             // chance to bind (without sleep all 11 might serialize
             // through the mutex faster than the next thread arrives).
-            sleepMs(20);
+            ioi.sleep(.fromMilliseconds(20), .awake) catch {};
             _ = l.fetchSub(1, .acq_rel);
         }
     };

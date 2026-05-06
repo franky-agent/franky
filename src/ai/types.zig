@@ -18,10 +18,10 @@ pub const TextContent = struct {
     }
 
     pub fn dupe(self: TextContent, allocator: std.mem.Allocator) !TextContent {
-        return .{
-            .text = try allocator.dupe(u8, self.text),
-            .text_signature = if (self.text_signature) |s| try allocator.dupe(u8, s) else null,
-        };
+        const text = try allocator.dupe(u8, self.text);
+        errdefer allocator.free(text);
+        const sig = if (self.text_signature) |s| try allocator.dupe(u8, s) else null;
+        return .{ .text = text, .text_signature = sig };
     }
 };
 
@@ -39,11 +39,10 @@ pub const ThinkingContent = struct {
     }
 
     pub fn dupe(self: ThinkingContent, allocator: std.mem.Allocator) !ThinkingContent {
-        return .{
-            .thinking = try allocator.dupe(u8, self.thinking),
-            .thinking_signature = if (self.thinking_signature) |s| try allocator.dupe(u8, s) else null,
-            .redacted = self.redacted,
-        };
+        const thinking = try allocator.dupe(u8, self.thinking);
+        errdefer allocator.free(thinking);
+        const sig = if (self.thinking_signature) |s| try allocator.dupe(u8, s) else null;
+        return .{ .thinking = thinking, .thinking_signature = sig, .redacted = self.redacted };
     }
 };
 
@@ -59,10 +58,10 @@ pub const ImageContent = struct {
     }
 
     pub fn dupe(self: ImageContent, allocator: std.mem.Allocator) !ImageContent {
-        return .{
-            .data = try allocator.dupe(u8, self.data),
-            .mime_type = try allocator.dupe(u8, self.mime_type),
-        };
+        const data = try allocator.dupe(u8, self.data);
+        errdefer allocator.free(data);
+        const mime = try allocator.dupe(u8, self.mime_type);
+        return .{ .data = data, .mime_type = mime };
     }
 };
 
@@ -85,12 +84,14 @@ pub const ToolCall = struct {
     }
 
     pub fn dupe(self: ToolCall, allocator: std.mem.Allocator) !ToolCall {
-        return .{
-            .id = try allocator.dupe(u8, self.id),
-            .name = try allocator.dupe(u8, self.name),
-            .arguments_json = try allocator.dupe(u8, self.arguments_json),
-            .thought_signature = if (self.thought_signature) |s| try allocator.dupe(u8, s) else null,
-        };
+        const id = try allocator.dupe(u8, self.id);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, self.name);
+        errdefer allocator.free(name);
+        const args = try allocator.dupe(u8, self.arguments_json);
+        errdefer allocator.free(args);
+        const sig = if (self.thought_signature) |s| try allocator.dupe(u8, s) else null;
+        return .{ .id = id, .name = name, .arguments_json = args, .thought_signature = sig };
     }
 };
 
@@ -241,9 +242,12 @@ pub const Diagnostics = struct {
     }
 
     pub fn dupe(self: Diagnostics, allocator: std.mem.Allocator) !Diagnostics {
+        const trace_id = if (self.trace_id) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (trace_id) |s| allocator.free(s);
+        const frr = if (self.finish_reason_raw) |s| try allocator.dupe(u8, s) else null;
         return .{
-            .trace_id = if (self.trace_id) |s| try allocator.dupe(u8, s) else null,
-            .finish_reason_raw = if (self.finish_reason_raw) |s| try allocator.dupe(u8, s) else null,
+            .trace_id = trace_id,
+            .finish_reason_raw = frr,
             .parts_seen = self.parts_seen,
             .candidates_tokens = self.candidates_tokens,
             .thoughts_tokens = self.thoughts_tokens,

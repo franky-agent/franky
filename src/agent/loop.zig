@@ -78,9 +78,11 @@ pub fn defaultConvertToLlm(
                             "{s}{s}",
                             .{ compaction_prefix, t.text },
                         );
+                        errdefer allocator.free(merged);
+                        const sig = if (t.text_signature) |s| try allocator.dupe(u8, s) else null;
                         try content.append(allocator, .{ .text = .{
                             .text = merged,
-                            .text_signature = if (t.text_signature) |s| try allocator.dupe(u8, s) else null,
+                            .text_signature = sig,
                         } });
                         first_text_done = true;
                     } else {
@@ -93,9 +95,17 @@ pub fn defaultConvertToLlm(
             for (m.content) |cb| try content.append(allocator, try cb.dupe(allocator));
         }
 
-        try out.append(allocator, .{
+        const content_slice = try content.toOwnedSlice(allocator);
+        errdefer {
+            for (content_slice) |cb| cb.deinit(allocator);
+            allocator.free(content_slice);
+        }
+
+        // Build the message as a local so we can errdefer cleanup
+        // if any of the optional-field dupes fails.
+        var msg: ai.types.Message = .{
             .role = if (is_compaction) .user else m.role,
-            .content = try content.toOwnedSlice(allocator),
+            .content = content_slice,
             .timestamp = m.timestamp,
             .stop_reason = m.stop_reason,
             .usage = m.usage,
@@ -105,7 +115,9 @@ pub fn defaultConvertToLlm(
             .api = if (m.api) |s| try allocator.dupe(u8, s) else null,
             .tool_call_id = if (m.tool_call_id) |s| try allocator.dupe(u8, s) else null,
             .is_error = m.is_error,
-        });
+        };
+        errdefer msg.deinit(allocator);
+        try out.append(allocator, msg);
     }
     return out.toOwnedSlice(allocator);
 }
@@ -304,6 +316,9 @@ pub fn agentLoop(
     var current_cap: u32 = config.max_turns;
     cap_loop: while (true) {
         while (turn_count < current_cap) : (turn_count += 1) {
+            // Mark frame boundary for profiler (Trace Event Format).
+            @import("profiler").frameMark();
+
             if (config.cancel.isFired()) {
                 pushAgentError(out, io, allocator, .aborted, "cancelled") catch {};
                 return;
@@ -385,6 +400,10 @@ fn runTurn(
 
     // Build context from messages.
     const llm_messages = try config.convert_to_llm(allocator, transcript.messages.items);
+    errdefer {
+        for (llm_messages) |*m| m.deinit(allocator);
+        allocator.free(llm_messages);
+    }
     if (ai.log.enabledForScope(.trace, "message")) {
         for (llm_messages, 0..) |m, i| {
             logMessageTrace("send", i, m);
@@ -392,6 +411,10 @@ fn runTurn(
     }
     // Clone tools into the Context tools slice.
     const tools_ctx = try cloneTools(allocator, config.tools);
+    errdefer {
+        for (tools_ctx) |t| t.deinit(allocator);
+        allocator.free(tools_ctx);
+    }
     const context: ai.types.Context = .{
         .system_prompt = try allocator.dupe(u8, config.system_prompt),
         .messages = llm_messages,
@@ -1429,11 +1452,19 @@ fn cloneTools(
     tools: []const at.AgentTool,
 ) ![]ai.types.Tool {
     const out = try allocator.alloc(ai.types.Tool, tools.len);
-    for (tools, 0..) |t, i| out[i] = .{
-        .name = try allocator.dupe(u8, t.name),
-        .description = try allocator.dupe(u8, t.description),
-        .parameters_json = try allocator.dupe(u8, t.parameters_json),
-    };
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |t| t.deinit(allocator);
+        allocator.free(out);
+    }
+    for (tools, 0..) |t, i| {
+        out[i] = .{
+            .name = try allocator.dupe(u8, t.name),
+            .description = try allocator.dupe(u8, t.description),
+            .parameters_json = try allocator.dupe(u8, t.parameters_json),
+        };
+        cloned = i + 1;
+    }
     return out;
 }
 
@@ -1444,9 +1475,14 @@ fn dupeMessage(allocator: std.mem.Allocator, m: ai.types.Message) !ai.types.Mess
         content.deinit(allocator);
     }
     for (m.content) |cb| try content.append(allocator, try cb.dupe(allocator));
-    return .{
+    const content_slice = try content.toOwnedSlice(allocator);
+    errdefer {
+        for (content_slice) |cb| cb.deinit(allocator);
+        allocator.free(content_slice);
+    }
+    var msg: ai.types.Message = .{
         .role = m.role,
-        .content = try content.toOwnedSlice(allocator),
+        .content = content_slice,
         .timestamp = m.timestamp,
         .stop_reason = m.stop_reason,
         .usage = m.usage,
@@ -1459,6 +1495,8 @@ fn dupeMessage(allocator: std.mem.Allocator, m: ai.types.Message) !ai.types.Mess
         .custom_role = if (m.custom_role) |s| try allocator.dupe(u8, s) else null,
         .meta_json = if (m.meta_json) |s| try allocator.dupe(u8, s) else null,
     };
+    errdefer msg.deinit(allocator);
+    return msg;
 }
 
 // ─── tests ──────────────────────────────────────────────────────
