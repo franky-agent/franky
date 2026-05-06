@@ -272,7 +272,20 @@ pub fn applyEdits(
         try renderEditDiff(&summary, allocator, i, d.old, d.new);
     }
 
-    const details = try std.fmt.allocPrint(allocator, "{{\"edits\":{d}}}", .{edits.len});
+    // Build details_json with optional unified diff for the web UI diff view.
+    // Failure to compute the diff is non-fatal — the plain text summary still works.
+    const details = blk: {
+        const diff_str = computeUnifiedDiff(allocator, original, buf.items, path) catch null;
+        if (diff_str) |d| {
+            defer allocator.free(d);
+            // JSON-escape the diff string for embedding in details_json.
+            const escaped = try escapeJsonString(allocator, d);
+            defer allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(allocator, "{{\"edits\":{d},\"diff\":\"{s}\",\"path\":\"{s}\"}}", .{ edits.len, escaped, path });
+        } else {
+            break :blk try std.fmt.allocPrint(allocator, "{{\"edits\":{d},\"diff\":null,\"path\":\"{s}\"}}", .{ edits.len, path });
+        }
+    };
     const text = try allocator.dupe(u8, summary.items);
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };
@@ -460,6 +473,304 @@ fn atomicWrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
 }
 
 var tmp_counter: std.atomic.Value(u32) = .init(0);
+
+// ─── Unified diff generation (v2.8) ────────────────────────────────
+
+/// Compute a standard unified diff between `original` and `modified`.
+/// Returns the full diff including `--- a/<path>` / `+++ b/<path>` headers
+/// and hunks with up to 3 context lines. Uses a simple LCS DP table
+/// suitable for files up to ~2000 lines. Returns null on any error
+/// (OOM, too large, etc.) — callers should fall back gracefully.
+fn computeUnifiedDiff(
+    allocator: std.mem.Allocator,
+    original: []const u8,
+    modified: []const u8,
+    path: []const u8,
+) ![]u8 {
+    // Split into lines, preserving trailing-newline in each slice.
+    const orig_lines = try splitLines(allocator, original);
+    defer allocator.free(orig_lines);
+    const mod_lines = try splitLines(allocator, modified);
+    defer allocator.free(mod_lines);
+
+    const n = orig_lines.len;
+    const m = mod_lines.len;
+
+    // Cap at 2000 lines to avoid O(n*m) blowup.
+    if (n > 2000 or m > 2000) return error.TooLarge;
+
+    // LCS DP table — flat [n+1][m+1] usize array.
+    const cols = m + 1;
+    const dp = try allocator.alloc(usize, (n + 1) * cols);
+    defer allocator.free(dp);
+
+    var i: usize = 0;
+    while (i <= n) : (i += 1) {
+        var j: usize = 0;
+        while (j <= m) : (j += 1) {
+            if (i == 0 or j == 0) {
+                dp[i * cols + j] = 0;
+            } else if (std.mem.eql(u8, orig_lines[i - 1], mod_lines[j - 1])) {
+                dp[i * cols + j] = dp[(i - 1) * cols + (j - 1)] + 1;
+            } else {
+                dp[i * cols + j] = @max(dp[(i - 1) * cols + j], dp[i * cols + (j - 1)]);
+            }
+        }
+    }
+
+    // Trace back to produce a forward edit script.
+    // We collect DiffOp values in forward order.
+    var ops: std.ArrayList(DiffOp) = .empty;
+    defer ops.deinit(allocator);
+
+    {
+        i = n;
+        var j: usize = m;
+        var rev: std.ArrayList(DiffOp) = .empty;
+        defer rev.deinit(allocator);
+
+        while (i > 0 or j > 0) {
+            if (i > 0 and j > 0 and std.mem.eql(u8, orig_lines[i - 1], mod_lines[j - 1])) {
+                try rev.append(allocator, .{ .kind = .keep, .orig_idx = i - 1, .mod_idx = j - 1 });
+                i -= 1;
+                j -= 1;
+            } else if (j > 0 and (i == 0 or dp[i * cols + (j - 1)] >= dp[(i - 1) * cols + j])) {
+                try rev.append(allocator, .{ .kind = .add, .orig_idx = null, .mod_idx = j - 1 });
+                j -= 1;
+            } else if (i > 0) {
+                try rev.append(allocator, .{ .kind = .remove, .orig_idx = i - 1, .mod_idx = null });
+                i -= 1;
+            }
+        }
+
+        // Reverse into forward order.
+        var ri: usize = rev.items.len;
+        while (ri > 0) {
+            ri -= 1;
+            try ops.append(allocator, rev.items[ri]);
+        }
+    }
+
+    // Group ops into hunks with 3 lines of context.
+    const ctx: usize = 3;
+    var hunks: std.ArrayList(Hunk) = .empty;
+    defer hunks.deinit(allocator);
+
+    var oi: usize = 0;
+    while (oi < ops.items.len) {
+        // Find the range of ops that form a hunk: a sequence of changes
+        // separated by no more than 2*ctx keep lines.
+        var hunk_end = oi + 1;
+        var keep_run: usize = 0;
+        while (hunk_end < ops.items.len) {
+            switch (ops.items[hunk_end].kind) {
+                .keep => {
+                    keep_run += 1;
+                    if (keep_run > 2 * ctx) break;
+                },
+                .remove, .add => {
+                    keep_run = 0;
+                },
+            }
+            hunk_end += 1;
+        }
+        // If we broke because keep_run exceeded the threshold,
+        // back up to include only ctx keeps at the end.
+        if (keep_run > 2 * ctx) {
+            hunk_end -= (keep_run - ctx);
+        }
+
+        // Collect the hunk ops.
+        const hunk_ops = ops.items[oi..hunk_end];
+
+        // Compute line numbers for hunk header.
+        var orig_start: ?usize = null;
+        var mod_start: ?usize = null;
+        var orig_count: usize = 0;
+        var mod_count: usize = 0;
+
+        for (hunk_ops) |op| {
+            switch (op.kind) {
+                .keep => {
+                    orig_count += 1;
+                    mod_count += 1;
+                    if (orig_start == null) {
+                        orig_start = op.orig_idx.?;
+                        mod_start = op.mod_idx.?;
+                    }
+                },
+                .remove => {
+                    orig_count += 1;
+                    if (orig_start == null) {
+                        orig_start = op.orig_idx.?;
+                        mod_start = op.mod_idx orelse 0;
+                    }
+                },
+                .add => {
+                    mod_count += 1;
+                    if (orig_start == null) {
+                        orig_start = op.orig_idx orelse 0;
+                        mod_start = op.mod_idx.?;
+                    }
+                },
+            }
+        }
+
+        // Build the hunk body.
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+
+        for (hunk_ops) |op| {
+            switch (op.kind) {
+                .keep => {
+                    try body.appendSlice(allocator, " ");
+                    try body.appendSlice(allocator, orig_lines[op.orig_idx.?]);
+                },
+                .remove => {
+                    try body.appendSlice(allocator, "-");
+                    try body.appendSlice(allocator, orig_lines[op.orig_idx.?]);
+                },
+                .add => {
+                    try body.appendSlice(allocator, "+");
+                    try body.appendSlice(allocator, mod_lines[op.mod_idx.?]);
+                },
+            }
+        }
+
+        // Trim trailing context lines from the body (they'll be leading
+        // context of the next hunk or are unnecessary at end of file).
+        // Count trailing keep ops.
+        var trail_keep: usize = 0;
+        var bi: usize = hunk_ops.len;
+        while (bi > 0) {
+            bi -= 1;
+            if (hunk_ops[bi].kind == .keep) {
+                trail_keep += 1;
+            } else {
+                break;
+            }
+        }
+        // Keep up to ctx trailing context lines.
+        const trim_keep = if (trail_keep > ctx) trail_keep - ctx else 0;
+        if (trim_keep > 0) {
+            // Trim from both body and counts.
+            // Find where the trim starts in the body.
+            var trim_chars: usize = 0;
+            var trim_i: usize = hunk_ops.len - trim_keep;
+            while (trim_i < hunk_ops.len) : (trim_i += 1) {
+                const op = hunk_ops[trim_i];
+                // Each line: 1 prefix char + line content
+                const line_len = 1 + (if (op.kind == .keep) orig_lines[op.orig_idx.?].len else if (op.kind == .remove) orig_lines[op.orig_idx.?].len else mod_lines[op.mod_idx.?].len);
+                trim_chars += line_len;
+                orig_count -= 1;
+                mod_count -= 1;
+            }
+            body.items.len -= trim_chars;
+        }
+
+        if (body.items.len > 0) {
+            try hunks.append(allocator, .{
+                .orig_start = (orig_start orelse 0) + 1, // 1-indexed
+                .orig_count = orig_count,
+                .mod_start = (mod_start orelse 0) + 1,
+                .mod_count = mod_count,
+                .body = try body.toOwnedSlice(allocator),
+            });
+        }
+
+        oi = hunk_end;
+    }
+
+    // Build the full diff output.
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
+
+    try result.appendSlice(allocator, "--- a/");
+    try result.appendSlice(allocator, path);
+    try result.appendSlice(allocator, "\n+++ b/");
+    try result.appendSlice(allocator, path);
+    try result.appendSlice(allocator, "\n");
+
+    for (hunks.items) |h| {
+        try result.appendSlice(allocator, "@@ -");
+        try appendUint(&result, allocator, h.orig_start);
+        try result.appendSlice(allocator, ",");
+        try appendUint(&result, allocator, h.orig_count);
+        try result.appendSlice(allocator, " +");
+        try appendUint(&result, allocator, h.mod_start);
+        try result.appendSlice(allocator, ",");
+        try appendUint(&result, allocator, h.mod_count);
+        try result.appendSlice(allocator, " @@\n");
+        try result.appendSlice(allocator, h.body);
+        allocator.free(h.body);
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+const DiffOpKind = enum { keep, remove, add };
+
+const DiffOp = struct {
+    kind: DiffOpKind,
+    orig_idx: ?usize,
+    mod_idx: ?usize,
+};
+
+const Hunk = struct {
+    orig_start: usize,
+    orig_count: usize,
+    mod_start: usize,
+    mod_count: usize,
+    body: []const u8,
+};
+
+/// Split text into line slices, including the trailing newline (if any)
+/// in each slice. Each line ends at either a '\n' or EOF.
+fn splitLines(allocator: std.mem.Allocator, text: []const u8) ![][]const u8 {
+    if (text.len == 0) return try allocator.alloc([]const u8, 0);
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(allocator);
+
+    var start: usize = 0;
+    while (start < text.len) {
+        const nl = std.mem.indexOfScalar(u8, text[start..], '\n');
+        const end = if (nl) |pos| start + pos + 1 else text.len;
+        try lines.append(allocator, text[start..end]);
+        start = end;
+    }
+
+    return lines.toOwnedSlice(allocator);
+}
+
+/// Append a usize as decimal digits to an ArrayList.
+fn appendUint(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: usize) !void {
+    var tmp: [20]u8 = undefined;
+    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
+    try buf.appendSlice(allocator, s);
+}
+
+/// JSON-escape a string for embedding in a JSON value.
+fn escapeJsonString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    for (s) |c| switch (c) {
+        '"' => try buf.appendSlice(allocator, "\\\""),
+        '\\' => try buf.appendSlice(allocator, "\\\\"),
+        '\n' => try buf.appendSlice(allocator, "\\n"),
+        '\r' => try buf.appendSlice(allocator, "\\r"),
+        '\t' => try buf.appendSlice(allocator, "\\t"),
+        0...0x07, 0x0b, 0x0e...0x1f => {
+            var tmp: [8]u8 = undefined;
+            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
+            try buf.appendSlice(allocator, w);
+        },
+        else => try buf.append(allocator, c),
+    };
+
+    return buf.toOwnedSlice(allocator);
+}
 
 // ─── tests ────────────────────────────────────────────────────────
 

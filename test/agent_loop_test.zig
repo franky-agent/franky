@@ -596,3 +596,172 @@ test "agent loop: max_turns hook returning .stop emits max_turns_exceeded immedi
     try testing.expectEqual(@as(u32, 2), turn_starts);
     try testing.expectEqual(@as(u32, 1), max_turns_errors);
 }
+
+test "agent loop: max_turns_summarize runs one tool-disabled summary turn before max_turns_exceeded" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = std.testing.allocator;
+
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+
+    // Two normal turns end in tool_calls — loop wants to keep going.
+    try pushNTurnsWithToolCall(&faux, 2);
+    // Third "turn" (the forced summary) is text-only — the model
+    // is supposed to emit a final report.
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "summary: tried X, blocked on Y", .chunk_size = 4 } },
+        .{ .done = .{ .stop_reason = .stop } },
+    } });
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel = ai.stream.Cancel{};
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var ch = try newAgentChannel(gpa);
+    defer ch.deinit();
+
+    const echo_tool = at.AgentTool{
+        .name = "echo",
+        .description = "echo",
+        .parameters_json = "{\"type\":\"object\"}",
+        .execute = echoTool,
+    };
+
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &[_]at.AgentTool{echo_tool},
+        .registry = &reg,
+        .cancel = &cancel,
+        .max_turns = 2,
+        .max_turns_summarize = true,
+    }, &ch);
+
+    var turn_starts: u32 = 0;
+    var max_turns_errors: u32 = 0;
+    while (ch.next(io)) |ev| {
+        switch (ev) {
+            .turn_start => turn_starts += 1,
+            .agent_error => |d| {
+                if (d.code == .max_turns_exceeded) max_turns_errors += 1;
+            },
+            else => {},
+        }
+        ev.deinit(gpa);
+    }
+
+    // 2 capped turns + 1 forced summary = 3 turn_starts.
+    try testing.expectEqual(@as(u32, 3), turn_starts);
+    // max_turns_exceeded still fires after the summary so callers
+    // that gate on it stay backwards-compatible.
+    try testing.expectEqual(@as(u32, 1), max_turns_errors);
+
+    // Transcript ends with: synthetic user prompt → assistant summary.
+    const msgs = transcript.messages.items;
+    try testing.expect(msgs.len >= 2);
+    const last = msgs[msgs.len - 1];
+    try testing.expectEqual(ai.types.Role.assistant, last.role);
+    var saw_summary = false;
+    for (last.content) |cb| switch (cb) {
+        .text => |t| {
+            if (std.mem.indexOf(u8, t.text, "summary:") != null) saw_summary = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_summary);
+
+    // The penultimate message is the synthetic user prompt.
+    const penultimate = msgs[msgs.len - 2];
+    try testing.expectEqual(ai.types.Role.user, penultimate.role);
+    var saw_budget_msg = false;
+    for (penultimate.content) |cb| switch (cb) {
+        .text => |t| {
+            if (std.mem.indexOf(u8, t.text, "Tool budget exhausted") != null) saw_budget_msg = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_budget_msg);
+}
+
+test "agent loop: max_turns_summarize=false preserves legacy behavior" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = std.testing.allocator;
+
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+    try pushNTurnsWithToolCall(&faux, 5);
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel = ai.stream.Cancel{};
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var ch = try newAgentChannel(gpa);
+    defer ch.deinit();
+
+    const echo_tool = at.AgentTool{
+        .name = "echo",
+        .description = "echo",
+        .parameters_json = "{\"type\":\"object\"}",
+        .execute = echoTool,
+    };
+
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &[_]at.AgentTool{echo_tool},
+        .registry = &reg,
+        .cancel = &cancel,
+        .max_turns = 2,
+        // .max_turns_summarize defaults to false
+    }, &ch);
+
+    var turn_starts: u32 = 0;
+    var max_turns_errors: u32 = 0;
+    while (ch.next(io)) |ev| {
+        switch (ev) {
+            .turn_start => turn_starts += 1,
+            .agent_error => |d| {
+                if (d.code == .max_turns_exceeded) max_turns_errors += 1;
+            },
+            else => {},
+        }
+        ev.deinit(gpa);
+    }
+
+    // No extra summary turn — exactly cap turn_starts.
+    try testing.expectEqual(@as(u32, 2), turn_starts);
+    try testing.expectEqual(@as(u32, 1), max_turns_errors);
+    // No synthetic "Tool budget exhausted" user message was appended.
+    // (The last message will be a tool_result from the cap-hitting
+    // turn; the assertion just verifies the synthetic prompt isn't
+    // present anywhere in the transcript.)
+    const msgs = transcript.messages.items;
+    for (msgs) |m| if (m.role == .user) {
+        for (m.content) |cb| switch (cb) {
+            .text => |t| try testing.expect(std.mem.indexOf(u8, t.text, "Tool budget exhausted") == null),
+            else => {},
+        };
+    };
+}

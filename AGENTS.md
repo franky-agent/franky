@@ -1,7 +1,7 @@
 Franky Codebase Analysis — Complete Report
 Overview
 
-Franky is a provider-agnostic, streaming LLM agent framework written in Zig 0.17-dev. It's a mature, layered runtime (~908 passing tests) for building tool-using AI agents, shipping with a complete coding-agent CLI out of the box.
+Franky is a provider-agnostic, streaming LLM agent framework written in Zig 0.17-dev. It's a mature, layered runtime (~881 passing tests) for building tool-using AI agents, shipping with a complete coding-agent CLI out of the box.
 
 Version: 2.3.0 (library root), built on Zig 0.17-dev (master), zero external dependencies.
 
@@ -200,7 +200,7 @@ Programmatic entry point for embedding franky in other Zig programs. Re-exports 
 ---
 7. Test Suite
 
-908 tests across:
+881 tests across:
 
     Unit tests: Inline in every source file (types, channels, errors, tools, gitignore, etc.)
     Integration tests (test/):
@@ -269,7 +269,7 @@ Skills
     Permission system with role tiers (4 levels), tool-level gates, bash verb fingerprinting, and persistent allow/deny
     Spec-driven development with automated cross-reference checking
     7 LLM providers with unified streaming interface
-    908 tests with leak detection on every run
+    881 tests with leak detection on every run
 
 ---
 11. Identified Considerations / Areas of Note

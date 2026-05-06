@@ -262,6 +262,14 @@ pub const Config = struct {
     /// Optional per-hook userdata. Falls back to `hook_userdata` when
     /// null — same pattern as `before_tool_call_userdata` etc.
     on_max_turns_userdata: ?*anyopaque = null,
+    /// When true, after the cap is exhausted and any `on_max_turns`
+    /// extension credits are spent, run one final tool-disabled turn
+    /// with a synthetic user message asking the model to produce a
+    /// final report. Guarantees an `end_turn` and a useful artifact
+    /// instead of just `agent_error`. The `max_turns_exceeded`
+    /// agent_error still fires after the summary turn so callers
+    /// that programmatically gate on it stay backwards-compatible.
+    max_turns_summarize: bool = false,
     /// v1.16.3 — when true, if the assistant ends a turn with text
     /// content that parses as a recognized tool-call shape (e.g.
     /// `{"name": "X", "parameters": {...}}` or `{"type": "function",
@@ -390,6 +398,16 @@ pub fn agentLoop(
         }
         break :cap_loop;
     }
+
+    // Best-effort: provider/allocation failures here are warn-logged
+    // and fall through to the `agent_error{max_turns_exceeded}` path
+    // that callers already handle.
+    if (config.max_turns_summarize and !config.cancel.isFired()) {
+        runForcedSummary(allocator, io, transcript, config, out, current_cap, @ptrCast(&loop_client)) catch |err| {
+            ai.log.log(.warn, "loop", "forced_summary_failed", "err={s}", .{@errorName(err)});
+        };
+    }
+
     const msg = std.fmt.allocPrint(
         allocator,
         "max turns ({d}) reached",
@@ -401,6 +419,44 @@ pub fn agentLoop(
     };
     defer allocator.free(msg);
     pushAgentError(out, io, allocator, .max_turns_exceeded, msg) catch {};
+}
+
+/// Append a synthetic user message asking for a final report, then
+/// run one tool-disabled turn so the model has to emit text. The
+/// synthetic user message is owned by the transcript on success; on
+/// append failure we free locally before returning.
+fn runForcedSummary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    transcript: *Transcript,
+    config: Config,
+    out: *AgentChannel,
+    cap: u32,
+    http_client: ?*anyopaque,
+) !void {
+    const prompt = try std.fmt.allocPrint(
+        allocator,
+        "Tool budget exhausted ({d} turns). No more tools — produce a final report in plain text: what you tried, what's still unknown, what you'd do next. Do not call any tools.",
+        .{cap},
+    );
+    errdefer allocator.free(prompt);
+
+    const content = try allocator.alloc(ai.types.ContentBlock, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .text = .{ .text = prompt } };
+
+    try transcript.append(.{
+        .role = .user,
+        .content = content,
+        .timestamp = ai.stream.nowMillis(),
+    });
+    // Ownership of `prompt` and `content` is now the transcript's.
+
+    var no_tools_cfg = config;
+    no_tools_cfg.tools = &.{};
+    _ = runTurn(allocator, io, transcript, no_tools_cfg, out, http_client) catch |err| {
+        ai.log.log(.warn, "loop", "forced_summary_turn_failed", "err={s}", .{@errorName(err)});
+    };
 }
 
 /// Run one turn. Returns true if the caller should loop again, false to stop.
@@ -1223,6 +1279,8 @@ const dsml_vbar = "\xef\xbd\x9c";
 const dsml_open = "<" ++ dsml_vbar ++ "DSML" ++ dsml_vbar;
 const dsml_invoke_tag = dsml_open ++ "invoke ";
 const dsml_param_tag = dsml_open ++ "parameter ";
+/// Closing tag prefix: "</|DSML|" — matches </|DSML|parameter>, </|DSML|invoke>, </|DSML|tool_calls>.
+const dsml_close_tag = "<" ++ "/" ++ dsml_vbar ++ "DSML" ++ dsml_vbar;
 
 /// Parses the first DSML `<invoke>` block found in `text`.
 /// Returns null when no DSML markup is present or the tool name is not in `tools`.
@@ -1260,7 +1318,12 @@ fn extractDsmlToolCall(
         const ptype = dsmlParamType(rest);
         const pgt = std.mem.indexOf(u8, rest, ">") orelse { pos = pstart + 1; continue; };
         const val_s = pgt + 1;
-        const val_e = if (std.mem.indexOf(u8, rest[val_s..], dsml_open)) |n| val_s + n else rest.len;
+        const val_e = blk: {
+            const n_open = std.mem.indexOf(u8, rest[val_s..], dsml_open);
+            const n_close = std.mem.indexOf(u8, rest[val_s..], dsml_close_tag);
+            const n = if (n_open) |a| if (n_close) |b| @min(a, b) else a else n_close;
+            break :blk if (n) |nn| val_s + nn else rest.len;
+        };
         const raw = std.mem.trim(u8, rest[val_s..val_e], " \t\n\r");
 
         if (!first) try buf.append(allocator, ',');
@@ -1837,6 +1900,67 @@ test "extractDsmlToolCall: tool name not in registry → null" {
         "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"x\" string=\"true\">y\n";
     const result = try extractDsmlToolCall(gpa, text, &tools);
     try testing.expect(result == null);
+}
+
+test "extractDsmlToolCall: closing tag trims value without leaking" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("read")};
+    const text =
+        "<\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls>\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cinvoke name=\"read\">\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"path\" string=\"true\">/path/to/file\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9cparameter>\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9cinvoke>\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls>\n";
+    const result = (try extractDsmlToolCall(gpa, text, &tools)).?;
+    defer gpa.free(result.name);
+    defer gpa.free(result.args);
+    try testing.expectEqualStrings("read", result.name);
+    try testing.expectEqualStrings("{\"path\":\"/path/to/file\"}", result.args);
+}
+
+test "extractDsmlToolCall: multiple params with closing tags" {
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("write")};
+    const text =
+        "<\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls>\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cinvoke name=\"write\">\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"path\" string=\"true\">/out.txt\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9cparameter>\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"overwrite\" boolean=\"true\">true\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9cparameter>\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9cinvoke>\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls>\n";
+    const result = (try extractDsmlToolCall(gpa, text, &tools)).?;
+    defer gpa.free(result.name);
+    defer gpa.free(result.args);
+    try testing.expectEqualStrings("write", result.name);
+    try testing.expectEqualStrings(
+        "{\"path\":\"/out.txt\",\"overwrite\":true}",
+        result.args,
+    );
+}
+
+test "extractDsmlToolCall: value after closing tag not consumed" {
+    // Regression: ensure that when one param has a closing tag and the next
+    // param follows, the second param is still parsed correctly.
+    const gpa = testing.allocator;
+    const tools = [_]at.AgentTool{fakeToolForTest("multi")};
+    const text =
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cinvoke name=\"multi\">\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"a\" string=\"true\">val1\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9cparameter>\n" ++
+        "<\xef\xbd\x9cDSML\xef\xbd\x9cparameter name=\"b\" string=\"true\">val2\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9cparameter>\n" ++
+        "</\xef\xbd\x9cDSML\xef\xbd\x9cinvoke>\n";
+    const result = (try extractDsmlToolCall(gpa, text, &tools)).?;
+    defer gpa.free(result.name);
+    defer gpa.free(result.args);
+    try testing.expectEqualStrings("multi", result.name);
+    try testing.expectEqualStrings(
+        "{\"a\":\"val1\",\"b\":\"val2\"}",
+        result.args,
+    );
 }
 
 test "maybeApplyDsmlThinkingFallback: extracts tool call from thinking block" {

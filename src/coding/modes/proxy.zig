@@ -330,7 +330,7 @@ const Session = struct {
                 // v1.28.1 — log lifecycle so a future pool-fill is
                 // visible without curl-probing. `live` is the count
                 // AFTER this addition.
-                ai.log.log(.warn, "proxy", "subscriber.added", "live={d}/{d}", .{ self.liveSubsLocked(), max_subs });
+                ai.log.log(.info, "proxy", "subscriber.added", "live={d}/{d}", .{ self.liveSubsLocked(), max_subs });
                 return true;
             }
         }
@@ -354,7 +354,7 @@ const Session = struct {
             if (s == sub) {
                 self.subs[i] = null;
                 // v1.28.1 — `live` is the count AFTER this removal.
-                ai.log.log(.warn, "proxy", "subscriber.removed", "live={d}/{d}", .{ self.liveSubsLocked(), max_subs });
+                ai.log.log(.info, "proxy", "subscriber.removed", "live={d}/{d}", .{ self.liveSubsLocked(), max_subs });
                 return;
             }
         }

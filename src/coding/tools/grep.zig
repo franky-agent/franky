@@ -218,7 +218,7 @@ fn badRegexError(
     };
     const msg = try std.fmt.allocPrint(
         allocator,
-        "{s} at position {d} in pattern {s}\\ (use regex=false for literal substring search)",
+        "{s} at position {d} in pattern {s} (use regex=false for literal substring search)",
         .{ kind, pos, pattern },
     );
     defer allocator.free(msg);

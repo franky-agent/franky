@@ -718,6 +718,12 @@ const ErrorKind = enum {
     aborted,
     config_error,
     invalid_args,
+    /// Sub-agent terminated normally but produced no text content
+    /// in any assistant message — e.g. the model emitted a
+    /// malformed tool call inside thinking, or trailed off without
+    /// summarizing. Surfaced as a failure so the parent doesn't
+    /// silently absorb an empty answer.
+    no_final_text,
 
     fn name(self: ErrorKind) []const u8 {
         return @tagName(self);
@@ -734,6 +740,7 @@ const ErrorKind = enum {
             .aborted => "parent agent is being shut down — do not retry",
             .config_error => "the subagent tool wasn't wired in this mode driver; this is a franky bug, file an issue",
             .invalid_args => "fix the JSON arguments per the schema and retry",
+            .no_final_text => "the model exited without writing a user-facing response (likely emitted a malformed tool call inside thinking, or trailed off without summarizing); re-prompt with an explicit \"summarize your findings as text\" instruction or pick a stronger model",
         };
     }
 };
@@ -1043,6 +1050,28 @@ fn runSubagent(
     const turn_count = countAssistantTurns(&sub_agent.transcript);
     const tool_call_count = countToolCalls(&sub_agent.transcript);
 
+    // Surface "ran to completion but never produced a text answer"
+    // as a failure rather than `ok: true, final_text: ""`. The
+    // parent agent otherwise can't tell a successful empty response
+    // apart from a model that hallucinated a tool call inside its
+    // thinking block (a known small-model failure mode). Pass the
+    // tail of the last thinking block as `partial_text` so the
+    // caller has enough signal to decide whether to retry, switch
+    // models, or give up.
+    if (final_text_raw.len == 0) {
+        const thinking_tail = lastAssistantThinkingTail(allocator, &sub_agent.transcript, 200) catch null;
+        defer if (thinking_tail) |t| allocator.free(t);
+        const stop_name = if (lastAssistantStopReason(&sub_agent.transcript)) |sr| @tagName(sr) else "unknown";
+        const msg = std.fmt.allocPrint(
+            allocator,
+            "sub-agent completed {d} turn(s) and {d} tool call(s) but produced no final answer text. Last assistant stop reason: {s}.",
+            .{ turn_count, tool_call_count, stop_name },
+        ) catch unreachable;
+        defer allocator.free(msg);
+        ai.log.log(.warn, "subagent", "no-final-text", "call_id={s} turns={d} tool_calls={d} stop={s}", .{ call_id, turn_count, tool_call_count, stop_name });
+        return errorResult(allocator, .no_final_text, msg, .{ .partial_text = thinking_tail, .turn_count = turn_count });
+    }
+
     // Cap `final_text`. Two limits; whichever is lower wins:
     //   - global `final_text_max_bytes` (4 KB) — always applied.
     //   - preset's `safety.max_result_bytes` — opt-in per preset.
@@ -1222,6 +1251,50 @@ fn lastAssistantText(allocator: std.mem.Allocator, transcript: *const loop_mod.T
             .text => |t| return try allocator.dupe(u8, t.text),
             else => {},
         };
+    }
+    return null;
+}
+
+fn lastAssistantThinkingTail(
+    allocator: std.mem.Allocator,
+    transcript: *const loop_mod.Transcript,
+    max_bytes: usize,
+) !?[]u8 {
+    const msgs = transcript.messages.items;
+    var i: usize = msgs.len;
+    while (i > 0) {
+        i -= 1;
+        if (msgs[i].role != .assistant) continue;
+        var j: usize = msgs[i].content.len;
+        while (j > 0) {
+            j -= 1;
+            switch (msgs[i].content[j]) {
+                .thinking => |th| {
+                    const trunc = truncate_mod.truncateTail(th.thinking, .{
+                        .max_lines = std.math.maxInt(usize),
+                        .max_bytes = max_bytes,
+                    });
+                    if (!trunc.truncated) return try allocator.dupe(u8, trunc.content);
+                    var out: std.ArrayList(u8) = .empty;
+                    errdefer out.deinit(allocator);
+                    try out.appendSlice(allocator, "[…]");
+                    try out.appendSlice(allocator, trunc.content);
+                    return try out.toOwnedSlice(allocator);
+                },
+                else => {},
+            }
+        }
+    }
+    return null;
+}
+
+fn lastAssistantStopReason(transcript: *const loop_mod.Transcript) ?ai.types.StopReason {
+    const msgs = transcript.messages.items;
+    var i: usize = msgs.len;
+    while (i > 0) {
+        i -= 1;
+        if (msgs[i].role != .assistant) continue;
+        return msgs[i].stop_reason;
     }
     return null;
 }
@@ -1628,6 +1701,56 @@ test "errorResult emits valid JSON with kind + hint + tool_code" {
     try testing.expect(std.mem.indexOf(u8, text, "\"partial_text\":\"partial answer\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"turn_count\":3") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"hint\":\"") != null);
+}
+
+test "lastAssistantThinkingTail: returns last block, capped with prefix" {
+    const gpa = testing.allocator;
+    var transcript = loop_mod.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    // Two assistant messages, the latest with a long thinking block.
+    const c1 = try gpa.alloc(ai.types.ContentBlock, 1);
+    c1[0] = .{ .thinking = .{ .thinking = try gpa.dupe(u8, "early thinking") } };
+    try transcript.append(.{ .role = .assistant, .content = c1, .timestamp = 0 });
+
+    const long_thinking = "X" ** 500;
+    const c2 = try gpa.alloc(ai.types.ContentBlock, 1);
+    c2[0] = .{ .thinking = .{ .thinking = try gpa.dupe(u8, long_thinking) } };
+    try transcript.append(.{ .role = .assistant, .content = c2, .timestamp = 0 });
+
+    const tail = (try lastAssistantThinkingTail(gpa, &transcript, 64)).?;
+    defer gpa.free(tail);
+    // 3 bytes prefix "[…]" (UTF-8: 0xE2 0x80 0xA6 → 3 bytes for the
+    // ellipsis alone, plus the [ and ]) + last 64 bytes of "X"*500.
+    try testing.expect(std.mem.startsWith(u8, tail, "[…]"));
+    try testing.expect(std.mem.endsWith(u8, tail, "X" ** 64));
+}
+
+test "lastAssistantThinkingTail: short block returned unchanged" {
+    const gpa = testing.allocator;
+    var transcript = loop_mod.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    const c = try gpa.alloc(ai.types.ContentBlock, 1);
+    c[0] = .{ .thinking = .{ .thinking = try gpa.dupe(u8, "brief") } };
+    try transcript.append(.{ .role = .assistant, .content = c, .timestamp = 0 });
+
+    const tail = (try lastAssistantThinkingTail(gpa, &transcript, 200)).?;
+    defer gpa.free(tail);
+    try testing.expectEqualStrings("brief", tail);
+}
+
+test "lastAssistantThinkingTail: returns null when no thinking exists" {
+    const gpa = testing.allocator;
+    var transcript = loop_mod.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    const c = try gpa.alloc(ai.types.ContentBlock, 1);
+    c[0] = .{ .text = .{ .text = try gpa.dupe(u8, "hello") } };
+    try transcript.append(.{ .role = .assistant, .content = c, .timestamp = 0 });
+
+    const tail = try lastAssistantThinkingTail(gpa, &transcript, 200);
+    try testing.expect(tail == null);
 }
 
 test "concurrency cap: 11 simultaneous acquires never exceed the cap (v1.24.4)" {

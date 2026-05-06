@@ -1207,5 +1207,98 @@ button#send:hover:not(:disabled) {
 .sa-overlay-body .sa-thinking-content { font-size: 12.5px; margin-top: 6px; }
 .sa-overlay-body .sa-text { font-size: 13.5px; line-height: 1.7; }
 .sa-overlay-body .sa-text p { margin-bottom: 8px; }
-.sa-overlay-body .sa-tool-entry { font-size: 12px; padding: 7px 12px; }
-.sa-overlay-body .sa-tool-entry .sa-tool-args { font-size: 11px; }
+.sa-overlay-body .sa-tool-entry {
+    font-size: 12px;
+    padding: 7px 12px;
+    /* Args may wrap to multiple lines; keep arrow/name/status
+     * top-aligned with the first line of args instead of centered
+     * across the whole entry. */
+    align-items: flex-start;
+}
+.sa-overlay-body .sa-tool-entry .sa-tool-args {
+    font-size: 11px;
+    /* The compact inline panel truncates with ellipsis because
+     * width is tight. The overlay has 80vw × 80vh of room — let
+     * args wrap so the user can read the full payload. */
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow: visible;
+    text-overflow: clip;
+}
+
+/* Edit-tool diff view — overrides for diff2html-rendered cards. */
+
+.tool-card.is-edit .tool-result-log {
+    padding: 0;
+    overflow-x: auto;
+}
+
+.tool-card.is-edit .d2h-wrapper {
+    font-size: 12px;
+}
+
+/* Hide the redundant file header — we already have the tool head */
+.tool-card.is-edit .d2h-file-header {
+    display: none;
+}
+
+.tool-card.is-edit .d2h-code-line {
+    padding: 0 6px;
+}
+
+/* View-toggle button next to the tool head */
+.diff-view-toggle {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 11px;
+    cursor: pointer;
+    color: var(--muted);
+    margin-left: auto;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+}
+
+.diff-view-toggle:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+/* Dark-theme compatibility for diff2html */
+.tool-card.is-edit .d2h-code-side-line,
+.tool-card.is-edit .d2h-code-line {
+    background: transparent;
+    color: var(--text);
+}
+
+.tool-card.is-edit .d2h-info {
+    background: var(--panel);
+    color: var(--muted);
+    border-color: var(--border);
+}
+
+.tool-card.is-edit .d2h-del {
+    background: rgba(248, 81, 73, 0.1);
+}
+
+.tool-card.is-edit .d2h-ins {
+    background: rgba(63, 185, 80, 0.1);
+}
+
+.tool-card.is-edit .d2h-code-line del,
+.tool-card.is-edit .d2h-code-side-line del {
+    background: rgba(248, 81, 73, 0.2);
+    text-decoration: none;
+}
+
+.tool-card.is-edit .d2h-code-line ins,
+.tool-card.is-edit .d2h-code-side-line ins {
+    background: rgba(63, 185, 80, 0.2);
+    text-decoration: none;
+}
+
+/* Prevent diff2html's line-number column from wrapping */
+.tool-card.is-edit .d2h-code-line-prefix {
+    width: auto;
+    min-width: 32px;
+}

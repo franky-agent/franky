@@ -13,14 +13,14 @@ on disk, **four run modes** (`print` / `interactive` / `rpc` / `proxy`),
 a built-in web UI served by proxy mode, capability roles, a per-tool
 permission overlay, bearer-token auth (`--auth-token` /
 `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN`) for subscription /
-gateway flows, and per-phase HTTP timeouts. **908 tests** pass at the
+gateway flows, and per-phase HTTP timeouts. **881 tests** pass at the
 current cut.
 
 ## Quick start
 
 ```sh
 # Build
-./build.sh                       # or: zig build
+zig build
 
 # Run (offline, no API key needed — uses the faux provider)
 ./zig-out/bin/franky "hello"
@@ -37,7 +37,7 @@ export ANTHROPIC_API_KEY=sk-ant-…
 ./zig-out/bin/franky --mode proxy
 
 # Run tests
-./test.sh                        # or: zig build test
+zig build test
 ```
 
 With no flags and no API key in the environment, franky defaults to the
@@ -61,7 +61,7 @@ without network access.
 | **Run mode** | `print` (one prompt → output → exit) | `--mode interactive` (TUI) / `--mode rpc` (JSON-RPC over stdio) / `--mode proxy` (HTTP/SSE + web UI) | n/a — explicit choice per run |
 | **Capability role** | `plan` (read + workspace writes, no shell) | `--role read` / `--role plan` / `--role code` (adds bash) / `--role full` (no §R restrictions) | n/a — always bound at session init |
 | **Permission overlay** | off | `--prompts` toggles the gate. Pair with `--yes` (CI), `--allow-tools <csv>`, `--deny-tools <csv>`, or `--ask-tools <csv>` (or `--ask-tools all` for ask-on-every-call) | omit `--prompts` |
-| **Sandbox** | host process (auto-detected) | wrap with `scripts/franky-zerobox` (zerobox) or run in a container (`docs/sandbox.md` recipes) | n/a — recommendation, not enforced |
+| **Sandbox** | host process (auto-detected) | run in a container (see `docs/sandbox.md` recipes) | n/a — recommendation, not enforced |
 | **Reasoning** | off | `--thinking minimal\|low\|medium\|high\|xhigh` | `--thinking off` |
 | **Session persistence** | on (writes to `~/.franky/sessions/<ulid>/`) | default | `--no-session` |
 | **Resume / branching** | new session per run | `--continue` (most recent) or `--resume <id>`; `--fork <name>` / `--checkout <name>` | n/a |
@@ -151,8 +151,7 @@ change role, restart franky. The `/role` slash command in interactive
 mode is read-only.
 
 When you select `code` or `full` outside a detected sandbox a yellow
-banner reminds you to wrap the run with `scripts/franky-zerobox` or a
-container.
+banner reminds you to wrap the run in a container or equivalent isolation.
 
 ### Per-tool permission overlay (§5.11)
 
@@ -306,7 +305,7 @@ Full list: `franky --help`. Highlights:
 | `FRANKY_LOG_FILE` | Override `--log-file` |
 | `FRANKY_DEBUG` | `1` or `true` → debug level |
 | `FRANKY_CONNECT_TIMEOUT_MS` / `FRANKY_UPLOAD_TIMEOUT_MS` / `FRANKY_FIRST_BYTE_TIMEOUT_MS` / `FRANKY_EVENT_GAP_TIMEOUT_MS` | Override the matching `--*-timeout-ms` flag |
-| `ZEROBOX_ACTIVE` | Set by `scripts/franky-zerobox` to silence the sandbox warning |
+| `ZEROBOX_ACTIVE` | Set externally to silence the sandbox warning |
 
 ### Bearer-token auth
 
@@ -333,13 +332,15 @@ mint tokens via their own tooling.
 
 `--role code` and `--role full` execute shell commands on the host
 filesystem. Wrap them in a sandbox when running against untrusted
-prompts. `scripts/franky-zerobox` is the canonical wrapper:
+prompts. Zerobox-style process isolation or Docker are the canonical
+wrappers:
 
 ```sh
-./scripts/franky-zerobox --role code --mode interactive
+# Using Docker (see docs/sandbox.md for recipes)
+docker run --rm -v "$(pwd):/workspace" ...
 ```
 
-Recipes for zerobox, Docker, devcontainer, Lima, and the Slack-bot
+Recipes for Docker, devcontainer, Lima, and the Slack-bot
 (`franky-do`) pattern live in [`docs/sandbox.md`](docs/sandbox.md).
 
 ### Sessions on disk
@@ -382,10 +383,12 @@ the one below it:
 
 ```
 src/
-  root.zig             # Library root (re-exports ai, agent, coding)
-  bin/main.zig         # CLI entrypoint
+  root.zig             # Library root (re-exports ai, agent, coding, tui, sdk)
+  sdk.zig              # Programmatic SDK facade (§5.9)
+  test_helpers.zig     # Shared test Io helpers
 
   ai/                  # Provider-agnostic LLM streaming
+    mod.zig            # Module root
     types.zig          # Context, Message, ContentBlock, Usage, Tool, Model, ThinkingLevel
     errors.zig         # AgentError + ErrorDetails (error taxonomy)
     sse.zig            # Server-Sent Events parser
@@ -394,40 +397,90 @@ src/
     stream.zig         # StreamEvent, Reducer, drainToMessage, Cancel
     registry.zig       # API-tag → StreamFn dispatch
     http.zig           # HTTP + SSE streaming transport
+    retry.zig          # Retry logic for transient errors
     log.zig            # Leveled stderr logger (err/warn/info/debug/trace)
+    transform.zig      # Cross-provider message transform (thinking-block adaption)
     providers/
-      faux.zig         # Scripted test provider
-      anthropic.zig    # Anthropic Messages API (full SSE translation)
       AUTH.md          # Authentication schemes documentation
+      anthropic.zig    # Anthropic Messages API (full SSE translation)
+      faux.zig         # Scripted test provider
+      google_gemini.zig    # Google Gemini provider
+      google_vertex.zig    # Google Vertex AI provider
+      openai_chat.zig      # OpenAI Chat API provider
+      openai_gateway.zig   # OpenAI-compatible gateway adapter
+      openai_responses.zig # OpenAI Responses API provider
 
   agent/               # Stateful, tool-using runtime
+    mod.zig            # Module root
     types.zig          # AgentEvent, AgentTool, ToolResult
     loop.zig           # agentLoop — the low-level turn state machine
     agent.zig          # Stateful Agent class (worker thread + subscribers)
 
   coding/              # The coding-agent layer
+    mod.zig            # Module root
+    cli.zig            # CLI argument parsing
+    session.zig        # session.json + transcript.json round-trip (ULID, atomic writes)
+    settings.zig       # $FRANKY_HOME/settings.json runtime limits
+    auth.zig           # $FRANKY_HOME/auth.json bearer token records
+    models.zig         # §H.3 model catalog + lookup
+    models_fetch.zig   # Provider endpoint pollers for gen-models
+    models_render.zig  # Model catalog renderer
+    role.zig           # Capability tiers (read/plan/code/full)
+    permissions.zig    # Tool permission overlay with --allow-tools/--deny-tools/--ask-tools
+    path_safety.zig    # Workspace path canonicalization + escape detection
+    gitignore.zig      # Multi-level .gitignore parsing with negation
+    env_denylist.zig   # Blocks dangerous env vars from bash subprocesses
+    extensions.zig     # Tier-1 static module extension loading
+    regex.zig          # Regex engine (gitignore-aware)
     tools/
       read.zig         # Read file (line-numbered, binary/size guards)
       write.zig        # Atomic file creation (clobber protection)
       edit.zig         # Atomic multi-edit (find/replace)
-      bash.zig         # Shell execution
-      ls.zig           # Directory listing
+      bash.zig         # Shell execution (cwd-locked, env-denylist, timeout)
+      ls.zig           # Directory listing (recursive, gitignore-aware)
       find.zig         # Glob-based file search
-      grep.zig         # Literal-substring search
+      grep.zig         # Literal-substring + regex search
+      subagent.zig     # Sub-agent delegation
+      web_search.zig   # Web search
+      web_fetch.zig    # Full page content fetch
+      truncate.zig     # Output truncation utility
+      workspace.zig    # Workspace context tool
+      common.zig       # Shared tool utilities
     modes/
-      print.zig        # Print-mode CLI driver
-    cli.zig            # CLI argument parsing
-    session.zig        # session.json + transcript.json round-trip (ULID, atomic writes)
+      print.zig        # One-shot print-mode CLI driver
+      interactive.zig  # Full TUI with scrollback + slash commands
+      rpc.zig          # JSON-RPC over stdio for programmatic clients
+      proxy.zig        # HTTP/SSE listener (127.0.0.1:8787) + built-in web UI
+      web/
+        index.html     # Web UI HTML
+        app.js         # Web UI client (js)
+        style.css      # Web UI styles
+
+  tui/                  # Terminal UI components (interactive mode)
+    mod.zig             # Module root
+    buffer.zig          # Terminal screen buffer with double-buffering
+    cell.zig            # Screen cell representation
+    editor.zig          # Text editing widget
+    text_buffer.zig     # Line-based text storage
+    key_decoder.zig     # Terminal input parsing
+    region.zig          # Screen region management
+    keybindings.zig     # Configurable key binding system
+    diff_renderer.zig   # Side-by-side diff display
+
+  bin/
+    main.zig              # CLI entrypoint (franky binary)
+    gen_models.zig        # Model catalog regenerator
+    franky_doctor.zig     # Cross-session self-improvement analyzer
+    check_spec_anchors.zig # §-reference verifier
 
 test/
-  agent_loop_test.zig  # End-to-end: agent + faux + tool round-trip
-  agent_class_test.zig # Stateful Agent: subscribe/prompt/reset
+  agent_loop_test.zig   # End-to-end: agent + faux + tool round-trip
+  agent_class_test.zig  # Stateful Agent: subscribe/prompt/reset
+  gitignore_test.zig    # Multi-level .gitignore with real filesystem tree
+  parallel_tools_test.zig # Parallel tool execution correctness
+  kitchen_sink_test.zig # Combined feature interaction
+  replay_test.zig       # Session replay from stored transcripts
 
-scripts/
-  env.sh              # Virtiofs cache-redirect helper
-
-build.sh              # Build wrapper (auto-detects virtiofs)
-test.sh               # Test wrapper
 Dockerfile.sandbox    # Dev container with Zig 0.17-dev
 ```
 
@@ -692,7 +745,7 @@ const grep_tool = franky.coding.tools.grep.tool();
 | `coding` modes | print, interactive (TUI), rpc (JSON-RPC), proxy (HTTP/SSE + web UI) | ✅ |
 | `coding` features | session persistence + branching + object-store + compaction, capability roles (§5.10), permission overlay foundation (§5.11), settings/auth/models JSON, bearer-token auth (`--auth-token` + `auth.json` round-trip), Tier-1 extensions | ✅ |
 
-**908 tests** pass at the current cut across one library binary and the
+**881 tests** pass at the current cut across one library binary and the
 integration binaries (`agent_loop`, `agent_class`, `gitignore`,
 `parallel_tools`, `kitchen_sink`). The `franky login` minting flow
 shipped in v1.2.* and was removed in v1.30.0 — bearer tokens are now
@@ -770,22 +823,12 @@ races on large (>10 MB) writes.
 **Fix:** Redirect Zig's cache to a non-virtiofs path:
 
 ```sh
-./build.sh     # auto-detects virtiofs and redirects the cache
-./test.sh
-```
-
-Or set the env vars manually:
-
-```sh
 export ZIG_LOCAL_CACHE_DIR=/tmp/franky-zig-cache
 export ZIG_GLOBAL_CACHE_DIR=/tmp/franky-zig-global
 zig build
 ```
 
-On a normal filesystem (ext4, APFS, tmpfs, overlay) the wrappers are
-no-ops; plain `zig build` / `zig build test` works unchanged.
-
-Set `FRANKY_SKIP_CACHE_REDIRECT=1` to disable the redirect.
+On a normal filesystem (ext4, APFS, tmpfs, overlay) plain `zig build` / `zig build test` works unchanged.
 
 ### `zig build test` fails on macOS with Homebrew Zig 0.16
 

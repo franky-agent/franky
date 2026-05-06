@@ -236,6 +236,8 @@ function highlightCodeBlocks(container) {
     // the runtime role gate emits as `tool_code` on a denied tool
     // call. Kept in sync by hand; if you rename one, rename both.
     const ROLE_DENIED = 'role_denied';
+    const SUBAGENT_TOOL_NAME = 'subagent';
+    const EDIT_TOOL_NAME = 'edit';
 
     const conversation = document.getElementById('conversation');
     const form = document.getElementById('composer');
@@ -479,7 +481,7 @@ function highlightCodeBlocks(container) {
         conversation.appendChild(el);
     }
 
-    function appendFinalizedToolCard(callId, name, isError) {
+    function appendFinalizedToolCard(callId, name, isError, argsJson, resultText, detailsJson) {
         const el = document.createElement('div');
         el.className = 'tool-card' + (isError ? ' is-error' : '');
         const head = document.createElement('div');
@@ -489,7 +491,52 @@ function highlightCodeBlocks(container) {
         head.querySelector('.tool-name').textContent = name;
         head.querySelector('.tool-status').textContent = isError ? 'error' : 'done';
         el.appendChild(head);
+
+        if (name === SUBAGENT_TOOL_NAME) {
+            attachSubagentPanel(el, callId);
+            const state = createSubagentSection(callId, argsJson || '');
+            if (state) {
+                state.done = true;
+                state.isError = isError;
+                if (state.badgeEl) {
+                    state.badgeEl.className = 'sa-badge ' + (isError ? 'error' : 'done');
+                    state.badgeEl.textContent = isError ? 'error' : 'done';
+                }
+                if (resultText) {
+                    try {
+                        const parsed = JSON.parse(resultText);
+                        if (parsed && parsed.final_text) {
+                            state.textBlocks.set(0, parsed.final_text);
+                        }
+                    } catch (_) { /* non-JSON body — keep state.textBlocks empty */ }
+                }
+            }
+            const log = el.querySelector('.subagent-log');
+            if (log && resultText) {
+                const entry = document.createElement('div');
+                entry.className = 'subagent-entry' + (isError ? ' sa-error' : '');
+                entry.textContent = (isError ? '⚠ ' : '✓ ') + resultText;
+                log.appendChild(entry);
+            }
+        } else {
+            attachResultPanel(el);
+            const panel = el.querySelector('.tool-result-log');
+            const toggle = el.querySelector('.tool-result-toggle');
+            const renderedDiff = !isError && tryRenderDiffPanel(el, panel, toggle, detailsJson);
+            if (!renderedDiff && resultText) panel.textContent = resultText;
+        }
+
         conversation.appendChild(el);
+    }
+
+    /// Attempt to render `detailsJson` as a unified diff into `panel`.
+    /// Returns true on success — caller should skip the plain-text fallback.
+    function tryRenderDiffPanel(el, panel, toggle, detailsJson) {
+        if (!detailsJson) return false;
+        const details = parseData(detailsJson);
+        if (!details || !details.diff) return false;
+        renderEditDiffView(el, panel, toggle, details);
+        return true;
     }
 
     function appendError(message) {
@@ -544,6 +591,9 @@ function highlightCodeBlocks(container) {
             thinkingBlocks: new Map(),
             toolArgs: new Map(),
         };
+        textDirty = false;
+        thinkingDirty = false;
+        textHasFence = false;
         hideTurnIndicator();
         scrollToBottom();
     }
@@ -552,17 +602,51 @@ function highlightCodeBlocks(container) {
         if (!active.el) startAssistantMessage('assistant');
     }
 
+    // Reasoning models emit 10K+ thinking_delta events in a single
+    // turn; doing the full join+innerHTML+scroll dance per event
+    // froze the browser tab. Defer DOM writes to one rAF per active
+    // message and only re-render the panes that actually changed.
+    let activeRenderScheduled = false;
+    let textDirty = false;
+    let thinkingDirty = false;
+    let textHasFence = false;
+
+    function flushActiveRender() {
+        activeRenderScheduled = false;
+        if (!active.el) return;
+        const wrote = textDirty || thinkingDirty;
+        if (textDirty && active.contentEl) {
+            const ordered = joinOrderedBlocks(active.blocks);
+            if (ordered.length > 0) {
+                active.contentEl.innerHTML = Markdown.render(ordered);
+                if (textHasFence) highlightCodeBlocks(active.contentEl);
+            }
+            textDirty = false;
+        }
+        if (thinkingDirty && active.thinkingEl) {
+            active.thinkingEl.textContent = joinOrderedBlocks(active.thinkingBlocks);
+            thinkingDirty = false;
+        }
+        if (wrote) scrollToBottom();
+    }
+
+    function scheduleActiveRender() {
+        if (activeRenderScheduled) return;
+        activeRenderScheduled = true;
+        requestAnimationFrame(flushActiveRender);
+    }
+
     function appendTextDelta(blockIndex, delta) {
         ensureActiveMessage();
         const prev = active.blocks.get(blockIndex) || '';
         active.blocks.set(blockIndex, prev + delta);
-        // Re-render content as the concatenation of all block deltas in
-        // index order. This keeps multi-block messages stable even if
-        // deltas arrive interleaved.
-        const ordered = joinOrderedBlocks(active.blocks);
-        active.contentEl.innerHTML = Markdown.render(ordered);
-        if (ordered.includes('```')) highlightCodeBlocks(active.contentEl);
-        scrollToBottom();
+        textDirty = true;
+        if (!textHasFence && delta.indexOf('`') !== -1) {
+            // Cheap superset check; the actual fence detection happens
+            // on render. Avoids re-scanning the full joined buffer.
+            textHasFence = true;
+        }
+        scheduleActiveRender();
     }
 
     function appendThinkingDelta(blockIndex, delta) {
@@ -570,17 +654,19 @@ function highlightCodeBlocks(container) {
         if (!active.thinkingEl) {
             active.thinkingEl = document.createElement('div');
             active.thinkingEl.className = 'thinking';
-            // Insert before the main content so thinking appears above.
             active.el.insertBefore(active.thinkingEl, active.contentEl);
         }
         const prev = active.thinkingBlocks.get(blockIndex) || '';
         active.thinkingBlocks.set(blockIndex, prev + delta);
-        active.thinkingEl.textContent = joinOrderedBlocks(active.thinkingBlocks);
-        scrollToBottom();
+        thinkingDirty = true;
+        scheduleActiveRender();
     }
 
     function endAssistantMessage() {
         if (!active.el) return;
+        // Force a synchronous flush of any deferred render so the
+        // empty-bubble check below and the DOM hand-off see final state.
+        flushActiveRender();
         // If the message ended up empty (tool-only turn), drop the bubble.
         if (active.contentEl.textContent.length === 0 && !active.thinkingEl) {
             active.el.remove();
@@ -652,13 +738,14 @@ function highlightCodeBlocks(container) {
             if (nameEl) nameEl.textContent = name;
             const status = card.el.querySelector('.tool-status');
             if (status) status.textContent = 'running…';
-            if (name === 'subagent') {
+            if (name === SUBAGENT_TOOL_NAME) {
                 attachSubagentPanel(card.el, callId);
                 createSubagentSection(callId, argsJson || '');
                 openSubagentPanel();
             } else {
                 attachResultPanel(card.el);
             }
+            if (name === EDIT_TOOL_NAME) card.el.classList.add('is-edit');
             toolCards.set(callId, card.el);
             scrollToBottom();
             return;
@@ -669,6 +756,7 @@ function highlightCodeBlocks(container) {
         // fresh card. Matches the v1.5.0 behavior.
         const el = document.createElement('div');
         el.className = 'tool-card';
+        if (name === EDIT_TOOL_NAME) el.classList.add('is-edit');
         const head = document.createElement('div');
         head.className = 'tool-head';
         head.innerHTML =
@@ -679,7 +767,7 @@ function highlightCodeBlocks(container) {
         el.appendChild(head);
         el.appendChild(args);
 
-        if (name === 'subagent') {
+        if (name === SUBAGENT_TOOL_NAME) {
             attachSubagentPanel(el, callId);
             createSubagentSection(callId, argsJson || '');
             openSubagentPanel();
@@ -692,7 +780,7 @@ function highlightCodeBlocks(container) {
         scrollToBottom();
     }
 
-    function endToolCall(callId, isError, toolCode, resultText) {
+    function endToolCall(callId, isError, toolCode, resultText, detailsJson) {
         finalizeSubagentSection(callId, isError);
         const el = toolCards.get(callId);
         if (!el) return;
@@ -715,23 +803,67 @@ function highlightCodeBlocks(container) {
                 entry.textContent = (isError ? '⚠ ' : '✓ ') + resultText;
                 saLog.appendChild(entry);
             }
-            if (isError && toggle) {
-                toggle.setAttribute('aria-expanded', 'true');
-                toggle.textContent = '▼';
-                saLog.removeAttribute('hidden');
-            }
+            if (isError) expandResultPanel(toggle, saLog);
             return;
         }
 
-        // Regular tool cards: populate the dedicated result log.
         const panel = el.querySelector('.tool-result-log');
-        if (panel && resultText) {
+        if (!isError && tryRenderDiffPanel(el, panel, toggle, detailsJson)) return;
+
+        if (resultText) {
             panel.textContent = resultText;
-            if (isError && toggle) {
-                toggle.setAttribute('aria-expanded', 'true');
-                toggle.textContent = '▼';
-                panel.removeAttribute('hidden');
-            }
+            if (isError) expandResultPanel(toggle, panel);
+        }
+    }
+
+    /// Render a visual diff (via diff2html) into a tool card. Adds
+    /// the `is-edit` class, auto-expands the result panel, and adds
+    /// a unified ↔ side-by-side toggle button. Falls back to plain
+    /// text if diff2html is missing or throws.
+    function renderEditDiffView(cardEl, panelEl, toggleEl, details) {
+        cardEl.classList.add('is-edit');
+        expandResultPanel(toggleEl, panelEl);
+
+        // Memoize per-mode rendered HTML so toggling between
+        // unified and side-by-side doesn't re-parse the diff.
+        const cache = {};
+        function show(mode) {
+            if (!cache[mode]) cache[mode] = renderDiffHtml(details.diff, mode, details.path);
+            panelEl.innerHTML = cache[mode];
+        }
+
+        let currentMode = 'line-by-line';
+        const viewToggle = document.createElement('button');
+        viewToggle.className = 'diff-view-toggle';
+        viewToggle.textContent = 'Side-by-side';
+        viewToggle.addEventListener('click', function () {
+            currentMode = (currentMode === 'line-by-line') ? 'side-by-side' : 'line-by-line';
+            viewToggle.textContent = (currentMode === 'line-by-line') ? 'Side-by-side' : 'Unified';
+            show(currentMode);
+        });
+        const head = cardEl.querySelector('.tool-head');
+        if (head) head.appendChild(viewToggle);
+
+        show(currentMode);
+    }
+
+    /// Render a unified-diff string into HTML or fall back to the
+    /// raw text. Returns the string to assign to `innerHTML` /
+    /// `textContent` (caller decides which by checking for an
+    /// HTML-shaped result).
+    function renderDiffHtml(diffString, mode, filePath) {
+        const fullDiff = '--- a/' + (filePath || 'file') + '\n+++ b/' + (filePath || 'file') + '\n' + diffString;
+        if (typeof Diff2Html === 'undefined') return escHtml(diffString);
+        try {
+            return Diff2Html.html(fullDiff, {
+                outputFormat: mode,
+                drawFileList: false,
+                fileContentToggle: false,
+                matching: 'lines',
+                highlight: true,
+            });
+        } catch (_) {
+            return escHtml(diffString);
         }
     }
 
@@ -856,6 +988,13 @@ function highlightCodeBlocks(container) {
         if (head) head.appendChild(toggle);
     }
 
+    function expandResultPanel(toggleEl, panelEl) {
+        if (!toggleEl) return;
+        toggleEl.setAttribute('aria-expanded', 'true');
+        toggleEl.textContent = '▼';
+        if (panelEl) panelEl.removeAttribute('hidden');
+    }
+
     /// Wire up the collapsible sub-agent progress panel on a tool card.
     /// Called from startToolCall for both fresh cards and claimed
     /// pending cards (streaming providers open a pending card before
@@ -952,22 +1091,6 @@ function highlightCodeBlocks(container) {
                 log.removeAttribute('hidden');
             }
 
-        } else if (kind === 'text_delta') {
-            el = document.createElement('div');
-            el.className = 'subagent-entry';
-            const preview = (upd.delta || '').slice(0, 60);
-            el.style.opacity = '0.6';
-            el.style.fontSize = '11px';
-            el.textContent = '› ' + preview + (upd.delta && upd.delta.length > 60 ? '…' : '');
-
-        } else if (kind === 'thinking_delta') {
-            el = document.createElement('div');
-            el.className = 'subagent-entry';
-            const preview = (upd.delta || '').slice(0, 60);
-            el.style.opacity = '0.5';
-            el.style.fontSize = '11px';
-            el.style.fontStyle = 'italic';
-            el.textContent = '› (thinking) ' + preview + (upd.delta && upd.delta.length > 60 ? '…' : '');
         }
 
         if (el) {
@@ -1344,7 +1467,7 @@ function highlightCodeBlocks(container) {
             noteEvent();
             const data = parseData(e.data);
             if (!data) return;
-            endToolCall(data.callId, !!data.isError, data.toolCode || null, data.resultText || '');
+            endToolCall(data.callId, !!data.isError, data.toolCode || null, data.resultText || '', data.detailsJson || null);
             // After a tool completes the loop usually starts the
             // next assistant turn — show "thinking…" until the
             // next message_start arrives.
@@ -2152,13 +2275,18 @@ function highlightCodeBlocks(container) {
         }
         if (!data || !Array.isArray(data.messages)) return;
 
-        // Pass 1: collect tool_result statuses keyed by toolCallId so
-        // pass 2 can paint each tool card with its final state in
-        // one go.
-        const toolStatus = new Map();
+        // Pass 1: collect tool_result status + concatenated text body
+        // keyed by toolCallId so pass 2 can paint each card's final
+        // state — including the expandable result body and, for
+        // subagent calls, the side-panel row + inline summary.
+        const toolResults = new Map();
         for (const m of data.messages) {
             if (m.role === 'toolResult' && m.toolCallId) {
-                toolStatus.set(m.toolCallId, !!m.isError);
+                const text = (m.blocks || [])
+                    .filter(b => b.kind === 'text')
+                    .map(b => b.text || '')
+                    .join('');
+                toolResults.set(m.toolCallId, { isError: !!m.isError, resultText: text });
             }
         }
 
@@ -2178,13 +2306,16 @@ function highlightCodeBlocks(container) {
                 appendFinalizedAssistantMessage(m.blocks || [], 'assistant');
                 for (const b of m.blocks || []) {
                     if (b.kind === 'tool_call' && b.id) {
-                        const isErr = toolStatus.get(b.id) === true;
-                        appendFinalizedToolCard(b.id, b.name || 'tool', isErr);
+                        const r = toolResults.get(b.id) || { isError: false, resultText: '' };
+                        appendFinalizedToolCard(b.id, b.name || 'tool', r.isError, b.args || '', r.resultText);
                     }
                 }
             }
             // toolResult, custom — skipped
         }
+
+        if (subagentSections.size > 0) openSubagentPanel();
+
         // Page just loaded / session just switched — land at the
         // bottom (newest message) regardless of saved scroll state.
         scrollToBottom(true);

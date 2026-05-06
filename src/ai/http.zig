@@ -654,11 +654,21 @@ fn fetchPhased(
     // at the SSE layer (`driveSseFromBytes`). For non-SSE
     // responses, the response_writer's own pacing applies. True
     // streaming SSE parse is post-1.0 (§N.2 `io.concurrent`).
+    //
+    // Snapshot string fields from the head before initializing the
+    // body reader: `Response.reader(...)` and
+    // `Response.readerDecompressing(...)` both call
+    // `head.invalidateStrings()`, which fills `content_type` (and the
+    // other string slices) with `undefined` (the 0xaa pattern).
+    // Reading them afterward — as the chunk-truncation tolerance check
+    // needs to do — segfaults inside `startsWithIgnoreCase`.
+    const content_type_snapshot = response.head.content_type;
+
     const response_writer = opts.response_writer orelse {
         const reader = response.reader(&.{});
         _ = reader.discardRemaining() catch {
             const body_err = response.bodyErr().?;
-            if (toleratedChunkTruncation(body_err, response.head.content_type)) {
+            if (toleratedChunkTruncation(body_err, content_type_snapshot)) {
                 return .{ .status = response.head.status };
             }
             return body_err;
@@ -684,7 +694,7 @@ fn fetchPhased(
     _ = reader.streamRemaining(response_writer) catch |e| switch (e) {
         error.ReadFailed => {
             const body_err = response.bodyErr().?;
-            if (toleratedChunkTruncation(body_err, response.head.content_type)) {
+            if (toleratedChunkTruncation(body_err, content_type_snapshot)) {
                 // Bytes streamed before the truncation are already in
                 // `response_writer`. SSE callers parse them via the
                 // `[DONE]` sentinel; nothing meaningful was lost.
@@ -1320,7 +1330,16 @@ test "driveSseFromBytesWithTimeouts fires Timeout when handler stalls past event
 
 const test_h = @import("../test_helpers.zig");
 
-const StallPhase = enum { none, first_byte };
+const StallPhase = enum {
+    none,
+    first_byte,
+    /// Replies with a chunked `text/event-stream` body, sends one
+    /// well-formed chunk, then closes the TCP connection without
+    /// the trailing `0\r\n\r\n` terminator. Used to reproduce the
+    /// Ollama-style truncation that `toleratedChunkTruncation` is
+    /// supposed to absorb.
+    chunk_truncate_sse,
+};
 
 const StallServer = struct {
     server: std.Io.net.Server,
@@ -1373,6 +1392,23 @@ fn stallServerLoop(s: *StallServer) void {
         .none => {
             const reply =
                 "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+            var wbuf: [256]u8 = undefined;
+            var w = stream.writer(s.io, &wbuf);
+            w.interface.writeAll(reply) catch {};
+            w.interface.flush() catch {};
+        },
+        .chunk_truncate_sse => {
+            // Chunked SSE reply with one valid 14-byte chunk
+            // (`data: [DONE]\n\n`) and no terminator chunk — the
+            // connection-close *is* the end-of-body, which std.http
+            // surfaces as `error.HttpChunkTruncated`.
+            const reply =
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: text/event-stream\r\n" ++
+                "Transfer-Encoding: chunked\r\n" ++
+                "Connection: close\r\n" ++
+                "\r\n" ++
+                "e\r\ndata: [DONE]\n\n\r\n";
             var wbuf: [256]u8 = undefined;
             var w = stream.writer(s.io, &wbuf);
             w.interface.writeAll(reply) catch {};
@@ -1503,6 +1539,53 @@ test "toleratedChunkTruncation: only HttpChunkTruncated on SSE is tolerated" {
     // Not tolerated: any other error class, even on SSE.
     try testing.expect(!toleratedChunkTruncation(error.ConnectionResetByPeer, "text/event-stream"));
     try testing.expect(!toleratedChunkTruncation(error.HttpChunkInvalid, "text/event-stream"));
+}
+
+// Regression: the chunk-truncation tolerance check used to read
+// `response.head.content_type` *after* `response.readerDecompressing(...)`,
+// which calls `head.invalidateStrings()` and fills the slice with
+// `undefined` (the 0xaa pattern). On a real Ollama-style truncation the
+// resulting `startsWithIgnoreCase` call segfaulted at 0xaaaaaaaaaaaaaaaa.
+// This test drives a chunked SSE response that closes without the
+// terminator chunk; the fix snapshots `content_type` before any reader
+// init, so the truncation must be tolerated and the call must succeed.
+test "fetchPhased: tolerates chunk-truncated SSE without segfaulting on invalidated head strings" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var s = bindStallServer(io, .chunk_truncate_sse, 0) orelse return;
+    defer s.server.deinit(io);
+    const server_thread = try std.Thread.spawn(.{}, stallServerLoop, .{&s});
+    defer server_thread.join();
+
+    var client = Client{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    var bw = std.Io.Writer.Allocating.init(gpa);
+    defer bw.deinit();
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/", .{s.port});
+    defer gpa.free(url);
+
+    var cancel: stream_mod.Cancel = .{};
+    var pi: PhaseInfo = .{};
+    const result = try fetchWithRetryAndTimeoutsAndHooksAndPhases(
+        &client,
+        .{ .location = .{ .url = url }, .method = .GET },
+        &bw,
+        &cancel,
+        .{ .max_retries = 0 },
+        .{ .connect_ms = 5_000, .upload_ms = 5_000, .first_byte_ms = 5_000 },
+        .{},
+        &pi,
+    );
+
+    try testing.expectEqual(@as(u16, 200), @intFromEnum(result.status));
+    // The pre-truncation chunk bytes must have been delivered to the
+    // body writer — SSE callers parse them via the `[DONE]` sentinel.
+    try testing.expectEqualStrings("data: [DONE]\n\n", bw.written());
 }
 
 // ─── v1.16.1 — writeTraceFile tests ────────────────────────────

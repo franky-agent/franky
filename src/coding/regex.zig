@@ -18,8 +18,13 @@
 //! Deliberately **not** supported (out of scope — would balloon the
 //! engine): capture groups, backreferences, lazy quantifiers (`*?`,
 //! `+?`), bounded quantifiers (`{n,m}`), lookaround, Unicode property
-//! classes. Patterns using those syntaxes surface as `InvalidEscape` or
-//! `TrailingGarbage`.
+//! classes. Patterns using those syntaxes surface as `TrailingGarbage`.
+//!
+//! Unknown escapes (`\X` where X is not in the table above) are
+//! accepted as literal `X`, matching ECMAScript / PCRE leniency. This
+//! prevents avoidable compile errors when callers over-escape (e.g.
+//! `\"` from a JSON-embedded pattern). Only a trailing `\` with no
+//! following byte still raises `InvalidEscape`.
 //!
 //! Pipeline: pattern → recursive-descent AST → bytecode `[]Op` with
 //! `split` for nondeterministic branches → depth-first backtracking
@@ -396,11 +401,10 @@ const Parser = struct {
             't' => Node{ .lit = '\t' },
             'r' => Node{ .lit = '\r' },
             '0' => Node{ .lit = 0 },
-            '.', '*', '+', '?', '|', '(', ')', '[', ']', '^', '$', '\\', '/', '-', '{', '}' => Node{ .lit = e },
-            else => blk: {
-                self.err_pos = self.pos - 1;
-                break :blk CompileError.InvalidEscape;
-            },
+            // Lenient: any other byte after `\` is taken as literal.
+            // Matches ECMAScript / PCRE behavior and avoids spurious
+            // failures when callers over-escape (e.g. `\"`).
+            else => Node{ .lit = e },
         };
     }
 
@@ -538,11 +542,8 @@ const Parser = struct {
                 't' => @as(?u8, '\t'),
                 'r' => @as(?u8, '\r'),
                 '0' => @as(?u8, 0),
-                ']', '\\', '-', '[', '^', '/', '.', '*', '+', '?', '|', '(', ')', '{', '}', '$' => @as(?u8, e),
-                else => blk: {
-                    self.err_pos = self.pos - 1;
-                    break :blk CompileError.InvalidEscape;
-                },
+                // Lenient: unknown `\X` inside a class is literal X.
+                else => @as(?u8, e),
             };
         }
         _ = self.advance();
@@ -831,10 +832,19 @@ test "regex: error — dangling quantifier" {
     try testing.expectError(CompileError.DanglingQuantifier, err);
 }
 
-test "regex: error — invalid escape" {
+test "regex: error — trailing backslash" {
     var report: ErrorReport = .{};
-    const err = compileOpts(testing.allocator, "\\q", .{}, &report);
+    const err = compileOpts(testing.allocator, "foo\\", .{}, &report);
     try testing.expectError(CompileError.InvalidEscape, err);
+}
+
+test "regex: lenient — unknown escapes are literal" {
+    // `\"` is a common over-escape from JSON-embedded patterns.
+    try expectMatch("\\\"hello\\\"", "say \"hello\" loudly");
+    // Same for any other unknown letter — `\q` is literal `q`.
+    try expectMatch("a\\qb", "aqb");
+    // Inside a character class.
+    try expectMatch("[\\q]", "q");
 }
 
 test "regex: error — invalid range" {

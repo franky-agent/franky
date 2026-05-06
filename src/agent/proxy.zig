@@ -121,6 +121,13 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
                 if (cb == .text) try combined.appendSlice(allocator, cb.text.text);
             }
             try appendJsonStr(&buf, allocator, combined.items);
+            // v2.8 — include details_json as opaque metadata for the front-end
+            // (e.g. unified diff for the edit tool). The value is already valid
+            // JSON, so we append it directly without re-encoding.
+            if (e.result.details_json) |dj| {
+                try buf.appendSlice(allocator, ",\"detailsJson\":");
+                try buf.appendSlice(allocator, dj);
+            }
         },
         .tool_permission_request => |r| {
             try buf.appendSlice(allocator, "\"kind\":\"tool_permission_request\",\"callId\":");
