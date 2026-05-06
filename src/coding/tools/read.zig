@@ -127,6 +127,7 @@ fn execute(
         switch (r) {
             .ok => |c| {
                 canon_path = c.abs;
+                if (try common.contextIgnoreError(allocator, io, ws, c.abs)) |err| return err;
                 break :blk c.abs;
             },
             .err => |e| return common.toolError(allocator, e.code, e.message),
@@ -177,6 +178,7 @@ fn executeWithCtx(
         switch (r) {
             .ok => |c| {
                 canon_path = c.abs;
+                if (try common.contextIgnoreError(allocator, io, ws, c.abs)) |err| return err;
                 break :blk c.abs;
             },
             .err => |e| return common.toolError(allocator, e.code, e.message),
@@ -490,6 +492,58 @@ test "read tool with workspace: rejects workspace escape" {
         defer res.deinit(gpa);
         try testing.expect(res.is_error);
         try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "path_escape_workspace") != null);
+    }
+}
+
+test "read tool: refuses contextignored path with structured error (v2.9)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const ws_root = "/tmp/franky_read_contextignore";
+    _ = std.Io.Dir.cwd().deleteTree(io, ws_root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, ws_root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, ws_root);
+
+    // `.contextignore` blocks `archived.md`; `current.md` stays readable.
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, ws_root ++ "/.contextignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "archived.md\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, ws_root ++ "/archived.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "secret history\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, ws_root ++ "/current.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "live notes\n");
+    }
+
+    var ws: workspace_mod.Workspace = .{ .root = ws_root };
+    const t = toolWithWorkspace(&ws);
+    var cancel = ai.stream.Cancel{};
+
+    // Contextignored path → structured `contextignored` error.
+    {
+        var res = try t.execute(&t, gpa, io, "id1", "{\"path\":\"archived.md\"}", &cancel, .{});
+        defer res.deinit(gpa);
+        try testing.expect(res.is_error);
+        try testing.expect(res.tool_code != null);
+        try testing.expectEqualStrings(common.tool_code_contextignored, res.tool_code.?);
+        // The model should never see the file's contents in the error.
+        try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "secret history") == null);
+    }
+
+    // Allowed sibling still works.
+    {
+        var res = try t.execute(&t, gpa, io, "id2", "{\"path\":\"current.md\"}", &cancel, .{});
+        defer res.deinit(gpa);
+        try testing.expect(!res.is_error);
+        try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "live notes") != null);
     }
 }
 

@@ -160,6 +160,7 @@ fn execute(
         switch (r) {
             .ok => |c| {
                 canon_path = c.abs;
+                if (try common.contextIgnoreError(allocator, io, ws, c.abs)) |err| return err;
                 break :blk c.abs;
             },
             .err => |e| return common.toolError(allocator, e.code, e.message),
@@ -1196,4 +1197,64 @@ test "applyEdits: details_json carries the format version field" {
     try testing.expect(res.details_json != null);
     // The client allowlist matches this exact string — bump in lockstep.
     try testing.expect(std.mem.indexOf(u8, res.details_json.?, "\"format\":\"unified-diff-v1\"") != null);
+}
+
+test "edit tool: refuses to modify contextignored file (v2.9)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const ws_root = "/tmp/franky_edit_contextignore";
+    _ = std.Io.Dir.cwd().deleteTree(io, ws_root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, ws_root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, ws_root);
+
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, ws_root ++ "/.contextignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "archived.md\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, ws_root ++ "/archived.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "frozen content\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, ws_root ++ "/current.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "live content\n");
+    }
+
+    var ws: workspace_mod.Workspace = .{ .root = ws_root };
+    const t = toolWithWorkspace(&ws);
+    var cancel = ai.stream.Cancel{};
+
+    // Editing the contextignored file is refused; the file on disk
+    // must remain untouched.
+    {
+        var res = try t.execute(&t, gpa, io, "id1",
+            "{\"path\":\"archived.md\",\"edits\":[{\"old\":\"frozen\",\"new\":\"changed\"}]}",
+            &cancel, .{});
+        defer res.deinit(gpa);
+        try testing.expect(res.is_error);
+        try testing.expectEqualStrings(common.tool_code_contextignored, res.tool_code.?);
+
+        // Disk content unchanged.
+        const got = try readAllAlloc(gpa, io, ws_root ++ "/archived.md");
+        defer gpa.free(got);
+        try testing.expectEqualStrings("frozen content\n", got);
+    }
+
+    // Editing a sibling that's not ignored still works.
+    {
+        var res = try t.execute(&t, gpa, io, "id2",
+            "{\"path\":\"current.md\",\"edits\":[{\"old\":\"live\",\"new\":\"updated\"}]}",
+            &cancel, .{});
+        defer res.deinit(gpa);
+        try testing.expect(!res.is_error);
+        const got = try readAllAlloc(gpa, io, ws_root ++ "/current.md");
+        defer gpa.free(got);
+        try testing.expectEqualStrings("updated content\n", got);
+    }
 }

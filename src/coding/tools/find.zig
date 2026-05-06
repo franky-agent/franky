@@ -139,11 +139,8 @@ pub fn findMatches(
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
-    var ignore_stack: ?gitignore.Stack = null;
-    defer if (ignore_stack) |*s| s.deinit();
-    if (respect_gitignore) {
-        ignore_stack = gitignore.loadFromTree(allocator, io, cwd) catch null;
-    }
+    var stacks = gitignore.loadIgnoreStacks(allocator, io, cwd, respect_gitignore);
+    defer stacks.deinit();
 
     var found: usize = 0;
     var visited: usize = 0;
@@ -162,9 +159,7 @@ pub fn findMatches(
         // recursive find from repo root pulls in thousands of object
         // hashes and derails the LLM's context.
         if (std.mem.eql(u8, entry.path, ".git") or std.mem.startsWith(u8, entry.path, ".git/")) continue;
-        if (ignore_stack) |*s| {
-            if (s.isIgnored(entry.path, false)) continue;
-        }
+        if (stacks.isIgnored(entry.path, false)) continue;
         if (globMatch(pattern, entry.path)) {
             try out.appendSlice(allocator, entry.path);
             try out.append(allocator, '\n');
@@ -421,4 +416,48 @@ test "find tool: respectGitignore drops ignored matches" {
     try testing.expect(std.mem.indexOf(u8, text, "scratch.tmp") == null);
     try testing.expect(std.mem.indexOf(u8, text, "cache.zig") == null);
     try testing.expect(std.mem.indexOf(u8, text, ".gitignore") != null);
+}
+
+test "find tool: .contextignore is enforced unconditionally (v2.9)" {
+    // Pin the v2.9 contract: contextignored paths never appear in
+    // `find` output. We pass `respect_gitignore=false` here so the
+    // behaviour is observably independent of the gitignore stack.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_find_contextignore_test";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/archive");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.contextignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "archive/\nfrozen.md\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/current.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/frozen.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/archive/old.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    var res = try findMatches(gpa, io, base, "**/*", 100, false, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "current.md") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "frozen.md") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "archive/old.md") == null);
 }

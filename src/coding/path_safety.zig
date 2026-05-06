@@ -126,12 +126,14 @@ pub fn canonicalize(
     return .{ .abs = abs };
 }
 
-fn startsInRoot(abs: []const u8, root: []const u8) bool {
+/// True if `abs` is `root` itself or a path nested under it.
+/// Honours the directory boundary so `/workspace-other` does not
+/// match `/workspace` — the byte after `root` must be `/`. Both
+/// arguments are expected to be canonical (no `.` / `..` /
+/// trailing slashes).
+pub fn startsInRoot(abs: []const u8, root: []const u8) bool {
     if (std.mem.eql(u8, abs, root)) return true;
     if (!std.mem.startsWith(u8, abs, root)) return false;
-    // Boundary: the character immediately after `root` must be '/'
-    // so "/workspace-other" doesn't pass as nested under
-    // "/workspace".
     if (abs.len == root.len) return true;
     return abs[root.len] == '/';
 }

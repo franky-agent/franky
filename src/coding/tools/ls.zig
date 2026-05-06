@@ -135,14 +135,11 @@ pub fn listPath(
     try out.appendSlice(allocator, path);
     try out.append(allocator, '\n');
 
-    // Load `.gitignore` stack up front so per-entry checks are cheap.
-    // On load failure (I/O error, no permission, etc.) we degrade to
-    // "nothing ignored" rather than refusing to list.
-    var ignore_stack: ?gitignore.Stack = null;
-    defer if (ignore_stack) |*s| s.deinit();
-    if (respect_gitignore) {
-        ignore_stack = gitignore.loadFromTree(allocator, io, path) catch null;
-    }
+    // Load `.gitignore` (gated by `respect_gitignore`) and
+    // `.contextignore` (v2.9 — always on) up front. See
+    // `gitignore.loadIgnoreStacks` for the contract.
+    var stacks = gitignore.loadIgnoreStacks(allocator, io, path, respect_gitignore);
+    defer stacks.deinit();
 
     var count: usize = 0;
 
@@ -160,9 +157,7 @@ pub fn listPath(
             // `respectGitignore=true` it would otherwise show up. No
             // legitimate ls result lives in there for an LLM agent.
             if (std.mem.eql(u8, entry.name, ".git")) continue;
-            if (ignore_stack) |*s| {
-                if (s.isIgnored(entry.name, entry.kind == .directory)) continue;
-            }
+            if (stacks.isIgnored(entry.name, entry.kind == .directory)) continue;
             try appendEntry(&out, allocator, 0, entry.name, entry.kind);
             count += 1;
         }
@@ -180,9 +175,7 @@ pub fn listPath(
             // Hard-skip `.git` (and its subtree) regardless of
             // `.gitignore`. See note in the non-recursive branch.
             if (std.mem.eql(u8, entry.path, ".git") or std.mem.startsWith(u8, entry.path, ".git/")) continue;
-            if (ignore_stack) |*s| {
-                if (s.isIgnored(entry.path, entry.kind == .directory)) continue;
-            }
+            if (stacks.isIgnored(entry.path, entry.kind == .directory)) continue;
             try appendEntry(&out, allocator, depth, entry.path, entry.kind);
             count += 1;
         }
@@ -377,6 +370,62 @@ test "ls tool: hard-skips .git directory regardless of respectGitignore" {
     const text_flat = res_flat.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text_flat, "foo.zig") != null);
     try testing.expect(std.mem.indexOf(u8, text_flat, ".git") == null);
+}
+
+test "ls tool: .contextignore is enforced unconditionally (v2.9)" {
+    // Pin the v2.9 contract: `.contextignore` paths are hidden from `ls`
+    // regardless of any argument the model passes. We run with
+    // `respect_gitignore=false` so contextignore behavior is observably
+    // independent of the gitignore stack.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_ls_contextignore_test";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/archive");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.contextignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "archive/\nfrozen.md\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/current.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/frozen.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/archive/old.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+
+    // Recursive listing — gitignore disabled, contextignore still applies.
+    var res_rec = try listPath(gpa, io, base, true, 10, false, &cancel);
+    defer res_rec.deinit(gpa);
+    const text_rec = res_rec.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text_rec, "current.md") != null);
+    try testing.expect(std.mem.indexOf(u8, text_rec, "frozen.md") == null);
+    try testing.expect(std.mem.indexOf(u8, text_rec, "archive") == null);
+    try testing.expect(std.mem.indexOf(u8, text_rec, "old.md") == null);
+
+    // Non-recursive listing — same expectation at the top level.
+    var res_flat = try listPath(gpa, io, base, false, 1, false, &cancel);
+    defer res_flat.deinit(gpa);
+    const text_flat = res_flat.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text_flat, "current.md") != null);
+    try testing.expect(std.mem.indexOf(u8, text_flat, "frozen.md") == null);
+    try testing.expect(std.mem.indexOf(u8, text_flat, "archive") == null);
 }
 
 test "ls tool: respectGitignore=false preserves full listing" {

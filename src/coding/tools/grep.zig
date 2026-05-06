@@ -253,15 +253,12 @@ pub fn grepTree(
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
-    // Mirror the find/ls pattern: load every `.gitignore` under `cwd`
-    // once and consult `Stack.isIgnored` per entry. Falls back silently
-    // to "no ignore" when the load fails (e.g. no permission to walk
-    // the tree) — same behavior as find.zig.
-    var ignore_stack: ?gitignore.Stack = null;
-    defer if (ignore_stack) |*s| s.deinit();
-    if (respect_gitignore) {
-        ignore_stack = gitignore.loadFromTree(allocator, io, cwd) catch null;
-    }
+    // Mirror the find/ls pattern: load both ignore stacks once and
+    // consult them per entry. See `gitignore.loadIgnoreStacks` for
+    // the contract (gitignore is gated by `respect_gitignore`;
+    // contextignore is v2.9-unconditional).
+    var stacks = gitignore.loadIgnoreStacks(allocator, io, cwd, respect_gitignore);
+    defer stacks.deinit();
 
     var total: usize = 0;
     var any_line_truncated: bool = false;
@@ -274,9 +271,7 @@ pub fn grepTree(
         // legitimate grep result lives in there, and even one
         // packfile lookup is enough to derail a search.
         if (std.mem.startsWith(u8, entry.path, ".git/") or std.mem.eql(u8, entry.path, ".git")) continue;
-        if (ignore_stack) |*s| {
-            if (s.isIgnored(entry.path, false)) continue;
-        }
+        if (stacks.isIgnored(entry.path, false)) continue;
         if (files_glob) |g| if (!find_mod.globMatch(g, entry.path)) continue;
         if (total >= max_matches) {
             match_limit_reached = true;
@@ -897,6 +892,55 @@ test "grep tool: respectGitignore drops ignored matches (v1.26.2 regression)" {
     const text2 = res2.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text2, "visible.txt") != null);
     try testing.expect(std.mem.indexOf(u8, text2, "cache/leak.txt") != null);
+}
+
+test "grep tool: .contextignore is enforced unconditionally (v2.9)" {
+    // Pin the v2.9 contract: contextignored paths never appear in
+    // `grep` output, even with `respect_gitignore=false`. The needle
+    // is the same in every file so we can prove suppression by
+    // looking only at filenames in the result.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_grep_contextignore";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/archive");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.contextignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "archive/\nfrozen.md\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/current.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "needle here\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/frozen.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "needle in frozen\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/archive/old.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "needle in archive\n");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    var m = try regexMatcher("needle", false);
+    defer m.deinit();
+
+    // respect_gitignore=false — contextignore still suppresses.
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, false, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "current.md") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "frozen.md") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "archive/old.md") == null);
 }
 
 test "grep tool: path pointing to a single file works" {

@@ -75,6 +75,7 @@ fn execute(
         switch (r) {
             .ok => |c| {
                 canon_path = c.abs;
+                if (try common.contextIgnoreError(allocator, io, ws, c.abs)) |err| return err;
                 break :blk c.abs;
             },
             .err => |e| return common.toolError(allocator, e.code, e.message),
@@ -187,4 +188,47 @@ test "write overwrite=true replaces file" {
     var r2 = try writeFile(gpa, io, tmp, "second", true);
     defer r2.deinit(gpa);
     try testing.expect(!r2.is_error);
+}
+
+test "write tool: refuses to create at contextignored path (v2.9)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const ws_root = "/tmp/franky_write_contextignore";
+    _ = std.Io.Dir.cwd().deleteTree(io, ws_root) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, ws_root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, ws_root);
+
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, ws_root ++ "/.contextignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "archived/\n");
+    }
+
+    var ws: workspace_mod.Workspace = .{ .root = ws_root };
+    const t = toolWithWorkspace(&ws);
+    var cancel = ai.stream.Cancel{};
+
+    // Writing under the ignored directory → structured refusal; nothing
+    // hits disk.
+    {
+        var res = try t.execute(&t, gpa, io, "id1",
+            "{\"path\":\"archived/note.md\",\"content\":\"x\"}", &cancel, .{});
+        defer res.deinit(gpa);
+        try testing.expect(res.is_error);
+        try testing.expectEqualStrings(common.tool_code_contextignored, res.tool_code.?);
+        // File must not have been created.
+        const file_or_err = std.Io.Dir.cwd().openFile(io, ws_root ++ "/archived/note.md", .{});
+        try testing.expectError(error.FileNotFound, file_or_err);
+    }
+
+    // Allowed sibling write still works.
+    {
+        var res = try t.execute(&t, gpa, io, "id2",
+            "{\"path\":\"current.md\",\"content\":\"x\"}", &cancel, .{});
+        defer res.deinit(gpa);
+        try testing.expect(!res.is_error);
+    }
 }

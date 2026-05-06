@@ -13,6 +13,13 @@ const ai = struct {
     pub const types = @import("../../ai/types.zig");
 };
 const at = @import("../../agent/types.zig");
+const gitignore = @import("../gitignore.zig");
+const workspace_mod = @import("workspace.zig");
+
+/// v2.9 — tool_code emitted when a single-path tool refuses a path
+/// covered by `.contextignore`. Single literal so call sites and
+/// test assertions stay in sync.
+pub const tool_code_contextignored: []const u8 = "contextignored";
 
 /// Build a structured failure `ToolResult`. The rendered text
 /// carries `"[{code}] {msg}"` so models (and developers reading
@@ -29,6 +36,29 @@ pub fn toolError(
     arr[0] = .{ .text = .{ .text = text } };
     const code_dup = try allocator.dupe(u8, code);
     return .{ .content = arr, .is_error = true, .tool_code = code_dup };
+}
+
+/// v2.9 — return a `contextignored` `ToolResult` if `abs_path` is
+/// suppressed by any `.contextignore` under `workspace.root`, else
+/// null. Used by single-path tools (`read`/`write`/`edit`) to
+/// enforce the unconditional v2.9 gate.
+///
+/// Idiom at the call site:
+/// ```zig
+/// if (try common.contextIgnoreError(allocator, io, ws, abs)) |err| return err;
+/// ```
+pub fn contextIgnoreError(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace: *const workspace_mod.Workspace,
+    abs_path: []const u8,
+) !?at.ToolResult {
+    if (!gitignore.isContextIgnored(allocator, io, workspace.root, abs_path)) return null;
+    return try toolError(
+        allocator,
+        tool_code_contextignored,
+        "path is in .contextignore — archived/historical content not available to the model",
+    );
 }
 
 // ─── tests ────────────────────────────────────────────────────────

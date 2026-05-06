@@ -35,6 +35,7 @@
 //!     this too in most cases; we model the strict form).
 
 const std = @import("std");
+const path_safety = @import("path_safety.zig");
 
 // ─── Patterns ─────────────────────────────────────────────────────────
 
@@ -123,6 +124,92 @@ pub fn loadFromTree(
     io: std.Io,
     scan_root: []const u8,
 ) !Stack {
+    return loadFromTreeNamed(allocator, io, scan_root, ".gitignore");
+}
+
+/// Bundles the two ignore stacks every tree-walking tool consults:
+/// `.gitignore` (model-controllable via the tool's `respectGitignore`
+/// argument) and `.contextignore` (v2.9 — enforced unconditionally;
+/// no tool argument can disable it). `isIgnored` returns true when
+/// either stack matches.
+pub const IgnoreStacks = struct {
+    gitignore: ?Stack = null,
+    contextignore: ?Stack = null,
+
+    pub fn deinit(self: *IgnoreStacks) void {
+        if (self.gitignore) |*s| s.deinit();
+        if (self.contextignore) |*s| s.deinit();
+        self.* = .{};
+    }
+
+    pub fn isIgnored(self: *const IgnoreStacks, rel_path: []const u8, is_dir: bool) bool {
+        if (self.gitignore) |*s| if (s.isIgnored(rel_path, is_dir)) return true;
+        if (self.contextignore) |*s| if (s.isIgnored(rel_path, is_dir)) return true;
+        return false;
+    }
+};
+
+/// Load the two stacks every tree-walking tool consults. The
+/// gitignore stack is loaded only when `load_gitignore` is true
+/// (mirrors the tool's `respectGitignore` argument); the
+/// contextignore stack is always loaded (v2.9 unconditional gate).
+/// On per-stack load failure the corresponding field stays null —
+/// callers degrade to "nothing ignored" rather than refusing the
+/// whole tool call. Pair with `defer IgnoreStacks.deinit`.
+pub fn loadIgnoreStacks(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scan_root: []const u8,
+    load_gitignore: bool,
+) IgnoreStacks {
+    var stacks: IgnoreStacks = .{};
+    if (load_gitignore) {
+        stacks.gitignore = loadFromTree(allocator, io, scan_root) catch null;
+    }
+    stacks.contextignore = loadFromTreeNamed(allocator, io, scan_root, ".contextignore") catch null;
+    return stacks;
+}
+
+/// v2.9 — is `abs_path` suppressed by any `.contextignore` under
+/// `workspace_root`? Used by single-path tools (read/write/edit) to
+/// enforce the unconditional gate. `abs_path` is the canonical
+/// absolute path from `path_safety.canonicalize`; the workspace
+/// prefix is stripped internally via `path_safety.startsInRoot`.
+///
+/// Returns `true` (refuse) on load failure — failing closed honours
+/// the v2.9 "no bypass" contract.
+///
+/// TODO(v2.9.x perf): the stack is reloaded per call. For sessions
+/// with many edits on large repos this re-walks the tree each time.
+/// Cache at the `Workspace` level (invalidate on `.contextignore`
+/// mtime change) when profiling warrants it.
+pub fn isContextIgnored(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_root: []const u8,
+    abs_path: []const u8,
+) bool {
+    if (!path_safety.startsInRoot(abs_path, workspace_root)) return false;
+    var rel = abs_path[workspace_root.len..];
+    while (rel.len > 0 and rel[0] == '/') rel = rel[1..];
+    if (rel.len == 0) return false; // path == workspace root
+
+    var stack = loadFromTreeNamed(allocator, io, workspace_root, ".contextignore") catch return true;
+    defer stack.deinit();
+    return stack.isIgnored(rel, false);
+}
+
+/// Same shape as `loadFromTree` but loads patterns from files named
+/// `filename` rather than `.gitignore`. Used to support `.contextignore`
+/// (see v2.9) through the same nested-rules + glob-matching machinery.
+/// `filename` should not contain a path separator — it's matched against
+/// `std.fs.path.basename(entry.path)` during the tree walk.
+pub fn loadFromTreeNamed(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scan_root: []const u8,
+    filename: []const u8,
+) !Stack {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
 
@@ -144,18 +231,18 @@ pub fn loadFromTree(
 
     const arena_alloc = arena.allocator();
 
-    // Root `.gitignore` is never visible to walker under some backends
-    // (its path would be ".gitignore" with `dirname = null`); probe it
-    // explicitly.
-    if (fileExists(io, &root, ".gitignore")) {
+    // Root file is never visible to walker under some backends (its
+    // path would be just the basename with `dirname = null`); probe
+    // it explicitly.
+    if (fileExists(io, &root, filename)) {
         try base_dirs.append(allocator, try arena_alloc.dupe(u8, ""));
     }
 
     var walker = root.walk(allocator) catch {
-        // Walk failure — fall back to just the root .gitignore we
-        // already queued, parse it, and return.
+        // Walk failure — fall back to just the root file we already
+        // queued, parse it, and return.
         for (base_dirs.items) |bd| {
-            try loadOne(&arena, &patterns, allocator, io, &root, bd);
+            try loadOne(&arena, &patterns, allocator, io, &root, bd, filename);
         }
         return .{
             .allocator = allocator,
@@ -168,7 +255,7 @@ pub fn loadFromTree(
     while (walker.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         const base = std.fs.path.basename(entry.path);
-        if (!std.mem.eql(u8, base, ".gitignore")) continue;
+        if (!std.mem.eql(u8, base, filename)) continue;
         const dir_slice = std.fs.path.dirname(entry.path) orelse "";
         if (dir_slice.len == 0) continue; // root already probed
         try base_dirs.append(allocator, try arena_alloc.dupe(u8, dir_slice));
@@ -177,7 +264,7 @@ pub fn loadFromTree(
     // Pass 2 — sort shallowest first, then parse in that order.
     std.mem.sort([]const u8, base_dirs.items, {}, cmpByDepth);
     for (base_dirs.items) |bd| {
-        try loadOne(&arena, &patterns, allocator, io, &root, bd);
+        try loadOne(&arena, &patterns, allocator, io, &root, bd, filename);
     }
 
     return .{
@@ -264,9 +351,10 @@ fn loadOne(
     io: std.Io,
     root: *std.Io.Dir,
     rel_dir: []const u8,
+    filename: []const u8,
 ) !void {
-    const sub_path = if (rel_dir.len == 0) ".gitignore" else blk: {
-        break :blk try std.fs.path.join(out_alloc, &.{ rel_dir, ".gitignore" });
+    const sub_path = if (rel_dir.len == 0) filename else blk: {
+        break :blk try std.fs.path.join(out_alloc, &.{ rel_dir, filename });
     };
     defer if (rel_dir.len != 0) out_alloc.free(sub_path);
 
@@ -274,7 +362,7 @@ fn loadOne(
     defer file.close(io);
 
     const len = file.length(io) catch return;
-    if (len > 1 * 1024 * 1024) return; // ignore absurdly-large .gitignore files
+    if (len > 1 * 1024 * 1024) return; // ignore absurdly-large pattern files
     const bytes = out_alloc.alloc(u8, @intCast(len)) catch return;
     defer out_alloc.free(bytes);
     const n = file.readPositionalAll(io, bytes, 0) catch return;
@@ -648,4 +736,111 @@ test "gitignore: loadFromTree walks and composes files on disk" {
     try testing.expect(st.isIgnored("build", true));
     try testing.expect(st.isIgnored("sub/foo.log", false));
     try testing.expect(!st.isIgnored("sub/keep.log", false));
+}
+
+// v2.9 — `.contextignore` rides on the same matcher as `.gitignore`
+// via `loadFromTreeNamed`. The two tests below pin that behaviour:
+// (1) a `.contextignore`-named file produces an identical-shape stack;
+// (2) both files coexist in the same tree without interference.
+
+test "gitignore: loadFromTreeNamed loads .contextignore files (v2.9)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{
+        .argv0 = .empty,
+        .environ = .empty,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_contextignore_tree";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/sub");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.contextignore", .{});
+        defer f.close(io);
+        // `docs/archive/` (trailing slash) is the gitignore idiom for
+        // "this directory and everything inside it" — relies on the
+        // ancestor-prefix walk in `isIgnored` to propagate to children.
+        try f.writeStreamingAll(io, "docs/archive/\n*.legacy\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/sub/.contextignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "old/\n");
+    }
+
+    var st = try loadFromTreeNamed(gpa, io, base, ".contextignore");
+    defer st.deinit();
+
+    try testing.expect(st.patterns.len == 3);
+    // `docs/archive` itself is ignored (dir-only pattern); files inside
+    // are ignored via the ancestor-prefix walk in `isIgnored`.
+    try testing.expect(st.isIgnored("docs/archive", true));
+    try testing.expect(st.isIgnored("docs/archive/v0.md", false));
+    try testing.expect(st.isIgnored("foo.legacy", false));
+    try testing.expect(st.isIgnored("sub/old", true));
+    try testing.expect(!st.isIgnored("docs/spec/v2.md", false));
+}
+
+test "gitignore: .gitignore and .contextignore coexist as independent stacks (v2.9)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{
+        .argv0 = .empty,
+        .environ = .empty,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_dual_ignore_tree";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.gitignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "*.log\n");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.contextignore", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "docs/archive/\n");
+    }
+
+    var git_stack = try loadFromTree(gpa, io, base);
+    defer git_stack.deinit();
+    var ctx_stack = try loadFromTreeNamed(gpa, io, base, ".contextignore");
+    defer ctx_stack.deinit();
+
+    // Each stack only sees its own file's rules.
+    try testing.expect(git_stack.isIgnored("foo.log", false));
+    try testing.expect(!git_stack.isIgnored("docs/archive/x.md", false));
+    try testing.expect(ctx_stack.isIgnored("docs/archive/x.md", false));
+    try testing.expect(!ctx_stack.isIgnored("foo.log", false));
+}
+
+test "gitignore: loadFromTreeNamed on a tree without that file returns an empty stack (v2.9)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{
+        .argv0 = .empty,
+        .environ = .empty,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_empty_ctx_tree";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/sub");
+
+    var st = try loadFromTreeNamed(gpa, io, base, ".contextignore");
+    defer st.deinit();
+
+    try testing.expect(st.patterns.len == 0);
+    // Anything is allowed when no patterns exist.
+    try testing.expect(!st.isIgnored("foo", false));
+    try testing.expect(!st.isIgnored("sub/bar.log", false));
 }
