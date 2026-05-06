@@ -114,6 +114,10 @@ pub const StreamCtx = struct {
     out: *Channel,
     /// Opaque provider state — e.g., a FauxProvider ptr for the faux API.
     userdata: ?*anyopaque = null,
+    /// Optional persistent HTTP client for connection reuse across turns.
+    /// Providers cast to `*@import("http.zig").Client`. Null = per-request
+    /// client (legacy). Caller owns the lifetime.
+    http_client: ?*anyopaque = null,
 };
 
 pub const Entry = struct {

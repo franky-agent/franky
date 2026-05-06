@@ -23,6 +23,7 @@ const ai = struct {
     pub const channel = @import("../ai/channel.zig");
     pub const registry = @import("../ai/registry.zig");
     pub const log = @import("../ai/log.zig");
+    pub const http = @import("../ai/http.zig");
 };
 const at = @import("types.zig");
 
@@ -312,6 +313,24 @@ pub fn agentLoop(
     config: Config,
     out: *AgentChannel,
 ) void {
+    // Create one HTTP client per loop run so the connection pool is
+    // reused across turns (avoids a full TLS handshake on every LLM
+    // call). Proxy settings are applied once here rather than per-turn.
+    var loop_client = ai.http.Client{ .allocator = allocator, .io = io };
+    var loop_proxy_arena: ?std.heap.ArenaAllocator = null;
+    // Single defer block — client.deinit() must run before proxy_arena.deinit()
+    // because the client holds pointers into the arena (proxy host/auth strings).
+    defer {
+        loop_client.deinit();
+        if (loop_proxy_arena) |*a| a.deinit();
+    }
+    if (config.stream_options.environ_map) |env_map| {
+        loop_proxy_arena = ai.http.setupClientFromEnv(&loop_client, allocator, env_map) catch |e| blk: {
+            ai.log.log(.warn, "loop", "proxy_setup_failed", "err={s}", .{@errorName(e)});
+            break :blk null;
+        };
+    }
+
     var turn_count: u32 = 0;
     var current_cap: u32 = config.max_turns;
     cap_loop: while (true) {
@@ -329,7 +348,7 @@ pub fn agentLoop(
                     return;
                 }
             }
-            const keep_going = runTurn(allocator, io, transcript, config, out) catch |err| {
+            const keep_going = runTurn(allocator, io, transcript, config, out, @ptrCast(&loop_client)) catch |err| {
                 pushAgentError(out, io, allocator, agentErrorCode(err), @errorName(err)) catch {};
                 return;
             };
@@ -391,6 +410,7 @@ fn runTurn(
     transcript: *Transcript,
     config: Config,
     out: *AgentChannel,
+    http_client: ?*anyopaque,
 ) !bool {
     try out.push(io, .turn_start);
     ai.log.log(.debug, "turn", "start", "messages_in_transcript={d}", .{transcript.messages.items.len});
@@ -435,6 +455,7 @@ fn runTurn(
         .context = context,
         .options = opts,
         .out = &stream_ch,
+        .http_client = http_client,
     });
 
     try out.push(io, .{ .message_start = .{ .role = .assistant } });

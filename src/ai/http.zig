@@ -68,6 +68,12 @@ pub const Timeouts = registry_mod.Timeouts;
 // background, and `vendored/http_client.zig` for the patched source.
 pub const Client = @import("vendored/http_client.zig");
 
+/// Cast an opaque `StreamCtx.http_client` handle back to a typed pointer.
+/// The inverse of `@ptrCast(client_ptr)` at the call site.
+pub fn clientFromOpaque(h: *anyopaque) *Client {
+    return @ptrCast(@alignCast(h));
+}
+
 // ─── client setup ────────────────────────────────────────────────
 //
 // `setupClientFromEnv` consolidates proxy setup for any `Client`
@@ -596,10 +602,6 @@ fn fetchPhased(
         .headers = opts.headers,
         .extra_headers = opts.extra_headers,
         .privileged_headers = opts.privileged_headers,
-        // v1.8.0: force-close per request — a watchdog-killed
-        // connection MUST NOT go back in the pool. Re-handshake
-        // cost is acceptable; correctness wins.
-        .keep_alive = false,
     }) catch |e| {
         if (disarmPhase(guard)) return error.Timeout;
         return e;

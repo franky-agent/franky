@@ -617,37 +617,31 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 
     // Reuse streamSse by capturing bytes into the Allocating writer, then
     // hand the bytes to runFromSse.
-    var client = http_mod.Client{ .allocator = ctx.allocator, .io = ctx.io };
-    // v1.29.7 — `setupClientFromEnv` returns a proxy arena that
-    // must outlive the client. Single `defer { … }` block pins
-    // the order: client.deinit() first (uses proxy pointers),
-    // then the arena (frees them).
+    var local_client: http_mod.Client = undefined;
     var proxy_arena: ?std.heap.ArenaAllocator = null;
-    defer {
-        client.deinit();
+    const client: *http_mod.Client = if (ctx.http_client) |h|
+        @ptrCast(@alignCast(h))
+    else blk: {
+        local_client = .{ .allocator = ctx.allocator, .io = ctx.io };
+        if (ctx.options.environ_map) |env_map| {
+            proxy_arena = http_mod.setupClientFromEnv(&local_client, ctx.allocator, env_map) catch |e| {
+                try ctx.out.push(ctx.io, .start);
+                ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
+                    .code = errors.Code.transport,
+                    .message = try std.fmt.allocPrint(ctx.allocator, "client setup failed: {s}", .{@errorName(e)}),
+                } });
+                return;
+            };
+        }
+        break :blk &local_client;
+    };
+    defer if (ctx.http_client == null) {
+        local_client.deinit();
         if (proxy_arena) |*a| a.deinit();
-    }
+    };
 
-    // Honor HTTP(S)_PROXY / NO_PROXY when the caller supplied an
-    // environ map. Skipping this makes direct calls to `api.anthropic.com`
-    // fail with ConnectionRefused behind corporate / sandbox proxies.
-    if (ctx.options.environ_map) |env_map| {
-        proxy_arena = http_mod.setupClientFromEnv(&client, ctx.allocator, env_map) catch |e| {
-            try ctx.out.push(ctx.io, .start);
-            ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
-                .code = errors.Code.transport,
-                .message = try std.fmt.allocPrint(ctx.allocator, "client setup failed: {s}", .{@errorName(e)}),
-            } });
-            return;
-        };
-    }
-
-    // §F.1 retry wrap: 5xx + 429 + transient transport errors
-    // retried up to 3 times with decorrelated-jitter backoff.
-    // `fetchWithRetry` resets `bw` between attempts so a failed
-    // attempt doesn't leak body bytes into the next.
     var phase_info: http_mod.PhaseInfo = .{};
-    const result = http_mod.fetchWithRetryAndTimeoutsAndHooksAndPhases(&client, .{
+    const result = http_mod.fetchWithRetryAndTimeoutsAndHooksAndPhases(client, .{
         .location = .{ .url = default_endpoint },
         .method = .POST,
         .payload = body,

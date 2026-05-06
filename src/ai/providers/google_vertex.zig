@@ -95,31 +95,34 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 
     const cancel = ctx.options.cancel orelse unreachable;
 
-    var client = http_mod.Client{ .allocator = ctx.allocator, .io = ctx.io };
-    // v1.29.7 — proxy arena outlives the client; see anthropic.zig
-    // for the full lifetime rationale.
+    var local_client: http_mod.Client = undefined;
     var proxy_arena: ?std.heap.ArenaAllocator = null;
-    defer {
-        client.deinit();
+    const client: *http_mod.Client = if (ctx.http_client) |h|
+        @ptrCast(@alignCast(h))
+    else blk: {
+        local_client = .{ .allocator = ctx.allocator, .io = ctx.io };
+        if (ctx.options.environ_map) |env_map| {
+            proxy_arena = http_mod.setupClientFromEnv(&local_client, ctx.allocator, env_map) catch |e| {
+                try ctx.out.push(ctx.io, .start);
+                ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
+                    .code = errors.Code.transport,
+                    .message = try std.fmt.allocPrint(ctx.allocator, "client setup failed: {s}", .{@errorName(e)}),
+                } });
+                return;
+            };
+        }
+        break :blk &local_client;
+    };
+    defer if (ctx.http_client == null) {
+        local_client.deinit();
         if (proxy_arena) |*a| a.deinit();
-    }
-
-    if (ctx.options.environ_map) |env_map| {
-        proxy_arena = http_mod.setupClientFromEnv(&client, ctx.allocator, env_map) catch |e| {
-            try ctx.out.push(ctx.io, .start);
-            ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
-                .code = errors.Code.transport,
-                .message = try std.fmt.allocPrint(ctx.allocator, "client setup failed: {s}", .{@errorName(e)}),
-            } });
-            return;
-        };
-    }
+    };
 
     var bw = std.Io.Writer.Allocating.init(ctx.allocator);
     defer bw.deinit();
 
     var phase_info: http_mod.PhaseInfo = .{};
-    const result = http_mod.fetchWithRetryAndTimeoutsAndHooksAndPhases(&client, .{
+    const result = http_mod.fetchWithRetryAndTimeoutsAndHooksAndPhases(client, .{
         .location = .{ .url = endpoint },
         .method = .POST,
         .payload = body,
