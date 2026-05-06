@@ -53,15 +53,12 @@
 //! security envelope franky enforces.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const posix = std.posix;
 const franky = @import("../../root.zig");
 const ai = franky.ai;
 const agent = franky.agent;
 const at = agent.types;
 const cli_mod = franky.coding.cli;
 const print_mode = @import("print.zig");
-const profiler = @import("profiler");
 const tools_mod = franky.coding.tools;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
@@ -91,35 +88,6 @@ pub const RunError = error{
     BindFailed,
 } || std.mem.Allocator.Error;
 
-// ─── shutdown-on-signal ───────────────────────────────────────────
-//
-// The proxy's accept loop runs in an infinite `while (true)`.  The
-// default SIGINT / SIGTERM behaviour kills the process immediately,
-// skipping `defer` blocks and losing the profiler dump.  We install
-// a simple handler that sets an atomic flag and relies on the
-// handler having NO `SA_RESTART` flag, so the kernel `accept()`
-// syscall returns EINTR.  The error falls through to the `else`
-// branch of the accept catch, where we check the flag and return
-// gracefully through the defer chain.
-
-var g_shutdown_requested: std.atomic.Value(bool) = .init(false);
-
-fn shutdownSignalHandler(signo: posix.SIG) callconv(.c) void {
-    _ = signo;
-    g_shutdown_requested.store(true, .release);
-}
-
-fn installShutdownHandler() void {
-    if (builtin.os.tag == .windows) return;
-    var sa: posix.Sigaction = .{
-        .handler = .{ .handler = shutdownSignalHandler },
-        .mask = posix.sigemptyset(),
-        .flags = 0, // no SA_RESTART => accept() returns EINTR on signal
-    };
-    posix.sigaction(.INT, &sa, null);
-    posix.sigaction(.TERM, &sa, null);
-}
-
 /// Entry point — run an HTTP+SSE proxy listener on
 /// `cfg.proxy_host:cfg.proxy_port` (defaults `127.0.0.1:8787`).
 /// Blocks until the listener is shut down (Ctrl-C / SIGTERM).
@@ -134,25 +102,9 @@ pub fn run(
     try initSession(&session, allocator, io, environ, environ_map, cfg);
     defer session.deinit();
 
-    // ── Profiler ───────────────────────────────────────────────
-    profiler.init(.{ .allocator = allocator }) catch {};
-    defer {
-        profiler.dump("franky-proxy-profile.json", io) catch |err| {
-            ai.log.log(.warn, "profiler", "dump_failed", "error={s}", .{@errorName(err)});
-        };
-        profiler.deinit();
-    }
-    const _pzone = profiler.begin(@src(), "runProxy");
-    defer _pzone.end();
-
     // v1.18.0 — re-init the logger to a per-session path now that
     // we know the session id. Best-effort; falls through on failure.
     print_mode.maybeReinitLoggerForSession(allocator, io, cfg, environ_map, session.session_id);
-
-    // Reset shutdown flag (handlers from a previous mode must not
-    // linger and cause a false-positive exit).
-    g_shutdown_requested.store(false, .release);
-    installShutdownHandler();
 
     const port = cfg.proxy_port orelse default_port;
     var addr = std.Io.net.IpAddress.parseIp4(default_host, port) catch return error.BindFailed;
@@ -174,20 +126,9 @@ pub fn run(
     sw.interface.flush() catch {};
 
     while (true) {
-        // Check before blocking accept() in case the signal arrived
-        // between the last iteration and this one.
-        if (g_shutdown_requested.load(.acquire)) return;
-
         var stream = server.accept(io) catch |err| switch (err) {
             error.Canceled => return,
-            else => {
-                // errno from a signal-interrupted accept() — or any
-                // transient failure — falls through here.  Check the
-                // shutdown flag; if set, return gracefully so defers
-                // (profiler dump, session deinit, etc.) run.
-                if (g_shutdown_requested.load(.acquire)) return;
-                continue;
-            },
+            else => continue,
         };
         // Each connection owns its own thread. `handleConnection`
         // takes ownership of the stream and closes it on exit.

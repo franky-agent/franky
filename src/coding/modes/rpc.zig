@@ -28,7 +28,6 @@ const at = agent.types;
 const rpc = franky.coding.rpc;
 const cli_mod = franky.coding.cli;
 const print_mode = @import("print.zig");
-const profiler = @import("profiler");
 const tools_mod = franky.coding.tools;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
@@ -51,17 +50,6 @@ pub fn run(
     var session: Session = undefined;
     try initSession(&session, allocator, io, environ, environ_map, cfg);
     defer session.deinit();
-
-    // ── Profiler ───────────────────────────────────────────────
-    profiler.init(.{ .allocator = allocator }) catch {};
-    defer {
-        profiler.dump("franky-rpc-profile.json", io) catch |err| {
-            ai.log.log(.warn, "profiler", "dump_failed", "error={s}", .{@errorName(err)});
-        };
-        profiler.deinit();
-    }
-    const _pzone = profiler.begin(@src(), "runRpc");
-    defer _pzone.end();
 
     // Note: `--log-per-session` is a no-op in rpc mode. RPC mode
     // multiplexes virtual sessions through JSON-RPC `session.create`

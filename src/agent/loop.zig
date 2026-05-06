@@ -316,9 +316,6 @@ pub fn agentLoop(
     var current_cap: u32 = config.max_turns;
     cap_loop: while (true) {
         while (turn_count < current_cap) : (turn_count += 1) {
-            // Mark frame boundary for profiler (Trace Event Format).
-            @import("profiler").frameMark();
-
             if (config.cancel.isFired()) {
                 pushAgentError(out, io, allocator, .aborted, "cancelled") catch {};
                 return;

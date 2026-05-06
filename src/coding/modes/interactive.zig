@@ -49,7 +49,6 @@ const permissions_mod = franky.coding.permissions;
 const models_mod = franky.coding.models;
 const term_mod = @import("../terminal.zig");
 const print_mode = @import("print.zig");
-const profiler = @import("profiler");
 
 const RunError = error{InteractiveNotSupported} || std.mem.Allocator.Error;
 
@@ -141,16 +140,6 @@ fn runInteractive(
         }
     }
 
-    // ── Profiler ───────────────────────────────────────────────
-    profiler.init(.{ .allocator = allocator }) catch {};
-    defer {
-        profiler.dump("franky-interactive-profile.json", io) catch |err| {
-            ai.log.log(.warn, "profiler", "dump_failed", "error={s}", .{@errorName(err)});
-        };
-        profiler.deinit();
-    }
-    const _pzone = profiler.begin(@src(), "runInteractive");
-    defer _pzone.end();
 
     // ── Terminal setup ─────────────────────────────────────────────
     var terminal = term_mod.Terminal.enter(stdin.handle, stdout.handle) catch |err| {

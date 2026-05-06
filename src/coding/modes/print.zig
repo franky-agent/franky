@@ -32,7 +32,6 @@ const models_mod = franky.coding.models;
 const branching_mod = franky.coding.branching;
 const skills_mod = franky.coding.skills;
 const diagnostics_mod = franky.coding.diagnostics;
-const profiler = @import("profiler");
 
 /// Default model when the user didn't pass `--model`. Sonnet 4.6 is
 /// the current cost/latency sweet spot; Opus 4.6 is reachable via
@@ -202,17 +201,6 @@ fn runPrint(
 ) !void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
-
-    // ── Profiler ───────────────────────────────────────────────
-    profiler.init(.{ .allocator = allocator }) catch {};
-    defer {
-        profiler.dump("franky-profile.json", io) catch |err| {
-            ai.log.log(.warn, "profiler", "dump_failed", "error={s}", .{@errorName(err)});
-        };
-        profiler.deinit();
-    }
-    const _pzone = profiler.begin(@src(), "runPrint");
-    defer _pzone.end();
 
     // v1.7.5 — logger init moved up to `run()` so every mode
     // (not just print) honors `--log-level`. See the parent
