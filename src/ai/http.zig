@@ -656,7 +656,13 @@ fn fetchPhased(
     // streaming SSE parse is post-1.0 (§N.2 `io.concurrent`).
     const response_writer = opts.response_writer orelse {
         const reader = response.reader(&.{});
-        _ = reader.discardRemaining() catch return response.bodyErr().?;
+        _ = reader.discardRemaining() catch {
+            const body_err = response.bodyErr().?;
+            if (toleratedChunkTruncation(body_err, response.head.content_type)) {
+                return .{ .status = response.head.status };
+            }
+            return body_err;
+        };
         return .{ .status = response.head.status };
     };
 
@@ -676,11 +682,40 @@ fn fetchPhased(
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
     _ = reader.streamRemaining(response_writer) catch |e| switch (e) {
-        error.ReadFailed => return response.bodyErr().?,
+        error.ReadFailed => {
+            const body_err = response.bodyErr().?;
+            if (toleratedChunkTruncation(body_err, response.head.content_type)) {
+                // Bytes streamed before the truncation are already in
+                // `response_writer`. SSE callers parse them via the
+                // `[DONE]` sentinel; nothing meaningful was lost.
+                return .{ .status = response.head.status };
+            }
+            return body_err;
+        },
         else => return e,
     };
 
     return .{ .status = response.head.status };
+}
+
+/// Some upstream servers (notably Ollama-derived ones, and the
+/// OpenAI-compatible gateway some self-hosters wrap them in) close
+/// the TCP connection immediately after sending `data: [DONE]\n\n`
+/// without writing the trailing `0\r\n\r\n` chunk-terminator that
+/// HTTP/1.1 chunked transfer-encoding requires. Zig's std HTTP
+/// reader correctly flags this as `HttpChunkTruncated`, but for an
+/// SSE stream the truncation is benign — the application-level
+/// terminator (`[DONE]`) is already in the buffer.
+///
+/// We tolerate the error only when the response was advertised as
+/// `text/event-stream`. Real truncation on a normal JSON / binary
+/// body is still an error.
+fn toleratedChunkTruncation(err: anyerror, content_type: ?[]const u8) bool {
+    if (err != error.HttpChunkTruncated) return false;
+    const ct = content_type orelse return false;
+    // Match `text/event-stream` regardless of trailing `; charset=...`
+    // and case (RFC 7231 sec. 3.1.1.1 — media types are case-insensitive).
+    return std.ascii.startsWithIgnoreCase(ct, "text/event-stream");
 }
 
 /// Drop-in replacement for `client.fetch` with §F.1 retry policy
@@ -1452,6 +1487,22 @@ test "fetchPhased: PhaseTag.label returns canonical phase names" {
     try testing.expectEqualStrings("connect", PhaseTag.connect.label());
     try testing.expectEqualStrings("upload", PhaseTag.upload.label());
     try testing.expectEqualStrings("first_byte", PhaseTag.first_byte.label());
+}
+
+test "toleratedChunkTruncation: only HttpChunkTruncated on SSE is tolerated" {
+    // Tolerated: HttpChunkTruncated + SSE content-type.
+    try testing.expect(toleratedChunkTruncation(error.HttpChunkTruncated, "text/event-stream"));
+    try testing.expect(toleratedChunkTruncation(error.HttpChunkTruncated, "text/event-stream; charset=utf-8"));
+    try testing.expect(toleratedChunkTruncation(error.HttpChunkTruncated, "Text/Event-Stream"));
+
+    // Not tolerated: real truncation on a JSON / unknown / missing content-type.
+    try testing.expect(!toleratedChunkTruncation(error.HttpChunkTruncated, "application/json"));
+    try testing.expect(!toleratedChunkTruncation(error.HttpChunkTruncated, "text/plain"));
+    try testing.expect(!toleratedChunkTruncation(error.HttpChunkTruncated, null));
+
+    // Not tolerated: any other error class, even on SSE.
+    try testing.expect(!toleratedChunkTruncation(error.ConnectionResetByPeer, "text/event-stream"));
+    try testing.expect(!toleratedChunkTruncation(error.HttpChunkInvalid, "text/event-stream"));
 }
 
 // ─── v1.16.1 — writeTraceFile tests ────────────────────────────
