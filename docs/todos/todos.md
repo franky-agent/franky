@@ -196,3 +196,23 @@ Still occured in a different wasy now.
 … [truncated]
 --- end tool_args ---
 ```
+
+# Edit tool cause memorry kill
+
+```dmesg
+[43193.653284] 9707 pages reserved
+[43193.653313] Tasks state (memory values in pages):
+[43193.653349] [ pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name
+[43193.653430] [   119]  1000   119      167        0        0        0         0   114688        0             0 tini
+[43193.653509] [   124]  1000   124      173       32        0       32         0   114688        0             0 sh
+[43193.653591] [   125]  1000   125      913       72       64        8         0   114688        0             0 sleep
+[43193.653668] [   190]     0   190      742       38       32        6         0   114688        0             0 socat
+[43193.653751] [   197]  1000   197      303       73       32       41         0   131072        0             0 bash
+[43193.653833] [ 11507]  1000 11507   997347   766412   766412        0         0  6406144        0             0 franky
+[43193.653907] oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=e098be74819f9728e44a7141f3a84a6ebd2520719cb65bb9e15ad92c0ef081a3,mems_allowed=0,global_oom,task_memcg=/docker/e098be74819f9728e44a7141f3a84a6ebd2520719cb65bb9e15ad92c0ef081a3,task=franky,pid=11507,uid=1000
+[43193.655041] Out of memory: Killed process 11507 (franky) total-vm:15957552kB, anon-rss:12262592kB, file-rss:0kB, shmem-rss:0kB, UID:1000 pgtables:6256kB oom_score_adj:0
+```
+
+```tool call
+{"edits":[{"new":"Update at 06.05.2026","old":"","replaceAll":true}],"path":"README.md"}
+```

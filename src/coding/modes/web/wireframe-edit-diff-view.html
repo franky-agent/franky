@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Wireframe — v2.8 Edit Tool Diff View</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --error: #f85149;
+    --error-border: #f85149;
+    --error-bg: #2d1418;
+    --warn: #d29922;
+    --tool-bg: #1c2128;
+    --tool-border: #30363d;
+    --add-bg: rgba(63, 185, 80, 0.10);
+    --add-strong: rgba(63, 185, 80, 0.22);
+    --del-bg: rgba(248, 81, 73, 0.10);
+    --del-strong: rgba(248, 81, 73, 0.22);
+    --hunk-bg: #161b22;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 13px;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px 32px 60px;
+    line-height: 1.45;
+}
+
+h1 {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+h2 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    margin: 28px 0 10px;
+}
+.note {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 18px;
+    max-width: 760px;
+}
+
+.legend {
+    display: flex;
+    gap: 14px;
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 14px;
+}
+.legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.legend i {
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+    display: inline-block;
+}
+.legend i.add { background: var(--add-strong); }
+.legend i.del { background: var(--del-strong); }
+.legend i.hunk { background: var(--hunk-bg); border: 1px solid var(--border); }
+
+/* ── Tool card (mimics .tool-card from style.css) ───────────────── */
+.tool-card {
+    align-self: flex-start;
+    max-width: 980px;
+    background: var(--tool-bg);
+    border: 1px solid var(--tool-border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+    font-size: 12.5px;
+    margin-bottom: 28px;
+}
+
+.tool-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    margin-bottom: 6px;
+}
+.tool-name {
+    color: var(--accent);
+    font-weight: 600;
+}
+.tool-args { color: var(--text); }
+.tool-status {
+    font-size: 11px;
+    color: #3fb950;
+}
+.tool-result-toggle {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 11px;
+    padding: 0 4px;
+}
+
+/* The toggle button next to the tool head */
+.diff-view-toggle {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 11px;
+    cursor: pointer;
+    color: var(--muted);
+    margin-left: auto;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+}
+.diff-view-toggle:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+.tool-result-log {
+    border-top: 1px solid var(--tool-border);
+    padding: 0;
+    overflow-x: auto;
+    background: var(--bg);
+}
+
+/* ── Mock diff2html structure ───────────────────────────────────── */
+.d2h-wrapper { font-size: 12px; font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace; }
+
+/* Unified view — column widths driven by <colgroup> so the
+ * d2h-info row's colspan="3" doesn't make the table redistribute
+ * equally. Line-number columns are fixed-narrow; content flexes. */
+.d2h-file-diff { width: 100%; }
+.d2h-diff-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+}
+.d2h-diff-table td { vertical-align: top; }
+.d2h-code-line-prefix {
+    text-align: right;
+    color: var(--muted);
+    user-select: none;
+    padding: 0 6px;
+    font-size: 11px;
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+}
+.d2h-code-line-ctn {
+    padding: 0 8px;
+    white-space: pre;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.d2h-info td {
+    background: var(--hunk-bg);
+    color: var(--muted);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    padding: 2px 8px;
+    font-style: italic;
+}
+
+.d2h-ins td { background: var(--add-bg); }
+.d2h-del td { background: var(--del-bg); }
+
+.d2h-ins .d2h-code-line-prefix {
+    background: rgba(63, 185, 80, 0.18);
+    color: #3fb950;
+}
+.d2h-del .d2h-code-line-prefix {
+    background: rgba(248, 81, 73, 0.18);
+    color: var(--error);
+}
+
+/* Word-level highlights */
+.d2h-code-line ins,
+.d2h-code-side-line ins {
+    background: var(--add-strong);
+    text-decoration: none;
+    border-radius: 2px;
+}
+.d2h-code-line del,
+.d2h-code-side-line del {
+    background: var(--del-strong);
+    text-decoration: none;
+    border-radius: 2px;
+}
+
+/* Side-by-side view — same colgroup trick. Each side has its own
+ * table with one narrow line-number column and one wide content
+ * column. */
+.d2h-files-diff { display: flex; width: 100%; }
+.d2h-file-side-diff { flex: 1 1 50%; min-width: 0; overflow-x: auto; }
+.d2h-file-side-diff:first-child { border-right: 1px solid var(--border); }
+.d2h-side-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.d2h-side-table td { vertical-align: top; }
+.d2h-code-side-linenumber {
+    text-align: right;
+    color: var(--muted);
+    user-select: none;
+    padding: 0 6px;
+    font-size: 11px;
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+}
+.d2h-code-side-line {
+    padding: 0 8px;
+    white-space: pre;
+    color: var(--text);
+}
+.d2h-emptyplaceholder td { background: rgba(110, 118, 129, 0.10); color: var(--muted); }
+</style>
+</head>
+<body>
+
+<h1>v2.8 — Edit Tool Diff View Wireframe</h1>
+<p class="note">
+    Visualizes the edit tool's result panel after diff2html renders the
+    unified diff produced by <code>computeUnifiedDiff()</code> in
+    <code>edit.zig</code>. Two cards below show the same edit in both
+    output modes — toggled via the <em>Side-by-side</em> / <em>Unified</em>
+    button on the tool head. Auto-expanded on success; the d2h file header
+    is hidden because the tool head already shows the path.
+</p>
+
+<div class="legend">
+    <span><i class="hunk"></i> hunk header (<code>@@ … @@</code>)</span>
+    <span><i class="add"></i> insertion</span>
+    <span><i class="del"></i> deletion</span>
+</div>
+
+<!-- ─────────── 1. Unified (line-by-line) — DEFAULT ─────────── -->
+<h2>1 · Unified view (default)</h2>
+
+<div class="tool-card is-edit">
+    <div class="tool-head">
+        <span class="tool-result-toggle" aria-expanded="true">▼</span>
+        <span class="tool-name">edit</span>
+        <span class="tool-args">src/coding/modes/web/app.js</span>
+        <span class="tool-status">done</span>
+        <button class="diff-view-toggle">Side-by-side</button>
+    </div>
+
+    <div class="tool-result-log">
+        <div class="d2h-wrapper">
+            <div class="d2h-file-diff">
+                <table class="d2h-diff-table">
+                    <colgroup>
+                        <col style="width: 44px">
+                        <col style="width: 44px">
+                        <col>
+                    </colgroup>
+                    <tbody>
+                        <tr class="d2h-info">
+                            <td colspan="3">@@ -1387,9 +1387,11 @@ es.addEventListener('tool_execution_end', …</td>
+                        </tr>
+
+                        <tr>
+                            <td class="d2h-code-line-prefix">1387</td>
+                            <td class="d2h-code-line-prefix">1387</td>
+                            <td class="d2h-code-line-ctn">    es.addEventListener('tool_execution_end', (e) =&gt; {</td>
+                        </tr>
+                        <tr>
+                            <td class="d2h-code-line-prefix">1388</td>
+                            <td class="d2h-code-line-prefix">1388</td>
+                            <td class="d2h-code-line-ctn">        noteEvent();</td>
+                        </tr>
+                        <tr>
+                            <td class="d2h-code-line-prefix">1389</td>
+                            <td class="d2h-code-line-prefix">1389</td>
+                            <td class="d2h-code-line-ctn">        const data = parseData(e.data);</td>
+                        </tr>
+                        <tr>
+                            <td class="d2h-code-line-prefix">1390</td>
+                            <td class="d2h-code-line-prefix">1390</td>
+                            <td class="d2h-code-line-ctn">        if (!data) return;</td>
+                        </tr>
+
+                        <tr class="d2h-del">
+                            <td class="d2h-code-line-prefix">1391</td>
+                            <td class="d2h-code-line-prefix">-</td>
+                            <td class="d2h-code-line-ctn">-       endToolCall(data.callId, !!data.isError, data.toolCode || null, data.resultText || '');</td>
+                        </tr>
+                        <tr class="d2h-ins">
+                            <td class="d2h-code-line-prefix">-</td>
+                            <td class="d2h-code-line-prefix">1391</td>
+                            <td class="d2h-code-line-ctn">+       endToolCall(data.callId, !!data.isError, data.toolCode || null, data.resultText || '', <ins>data.detailsJson || null</ins>);</td>
+                        </tr>
+
+                        <tr>
+                            <td class="d2h-code-line-prefix">1392</td>
+                            <td class="d2h-code-line-prefix">1392</td>
+                            <td class="d2h-code-line-ctn">    });</td>
+                        </tr>
+                        <tr>
+                            <td class="d2h-code-line-prefix">1393</td>
+                            <td class="d2h-code-line-prefix">1393</td>
+                            <td class="d2h-code-line-ctn"></td>
+                        </tr>
+
+                        <tr class="d2h-info">
+                            <td colspan="3">@@ -759,7 +759,7 @@ function endToolCall(callId, isError, toolCode, …</td>
+                        </tr>
+
+                        <tr>
+                            <td class="d2h-code-line-prefix">759</td>
+                            <td class="d2h-code-line-prefix">759</td>
+                            <td class="d2h-code-line-ctn"> // Regular tool cards</td>
+                        </tr>
+                        <tr class="d2h-del">
+                            <td class="d2h-code-line-prefix">760</td>
+                            <td class="d2h-code-line-prefix">-</td>
+                            <td class="d2h-code-line-ctn">-function endToolCall(callId, isError, toolCode, <del>resultText</del>) {</td>
+                        </tr>
+                        <tr class="d2h-ins">
+                            <td class="d2h-code-line-prefix">-</td>
+                            <td class="d2h-code-line-prefix">760</td>
+                            <td class="d2h-code-line-ctn">+function endToolCall(callId, isError, toolCode, <ins>resultText, detailsJson</ins>) {</td>
+                        </tr>
+                        <tr>
+                            <td class="d2h-code-line-prefix">761</td>
+                            <td class="d2h-code-line-prefix">761</td>
+                            <td class="d2h-code-line-ctn">    finalizeSubagentSection(callId, isError);</td>
+                        </tr>
+                        <tr>
+                            <td class="d2h-code-line-prefix">762</td>
+                            <td class="d2h-code-line-prefix">762</td>
+                            <td class="d2h-code-line-ctn">    const el = toolCards.get(callId);</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<!-- ─────────── 2. Side-by-side ─────────── -->
+<h2>2 · Side-by-side view (after toggle)</h2>
+
+<div class="tool-card is-edit">
+    <div class="tool-head">
+        <span class="tool-result-toggle" aria-expanded="true">▼</span>
+        <span class="tool-name">edit</span>
+        <span class="tool-args">src/coding/modes/web/app.js</span>
+        <span class="tool-status">done</span>
+        <button class="diff-view-toggle">Unified</button>
+    </div>
+
+    <div class="tool-result-log">
+        <div class="d2h-wrapper">
+            <div class="d2h-files-diff">
+                <!-- LEFT: original -->
+                <div class="d2h-file-side-diff">
+                    <table class="d2h-side-table">
+                        <colgroup>
+                            <col style="width: 44px">
+                            <col>
+                        </colgroup>
+                        <tbody>
+                            <tr class="d2h-info"><td colspan="2">@@ -1387,9 +1387,11 @@</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">1387</td><td class="d2h-code-side-line">    es.addEventListener('tool_execution_end', (e) =&gt; {</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">1388</td><td class="d2h-code-side-line">        noteEvent();</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">1389</td><td class="d2h-code-side-line">        const data = parseData(e.data);</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">1390</td><td class="d2h-code-side-line">        if (!data) return;</td></tr>
+                            <tr class="d2h-del"><td class="d2h-code-side-linenumber">1391</td><td class="d2h-code-side-line">        endToolCall(data.callId, !!data.isError, data.toolCode || null, data.resultText || '');</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">1392</td><td class="d2h-code-side-line">    });</td></tr>
+
+                            <tr class="d2h-info"><td colspan="2">@@ -759,7 +759,7 @@</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">759</td><td class="d2h-code-side-line"> // Regular tool cards</td></tr>
+                            <tr class="d2h-del"><td class="d2h-code-side-linenumber">760</td><td class="d2h-code-side-line">function endToolCall(callId, isError, toolCode, <del>resultText</del>) {</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">761</td><td class="d2h-code-side-line">    finalizeSubagentSection(callId, isError);</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">762</td><td class="d2h-code-side-line">    const el = toolCards.get(callId);</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- RIGHT: modified -->
+                <div class="d2h-file-side-diff">
+                    <table class="d2h-side-table">
+                        <colgroup>
+                            <col style="width: 44px">
+                            <col>
+                        </colgroup>
+                        <tbody>
+                            <tr class="d2h-info"><td colspan="2">@@ -1387,9 +1387,11 @@</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">1387</td><td class="d2h-code-side-line">    es.addEventListener('tool_execution_end', (e) =&gt; {</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">1388</td><td class="d2h-code-side-line">        noteEvent();</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">1389</td><td class="d2h-code-side-line">        const data = parseData(e.data);</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">1390</td><td class="d2h-code-side-line">        if (!data) return;</td></tr>
+                            <tr class="d2h-ins"><td class="d2h-code-side-linenumber">1391</td><td class="d2h-code-side-line">        endToolCall(data.callId, !!data.isError, data.toolCode || null, data.resultText || '', <ins>data.detailsJson || null</ins>);</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">1392</td><td class="d2h-code-side-line">    });</td></tr>
+
+                            <tr class="d2h-info"><td colspan="2">@@ -759,7 +759,7 @@</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">759</td><td class="d2h-code-side-line"> // Regular tool cards</td></tr>
+                            <tr class="d2h-ins"><td class="d2h-code-side-linenumber">760</td><td class="d2h-code-side-line">function endToolCall(callId, isError, toolCode, <ins>resultText, detailsJson</ins>) {</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">761</td><td class="d2h-code-side-line">    finalizeSubagentSection(callId, isError);</td></tr>
+                            <tr><td class="d2h-code-side-linenumber">762</td><td class="d2h-code-side-line">    const el = toolCards.get(callId);</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<!-- ─────────── 3. Collapsed (toggle clicked) ─────────── -->
+<h2>3 · Collapsed (after user clicks the ▼ toggle)</h2>
+
+<div class="tool-card is-edit">
+    <div class="tool-head">
+        <span class="tool-result-toggle" aria-expanded="false">▶</span>
+        <span class="tool-name">edit</span>
+        <span class="tool-args">src/coding/modes/web/app.js</span>
+        <span class="tool-status">done</span>
+        <button class="diff-view-toggle">Side-by-side</button>
+    </div>
+</div>
+
+
+<!-- ─────────── 4. Error fallback ─────────── -->
+<h2>4 · Error / no diff available — plain-text fallback</h2>
+<p class="note">
+    When the edit fails (no_match, ambiguous, OOM during diff
+    computation, or the diff2html CDN is unreachable),
+    <code>renderEditDiffView</code> is skipped and the panel renders the
+    plain-text <code>resultText</code> the model already sees in its
+    transcript.
+</p>
+
+<div class="tool-card is-error">
+    <div class="tool-head">
+        <span class="tool-result-toggle" aria-expanded="true">▼</span>
+        <span class="tool-name">edit</span>
+        <span class="tool-args">src/coding/modes/web/app.js</span>
+        <span class="tool-status" style="color: var(--error)">error</span>
+    </div>
+    <div class="tool-result-log" style="padding: 8px 12px; white-space: pre-wrap; color: var(--text);">edit_no_match: pattern not found in src/coding/modes/web/app.js
+  [0] - const provider = data.provider || '?';
+  [0] - const model = data.model || '?';</div>
+</div>
+
+</body>
+</html>

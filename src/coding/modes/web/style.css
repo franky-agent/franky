@@ -1226,25 +1226,110 @@ button#send:hover:not(:disabled) {
     text-overflow: clip;
 }
 
-/* Edit-tool diff view — overrides for diff2html-rendered cards. */
+/* Edit-tool diff view — styles for the in-house renderer in
+ * `app.js` (`renderDiffUnified` / `renderDiffSideBySide`). The
+ * markup uses `.franky-diff` plus per-row classes `.fd-info`,
+ * `.fd-cntx`, `.fd-ins`, `.fd-del`, `.fd-empty` and per-cell
+ * `.fd-num`, `.fd-line`, `.fd-prefix`, `.fd-ctn`.
+ *
+ * Ported from `wireframe-edit-diff-view.html`. No CDN dependency,
+ * no `d2h-*` selectors to fight in the cascade.
+ */
 
 .tool-card.is-edit .tool-result-log {
     padding: 0;
     overflow-x: auto;
+    background: var(--bg);
 }
 
-.tool-card.is-edit .d2h-wrapper {
+.franky-diff {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
     font-size: 12px;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.45;
 }
 
-/* Hide the redundant file header — we already have the tool head */
-.tool-card.is-edit .d2h-file-header {
-    display: none;
+.franky-diff table {
+    border-collapse: collapse;
+    width: 100%;
+    table-layout: fixed;
+    background: transparent;
 }
 
-.tool-card.is-edit .d2h-code-line {
+.franky-diff td {
+    vertical-align: top;
+    padding: 0;
+    border: none;
+}
+
+/* Hunk header — italic, panel-tinted, bordered top + bottom. */
+.franky-diff .fd-info {
+    background: var(--panel);
+    color: var(--muted);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    font-style: italic;
+}
+.franky-diff .fd-info td { padding: 2px 8px; }
+
+/* Line-number gutter (compact, panel-tinted, right-aligned). */
+.franky-diff .fd-num {
+    text-align: right;
+    color: var(--muted);
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    font-size: 11px;
     padding: 0 6px;
+    user-select: none;
+    white-space: nowrap;
 }
+
+/* Code line cell — pre-formatted whitespace, prefix glyph + content. */
+.franky-diff .fd-line {
+    padding: 0 6px;
+    white-space: pre;
+    color: var(--text);
+}
+.franky-diff .fd-prefix {
+    display: inline-block;
+    width: 14px;
+    color: var(--muted);
+}
+.franky-diff .fd-ctn { color: inherit; background: transparent; }
+
+/* Per-row tints — context, insert, delete, and empty placeholder
+ * (used only in side-by-side to fill an unmatched left/right slot). */
+.franky-diff .fd-cntx  { background: transparent; }
+.franky-diff .fd-ins   { background: rgba(63, 185, 80, 0.10); }
+.franky-diff .fd-del   { background: rgba(248, 81, 73, 0.10); }
+.franky-diff .fd-empty { background: rgba(110, 118, 129, 0.08); }
+
+/* Match the line-num gutter colour to the row tint so the gutter
+ * doesn't visually break the row. */
+.franky-diff .fd-ins .fd-num { background: rgba(63, 185, 80, 0.18); color: #3fb950; }
+.franky-diff .fd-del .fd-num { background: rgba(248, 81, 73, 0.18); color: var(--error); }
+
+/* Coloured prefix glyph. */
+.franky-diff .fd-ins .fd-prefix { color: #3fb950; }
+.franky-diff .fd-del .fd-prefix { color: var(--error); }
+
+/* Side-by-side layout: two flex columns, each with its own table.
+ * `flex: 1 1 50%` + `min-width: 0` lets each side scroll
+ * independently for long lines without one squashing the other. */
+.franky-diff-side .fd-side-pair {
+    display: flex;
+    width: 100%;
+}
+.franky-diff-side .fd-side-col {
+    flex: 1 1 50%;
+    min-width: 0;
+    overflow-x: auto;
+}
+.franky-diff-side .fd-side-col:first-child {
+    border-right: 1px solid var(--border);
+}
+.franky-diff-side .fd-side-table { width: 100%; }
 
 /* View-toggle button next to the tool head */
 .diff-view-toggle {
@@ -1258,47 +1343,7 @@ button#send:hover:not(:disabled) {
     margin-left: auto;
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
 }
-
 .diff-view-toggle:hover {
     color: var(--accent);
     border-color: var(--accent);
-}
-
-/* Dark-theme compatibility for diff2html */
-.tool-card.is-edit .d2h-code-side-line,
-.tool-card.is-edit .d2h-code-line {
-    background: transparent;
-    color: var(--text);
-}
-
-.tool-card.is-edit .d2h-info {
-    background: var(--panel);
-    color: var(--muted);
-    border-color: var(--border);
-}
-
-.tool-card.is-edit .d2h-del {
-    background: rgba(248, 81, 73, 0.1);
-}
-
-.tool-card.is-edit .d2h-ins {
-    background: rgba(63, 185, 80, 0.1);
-}
-
-.tool-card.is-edit .d2h-code-line del,
-.tool-card.is-edit .d2h-code-side-line del {
-    background: rgba(248, 81, 73, 0.2);
-    text-decoration: none;
-}
-
-.tool-card.is-edit .d2h-code-line ins,
-.tool-card.is-edit .d2h-code-side-line ins {
-    background: rgba(63, 185, 80, 0.2);
-    text-decoration: none;
-}
-
-/* Prevent diff2html's line-number column from wrapping */
-.tool-card.is-edit .d2h-code-line-prefix {
-    width: auto;
-    min-width: 32px;
 }

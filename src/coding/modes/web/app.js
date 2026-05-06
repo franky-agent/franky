@@ -529,12 +529,29 @@ function highlightCodeBlocks(container) {
         conversation.appendChild(el);
     }
 
+    // Wire-format allowlist for the edit-tool diff view. The producer
+    // is `computeUnifiedDiff` in `src/coding/tools/edit.zig`; the
+    // parser is `parseUnifiedDiff` below. Bumping the format requires
+    // a change on both sides — Zig tests pin the wire bytes.
+    const SUPPORTED_DIFF_FORMATS = ['unified-diff-v1'];
+
     /// Attempt to render `detailsJson` as a unified diff into `panel`.
     /// Returns true on success — caller should skip the plain-text fallback.
+    /// `detailsJson` may arrive as an already-parsed object (live SSE path,
+    /// where the SSE handler JSON.parses the whole frame) or as a raw JSON
+    /// string (rehydration path, if the transcript stores it verbatim).
     function tryRenderDiffPanel(el, panel, toggle, detailsJson) {
         if (!detailsJson) return false;
-        const details = parseData(detailsJson);
+        const details = (typeof detailsJson === 'string') ? parseData(detailsJson) : detailsJson;
         if (!details || !details.diff) return false;
+        // Reject unknown format versions loudly. Missing `format` is
+        // tolerated so transcripts persisted before format versioning
+        // was added still rehydrate (their diff strings are v1-shaped).
+        if (details.format && !SUPPORTED_DIFF_FORMATS.includes(details.format)) {
+            console.warn('[franky] unrecognized diff format', details.format,
+                '— update SUPPORTED_DIFF_FORMATS in app.js to add support');
+            return false;
+        }
         renderEditDiffView(el, panel, toggle, details);
         return true;
     }
@@ -816,10 +833,10 @@ function highlightCodeBlocks(container) {
         }
     }
 
-    /// Render a visual diff (via diff2html) into a tool card. Adds
-    /// the `is-edit` class, auto-expands the result panel, and adds
-    /// a unified ↔ side-by-side toggle button. Falls back to plain
-    /// text if diff2html is missing or throws.
+    /// Render a visual diff into a tool card. Adds the `is-edit`
+    /// class, auto-expands the result panel, and adds a unified ↔
+    /// side-by-side toggle button. The diff string is parsed and
+    /// rendered by `renderDiffHtml` (in-house, no CDN dependency).
     function renderEditDiffView(cardEl, panelEl, toggleEl, details) {
         cardEl.classList.add('is-edit');
         expandResultPanel(toggleEl, panelEl);
@@ -847,24 +864,169 @@ function highlightCodeBlocks(container) {
         show(currentMode);
     }
 
-    /// Render a unified-diff string into HTML or fall back to the
-    /// raw text. Returns the string to assign to `innerHTML` /
-    /// `textContent` (caller decides which by checking for an
-    /// HTML-shaped result).
-    function renderDiffHtml(diffString, mode, filePath) {
-        const fullDiff = '--- a/' + (filePath || 'file') + '\n+++ b/' + (filePath || 'file') + '\n' + diffString;
-        if (typeof Diff2Html === 'undefined') return escHtml(diffString);
+    /// Render a unified-diff string into HTML using our own
+    /// renderer (no external dependency). Returns escaped text on
+    /// any unexpected error so the caller still sees something.
+    ///
+    /// The diff format is:
+    ///   --- a/<path>
+    ///   +++ b/<path>
+    ///   @@ -<oldStart>,<oldCount> +<newStart>,<newCount> @@
+    ///    context
+    ///   -removed
+    ///   +added
+    ///
+    /// We emit either a unified (one column) or side-by-side (two
+    /// stacked tables) rendering with our own classes — see
+    /// `.franky-diff` rules in style.css.
+    function renderDiffHtml(diffString, mode, _filePath) {
         try {
-            return Diff2Html.html(fullDiff, {
-                outputFormat: mode,
-                drawFileList: false,
-                fileContentToggle: false,
-                matching: 'lines',
-                highlight: true,
-            });
+            const hunks = parseUnifiedDiff(diffString);
+            if (mode === 'side-by-side') return renderDiffSideBySide(hunks);
+            return renderDiffUnified(hunks);
         } catch (_) {
             return escHtml(diffString);
         }
+    }
+
+    /// Parse a unified-diff string produced by `computeUnifiedDiff`
+    /// in `src/coding/tools/edit.zig`. The accepted grammar:
+    ///   `--- a/<path>` and `+++ b/<path>` file headers (skipped).
+    ///   `@@ -<old>(,<count>)? +<new>(,<count>)? @@` hunk headers.
+    ///   Body lines starting with ' ' (context), '-' (remove), '+' (add).
+    /// If you change this grammar, update `computeUnifiedDiff` AND the
+    /// golden/structural tests in `edit.zig` (§v2.8 block) — and bump
+    /// `SUPPORTED_DIFF_FORMATS` above.
+    function parseUnifiedDiff(diffString) {
+        const lines = diffString.split('\n');
+        const hunks = [];
+        let current = null;
+        for (const line of lines) {
+            if (line.startsWith('--- ') || line.startsWith('+++ ')) continue;
+            if (line.startsWith('@@')) {
+                const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+                if (!m) continue;
+                if (current) hunks.push(current);
+                current = {
+                    oldStart: parseInt(m[1], 10),
+                    newStart: parseInt(m[3], 10),
+                    header: line,
+                    ops: [],
+                };
+                continue;
+            }
+            if (!current) continue;
+            if (line.length === 0) continue;
+            const prefix = line[0];
+            const text = line.slice(1);
+            if (prefix === ' ') current.ops.push({ kind: 'keep', text: text });
+            else if (prefix === '-') current.ops.push({ kind: 'remove', text: text });
+            else if (prefix === '+') current.ops.push({ kind: 'add', text: text });
+        }
+        if (current) hunks.push(current);
+        return hunks;
+    }
+
+    function renderDiffUnified(hunks) {
+        let html = '<div class="franky-diff franky-diff-unified"><table>'
+            + '<colgroup><col style="width:44px"><col style="width:44px"><col></colgroup>'
+            + '<tbody>';
+        for (const hunk of hunks) {
+            html += '<tr class="fd-info"><td colspan="3">' + escHtml(hunk.header) + '</td></tr>';
+            let oldNum = hunk.oldStart;
+            let newNum = hunk.newStart;
+            for (const op of hunk.ops) {
+                if (op.kind === 'keep') {
+                    html += diffRowU('cntx', oldNum, newNum, ' ', op.text);
+                    oldNum++; newNum++;
+                } else if (op.kind === 'remove') {
+                    html += diffRowU('del', oldNum, '', '−', op.text);
+                    oldNum++;
+                } else {
+                    html += diffRowU('ins', '', newNum, '+', op.text);
+                    newNum++;
+                }
+            }
+        }
+        html += '</tbody></table></div>';
+        return html;
+    }
+
+    function diffRowU(kind, oldNum, newNum, glyph, text) {
+        return '<tr class="fd-' + kind + '">'
+            + '<td class="fd-num">' + oldNum + '</td>'
+            + '<td class="fd-num">' + newNum + '</td>'
+            + '<td class="fd-line">' + diffPrefix(glyph) + diffContent(text) + '</td></tr>';
+    }
+
+    function renderDiffSideBySide(hunks) {
+        let left = '<table class="fd-side-table"><colgroup><col style="width:44px"><col></colgroup><tbody>';
+        let right = '<table class="fd-side-table"><colgroup><col style="width:44px"><col></colgroup><tbody>';
+        for (const hunk of hunks) {
+            const info = '<tr class="fd-info"><td colspan="2">' + escHtml(hunk.header) + '</td></tr>';
+            left += info;
+            right += info;
+            let oldNum = hunk.oldStart;
+            let newNum = hunk.newStart;
+            let i = 0;
+            while (i < hunk.ops.length) {
+                const op = hunk.ops[i];
+                if (op.kind === 'keep') {
+                    left += diffRowS('cntx', oldNum, ' ', op.text);
+                    right += diffRowS('cntx', newNum, ' ', op.text);
+                    oldNum++; newNum++; i++;
+                } else {
+                    const dels = [], adds = [];
+                    while (i < hunk.ops.length && hunk.ops[i].kind !== 'keep') {
+                        if (hunk.ops[i].kind === 'remove') dels.push(hunk.ops[i]);
+                        else adds.push(hunk.ops[i]);
+                        i++;
+                    }
+                    const len = Math.max(dels.length, adds.length);
+                    for (let j = 0; j < len; j++) {
+                        if (j < dels.length) {
+                            left += diffRowS('del', oldNum, '−', dels[j].text);
+                            oldNum++;
+                        } else {
+                            left += diffRowS('empty', '', '', '');
+                        }
+                        if (j < adds.length) {
+                            right += diffRowS('ins', newNum, '+', adds[j].text);
+                            newNum++;
+                        } else {
+                            right += diffRowS('empty', '', '', '');
+                        }
+                    }
+                }
+            }
+        }
+        left += '</tbody></table>';
+        right += '</tbody></table>';
+        return '<div class="franky-diff franky-diff-side"><div class="fd-side-pair">'
+            + '<div class="fd-side-col">' + left + '</div>'
+            + '<div class="fd-side-col">' + right + '</div>'
+            + '</div></div>';
+    }
+
+    function diffRowS(kind, num, glyph, text) {
+        return '<tr class="fd-' + kind + '">'
+            + '<td class="fd-num">' + num + '</td>'
+            + '<td class="fd-line">' + diffPrefix(glyph) + diffContent(text) + '</td></tr>';
+    }
+
+    /// Render the leading `<span class="fd-prefix">` cell. Empty
+    /// or single-space glyph collapses to a non-breaking space so
+    /// the gutter column always has a stable width.
+    function diffPrefix(glyph) {
+        if (!glyph || glyph === ' ') return '<span class="fd-prefix">&nbsp;</span>';
+        return '<span class="fd-prefix">' + escHtml(glyph) + '</span>';
+    }
+
+    /// Render the `<span class="fd-ctn">` cell. Blank lines render
+    /// as `&nbsp;` so the row keeps its line-height; the row tint
+    /// (via the parent `<tr>` class) still signals the change.
+    function diffContent(text) {
+        return '<span class="fd-ctn">' + (text.length === 0 ? '&nbsp;' : escHtml(text)) + '</span>';
     }
 
     // v1.11.4 — permission-prompt modal. Renders an inline card
@@ -941,12 +1103,9 @@ function highlightCodeBlocks(container) {
 
     // ── v2.6 helpers ─────────────────────────────────────────────
 
+    const ESC_HTML_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
     function escHtml(s) {
-        return String(s)
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;');
+        return String(s).replace(/[&<>"]/g, function (c) { return ESC_HTML_MAP[c]; });
     }
 
     function joinOrderedBlocks(m) {

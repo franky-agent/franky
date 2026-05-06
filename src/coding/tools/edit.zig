@@ -173,6 +173,7 @@ fn execute(
         const old_v = ev.object.get("old") orelse return common.toolError(allocator, "invalid_args", "edit missing old");
         const new_v = ev.object.get("new") orelse return common.toolError(allocator, "invalid_args", "edit missing new");
         if (old_v != .string or new_v != .string) return common.toolError(allocator, "invalid_args", "edit old/new must be strings");
+        if (old_v.string.len == 0) return common.toolError(allocator, "invalid_args", "edit `old` must be non-empty");
         const replace_all = if (ev.object.get("replaceAll")) |x| (x == .bool and x.bool) else false;
         try edits.append(allocator, .{ .old = old_v.string, .new = new_v.string, .replace_all = replace_all });
     }
@@ -274,6 +275,9 @@ pub fn applyEdits(
 
     // Build details_json with optional unified diff for the web UI diff view.
     // Failure to compute the diff is non-fatal — the plain text summary still works.
+    // The `format` field is the contract version the client matches against
+    // (see app.js:tryRenderDiffPanel). Bump the suffix when the diff string
+    // shape changes and update the client allowlist in lockstep.
     const details = blk: {
         const diff_str = computeUnifiedDiff(allocator, original, buf.items, path) catch null;
         if (diff_str) |d| {
@@ -281,7 +285,7 @@ pub fn applyEdits(
             // JSON-escape the diff string for embedding in details_json.
             const escaped = try escapeJsonString(allocator, d);
             defer allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(allocator, "{{\"edits\":{d},\"diff\":\"{s}\",\"path\":\"{s}\"}}", .{ edits.len, escaped, path });
+            break :blk try std.fmt.allocPrint(allocator, "{{\"edits\":{d},\"format\":\"unified-diff-v1\",\"diff\":\"{s}\",\"path\":\"{s}\"}}", .{ edits.len, escaped, path });
         } else {
             break :blk try std.fmt.allocPrint(allocator, "{{\"edits\":{d},\"diff\":null,\"path\":\"{s}\"}}", .{ edits.len, path });
         }
@@ -423,6 +427,7 @@ fn replaceOnce(
     old: []const u8,
     new: []const u8,
 ) !void {
+    if (old.len == 0) return; // guard against empty-old infinite loop
     const at_ = std.mem.indexOf(u8, buf.items, old) orelse return;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
@@ -439,6 +444,7 @@ fn replaceAll(
     old: []const u8,
     new: []const u8,
 ) !void {
+    if (old.len == 0) return; // guard against empty-old infinite loop
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     var i: usize = 0;
@@ -481,6 +487,10 @@ var tmp_counter: std.atomic.Value(u32) = .init(0);
 /// and hunks with up to 3 context lines. Uses a simple LCS DP table
 /// suitable for files up to ~2000 lines. Returns null on any error
 /// (OOM, too large, etc.) — callers should fall back gracefully.
+///
+/// Format contract: paired with `parseUnifiedDiff` in
+/// `src/coding/modes/web/app.js`. See the `wire-format contract tests`
+/// block at the bottom of this file before changing the emit shape.
 fn computeUnifiedDiff(
     allocator: std.mem.Allocator,
     original: []const u8,
@@ -551,37 +561,33 @@ fn computeUnifiedDiff(
         }
     }
 
-    // Group ops into hunks with 3 lines of context.
+    // Group ops into hunks. For each change op (add/remove), expand
+    // outward by `ctx` keeps on either side; merge ranges that touch
+    // or overlap. Pure-keep regions never produce a hunk.
     const ctx: usize = 3;
     var hunks: std.ArrayList(Hunk) = .empty;
     defer hunks.deinit(allocator);
 
-    var oi: usize = 0;
-    while (oi < ops.items.len) {
-        // Find the range of ops that form a hunk: a sequence of changes
-        // separated by no more than 2*ctx keep lines.
-        var hunk_end = oi + 1;
-        var keep_run: usize = 0;
-        while (hunk_end < ops.items.len) {
-            switch (ops.items[hunk_end].kind) {
-                .keep => {
-                    keep_run += 1;
-                    if (keep_run > 2 * ctx) break;
-                },
-                .remove, .add => {
-                    keep_run = 0;
-                },
-            }
-            hunk_end += 1;
-        }
-        // If we broke because keep_run exceeded the threshold,
-        // back up to include only ctx keeps at the end.
-        if (keep_run > 2 * ctx) {
-            hunk_end -= (keep_run - ctx);
-        }
+    const Range = struct { start: usize, end: usize };
+    var ranges: std.ArrayList(Range) = .empty;
+    defer ranges.deinit(allocator);
 
-        // Collect the hunk ops.
-        const hunk_ops = ops.items[oi..hunk_end];
+    for (ops.items, 0..) |op, idx| {
+        if (op.kind == .keep) continue;
+        const start = if (idx >= ctx) idx - ctx else 0;
+        const end = @min(idx + ctx + 1, ops.items.len);
+        if (ranges.items.len > 0 and ranges.items[ranges.items.len - 1].end >= start) {
+            // Overlaps or touches the previous range — extend it.
+            if (ranges.items[ranges.items.len - 1].end < end) {
+                ranges.items[ranges.items.len - 1].end = end;
+            }
+        } else {
+            try ranges.append(allocator, .{ .start = start, .end = end });
+        }
+    }
+
+    for (ranges.items) |range| {
+        const hunk_ops = ops.items[range.start..range.end];
 
         // Compute line numbers for hunk header.
         var orig_start: ?usize = null;
@@ -637,37 +643,6 @@ fn computeUnifiedDiff(
             }
         }
 
-        // Trim trailing context lines from the body (they'll be leading
-        // context of the next hunk or are unnecessary at end of file).
-        // Count trailing keep ops.
-        var trail_keep: usize = 0;
-        var bi: usize = hunk_ops.len;
-        while (bi > 0) {
-            bi -= 1;
-            if (hunk_ops[bi].kind == .keep) {
-                trail_keep += 1;
-            } else {
-                break;
-            }
-        }
-        // Keep up to ctx trailing context lines.
-        const trim_keep = if (trail_keep > ctx) trail_keep - ctx else 0;
-        if (trim_keep > 0) {
-            // Trim from both body and counts.
-            // Find where the trim starts in the body.
-            var trim_chars: usize = 0;
-            var trim_i: usize = hunk_ops.len - trim_keep;
-            while (trim_i < hunk_ops.len) : (trim_i += 1) {
-                const op = hunk_ops[trim_i];
-                // Each line: 1 prefix char + line content
-                const line_len = 1 + (if (op.kind == .keep) orig_lines[op.orig_idx.?].len else if (op.kind == .remove) orig_lines[op.orig_idx.?].len else mod_lines[op.mod_idx.?].len);
-                trim_chars += line_len;
-                orig_count -= 1;
-                mod_count -= 1;
-            }
-            body.items.len -= trim_chars;
-        }
-
         if (body.items.len > 0) {
             try hunks.append(allocator, .{
                 .orig_start = (orig_start orelse 0) + 1, // 1-indexed
@@ -677,8 +652,6 @@ fn computeUnifiedDiff(
                 .body = try body.toOwnedSlice(allocator),
             });
         }
-
-        oi = hunk_end;
     }
 
     // Build the full diff output.
@@ -1130,4 +1103,97 @@ test "execute: wrong edits type includes type name in error" {
     defer res.deinit(gpa);
     try testing.expect(res.is_error);
     try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "got number") != null);
+}
+
+// ─── §v2.8 — wire-format contract tests for the web UI diff view ────────
+//
+// These two tests pin the contract between `computeUnifiedDiff` (this
+// file) and `parseUnifiedDiff` in `src/coding/modes/web/app.js`. A
+// silent format drift between the two sides causes the browser to fall
+// back to escaped raw text — these tests turn that silent drift into a
+// loud test failure. If either fails after a deliberate format change,
+// update BOTH the JS parser and the test fixture in lockstep.
+
+test "computeUnifiedDiff: golden snapshot of the wire format" {
+    const gpa = testing.allocator;
+
+    const original = "alpha\nbeta\ngamma\ndelta\n";
+    const modified = "alpha\nBETA\ngamma\ndelta\n";
+    const got = try computeUnifiedDiff(gpa, original, modified, "f.txt");
+    defer gpa.free(got);
+
+    const want =
+        "--- a/f.txt\n" ++
+        "+++ b/f.txt\n" ++
+        "@@ -1,4 +1,4 @@\n" ++
+        " alpha\n" ++
+        "-beta\n" ++
+        "+BETA\n" ++
+        " gamma\n" ++
+        " delta\n";
+    try testing.expectEqualStrings(want, got);
+}
+
+test "computeUnifiedDiff: every output line matches the JS parser's grammar" {
+    const gpa = testing.allocator;
+
+    // A multi-hunk fixture: two distant changes at the start and end of
+    // the file so we exercise headers, multiple `@@` lines, and all
+    // three body prefixes (` `, `-`, `+`).
+    const original =
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+    const modified =
+        "ONE\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nTEN\n";
+    const got = try computeUnifiedDiff(gpa, original, modified, "f.txt");
+    defer gpa.free(got);
+
+    var lines = std.mem.splitScalar(u8, got, '\n');
+    var line_idx: usize = 0;
+    var hunk_count: usize = 0;
+    while (lines.next()) |line| : (line_idx += 1) {
+        if (line.len == 0) continue; // trailing empty after final \n
+        // First two non-empty lines are the file headers.
+        if (line_idx == 0) {
+            try testing.expect(std.mem.startsWith(u8, line, "--- a/"));
+            continue;
+        }
+        if (line_idx == 1) {
+            try testing.expect(std.mem.startsWith(u8, line, "+++ b/"));
+            continue;
+        }
+        // Subsequent lines are either hunk headers or body lines.
+        if (std.mem.startsWith(u8, line, "@@")) {
+            // Mirror the JS regex shape: `@@ -N(,M)? +N(,M)? @@`,
+            // optionally followed by a trailing context label.
+            try testing.expect(std.mem.endsWith(u8, line, " @@") or
+                std.mem.indexOf(u8, line, " @@ ") != null);
+            try testing.expect(std.mem.indexOf(u8, line, " -") != null);
+            try testing.expect(std.mem.indexOf(u8, line, " +") != null);
+            hunk_count += 1;
+            continue;
+        }
+        // Body line — must start with ' ', '-', or '+'.
+        const c = line[0];
+        try testing.expect(c == ' ' or c == '-' or c == '+');
+    }
+    try testing.expect(hunk_count >= 1);
+}
+
+test "applyEdits: details_json carries the format version field" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const path = "/tmp/franky_edit_format_field.txt";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeTempFile(io, path, "alpha\nbeta\ngamma\n");
+    const edits = [_]EditOp{.{ .old = "beta", .new = "BETA", .replace_all = false }};
+    var res = try applyEdits(gpa, io, path, &edits);
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    try testing.expect(res.details_json != null);
+    // The client allowlist matches this exact string — bump in lockstep.
+    try testing.expect(std.mem.indexOf(u8, res.details_json.?, "\"format\":\"unified-diff-v1\"") != null);
 }
