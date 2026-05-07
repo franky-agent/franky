@@ -118,3 +118,55 @@ Still occured in a different wasy now.
 ```tool call
 {"edits":[{"new":"Update at 06.05.2026","old":"","replaceAll":true}],"path":"README.md"}
 ```
+
+# Find tools return wrong not found files (Done | Need Verification)
+
+Here is the real folder structure:
+```
+AGENTS.md
+README.md
+build.zig.zon
+settings.json
+src
+zig-out
+Dockerfile.sandbox
+build.zig
+docs
+skills
+test
+```
+
+```
+tool: find error
+{"pattern":"**/test.zig","cwd":"src/coding/tools/bash"}
+[file_not_found] src/coding/tools/bash
+tool: find error
+{"pattern":"**/*.zig","cwd":"src/coding/regex"}
+[file_not_found] src/coding/regex
+tool: find error
+{"pattern":"**/test.zig","cwd":"src/ai/http"}
+[file_not_found] src/ai/http
+```
+
+```
+tool: bash done
+{"command":"grep -n \"pub fn exec\\|pub fn matches\\|step_budget\\|stepBudget\\|StepBudget\\|budget\" src/coding/regex.zig | head -30","description":"Find regex exec and budget functions"}
+[exit] code=0
+[stderr]
+grep: src/coding/regex.zig: No such file or directory
+tool: bash error
+{"command":"wc -l src/coding/regex.zig","description":"Line count of regex.zig"}
+[exit] code=1
+[stderr]
+wc: src/coding/regex.zig: No such file or directory
+```
+
+But read tool found the same path
+```
+tool: read done
+{"path":"src/coding/tools/bash.zig","offset":1030,"limit":80}
+tool: read done
+{"path":"src/coding/regex.zig","offset":880,"limit":50}
+tool: read done
+{"path":"src/ai/http.zig","offset":1275,"limit":100}
+```

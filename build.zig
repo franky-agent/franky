@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     const unit_tests = b.addTest(.{
         .name = "franky-test",
@@ -137,6 +138,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(path),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         });
         mod.addImport("franky", test_module);
         const name = std.fs.path.stem(path);
@@ -151,8 +153,8 @@ pub fn build(b: *std.Build) void {
 
     // `zig build test-profile` — build (do not run) FP-preserved test
     // binaries to zig-out/bin/franky-{test,<integration>_test}. See
-    // docs/design/profiling_guide.md §3 for the rationale: external
-    // profilers (perf --call-graph fp) need %rbp preserved, which the
+    // docs/spec/v2.md §8.1 for the rationale: external profilers
+    // (perf --call-graph fp) need %rbp preserved, which the
     // optimiser otherwise strips above Debug. The regular `zig build
     // test` path is unchanged — these are separate modules / artifacts.
     //
@@ -212,8 +214,8 @@ pub fn build(b: *std.Build) void {
     // `zig build profile -- [options]` — drive perf + heaptrack +
     // inferno against the FP-preserved test binaries to produce CPU
     // and memory flamegraphs. See `src/bin/franky_profile.zig` for
-    // the CLI surface and docs/design/profiling_guide.md §3.5 for
-    // the spec.
+    // the CLI surface and docs/spec/v2.md §8.2 for the spec
+    // (long-form how-to: docs/archive/profiling_guide.md).
     const profile_driver_module = b.createModule(.{
         .root_source_file = b.path("src/bin/franky_profile.zig"),
         .target = target,

@@ -41,6 +41,7 @@ pub const parameters_json: []const u8 =
     \\    "cwd": {"type": "string", "description": "Working directory for the command. Defaults to the session cwd (if any) else the agent's cwd."},
     \\    "timeoutMs": {"type": "integer", "minimum": 1, "description": "Hard timeout in milliseconds (default 120000)."},
     \\    "background": {"type": "boolean", "description": "Run detached; returns immediately with {pid, outputFile}. Default false."},
+    \\    "resetCwd": {"type": "boolean", "description": "Clear the session-tracked cwd before resolving the working directory for this call (so it falls back to the agent's startup cwd unless an explicit `cwd` arg is given). Use this if a prior command's `cd` left the session in an unwanted directory. Default false."},
     \\    "description": {"type": "string", "description": "Short human-readable description of what the command does."}
     \\  },
     \\  "additionalProperties": false
@@ -153,7 +154,7 @@ pub fn tool() at.AgentTool {
 pub fn toolWithState(state: *SessionBashState) at.AgentTool {
     return .{
         .name = "bash",
-        .description = "Run a shell command (via /bin/sh -c). Cwd persists via SessionBashState. Output truncates to last 2000 lines / 50 KB with on-disk spill — pipe through `head`/`tail`/`grep` for long output.",
+        .description = "Run a shell command (via /bin/sh -c). Cwd persists via SessionBashState across calls; the result includes a `[cwd]` footer so drift after an in-place `cd` is visible. Pass `resetCwd: true` to clear the tracked cwd before the call. Output truncates to last 2000 lines / 50 KB with on-disk spill — pipe through `head`/`tail`/`grep` for long output.",
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
         .ctx = @ptrCast(state),
@@ -173,7 +174,7 @@ pub const BashCtx = struct {
 pub fn toolWithStateAndWorkspace(ctx: *BashCtx) at.AgentTool {
     return .{
         .name = "bash",
-        .description = "Run a shell command with session-tracked cwd + workspace path-safety + env denylist + shell-trust policy. Output truncates to last 2000 lines / 50 KB with on-disk spill — pipe through `head`/`tail`/`grep` for long output.",
+        .description = "Run a shell command with session-tracked cwd + workspace path-safety + env denylist + shell-trust policy. Result includes a `[cwd]` footer so cwd drift is visible; pass `resetCwd: true` to clear the tracked cwd before the call. Output truncates to last 2000 lines / 50 KB with on-disk spill — pipe through `head`/`tail`/`grep` for long output.",
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
         .ctx = @ptrCast(ctx),
@@ -286,6 +287,17 @@ fn execute(
     else
         null;
 
+    // `resetCwd: true` clears the session-tracked cwd before this
+    // call resolves its effective working directory — see §C.4
+    // visibility/escape-hatch addendum.
+    const reset_cwd: bool = if (root.object.get("resetCwd")) |v|
+        (v == .bool and v.bool)
+    else
+        false;
+    if (reset_cwd) {
+        if (state) |s| s.cwd_buf.clearRetainingCapacity();
+    }
+
     // Precedence: explicit `cwd` arg > session-tracked cwd > inherit.
     const cwd_opt: ?[]const u8 = cwd_arg_opt orelse if (state) |s| s.getCwd() else null;
 
@@ -351,7 +363,12 @@ fn execute(
     emitChunked(allocator, on_update, parsed_trailer.clean_stdout);
 
     const session_dir: ?[]const u8 = if (state) |s| s.getSessionDir() else null;
-    return try formatResult(allocator, io, call_id, session_dir, result, parsed_trailer.clean_stdout);
+    // Surface the session-tracked cwd in the result so drift after
+    // an in-place `cd` is visible to the caller. Only emitted when
+    // a SessionBashState is wired — the stateless `tool()` factory
+    // has no cwd to drift, so its result format is unchanged.
+    const reported_cwd: ?[]const u8 = if (state) |s| s.getCwd() else null;
+    return try formatResult(allocator, io, call_id, session_dir, reported_cwd, result, parsed_trailer.clean_stdout);
 }
 
 /// Full §R.5/§R.6 bash: session state + workspace-scope path-check
@@ -405,6 +422,16 @@ fn executeWithCtx(
         }
         break :blk p;
     } else null;
+
+    // `resetCwd: true` clears the session-tracked cwd before this
+    // call resolves its effective working directory.
+    const reset_cwd: bool = if (root.object.get("resetCwd")) |v|
+        (v == .bool and v.bool)
+    else
+        false;
+    if (reset_cwd) {
+        if (state) |s| s.cwd_buf.clearRetainingCapacity();
+    }
 
     // Precedence: explicit `cwd` arg > session-tracked cwd > inherit.
     const cwd_opt: ?[]const u8 = cwd_from_arg orelse if (state) |s| s.getCwd() else null;
@@ -473,7 +500,8 @@ fn executeWithCtx(
 
     emitChunked(allocator, on_update, parsed_trailer.clean_stdout);
     const session_dir: ?[]const u8 = if (state) |s| s.getSessionDir() else null;
-    return try formatResult(allocator, io, call_id, session_dir, result, parsed_trailer.clean_stdout);
+    const reported_cwd: ?[]const u8 = if (state) |s| s.getCwd() else null;
+    return try formatResult(allocator, io, call_id, session_dir, reported_cwd, result, parsed_trailer.clean_stdout);
 }
 
 pub const TrailerResult = struct {
@@ -519,6 +547,7 @@ fn formatResult(
     io: std.Io,
     call_id: []const u8,
     session_dir: ?[]const u8,
+    reported_cwd: ?[]const u8,
     result: std.process.RunResult,
     clean_stdout: []const u8,
 ) !at.ToolResult {
@@ -542,6 +571,15 @@ fn formatResult(
     }
     if (clean_stdout.len == 0 and result.stderr.len == 0) {
         try buf.appendSlice(allocator, "(no output)\n");
+    }
+    // Cwd footer — placed at the END so tail-truncation preserves
+    // it even for very large outputs. Only emitted when a
+    // SessionBashState was passed in (callers without state have no
+    // cwd to drift).
+    if (reported_cwd) |cwd| {
+        try buf.appendSlice(allocator, "[cwd] ");
+        try buf.appendSlice(allocator, cwd);
+        try buf.append(allocator, '\n');
     }
 
     const trunc = truncate_mod.truncateTail(buf.items, .{});
@@ -950,6 +988,96 @@ test "bash tool: honors explicit cwd arg over session-tracked cwd" {
     // Session cwd should NOT have shifted to `/a`'s explicit override;
     // the trailer in that run reports `/b`, which updates state.
     try testing.expectEqualStrings(resolved_b, state.getCwd().?);
+}
+
+test "bash tool: result includes [cwd] footer when state is wired" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_bash_cwd_footer";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    var state = SessionBashState.init(gpa);
+    defer state.deinit();
+    try state.setCwd(base);
+
+    var cancel: ai.stream.Cancel = .{};
+    const t = toolWithState(&state);
+    var res = try t.execute(&t, gpa, io, "id-foot", "{\"command\":\"echo ok\"}", &cancel, .{});
+    defer res.deinit(gpa);
+
+    const txt = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, txt, "[cwd] ") != null);
+    // Footer reflects the post-call session cwd (which the wrapper's
+    // trailer set via $PWD — matches `base` here).
+    try testing.expect(std.mem.indexOf(u8, txt, base) != null);
+}
+
+test "bash tool: stateless tool() omits [cwd] footer (output unchanged)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var cancel: ai.stream.Cancel = .{};
+    const t = tool();
+    var res = try t.execute(&t, gpa, io, "id-nostate", "{\"command\":\"echo ok\"}", &cancel, .{});
+    defer res.deinit(gpa);
+
+    try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "[cwd] ") == null);
+}
+
+test "bash tool: resetCwd clears session-tracked cwd before resolving" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    // Seed two dirs: one we'll cd into and abandon, one we expect to
+    // land in after reset (= the agent process's cwd, captured via
+    // a follow-up `pwd`).
+    const base = "/tmp/franky_bash_resetcwd";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    var state = SessionBashState.init(gpa);
+    defer state.deinit();
+    try state.setCwd(base);
+
+    var cancel: ai.stream.Cancel = .{};
+    const t = toolWithState(&state);
+
+    // Sanity: state.getCwd() reflects the seeded cwd.
+    try testing.expect(state.getCwd() != null);
+
+    // resetCwd:true wipes the tracked cwd before the call resolves
+    // its working directory. The command runs in the inherited
+    // (agent process) cwd, NOT in `base`.
+    var r = try t.execute(
+        &t,
+        gpa,
+        io,
+        "id-reset",
+        "{\"command\":\"pwd\",\"resetCwd\":true}",
+        &cancel,
+        .{},
+    );
+    defer r.deinit(gpa);
+
+    const txt = r.content[0].text.text;
+    // The pwd output should NOT be the abandoned `base`. It will be
+    // whatever the test-runner's cwd is — we don't assert the exact
+    // path (it varies by build host), only that drift is gone.
+    try testing.expect(std.mem.indexOf(u8, txt, base) == null);
+    // Post-call, state.cwd_buf holds the inherited cwd (the trailer
+    // captured $PWD). It is non-null but != `base`.
+    try testing.expect(state.getCwd() != null);
+    try testing.expect(!std.mem.eql(u8, state.getCwd().?, base));
 }
 
 /// v1.3.2 — resolve `<base>/<sub>` through `std.Io.Dir.realPathFile`

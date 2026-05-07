@@ -1,8 +1,8 @@
 //! `zig build profile -- [options]` — drive perf + heaptrack + inferno
 //! against the FP-preserved test binaries to produce CPU and memory
-//! flamegraphs. See `docs/design/profiling_guide.md` for the spec
-//! (TL;DR + §3.5 cover the user-visible surface; §§4–5 cover the
-//! underlying perf / heaptrack mechanics this binary wraps).
+//! flamegraphs. Spec: docs/spec/v2.md §8. Long-form how-to:
+//! docs/archive/profiling_guide.md (archived; the perf / heaptrack
+//! mechanics this binary wraps haven't moved).
 //!
 //! Run:
 //!
@@ -17,8 +17,9 @@
 //! build time via `-Dprofile-filter=PATTERN` (repeatable).
 //!
 //! The driver is intentionally a thin wrapper around the manual
-//! commands documented in §§4–5 of the profiling guide. When
-//! something doesn't look right, drop down to those commands by hand.
+//! perf / heaptrack commands. When something doesn't look right,
+//! drop down to those commands by hand — the archived guide
+//! documents the full pipeline.
 
 const std = @import("std");
 const franky = @import("franky");
@@ -34,8 +35,8 @@ const test_binaries = [_][]const u8{
 };
 
 // `heaptrack_print --flamegraph-cost-type` dimensions. heaptrack 1.5
-// only accepts these four — see `heaptrack_print --help`. Guide
-// §5.2.1 explains what each one tells you.
+// only accepts these four — see `heaptrack_print --help`. Spec
+// §8.4 explains what each one tells you.
 const memory_costs = [_][]const u8{
     "peak",
     "leaked",
@@ -59,7 +60,7 @@ const usage =
     \\                       test-profile FP-preserved build, which is
     \\                       the default for `zig build test-profile`).
     \\                       Use `dwarf` when the optimiser elided
-    \\                       frames (§7.3 of the guide).
+    \\                       frames (§8.5).
     \\  --no-keep-trace      Delete perf.data and heaptrack.*.zst after
     \\                       rendering the SVGs. Default: keep, so SVGs
     \\                       can be re-rendered without re-capturing.
@@ -75,7 +76,8 @@ const usage =
     \\  zig build profile -Dprofile-filter=parallel
     \\  zig build profile -Dprofile-filter=edit -Dprofile-filter=grep
     \\
-    \\see docs/design/profiling_guide.md for the full spec.
+    \\see docs/spec/v2.md §8 (or the archived how-to at
+    \\docs/archive/profiling_guide.md) for the full spec.
     \\
 ;
 
@@ -173,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
     if (@import("builtin").os.tag != .linux) {
         try writeErr(io, "franky profile: this driver is Linux-only.\n" ++
             "  perf and heaptrack don't work on macOS; use Instruments / dtrace.\n" ++
-            "  See docs/design/profiling_guide.md §2 for the macOS pointers.\n");
+            "  See docs/archive/profiling_guide.md §2 for the macOS pointers.\n");
         std.process.exit(2);
     }
 

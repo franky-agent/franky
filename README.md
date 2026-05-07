@@ -751,6 +751,52 @@ integration binaries (`agent_loop`, `agent_class`, `gitignore`,
 shipped in v1.2.* and was removed in v1.30.0 — bearer tokens are now
 minted externally.
 
+### Profiling
+
+CPU and memory flamegraphs against the test suite. Spec lives in
+[`docs/spec/v2.md`](docs/spec/v2.md) §8; the long-form how-to was
+archived to [`docs/archive/profiling_guide.md`](docs/archive/profiling_guide.md).
+
+**Prerequisites** (Linux only — perf + heaptrack don't work on
+macOS): `perf`, `heaptrack`, `heaptrack_print`, and `inferno-{collapse-perf,flamegraph,diff-folded}`
+(install via `cargo install inferno`).
+
+```sh
+# 1. Build frame-pointer-preserved + libc-linked test binaries.
+zig build test-profile
+
+# 2. Capture CPU + all four memory flamegraphs against franky-test.
+#    Output: zig-out/profile/franky-test/<unix_ms>/{cpu,mem-{peak,leaked,allocations,temporary}}.{folded,svg}
+zig build profile
+
+# Verify prereqs without capturing
+zig build profile -- --check
+
+# List installed test binaries
+zig build profile -- --list
+
+# CPU only / mem only against a different test binary
+zig build profile -- --binary franky-parallel_tools_test --mode cpu
+zig build profile -- --binary franky-kitchen_sink_test  --mode mem
+
+# Narrow capture to a subset of tests (compile-time filter, repeatable)
+zig build profile -Dprofile-filter=parallel
+zig build profile -Dprofile-filter=edit -Dprofile-filter=grep
+
+# Don't keep the raw perf.data / heaptrack.zst (renders SVGs, then deletes)
+zig build profile -- --no-keep-trace
+```
+
+The four memory flamegraphs are `peak` / `leaked` / `allocations` /
+`temporary` — see v2 §8.4 for what each one tells you.
+`leaked.svg` should normally be empty (the test runner's GPA fails
+on leaks); a non-empty leaked graph means an external tracer caught
+something the GPA missed (typically C-malloc allocations from
+vendored deps).
+
+If a CPU flamegraph collapses to a single tower with no caller
+context, frame pointers were stripped — see v2 §8.5.
+
 ### Regenerating `models.json`
 
 ```sh
