@@ -148,4 +148,86 @@ pub fn build(b: *std.Build) void {
         });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+
+    // `zig build test-profile` — build (do not run) FP-preserved test
+    // binaries to zig-out/bin/franky-{test,<integration>_test}. See
+    // docs/design/profiling_guide.md §3 for the rationale: external
+    // profilers (perf --call-graph fp) need %rbp preserved, which the
+    // optimiser otherwise strips above Debug. The regular `zig build
+    // test` path is unchanged — these are separate modules / artifacts.
+    //
+    // `-Dprofile-filter=PATTERN` (optional) narrows the captured test
+    // set at compile time. Zig 0.17's standalone test binary does not
+    // accept --test-filter at runtime, so the filter must be baked
+    // into the binary here. Multiple uses of -Dprofile-filter accumulate.
+    const profile_filters = b.option(
+        []const []const u8,
+        "profile-filter",
+        "Narrow the FP-preserved test binaries to tests matching PATTERN (compile-time; repeatable)",
+    ) orelse &[_][]const u8{};
+    // `link_libc = true` is required for heaptrack: it injects via
+    // LD_PRELOAD, which is a no-op on statically-linked binaries (no
+    // dynamic loader, no preload). Without this the memory pipeline
+    // deadlocks — the binary never opens the heaptrack FIFO, and
+    // `heaptrack_interpret < $fifo` blocks forever waiting for a writer.
+    const profile_test_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .omit_frame_pointer = false,
+        .link_libc = true,
+    });
+    const profile_unit_tests = b.addTest(.{
+        .name = "franky-test",
+        .root_module = profile_test_module,
+        .filters = profile_filters,
+        .use_llvm = use_llvm,
+        .use_lld = use_lld,
+    });
+    const test_profile_step = b.step(
+        "test-profile",
+        "Build profilable test binaries (FP-preserved) into zig-out/bin (no run)",
+    );
+    test_profile_step.dependOn(&b.addInstallArtifact(profile_unit_tests, .{}).step);
+    for (integration_files) |path| {
+        const profile_mod = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+            .omit_frame_pointer = false,
+            .link_libc = true,
+        });
+        profile_mod.addImport("franky", profile_test_module);
+        const name = std.fs.path.stem(path);
+        const profile_t = b.addTest(.{
+            .name = b.fmt("franky-{s}", .{name}),
+            .root_module = profile_mod,
+            .filters = profile_filters,
+            .use_llvm = use_llvm,
+            .use_lld = use_lld,
+        });
+        test_profile_step.dependOn(&b.addInstallArtifact(profile_t, .{}).step);
+    }
+
+    // `zig build profile -- [options]` — drive perf + heaptrack +
+    // inferno against the FP-preserved test binaries to produce CPU
+    // and memory flamegraphs. See `src/bin/franky_profile.zig` for
+    // the CLI surface and docs/design/profiling_guide.md §3.5 for
+    // the spec.
+    const profile_driver_module = b.createModule(.{
+        .root_source_file = b.path("src/bin/franky_profile.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    profile_driver_module.addImport("franky", franky_module);
+    const profile_driver_exe = b.addExecutable(.{
+        .name = "franky-profile",
+        .root_module = profile_driver_module,
+        .use_llvm = use_llvm,
+        .use_lld = use_lld,
+    });
+    const profile_driver_run = b.addRunArtifact(profile_driver_exe);
+    profile_driver_run.step.dependOn(test_profile_step);
+    if (b.args) |args| profile_driver_run.addArgs(args);
+    b.step("profile", "Capture CPU + memory flamegraphs from the test suite").dependOn(&profile_driver_run.step);
 }

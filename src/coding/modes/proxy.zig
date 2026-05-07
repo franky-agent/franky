@@ -409,11 +409,15 @@ const Session = struct {
         const id = self.next_event_id;
         self.next_event_id += 1;
 
-        const stamped = std.fmt.allocPrint(
-            allocator,
-            "id: {d}\n{s}",
-            .{ id, frame_body },
-        ) catch {
+        // Pre-size the stamped buffer in one allocation. Going through
+        // `fmt.allocPrint` here used to cost an alloc + a remap per
+        // call (initCapacity is small, the format result overflows it),
+        // which dominated allocator traffic on tests that broadcast
+        // through the ring. `bufPrint` for the id header is bounded
+        // (u64 → at most 20 digits + "id: \n").
+        var id_buf: [32]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&id_buf, "id: {d}\n", .{id}) catch unreachable;
+        const stamped = allocator.alloc(u8, id_str.len + frame_body.len) catch {
             // Allocation failed — give up on storing this event,
             // but still try to fan out the unstamped frame so live
             // subscribers don't miss it. Future reconnects after
@@ -422,6 +426,8 @@ const Session = struct {
             self.fanOutLocked(frame_body);
             return;
         };
+        @memcpy(stamped[0..id_str.len], id_str);
+        @memcpy(stamped[id_str.len..], frame_body);
 
         // `id` is u64 but replay_ring is indexed by usize. The
         // modulus is bounded by replay_ring_capacity, so the

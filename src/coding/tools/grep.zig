@@ -533,9 +533,7 @@ fn writeMatchLine(
     const t = truncate_mod.truncateLine(line, truncate_mod.grep_max_line_length);
     if (t.was_truncated) lines_truncated.* = true;
     const suffix: []const u8 = if (t.was_truncated) "... [truncated]" else "";
-    const s = try std.fmt.allocPrint(allocator, "{s}:{d}:{s}{s}\n", .{ path, line_no, t.text, suffix });
-    defer allocator.free(s);
-    try out.appendSlice(allocator, s);
+    try out.print(allocator, "{s}:{d}:{s}{s}\n", .{ path, line_no, t.text, suffix });
 }
 
 fn writeContextLine(
@@ -549,9 +547,7 @@ fn writeContextLine(
     const t = truncate_mod.truncateLine(line, truncate_mod.grep_max_line_length);
     if (t.was_truncated) lines_truncated.* = true;
     const suffix: []const u8 = if (t.was_truncated) "... [truncated]" else "";
-    const s = try std.fmt.allocPrint(allocator, "{s}-{d}-{s}{s}\n", .{ path, line_no, t.text, suffix });
-    defer allocator.free(s);
-    try out.appendSlice(allocator, s);
+    try out.print(allocator, "{s}-{d}-{s}{s}\n", .{ path, line_no, t.text, suffix });
 }
 
 fn indexOfNoCase(haystack: []const u8, needle: []const u8) ?usize {
