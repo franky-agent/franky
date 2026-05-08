@@ -27,17 +27,38 @@ Activate on `/review --multimodel` or `franky --skill multimodel-review` with th
       `max_models` profiles (default 4) whose names suggest code capability.
 
 3. **Fan out in parallel — single tool-call batch.**
-   Spawn one `code-audit` subagent per selected profile. All subagents receive
-   the identical prompt:
+   Spawn one `diff-review` subagent per selected profile. All subagents receive
+   the identical prompt. **The prompt is critical: it must be strict about
+   bounding the agent's investigation.** `diff-review` has NO file-reading
+   tools — it can only analyse the diff text in the prompt. Use the following
+   wording verbatim:
 
-   > "Review the following diff for correctness, security, and performance
-   > issues. Report each finding on its own line as:
-   > `file:line — description`
+   > "Review this diff for correctness, security, and performance issues.
+   >
+   > **Rules (follow exactly):**
+   > 1. **Work from the diff only.** Do NOT read, grep, or examine any
+   >    source files outside what is shown in the diff. If context from
+   >    the diff alone is insufficient, prefix the finding with
+   >    `[needs verification]` and move on.
+   > 2. **Make exactly one pass.** Identify all findings from the diff text
+   >    in a single read-through. Do NOT go back to re-evaluate earlier
+   >    findings after reading later parts of the diff.
+   > 3. **Do not speculate on allocator types, method signatures, or
+   >    standard-library behavior** that you cannot confirm from the diff.
+   >    Flag those with `[uncertain]` if they matter.
+   > 4. **Report only confirmed findings.** Omit "potential" or "might be"
+   >    issues unless you are certain.
+   > 5. **Output format — one line per finding:**
+   >    `file:line — description`
+   >    Prefix with `[critical]`, `[bug]`, `[leak]`, `[race]`, `[design]`,
+   >    or `[nit]` as appropriate.
+   > 6. **Keep the response under 300 lines total.** Be concise.
+   >
    > Include only real issues; omit style nits and formatting comments."
    > [paste full diff]
 
    Use `timeout_ms` from the Review configuration (default 180000).
-   Use `preset: "code-audit"` and `profile: "<profile-name>"` for each call.
+   Use `preset: "diff-review"` and `profile: "<profile-name>"` for each call.
 
 4. **Check quorum.**
    Count how many subagents returned output. If fewer than `min_models`

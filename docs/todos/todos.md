@@ -203,3 +203,47 @@ styled tooltip (`#role-tooltip`) that appears on hover. It shows:
 The tooltip lives as a child of `.role-pill` in the HTML, positioned absolutely below the
 pill via CSS. The server-side `/role` endpoint (`renderRoleStatusJson` in `role.zig`) already
 provided all the necessary data — the JS side just needed to route it into the new DOM elements.
+
+# Hide .git folders in find tool results
+
+```
+ool: bash done
+{"command":"find . -maxdepth 2 -type f | head -80","description":"List files in workspace to understand structure"}
+[exit] code=0
+[stdout]
+./transcript.txt
+./.containifyci/containifyci.go
+./.containifyci/go.mod
+./.containifyci/go.sum
+./SANDBOX.md
+./agent-guardrails.pdf
+./.contextignore
+./.goreleaser.yaml
+./settings.json
+./test/gitignore_test.zig
+./test/agent_loop_test.zig
+./test/agent_class_test.zig
+./test/parallel_tools_test.zig
+./test/replay_test.zig
+./test/kitchen_sink_test.zig
+./build.zig.zon
+./.teller.yml
+./build.zig
+./.franky-workflow.yaml
+./docs/README.md
+./review-subagent-1.md
+./README.md
+./Dockerfile.sandbox
+./review-subagent-2.md
+./.gitignore
+./skills/zig.md
+./transcript2.txt
+./AGENTS.md
+./.git/ORIG_HEAD
+./.git/config
+./.git/HEAD
+./.git/description
+./.git/index
+./.git/packed-refs
+./.git/COMMIT_EDITMSG
+```

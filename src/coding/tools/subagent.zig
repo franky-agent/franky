@@ -361,6 +361,7 @@ fn selectTools(
 }
 
 const research_tool_names = [_][]const u8{ "read", "ls", "find", "grep", "web_search", "web_fetch" };
+const diff_review_tool_names = [_][]const u8{};
 const file_ops_tool_names = [_][]const u8{ "read", "write", "edit", "ls" };
 const bash_runner_tool_names = [_][]const u8{ "bash", "ls" };
 
@@ -370,6 +371,10 @@ fn buildResearchTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![
 
 fn buildCodeAuditTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
     return selectTools(alloc, parent, &research_tool_names);
+}
+
+fn buildDiffReviewTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
+    return selectTools(alloc, parent, &diff_review_tool_names);
 }
 
 fn buildFileOpsTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
@@ -405,6 +410,21 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
         \\Report findings as a structured list with file paths and line references.
         ,
         .build_tools = buildCodeAuditTools,
+        .safety = .{ .read_only = true },
+    });
+    try reg.register(.{
+        .name = "diff-review",
+        .description = "Reviews a diff pasted in the prompt — has NO file tools (works from prompt text only).",
+        .default_profile = "ollama-deepseek-pro",
+        .default_role = .read,
+        .default_system_prompt =
+        \\You are a diff-review sub-agent. You have NO file-read tools.
+        \\Analyse the diff text in the prompt above. Identify correctness,
+        \\security, and performance issues. Report each finding as:
+        \\file:line — [severity] description
+        \\Be concise. Omit style nits.
+        ,
+        .build_tools = buildDiffReviewTools,
         .safety = .{ .read_only = true },
     });
     try reg.register(.{
@@ -1549,13 +1569,13 @@ test "PresetRegistry: register + get" {
     try testing.expect(reg.get("nonexistent") == null);
 }
 
-test "registerBuiltinPresets: populates all four built-ins" {
+test "registerBuiltinPresets: populates all five built-ins" {
     const gpa = testing.allocator;
     var reg = PresetRegistry.init(gpa);
     defer reg.deinit();
     try registerBuiltinPresets(&reg);
 
-    const names = [_][]const u8{ "research", "code-audit", "file-ops", "bash-runner" };
+    const names = [_][]const u8{ "research", "code-audit", "diff-review", "file-ops", "bash-runner" };
     for (names) |n| {
         const p = reg.get(n);
         try testing.expect(p != null);
@@ -1564,10 +1584,12 @@ test "registerBuiltinPresets: populates all four built-ins" {
     }
     try testing.expectEqual(role_mod.Role.read, reg.get("research").?.default_role);
     try testing.expectEqual(role_mod.Role.read, reg.get("code-audit").?.default_role);
+    try testing.expectEqual(role_mod.Role.read, reg.get("diff-review").?.default_role);
     try testing.expectEqual(role_mod.Role.plan, reg.get("file-ops").?.default_role);
     try testing.expectEqual(role_mod.Role.code, reg.get("bash-runner").?.default_role);
     try testing.expect(reg.get("research").?.safety.read_only);
     try testing.expect(reg.get("code-audit").?.safety.read_only);
+    try testing.expect(reg.get("diff-review").?.safety.read_only);
 }
 
 test "buildParametersJson: enum contains all registered preset names" {
@@ -1581,6 +1603,7 @@ test "buildParametersJson: enum contains all registered preset names" {
 
     try testing.expect(std.mem.indexOf(u8, params, "\"research\"") != null);
     try testing.expect(std.mem.indexOf(u8, params, "\"code-audit\"") != null);
+    try testing.expect(std.mem.indexOf(u8, params, "\"diff-review\"") != null);
     try testing.expect(std.mem.indexOf(u8, params, "\"file-ops\"") != null);
     try testing.expect(std.mem.indexOf(u8, params, "\"bash-runner\"") != null);
     try testing.expect(std.mem.indexOf(u8, params, "\"preset\"") != null);
