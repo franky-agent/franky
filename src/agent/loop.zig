@@ -500,6 +500,29 @@ fn runTurn(
         .http_client = http_client,
     });
 
+    // High-watermark guard: the provider fills stream_ch synchronously on
+    // this thread, so if it ever reaches 100 % the next push blocks and
+    // deadlocks (consumer hasn't started yet). Log a warning at 75 % so
+    // there is advance notice before that threshold is crossed.
+    // See docs/limits/stream-channel-capacity.md for full analysis.
+    {
+        const sc_used = stream_ch.len;
+        const sc_cap  = stream_ch.capacity;
+        if (sc_used * 4 >= sc_cap * 3) {
+            ai.log.log(
+                .warn, "loop", "stream_channel_high_watermark",
+                "events={d}/{d} ({d}%) — approaching deadlock threshold; see docs/limits/stream-channel-capacity.md",
+                .{ sc_used, sc_cap, sc_used * 100 / sc_cap },
+            );
+        } else {
+            ai.log.log(
+                .debug, "loop", "stream_channel_usage",
+                "events={d}/{d} ({d}%)",
+                .{ sc_used, sc_cap, sc_used * 100 / sc_cap },
+            );
+        }
+    }
+
     try out.push(io, .{ .message_start = .{ .role = .assistant } });
 
     var reducer = ai.stream.Reducer.init(allocator);
@@ -919,16 +942,23 @@ fn runToolsParallel(
 
 fn streamChannel(allocator: std.mem.Allocator) !ai.channel.Channel(ai.stream.StreamEvent) {
     // Provider-to-reducer buffer. The provider's streamFn pushes every
-    // SSE delta synchronously before runTurn drains, so this cap needs
-    // to hold an entire assistant response's worth of events without
-    // blocking. A large `write` or `edit` tool-call streams the body as
-    // dozens to thousands of `input_json_delta` fragments; 64 was not
-    // enough and deadlocked any turn that emitted a big tool-arg payload.
-    // 4096 gives a comfortable ~500 KiB ceiling while preserving
-    // backpressure if the provider ever produces more than that.
+    // SSE delta synchronously (whole response is buffered first) and the
+    // drain loop runs on the same thread — so this ring must fit the
+    // entire turn's event stream without ever blocking on push, because
+    // blocking = deadlock.
+    //
+    // Event budget per turn (worst observed: DeepSeek-v4-flash:cloud):
+    //   ~1 000 thinking_delta  (reasoning phase)
+    //   ~4 000 text_delta      (content phase, ~4 K tokens)
+    //   + start / done / diagnostic + misc overhead
+    //   ≈ 5 300 events total
+    //
+    // 65 536 gives a 12× safety margin over that observed peak and
+    // comfortably covers models producing up to ~60 K output tokens.
+    // Memory cost is transient (per-turn arena): ~3.5 MB at 54 B/slot.
     return try ai.channel.Channel(ai.stream.StreamEvent).initWithDrop(
         allocator,
-        4096,
+        65536,
         ai.stream.StreamEvent.deinit,
         allocator,
     );

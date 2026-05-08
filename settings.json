@@ -5,6 +5,12 @@
             "maxTotalMs": 180000
         }
     },
+    "review": {
+        "profiles": ["ollama-deepseek-flash", "ollama-home", "ollama-deepseek-pro"],
+        "min_models": 2,
+        "max_models": 4,
+        "timeout_ms": 180000
+    },
     "profiles": {
         "cerebras": {
             "provider": "gateway",

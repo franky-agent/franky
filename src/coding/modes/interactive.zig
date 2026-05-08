@@ -264,6 +264,10 @@ fn runInteractive(
     try slash_registry.register(.{ .name = "diagnostics", .description = "Per-turn diagnostic report (anomalies + trace pointers)", .handler = interactiveDiagnosticsHandler });
     try slash_registry.register(.{ .name = "improve", .description = "Cross-session self-improvement report (mines past summaries)", .handler = interactiveImproveHandler });
     try slash_registry.register(.{ .name = "skills", .description = "List loaded skills + which are active for this workspace", .handler = interactiveSkillsHandler });
+    // v2.16 — multi-model review pass-through. The skill file
+    // (multimodel-review.md) instructs the model what to do; we just
+    // forward the invocation so the model sees it as a user prompt.
+    try slash_registry.register(.{ .name = "review", .description = "Multi-model code review (requires --skill multimodel-review)", .handler = interactiveReviewHandler });
 
     // ── Extensions runtime ────────────────────────────────────────
     // Tier-1 extensions are compiled in and opt-in via `--extensions
@@ -2147,6 +2151,29 @@ fn interactiveTemplateHandler(ctx: *slash_mod.Ctx, args: []const []const u8) sla
 }
 
 // ─── v1.5.3 — §J remainder handlers ─────────────────────────────
+
+fn interactiveReviewHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!void {
+    const bridge = bridgeFromCtx(ctx);
+
+    // Build the user prompt: "Run a multi-model code review on:" plus args.
+    var pb: std.ArrayList(u8) = .empty;
+    errdefer pb.deinit(ctx.allocator);
+    try pb.appendSlice(ctx.allocator, "Run a multi-model code review on:");
+    for (args) |a| {
+        try pb.appendSlice(ctx.allocator, " ");
+        try pb.appendSlice(ctx.allocator, a);
+    }
+    const prompt = try pb.toOwnedSlice(ctx.allocator);
+    errdefer ctx.allocator.free(prompt);
+
+    // Enqueue as pending prompt so the next loop iteration submits it.
+    if (bridge.pending_prompt.*) |p| bridge.allocator.free(p);
+    bridge.pending_prompt.* = prompt;
+
+    const ack = try std.fmt.allocPrint(ctx.allocator, "multi-model review submitted; see results shortly...", .{});
+    defer ctx.allocator.free(ack);
+    try ctx.output.appendSlice(ctx.allocator, ack);
+}
 
 fn interactiveToolsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
     const bridge = bridgeFromCtx(ctx);

@@ -1377,6 +1377,60 @@ fn designHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!voi
     try ctx.output.appendSlice(ctx.allocator, "Opening design documents panel.");
 }
 
+fn reviewHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!void {
+    const px = proxySlashCtx(ctx);
+    const session = px.session;
+
+    // Build the user prompt: "Run a multi-model code review on:" plus args.
+    var pb: std.ArrayList(u8) = .empty;
+    defer pb.deinit(ctx.allocator);
+    try pb.appendSlice(ctx.allocator, "Run a multi-model code review on:");
+    for (args) |a| {
+        try pb.appendSlice(ctx.allocator, " ");
+        try pb.appendSlice(ctx.allocator, a);
+    }
+    const text = try pb.toOwnedSlice(ctx.allocator);
+    errdefer ctx.allocator.free(text);
+
+    // Append a user message to the transcript, then spawn a worker
+    // (passing null for text since we already appended it).
+    {
+        const content = ctx.allocator.alloc(ai.types.ContentBlock, 1) catch return;
+        content[0] = .{ .text = .{ .text = ctx.allocator.dupe(u8, text) catch {
+            ctx.allocator.free(content);
+            return;
+        } } };
+        session.transcript.append(.{
+            .role = .user,
+            .content = content,
+            .timestamp = ai.stream.nowMillis(),
+        }) catch {
+            ctx.allocator.free(content[0].text.text);
+            ctx.allocator.free(content);
+            return;
+        };
+    }
+    persistSession(session);
+
+    const ReviewArgs = struct { session: *Session };
+    const reviewWorker = struct {
+        fn run(s: ReviewArgs) void {
+            s.session.run_mutex.lockUncancelable(s.session.io);
+            defer s.session.run_mutex.unlock(s.session.io);
+            runOneTurnInternal(s.session, s.session.allocator, s.session.io, null);
+        }
+    }.run;
+    const t = std.Thread.spawn(.{}, reviewWorker, .{ReviewArgs{ .session = session }}) catch {
+        try ctx.output.appendSlice(ctx.allocator, "Could not spawn review worker.");
+        return;
+    };
+    if (session.pending_retry_worker) |prior| prior.join();
+    session.pending_retry_worker = t;
+
+    px.side_effect = .turn_restarted;
+    try ctx.output.appendSlice(ctx.allocator, "Multi-model review submitted; see results shortly...");
+}
+
 /// Build the proxy's slash registry. Caller owns the registry +
 /// must call `deinit`. The handlers above all cast
 /// `ctx.userdata` to `*ProxySlashCtx`.
@@ -1398,6 +1452,7 @@ fn buildProxySlashRegistry(allocator: std.mem.Allocator) !slash_mod.Registry {
     try reg.register(.{ .name = "improve", .description = "Cross-session self-improvement report (mines past summaries)", .handler = improveHandler });
     try reg.register(.{ .name = "skills", .description = "List loaded skills + which are active for this workspace", .handler = skillsHandler });
     try reg.register(.{ .name = "design", .description = "Open the Design Documents panel", .handler = designHandler });
+    try reg.register(.{ .name = "review", .description = "Multi-model code review (requires --skill multimodel-review)", .handler = reviewHandler });
     try reg.register(.{ .name = "quit", .description = "Close this browser tab", .handler = quitHandler });
     return reg;
 }
@@ -2019,7 +2074,7 @@ fn runOneTurnInternal(
     // we can fan events out to subscribers.
     var ch = agent.loop.AgentChannel.initWithDrop(
         allocator,
-        4096,
+        65536,
         at.AgentEvent.deinit,
         allocator,
     ) catch return;

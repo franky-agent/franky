@@ -561,7 +561,7 @@ fn runPrint(
     // backpressure still kicks in if the consumer genuinely stalls.
     var ch = try agent.loop.AgentChannel.initWithDrop(
         allocator,
-        4096,
+        65536,
         at.AgentEvent.deinit,
         allocator,
     );

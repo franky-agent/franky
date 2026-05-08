@@ -112,6 +112,7 @@ pub const Settings = struct {
         deinitStringArray(self.allocator, self.permissions_always_allow_bash);
         deinitStringArray(self.allocator, self.permissions_always_deny_tools);
         deinitStringArray(self.allocator, self.permissions_always_deny_bash);
+        deinitStringArray(self.allocator, self.review_profiles);
         self.* = undefined;
     }
 };
@@ -301,6 +302,21 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
 
     if (obj.get("max_turns")) |v| if (v == .integer and v.integer >= 1 and v.integer <= std.math.maxInt(u32)) {
         settings.max_turns = @intCast(v.integer);
+    };
+
+    if (obj.get("review")) |rev_v| if (rev_v == .object) {
+        if (rev_v.object.get("profiles")) |p| if (p == .array) {
+            try appendStringArray(alloc, &settings.review_profiles, p.array);
+        };
+        if (rev_v.object.get("minModels")) |m| if (m == .integer and m.integer >= 1) {
+            settings.review_min_models = @intCast(m.integer);
+        };
+        if (rev_v.object.get("maxModels")) |m| if (m == .integer and m.integer >= 1) {
+            settings.review_max_models = @intCast(m.integer);
+        };
+        if (rev_v.object.get("timeoutMs")) |t| if (t == .integer and t.integer >= 1) {
+            settings.review_timeout_ms = @intCast(t.integer);
+        };
     };
 }
 
@@ -595,4 +611,63 @@ test "loadLayered: rejects ill-typed overlay fields silently" {
     // valid one; settings.json is permissive at the edges.
     try testing.expectEqual(@as(usize, 1), s.permissions_always_allow_tools.len);
     try testing.expectEqualStrings("read", s.permissions_always_allow_tools[0]);
+}
+
+test "loadLayered: review.profiles + scalars parse correctly (A1)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "/tmp/franky_settings_review_a1";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"review":{"profiles":["ollama-gemma4","ollama-deepseek-flash"],"minModels":3,"maxModels":5,"timeoutMs":120000}}
+        );
+    }
+    var s = try loadLayered(testing.allocator, io, base, null);
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 2), s.review_profiles.len);
+    try testing.expectEqualStrings("ollama-gemma4", s.review_profiles[0]);
+    try testing.expectEqualStrings("ollama-deepseek-flash", s.review_profiles[1]);
+    try testing.expectEqual(@as(u32, 3), s.review_min_models);
+    try testing.expectEqual(@as(u32, 5), s.review_max_models);
+    try testing.expectEqual(@as(u64, 120_000), s.review_timeout_ms);
+}
+
+test "loadLayered: review.profiles concatenate across layers (A2)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const proj = "/tmp/franky_settings_review_a2_proj";
+    const home = "/tmp/franky_settings_review_a2_home";
+    _ = std.Io.Dir.cwd().deleteTree(io, proj) catch {};
+    _ = std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, proj) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, proj ++ "/.franky");
+    try std.Io.Dir.cwd().createDirPath(io, home ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, proj ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"review":{"profiles":["gemini"]}}
+        );
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, home ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"review":{"profiles":["ollama-gemma4","claude-sonnet"]}}
+        );
+    }
+    var s = try loadLayered(testing.allocator, io, proj, home);
+    defer s.deinit();
+    // Both layers contribute; order is user-layer first, project-layer second.
+    try testing.expectEqual(@as(usize, 3), s.review_profiles.len);
 }

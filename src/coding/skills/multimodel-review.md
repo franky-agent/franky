@@ -9,7 +9,8 @@ auto_apply: []
 
 # Multi-Model Code Review
 
-Activate on `/review --multimodel` or multimodel is enabled in settings.json
+Activate on `/review --multimodel` or `franky --skill multimodel-review` with the
+`/review` slash command.
 
 ## Process
 
