@@ -29,4 +29,4 @@ ENV ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
 ENV PATH="/home/agent/.cargo/bin:${PATH}"
 RUN echo 'alias claude="claude --allow-dangerously-skip-permissions --dangerously-skip-permissions"' >> ~/.bashrc && \
     echo 'alias clauder="claude --allow-dangerously-skip-permissions --dangerously-skip-permissions --resume"' >> ~/.bashrc && \
-    echo 'alias franky-deepseek="./zig-out/bin/franky --profile ollama-deepseek-flash --mode proxy" >> ~/.bashrc
+    echo 'alias franky-deepseek="./zig-out/bin/franky --profile ollama-deepseek-flash --mode proxy" >> ~/.bashrc'

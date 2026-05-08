@@ -1,5 +1,7 @@
 # Permission system — design study
 
+**Status:** draft — open for discussion
+
 Two competing approaches for keeping a franky agent session safe.
 This document captures both designs in full, compares them across
 seven decision axes, and ends with a recommendation.

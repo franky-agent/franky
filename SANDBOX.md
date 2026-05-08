@@ -1,3 +1,11 @@
+# sbx
+
+```
+sbx create --template containifyci/claude-code shell .
+sbx run shell-franky
+sbx ports shell-franky --publish 8787:8787
+```
+
 # cerebras
 sbx secret set-custom -g --host api.cerebras.ai --env CEREBRAS_API_KEY --value ${CEREBRAS_API_KEY}
 
@@ -6,10 +14,10 @@ sbx secret set-custom -g --host api.cloudflare.com --env CF_API_TOKEN --value ${
 sbx secret set-custom -g --host api.cloudflare.com --env CF_ACCOUNT_ID --value ${CF_ACCOUNT_ID}$
 
 # mistral
-/opt/homebrew/bin/teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host api.mistral.ai --env MISTRAL_KEY --value ${MISTRAL_API_KEY}'
+teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host api.mistral.ai --env MISTRAL_KEY --value ${MISTRAL_API_KEY}'
 
 # ollama
-/opt/homebrew/bin/teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host ollama.com --env OLLAMA_KEY --value ${OLLAMA_KEY}'
+teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host ollama.com --env OLLAMA_KEY --value ${OLLAMA_KEY}'
 
 # openrouter
 sbx secret set-custom -g --host openrouter.ai --env OPENROUTER_KEY --value ${OPENROUTER_KEY}
