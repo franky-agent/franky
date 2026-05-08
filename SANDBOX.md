@@ -1,0 +1,25 @@
+# cerebras
+sbx secret set-custom -g --host api.cerebras.ai --env CEREBRAS_API_KEY --value ${CEREBRAS_API_KEY}
+
+# cloudflare
+sbx secret set-custom -g --host api.cloudflare.com --env CF_API_TOKEN --value ${CF_API_TOKEN}
+sbx secret set-custom -g --host api.cloudflare.com --env CF_ACCOUNT_ID --value ${CF_ACCOUNT_ID}$
+
+# mistral
+/opt/homebrew/bin/teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host api.mistral.ai --env MISTRAL_KEY --value ${MISTRAL_API_KEY}'
+
+# ollama
+/opt/homebrew/bin/teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host ollama.com --env OLLAMA_KEY --value ${OLLAMA_KEY}'
+
+# openrouter
+sbx secret set-custom -g --host openrouter.ai --env OPENROUTER_KEY --value ${OPENROUTER_KEY}
+
+# gemini
+echo "$GEMINI_API_KEY" | sbx secret set -g google
+
+# openai
+echo "$OPENAI_API_KEY" | sbx secret set -g openai
+
+
+We can also wrap this up with teller so that we can have a .teller.yaml file
+that fetch the secrets and setup the sbx secret without the secrets ever being stored on disk or in environment variables.
