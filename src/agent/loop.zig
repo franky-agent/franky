@@ -31,6 +31,7 @@ pub const AgentChannel = at.AgentChannel;
 pub const AgentMessage = at.AgentMessage;
 
 const guardrails_mod = @import("guardrails/guardrails.zig");
+const truncate = @import("../coding/tools/truncate.zig");
 
 pub const ConvertToLlmFn = *const fn (
     allocator: std.mem.Allocator,
@@ -1025,7 +1026,27 @@ fn makeToolResultMessage(
         for (copied.items) |cb| cb.deinit(allocator);
         copied.deinit(allocator);
     }
-    for (r.result.content) |cb| try copied.append(allocator, try cb.dupe(allocator));
+    for (r.result.content) |cb| {
+        const block: ai.types.ContentBlock = switch (cb) {
+            .text => |t| blk: {
+                if (t.text.len <= truncate.tool_result_max_bytes) break :blk try cb.dupe(allocator);
+                // Slice at UTF-8 boundary, then append a size marker so the
+                // model knows content was dropped.
+                var end = truncate.tool_result_max_bytes;
+                while (end > 0 and (t.text[end] & 0xc0) == 0x80) end -= 1;
+                const size_str = try truncate.formatSize(allocator, t.text.len);
+                defer allocator.free(size_str);
+                const text = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}\n[...{s} truncated]",
+                    .{ t.text[0..end], size_str },
+                );
+                break :blk .{ .text = .{ .text = text } };
+            },
+            else => try cb.dupe(allocator),
+        };
+        try copied.append(allocator, block);
+    }
     return .{
         .role = .tool_result,
         .content = try copied.toOwnedSlice(allocator),
@@ -2069,4 +2090,45 @@ test "maybeApplyTextToolCallFallback: leaves message untouched when no match" {
     // Still text — fallback didn't touch it.
     try testing.expect(msg.content[0] == .text);
     try testing.expectEqualStrings("Sure, I'll think about it.", msg.content[0].text.text);
+}
+
+test "makeToolResultMessage: text blocks over 8KB are truncated with size marker" {
+    const gpa = testing.allocator;
+
+    // Build a 16KB text block — double the cap. The source buffer is stack-
+    // owned by the fake ToolResult; makeToolResultMessage allocates new memory
+    // for the truncated copy, so we free the source ourselves.
+    const big = try gpa.alloc(u8, 16 * 1024);
+    defer gpa.free(big);
+    @memset(big, 'a');
+
+    var cb: ai.types.ContentBlock = .{ .text = .{ .text = big } };
+    const result: at.ToolResult = .{ .content = (&cb)[0..1] };
+    const call_result: ToolCallResult = .{ .call_id = "test_id", .result = result, .terminate = false };
+
+    var msg = try makeToolResultMessage(gpa, call_result);
+    defer msg.deinit(gpa);
+
+    try testing.expect(msg.content.len == 1);
+    const text = msg.content[0].text.text;
+    try testing.expect(text.len <= truncate.tool_result_max_bytes + 32); // cap + marker overhead
+    try testing.expect(std.mem.indexOf(u8, text, "[...") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "truncated]") != null);
+}
+
+test "makeToolResultMessage: text blocks under 8KB pass through unchanged" {
+    const gpa = testing.allocator;
+
+    // Source text is not owned by at.ToolResult — makeToolResultMessage dupes
+    // it, so we free the original here.
+    const small = try gpa.dupe(u8, "hello tool result");
+    defer gpa.free(small);
+    var cb: ai.types.ContentBlock = .{ .text = .{ .text = small } };
+    const result: at.ToolResult = .{ .content = (&cb)[0..1] };
+    const call_result: ToolCallResult = .{ .call_id = "id2", .result = result, .terminate = false };
+
+    var msg = try makeToolResultMessage(gpa, call_result);
+    defer msg.deinit(gpa);
+
+    try testing.expectEqualStrings("hello tool result", msg.content[0].text.text);
 }

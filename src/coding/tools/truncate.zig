@@ -32,6 +32,10 @@ const std = @import("std");
 pub const default_max_lines: usize = 2000;
 pub const default_max_bytes: usize = 50 * 1024;
 pub const grep_max_line_length: usize = 500;
+/// Cap applied to each tool result text block before it enters the
+/// conversation history. Keeps large file reads from inflating every
+/// subsequent turn's input token count.
+pub const tool_result_max_bytes: usize = 8 * 1024;
 
 pub const TruncatedBy = enum { lines, bytes };
 
