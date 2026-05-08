@@ -128,11 +128,15 @@ const Session = struct {
     /// lifetime — referenced by `bash.toolWithState`.
     bash_state: tools_mod.bash.SessionBashState,
     web_search_ctx: tools_mod.web_search.WebSearchCtx = .{},
+    /// v2.10.0 — harness-enforced guardrails (stuck detection, compilation guard,
+    /// finish_task). Wired at session init; passed to loop.Config in runPrompt.
+    guardrail_state: agent.guardrails.GuardrailState = undefined,
 
     fn deinit(self: *Session) void {
         self.transcript.deinit();
         self.allocator.free(self.system_prompt);
         self.bash_state.deinit();
+        self.guardrail_state.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -268,6 +272,15 @@ fn initSession(
         };
         session.tools = try role_mod.filterTools(session.role_arena.allocator(), &all_tools_with_state, session.role_gate.set);
     }
+
+    // v2.10.0 — harness-enforced guardrails (stuck detection, compilation guard, finish_task).
+    session.guardrail_state = try agent.guardrails.GuardrailState.init(
+        allocator,
+        .{ .workspace_dir = environ.getPosix("PWD") orelse "." },
+        io,
+    );
+    errdefer session.guardrail_state.deinit();
+    session.guardrail_state.setupAutoCommitBranch(allocator, io);
 
     session.provider = try print_mode.resolveProviderIo(allocator, io, environ, cfg);
 
@@ -617,6 +630,15 @@ fn runPrompt(
     defer session.in_prompt = false;
 
     session.cancel = .{}; // reset per-prompt
+
+    // v2.10.0 — extend tools with finish_task guardrail tool.
+    {
+        const tools_with_guardrail = try allocator.alloc(at.AgentTool, session.tools.len + 1);
+        @memcpy(tools_with_guardrail[0..session.tools.len], session.tools);
+        tools_with_guardrail[session.tools.len] = session.guardrail_state.finishTaskTool();
+        session.tools = tools_with_guardrail;
+    }
+
     const worker_args: WorkerArgs = .{
         .allocator = allocator,
         .io = io,
@@ -635,6 +657,7 @@ fn runPrompt(
             .registry = &session.registry,
             .cancel = &session.cancel,
             .hook_userdata = @ptrCast(&session.session_gates),
+            .guardrails = &session.guardrail_state,
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .text_tool_call_fallback = session.cfg.text_tool_call_fallback,

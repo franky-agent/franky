@@ -190,6 +190,15 @@ pub const StuckDetector = struct {
             } });
         }
 
+        // v2.10.0 — emit typed agent_error alongside the tool-execution event
+        // so SDK consumers can subscribe to guardrail events generically.
+        try out.push(io, .{ .agent_error = .{
+            .code = .stuck_pattern,
+            .source = .guardrail,
+            .is_fatal = false,
+            .message = try allocator.dupe(u8, hint),
+        } });
+
         {
             const content = try allocator.alloc(ai.types.ContentBlock, 1);
             content[0] = .{ .text = .{ .text = try allocator.dupe(u8, hint) } };
@@ -213,6 +222,13 @@ pub const StuckDetector = struct {
         self.last_tool_name = null;
         self.last_tool_code = null;
         self.last_arg_hash = std.mem.zeroes([32]u8);
+        // Clear pending hint state so a recovered model doesn't
+        // get a stale hint on the next turn (Issue 2).
+        if (self.pending_tool_name) |s| self.allocator.free(s);
+        if (self.pending_tool_code) |s| self.allocator.free(s);
+        self.pending_tool_name = null;
+        self.pending_tool_code = null;
+        self.pending_hint = false;
     }
 };
 

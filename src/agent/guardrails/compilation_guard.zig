@@ -197,6 +197,15 @@ pub const CompilationGuard = struct {
             } });
         }
 
+        // v2.10.0 — emit typed agent_error alongside the tool-execution event
+        // so SDK consumers can subscribe to guardrail events generically.
+        try out.push(io, .{ .agent_error = .{
+            .code = .compilation_failed,
+            .source = .guardrail,
+            .is_fatal = false,
+            .message = try allocator.dupe(u8, hint),
+        } });
+
         {
             const content = try allocator.alloc(ai.types.ContentBlock, 1);
             content[0] = .{ .text = .{ .text = try allocator.dupe(u8, hint) } };
