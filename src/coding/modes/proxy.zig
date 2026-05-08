@@ -251,6 +251,7 @@ const Session = struct {
     /// session's lifetime — referenced by `tools_mod.bash.toolWithState`.
     bash_state: tools_mod.bash.SessionBashState,
     web_search_ctx: tools_mod.web_search.WebSearchCtx = .{},
+    guardrail_state: agent.guardrails.GuardrailState = undefined,
 
     /// Single-flight gate around the agent loop. Concurrent
     /// `POST /prompt` requests queue here.
@@ -305,6 +306,7 @@ const Session = struct {
         self.allocator.free(self.session_id);
         if (self.parent_dir) |p| self.allocator.free(p);
         self.bash_state.deinit();
+        self.guardrail_state.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -553,6 +555,12 @@ fn initSession(
         .prompts_enabled = prompts_enabled,
     };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
+    session.guardrail_state = try agent.guardrails.GuardrailState.init(
+        allocator,
+        .{ .workspace_dir = environ.getPosix("PWD") orelse "." },
+        io,
+    );
+    errdefer session.guardrail_state.deinit();
     session.session_gates = .{
         .role = &session.role_gate,
         .permissions = if (session.prompts_enabled) &session.permission_store else null,
@@ -670,10 +678,11 @@ fn initSession(
             // v2.7 — enable full text/thinking deltas for the panel.
             .verbose_progress = true,
         };
-        const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 2);
+        const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 3);
         @memcpy(final_tools[0..session.tools.len], session.tools);
         final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
         final_tools[session.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
+        final_tools[session.tools.len + 2] = session.guardrail_state.finishTaskTool();
         session.tools = final_tools;
     }
 
@@ -1989,6 +1998,7 @@ fn runOneTurnInternal(
             .tools = session.tools,
             .registry = &session.registry,
             .cancel = &session.cancel,
+            .guardrails = &session.guardrail_state,
             .hook_userdata = @ptrCast(&session.session_gates),
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
@@ -3017,11 +3027,13 @@ fn initSessionForTestWithDir(
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
     };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
+    session.guardrail_state = try agent.guardrails.GuardrailState.init(allocator, .{ .workspace_dir = "." }, io);
     session.session_gates = .{ .role = &session.role_gate };
     errdefer session.registry.deinit();
     errdefer session.faux.deinit();
     errdefer session.permission_store.deinit();
     errdefer session.bash_state.deinit();
+    errdefer session.guardrail_state.deinit();
     try session.registry.register(.{
         .api = "faux",
         .provider = "faux",

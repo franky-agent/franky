@@ -1091,6 +1091,7 @@ fn runOneTurn(
                 .tools = session.tools,
                 .registry = &session.registry,
                 .cancel = &cancel,
+                .guardrails = &session.guardrail_state,
                 .hook_userdata = @ptrCast(&stop_requested),
                 .role_denied = permissions_mod.SessionGates.roleDenied,
                 .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
@@ -1674,6 +1675,7 @@ const SessionBinding = struct {
     /// (`interactive-<startup_ms>`) for the persist path; rpc and
     /// proxy use real session ids instead.
     startup_ms: i64 = 0,
+    guardrail_state: agent.guardrails.GuardrailState = undefined,
 
     /// Fills `binding` in place. Taking the destination pointer is
     /// required: the `FauxProvider`'s address gets registered with
@@ -1785,6 +1787,14 @@ const SessionBinding = struct {
         errdefer binding.arena.deinit();
         errdefer binding.permission_store.deinit();
 
+        const wr_dir = if (binding.workspace) |ws| ws.root else ".";
+        binding.guardrail_state = try agent.guardrails.GuardrailState.init(
+            allocator,
+            .{ .workspace_dir = wr_dir },
+            io,
+        );
+        errdefer binding.guardrail_state.deinit();
+
         binding.provider = try print_mode.resolveProvider(allocator, environ, cfg);
         try binding.registry.register(.{
             .api = "faux",
@@ -1843,10 +1853,11 @@ const SessionBinding = struct {
                 .permission_prompter_slot = null,
                 .parent_session_dir = null,
             };
-            const final_tools = try aa.alloc(at.AgentTool, binding.tools.len + 2);
+            const final_tools = try aa.alloc(at.AgentTool, binding.tools.len + 3);
             @memcpy(final_tools[0..binding.tools.len], binding.tools);
             final_tools[binding.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
             final_tools[binding.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_registry);
+            final_tools[binding.tools.len + 2] = binding.guardrail_state.finishTaskTool();
             binding.tools = final_tools;
         }
 
@@ -1861,6 +1872,7 @@ const SessionBinding = struct {
         self.faux.deinit();
         self.permission_store.deinit();
         self.bash_state.deinit();
+        self.guardrail_state.deinit();
         self.arena.deinit();
     }
 

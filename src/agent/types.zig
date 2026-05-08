@@ -5,6 +5,7 @@ const ai = struct {
     pub const types = @import("../ai/types.zig");
     pub const errors = @import("../ai/errors.zig");
     pub const stream = @import("../ai/stream.zig");
+    pub const channel = @import("../ai/channel.zig");
 };
 
 pub const ToolResult = struct {
@@ -52,6 +53,31 @@ pub const OnUpdate = struct {
 
     pub fn push(self: OnUpdate, update: ToolUpdate) void {
         if (self.call) |f| f(self.ctx, update);
+    }
+};
+
+pub const AgentMessage = ai.types.Message;
+
+pub const AgentChannel = ai.channel.Channel(AgentEvent);
+
+/// Ordered sequence of messages that forms the conversation context.
+///
+/// Callers seed it with prior history; the loop appends assistant and
+/// tool-result messages. Ownership of each message is transferred to
+/// `messages` — caller deinits the whole thing with `Transcript.deinit`.
+pub const Transcript = struct {
+    allocator: std.mem.Allocator,
+    messages: std.ArrayList(AgentMessage) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) Transcript {
+        return .{ .allocator = allocator };
+    }
+    pub fn deinit(self: *Transcript) void {
+        for (self.messages.items) |*m| m.deinit(self.allocator);
+        self.messages.deinit(self.allocator);
+    }
+    pub fn append(self: *Transcript, msg: AgentMessage) !void {
+        try self.messages.append(self.allocator, msg);
     }
 };
 
@@ -149,7 +175,8 @@ pub const AgentEvent = union(AgentEventKind) {
 
     pub fn isTerminal(self: AgentEvent) bool {
         return switch (self) {
-            .agent_error, .agent_interrupted => true,
+            .agent_error => |d| d.is_fatal,
+            .agent_interrupted => true,
             else => false,
         };
     }

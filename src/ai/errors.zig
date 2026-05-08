@@ -62,6 +62,8 @@ pub const Code = enum {
     // internal
     protocol_violation,
     internal,
+    compilation_failed,
+    stuck_pattern,
 
     pub fn isRetryable(self: Code) bool {
         return switch (self) {
@@ -73,6 +75,14 @@ pub const Code = enum {
     pub fn toString(self: Code) []const u8 {
         return @tagName(self);
     }
+};
+
+/// Origin of an error event: LLM/tool or harness guardrail.
+pub const ErrorSource = enum {
+    /// Originated from an LLM call or tool execution.
+    llm,
+    /// Originated from a harness guardrail (compilation guard, stuck detector).
+    guardrail,
 };
 
 /// Zig error set — one global set for the whole library.
@@ -109,6 +119,9 @@ pub const AgentError = error{
 /// backing memory.
 pub const ErrorDetails = struct {
     code: Code,
+    source: ErrorSource = .llm,
+    /// false = advisory hint, loop continues; true = loop stops.
+    is_fatal: bool = true,
     message: []const u8,
     /// Sub-code: e.g., `edit_no_match`, `path_escape_workspace`.
     tool_code: ?[]const u8 = null,
@@ -138,6 +151,8 @@ pub const ErrorDetails = struct {
             .tool_blocked => error.ToolBlocked,
             .protocol_violation => error.ProtocolViolation,
             .internal => error.Internal,
+            .compilation_failed => error.ToolRuntime,
+            .stuck_pattern => error.Internal,
         };
     }
 
@@ -153,6 +168,8 @@ pub const ErrorDetails = struct {
         const pm = try dupeOpt(allocator, self.provider_message);
         return .{
             .code = self.code,
+            .source = self.source,
+            .is_fatal = self.is_fatal,
             .message = msg,
             .tool_code = tc,
             .provider_code = pc,

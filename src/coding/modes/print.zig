@@ -415,11 +415,19 @@ fn runPrint(
         .permission_prompter_slot = null, // print mode has no interactive prompter; sub-agents un-gate
         .parent_session_dir = null,
     };
+    var guardrail_state = try agent.guardrails.GuardrailState.init(
+        allocator,
+        .{ .workspace_dir = workspace_root orelse "." },
+        io,
+    );
+    defer guardrail_state.deinit();
+
     const final_tools = blk: {
-        const slice = try allocator.alloc(at.AgentTool, filtered_tools.len + 2);
+        const slice = try allocator.alloc(at.AgentTool, filtered_tools.len + 3);
         @memcpy(slice[0..filtered_tools.len], filtered_tools);
         slice[filtered_tools.len] = tools_mod.subagent.toolWithCtx(&subagent_ctx);
         slice[filtered_tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(&preset_registry);
+        slice[filtered_tools.len + 2] = guardrail_state.finishTaskTool();
         break :blk slice;
     };
     defer allocator.free(final_tools);
@@ -539,6 +547,7 @@ fn runPrint(
         .tools = final_tools,
         .registry = &reg,
         .cancel = &cancel,
+        .guardrails = &guardrail_state,
         .hook_userdata = @ptrCast(&session_gates),
         .role_denied = permissions_mod.SessionGates.roleDenied,
         .before_tool_call = permissions_mod.SessionGates.beforeToolCall,

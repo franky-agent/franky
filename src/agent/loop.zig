@@ -27,12 +27,10 @@ const ai = struct {
 };
 const at = @import("types.zig");
 
-pub const AgentChannel = ai.channel.Channel(at.AgentEvent);
+pub const AgentChannel = at.AgentChannel;
+pub const AgentMessage = at.AgentMessage;
 
-/// Extensible message type — for the MVP, agent messages ARE ai.types.Message.
-/// §4.2's "AgentMessage superset" is encoded via the `role == .custom` +
-/// `custom_role` fields, so custom roles can be filtered in `convertToLlm`.
-pub const AgentMessage = ai.types.Message;
+const guardrails_mod = @import("guardrails/guardrails.zig");
 
 pub const ConvertToLlmFn = *const fn (
     allocator: std.mem.Allocator,
@@ -288,29 +286,10 @@ pub const Config = struct {
     /// `<turn-N>.reducer-dump.json`; turn index is 0-based and
     /// reset per agent-loop run.
     reducer_dump_dir: ?[]const u8 = null,
+    guardrails: ?*guardrails_mod.GuardrailState = null,
 };
 
-/// Transcript owned by the loop.
-///
-/// Callers seed it with any prior history; the loop appends assistant +
-/// toolResult messages as the conversation progresses. Ownership of each
-/// message is transferred to `messages` — caller deinits the whole thing
-/// with `Transcript.deinit`.
-pub const Transcript = struct {
-    allocator: std.mem.Allocator,
-    messages: std.ArrayList(AgentMessage) = .empty,
-
-    pub fn init(allocator: std.mem.Allocator) Transcript {
-        return .{ .allocator = allocator };
-    }
-    pub fn deinit(self: *Transcript) void {
-        for (self.messages.items) |*m| m.deinit(self.allocator);
-        self.messages.deinit(self.allocator);
-    }
-    pub fn append(self: *Transcript, msg: AgentMessage) !void {
-        try self.messages.append(self.allocator, msg);
-    }
-};
+pub const Transcript = at.Transcript;
 
 /// Run one or more turns. Emits events into `out`; closes with
 /// a terminal `turn_end` or `agent_error`.
@@ -361,6 +340,13 @@ pub fn agentLoop(
                 return;
             };
             if (!keep_going) {
+                if (config.guardrails) |gr| {
+                    const gr_wants_turn = gr.betweenTurns(allocator, io, transcript, out) catch |err| blk: {
+                        ai.log.log(.warn, "guardrails", "between_turns_error", "err={s}", .{@errorName(err)});
+                        break :blk false;
+                    };
+                    if (gr_wants_turn) continue;
+                }
                 // Natural turn_end — check the between-turns hook
                 // (§4.3 followUp drain) before closing. When the
                 // hook returns `true`, the transcript has new
@@ -693,6 +679,8 @@ fn runTurn(
             }
         }
 
+        if (config.guardrails) |gr| gr.cacheArgs(tc.id, tc.arguments_json) catch {};
+
         try pushToolStart(out, io, allocator, tc.id, tool_def.name, tc.arguments_json);
 
         const on_update: at.OnUpdate = .{};
@@ -724,6 +712,8 @@ fn runTurn(
         if (config.after_tool_call) |hook| {
             hook(config.hook_userdata, &tool_def, tc.id, &call_res);
         }
+
+        if (config.guardrails) |gr| gr.afterToolCall(&tool_def, tc.id, &call_res);
 
         try pushToolEnd(out, io, allocator, tc.id, tool_def, call_res);
         try results.append(allocator, .{
@@ -825,6 +815,7 @@ fn runToolsParallel(
                 vetoed[i] = try makeErrorResult(allocator, reason);
             }
         }
+        if (config.guardrails) |gr| gr.cacheArgs(tc.id, tc.arguments_json) catch {};
         workers[i] = .{
             .tc = tc,
             .tool_def = tool_def,
@@ -895,6 +886,7 @@ fn runToolsParallel(
             if (config.after_tool_call) |hook| {
                 hook(config.hook_userdata, &w.tool_def, w.tc.id, &call_res);
             }
+            if (config.guardrails) |gr| gr.afterToolCall(&w.tool_def, w.tc.id, &call_res);
             try pushToolEnd(out, io, allocator, w.tc.id, w.tool_def, call_res);
             slot_results[i] = call_res;
             emitted[i] = true;
