@@ -2157,21 +2157,21 @@ fn interactiveReviewHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash
 
     // Build the user prompt: "Run a multi-model code review on:" plus args.
     var pb: std.ArrayList(u8) = .empty;
-    errdefer pb.deinit(ctx.allocator);
-    try pb.appendSlice(ctx.allocator, "Run a multi-model code review on:");
+    errdefer pb.deinit(bridge.allocator);
+    try pb.appendSlice(bridge.allocator, "Run a multi-model code review on:");
     for (args) |a| {
-        try pb.appendSlice(ctx.allocator, " ");
-        try pb.appendSlice(ctx.allocator, a);
+        try pb.appendSlice(bridge.allocator, " ");
+        try pb.appendSlice(bridge.allocator, a);
     }
-    const prompt = try pb.toOwnedSlice(ctx.allocator);
-    errdefer ctx.allocator.free(prompt);
+    const prompt = try pb.toOwnedSlice(bridge.allocator);
+    errdefer bridge.allocator.free(prompt);
 
     // Enqueue as pending prompt so the next loop iteration submits it.
     if (bridge.pending_prompt.*) |p| bridge.allocator.free(p);
     bridge.pending_prompt.* = prompt;
 
-    const ack = try std.fmt.allocPrint(ctx.allocator, "multi-model review submitted; see results shortly...", .{});
-    defer ctx.allocator.free(ack);
+    const ack = try std.fmt.allocPrint(bridge.allocator, "multi-model review submitted; see results shortly...", .{});
+    defer bridge.allocator.free(ack);
     try ctx.output.appendSlice(ctx.allocator, ack);
 }
 

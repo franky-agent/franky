@@ -500,10 +500,11 @@ fn runTurn(
         .http_client = http_client,
     });
 
-    // High-watermark guard: the provider fills stream_ch synchronously on
-    // this thread, so if it ever reaches 100 % the next push blocks and
-    // deadlocks (consumer hasn't started yet). Log a warning at 75 % so
-    // there is advance notice before that threshold is crossed.
+    // Diagnostic — channel usage during the synchronous stream that just
+    // completed. Because the provider pushes all events before the drain
+    // loop starts, the watermark at this point is the true peak. Log a
+    // warning at ≥75 % so operators can increase capacity before a future
+    // turn with more events hits 100 % and deadlocks.
     // See docs/limits/stream-channel-capacity.md for full analysis.
     {
         const sc_used = stream_ch.len;

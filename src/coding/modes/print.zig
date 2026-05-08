@@ -554,11 +554,10 @@ fn runPrint(
     };
 
     var cancel = ai.stream.Cancel{};
-    // 4096-event burst buffer: deep enough for a multi-thousand-token
-    // SSE stream's worth of text/tool-arg deltas without forcing the
-    // producer to block on the consumer. Memory cost is bounded
-    // (~event-size × 4096, <1 MiB) regardless of session length —
-    // backpressure still kicks in if the consumer genuinely stalls.
+    // 65536-event burst buffer: deep enough for any multi-thousand-token
+    // SSE stream's worth of text/tool-arg deltas (observed peak ~5300,
+    // 12× margin). Memory cost is transient (per-turn arena): ~3.5 MB at
+    // 54 B/slot. Backpressure still kicks in if the consumer genuinely stalls.
     var ch = try agent.loop.AgentChannel.initWithDrop(
         allocator,
         65536,

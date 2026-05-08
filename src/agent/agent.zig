@@ -447,16 +447,23 @@ pub const Agent = struct {
         // `out.push(...)` inline for every event (turn_start /
         // message_start / message_update × N / tool_execution_start /
         // tool_execution_end / message_end / turn_end), and once the
-        // channel hit capacity the blocking `push` waited for a
-        // consumer that wouldn't run until `agentLoop` returned —
-        // which it couldn't until `push` unblocked. With models that
-        // emit thinking deltas alongside text, even a 2-turn
-        // conversation can blow past 128 events. Match print mode's
-        // 4096 buffer + concurrent-drain pattern (see
-        // `coding/modes/print.zig` §"agent-loop worker thread").
+        // The provider pushes events synchronously (the whole response
+        // is buffered first) and the drain loop runs on the same thread
+        // — so this ring must fit the entire turn's event stream without
+        // ever blocking on push, because blocking = deadlock.
+        //
+        // Event budget per turn (worst observed: DeepSeek-v4-flash:cloud):
+        //   ~1 000 thinking_delta  (reasoning phase)
+        //   ~4 000 text_delta      (content phase, ~4 K tokens)
+        //   + start / done / diagnostic + misc overhead
+        //   ≈ 5 300 events total
+        //
+        // 65 536 gives a 12× safety margin over that observed peak and
+        // comfortably covers models producing up to ~60 K output tokens.
+        // Memory cost is transient (per-turn arena): ~3.5 MB at 54 B/slot.
         var ch = loop_mod.AgentChannel.initWithDrop(
             self.allocator,
-            4096,
+            65536,
             at.AgentEvent.deinit,
             self.allocator,
         ) catch return;

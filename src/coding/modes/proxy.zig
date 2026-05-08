@@ -1394,22 +1394,17 @@ fn reviewHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!
 
     // Append a user message to the transcript, then spawn a worker
     // (passing null for text since we already appended it).
-    {
-        const content = ctx.allocator.alloc(ai.types.ContentBlock, 1) catch return;
-        content[0] = .{ .text = .{ .text = ctx.allocator.dupe(u8, text) catch {
-            ctx.allocator.free(content);
-            return;
-        } } };
-        session.transcript.append(.{
-            .role = .user,
-            .content = content,
-            .timestamp = ai.stream.nowMillis(),
-        }) catch {
-            ctx.allocator.free(content[0].text.text);
-            ctx.allocator.free(content);
-            return;
-        };
-    }
+    const content = try ctx.allocator.alloc(ai.types.ContentBlock, 1);
+    errdefer ctx.allocator.free(content);
+    content[0] = ai.types.ContentBlock{ .text = .{
+        .text = try ctx.allocator.dupe(u8, text),
+    } };
+    errdefer ctx.allocator.free(content[0].text.text);
+    try session.transcript.append(.{
+        .role = .user,
+        .content = content,
+        .timestamp = ai.stream.nowMillis(),
+    });
     persistSession(session);
 
     const ReviewArgs = struct { session: *Session };
