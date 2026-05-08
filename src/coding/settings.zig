@@ -86,6 +86,11 @@ pub const Settings = struct {
     /// > profile `max_turns` > settings `max_turns` > built-in default 50.
     max_turns: ?u32 = null,
 
+    /// v2.13 — retry policy overrides. Parsed from `tools.retry.*`.
+    /// CLI flags `--retry-max-attempts` / `--retry-max-total-ms` still win.
+    retry_max_attempts: ?u32 = null,
+    retry_max_total_ms: ?u64 = null,
+
     pub fn deinit(self: *Settings) void {
         self.allocator.free(self.default_provider);
         self.allocator.free(self.default_model_anthropic);
@@ -242,6 +247,14 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
         if (tools_v.object.get("read")) |read_v| if (read_v == .object) {
             if (read_v.object.get("maxBytes")) |m| if (m == .integer and m.integer >= 1) {
                 settings.read_max_bytes = @intCast(m.integer);
+            };
+        };
+        if (tools_v.object.get("retry")) |retry_v| if (retry_v == .object) {
+            if (retry_v.object.get("maxAttempts")) |rv| if (rv == .integer and rv.integer >= 0 and rv.integer <= std.math.maxInt(u32)) {
+                settings.retry_max_attempts = @intCast(rv.integer);
+            };
+            if (retry_v.object.get("maxTotalMs")) |t| if (t == .integer and t.integer >= 0) {
+                settings.retry_max_total_ms = @intCast(t.integer);
             };
         };
     };

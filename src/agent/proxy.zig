@@ -121,7 +121,7 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
                 if (cb == .text) try combined.appendSlice(allocator, cb.text.text);
             }
             try appendJsonStr(&buf, allocator, combined.items);
-            // v2.8 — include details_json as opaque metadata for the front-end
+            // §6.8 — include details_json as opaque metadata for the front-end
             // (e.g. unified diff for the edit tool). The value is already valid
             // JSON, so we append it directly without re-encoding.
             if (e.result.details_json) |dj| {
@@ -151,6 +151,28 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
         },
         .agent_interrupted => {
             try buf.appendSlice(allocator, "\"kind\":\"agent_interrupted\"");
+        },
+        .provider_retry => |r| {
+            try buf.appendSlice(allocator, "\"kind\":\"provider_retry\",\"attempt\":");
+            try appendJsonInt(&buf, allocator, @intCast(r.attempt));
+            try buf.appendSlice(allocator, ",\"max_attempts\":");
+            try appendJsonInt(&buf, allocator, @intCast(r.max_attempts));
+            try buf.appendSlice(allocator, ",\"delay_ms\":");
+            try appendJsonInt(&buf, allocator, @intCast(r.delay_ms));
+            try buf.appendSlice(allocator, ",\"reason\":");
+            try appendJsonStr(&buf, allocator, @tagName(r.reason));
+            if (r.http_status) |s| {
+                try buf.appendSlice(allocator, ",\"http_status\":");
+                try appendJsonInt(&buf, allocator, @intCast(s));
+            }
+            if (r.provider_code) |pc| {
+                try buf.appendSlice(allocator, ",\"provider_code\":");
+                try appendJsonStr(&buf, allocator, pc);
+            }
+            if (r.provider_message) |pm| {
+                try buf.appendSlice(allocator, ",\"provider_message\":");
+                try appendJsonStr(&buf, allocator, pm);
+            }
         },
     }
     try buf.append(allocator, '}');

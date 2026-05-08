@@ -1,4 +1,4 @@
-//! Stuck Detector — §3 of v2.10 spec.
+//! Stuck Detector — §6.10.
 //!
 //! Detects when the model calls the same tool with the same args and gets the
 //! same error repeatedly. After `hint_threshold` consecutive identical errors,
@@ -190,7 +190,7 @@ pub const StuckDetector = struct {
             } });
         }
 
-        // v2.10.0 — emit typed agent_error alongside the tool-execution event
+        // §6.10 — emit typed agent_error alongside the tool-execution event
         // so SDK consumers can subscribe to guardrail events generically.
         try out.push(io, .{ .agent_error = .{
             .code = .stuck_pattern,

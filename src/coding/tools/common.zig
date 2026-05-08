@@ -16,7 +16,7 @@ const at = @import("../../agent/types.zig");
 const gitignore = @import("../gitignore.zig");
 const workspace_mod = @import("workspace.zig");
 
-/// v2.9 — tool_code emitted when a single-path tool refuses a path
+/// §6.9 — tool_code emitted when a single-path tool refuses a path
 /// covered by `.contextignore`. Single literal so call sites and
 /// test assertions stay in sync.
 pub const tool_code_contextignored: []const u8 = "contextignored";
@@ -38,10 +38,10 @@ pub fn toolError(
     return .{ .content = arr, .is_error = true, .tool_code = code_dup };
 }
 
-/// v2.9 — return a `contextignored` `ToolResult` if `abs_path` is
+/// §6.9 — return a `contextignored` `ToolResult` if `abs_path` is
 /// suppressed by any `.contextignore` under `workspace.root`, else
 /// null. Used by single-path tools (`read`/`write`/`edit`) to
-/// enforce the unconditional v2.9 gate.
+/// enforce the unconditional §6.9 gate.
 ///
 /// Idiom at the call site:
 /// ```zig

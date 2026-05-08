@@ -129,7 +129,7 @@ pub fn loadFromTree(
 
 /// Bundles the two ignore stacks every tree-walking tool consults:
 /// `.gitignore` (model-controllable via the tool's `respectGitignore`
-/// argument) and `.contextignore` (v2.9 — enforced unconditionally;
+/// argument) and `.contextignore` (§6.9 — enforced unconditionally;
 /// no tool argument can disable it). `isIgnored` returns true when
 /// either stack matches.
 pub const IgnoreStacks = struct {
@@ -152,7 +152,7 @@ pub const IgnoreStacks = struct {
 /// Load the two stacks every tree-walking tool consults. The
 /// gitignore stack is loaded only when `load_gitignore` is true
 /// (mirrors the tool's `respectGitignore` argument); the
-/// contextignore stack is always loaded (v2.9 unconditional gate).
+/// contextignore stack is always loaded (§6.9 unconditional gate).
 /// On per-stack load failure the corresponding field stays null —
 /// callers degrade to "nothing ignored" rather than refusing the
 /// whole tool call. Pair with `defer IgnoreStacks.deinit`.
@@ -170,16 +170,16 @@ pub fn loadIgnoreStacks(
     return stacks;
 }
 
-/// v2.9 — is `abs_path` suppressed by any `.contextignore` under
+/// §6.9 — is `abs_path` suppressed by any `.contextignore` under
 /// `workspace_root`? Used by single-path tools (read/write/edit) to
 /// enforce the unconditional gate. `abs_path` is the canonical
 /// absolute path from `path_safety.canonicalize`; the workspace
 /// prefix is stripped internally via `path_safety.startsInRoot`.
 ///
 /// Returns `true` (refuse) on load failure — failing closed honours
-/// the v2.9 "no bypass" contract.
+/// the §6.9 "no bypass" contract.
 ///
-/// TODO(v2.9.x perf): the stack is reloaded per call. For sessions
+/// TODO(§6.9 perf): the stack is reloaded per call. For sessions
 /// with many edits on large repos this re-walks the tree each time.
 /// Cache at the `Workspace` level (invalidate on `.contextignore`
 /// mtime change) when profiling warrants it.
@@ -201,7 +201,7 @@ pub fn isContextIgnored(
 
 /// Same shape as `loadFromTree` but loads patterns from files named
 /// `filename` rather than `.gitignore`. Used to support `.contextignore`
-/// (see v2.9) through the same nested-rules + glob-matching machinery.
+/// (§6.9) through the same nested-rules + glob-matching machinery.
 /// `filename` should not contain a path separator — it's matched against
 /// `std.fs.path.basename(entry.path)` during the tree walk.
 pub fn loadFromTreeNamed(
@@ -738,12 +738,12 @@ test "gitignore: loadFromTree walks and composes files on disk" {
     try testing.expect(!st.isIgnored("sub/keep.log", false));
 }
 
-// v2.9 — `.contextignore` rides on the same matcher as `.gitignore`
+// §6.9 — `.contextignore` rides on the same matcher as `.gitignore`
 // via `loadFromTreeNamed`. The two tests below pin that behaviour:
 // (1) a `.contextignore`-named file produces an identical-shape stack;
 // (2) both files coexist in the same tree without interference.
 
-test "gitignore: loadFromTreeNamed loads .contextignore files (v2.9)" {
+test "gitignore: loadFromTreeNamed loads .contextignore files (§6.9)" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{
         .argv0 = .empty,
         .environ = .empty,
@@ -784,7 +784,7 @@ test "gitignore: loadFromTreeNamed loads .contextignore files (v2.9)" {
     try testing.expect(!st.isIgnored("docs/spec/v2.md", false));
 }
 
-test "gitignore: .gitignore and .contextignore coexist as independent stacks (v2.9)" {
+test "gitignore: .gitignore and .contextignore coexist as independent stacks (§6.9)" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{
         .argv0 = .empty,
         .environ = .empty,
@@ -821,7 +821,7 @@ test "gitignore: .gitignore and .contextignore coexist as independent stacks (v2
     try testing.expect(!ctx_stack.isIgnored("foo.log", false));
 }
 
-test "gitignore: loadFromTreeNamed on a tree without that file returns an empty stack (v2.9)" {
+test "gitignore: loadFromTreeNamed on a tree without that file returns an empty stack (§6.9)" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{
         .argv0 = .empty,
         .environ = .empty,

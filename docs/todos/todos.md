@@ -170,3 +170,23 @@ tool: read done
 tool: read done
 {"path":"src/ai/http.zig","offset":1275,"limit":100}
 ```
+
+# Tool Status bar
+
+During one session show the user which tool was used how often like
+```
+bash: 4 read: 5 edit: 6 ...
+```
+
+Make 3 wireframes to show different styles and different locations for teh tool status bar
+
+# Franky restarts itself
+
+How can a running franky process restarts itself after for example the binary was re-compiled.
+
+This would enable a full feedback loop. Example
+* franky is started with the prompt to implement a new feature
+* its finished and everything compiles and test passes
+* now it would need to restart it self to do for example a ende2end test or
+  just to have the new feature enabled for the next session
+

@@ -495,7 +495,7 @@ test "read tool with workspace: rejects workspace escape" {
     }
 }
 
-test "read tool: refuses contextignored path with structured error (v2.9)" {
+test "read tool: refuses contextignored path with structured error (§6.9)" {
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();

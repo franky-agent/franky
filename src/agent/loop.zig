@@ -339,14 +339,14 @@ pub fn agentLoop(
                 pushAgentError(out, io, allocator, agentErrorCode(err), @errorName(err)) catch {};
                 return;
             };
+            if (config.guardrails) |gr| {
+                const gr_wants_turn = gr.betweenTurns(allocator, io, transcript, out) catch |err| blk: {
+                    ai.log.log(.warn, "guardrails", "between_turns_error", "err={s}", .{@errorName(err)});
+                    break :blk false;
+                };
+                if (gr_wants_turn) continue;
+            }
             if (!keep_going) {
-                if (config.guardrails) |gr| {
-                    const gr_wants_turn = gr.betweenTurns(allocator, io, transcript, out) catch |err| blk: {
-                        ai.log.log(.warn, "guardrails", "between_turns_error", "err={s}", .{@errorName(err)});
-                        break :blk false;
-                    };
-                    if (gr_wants_turn) continue;
-                }
                 // Natural turn_end — check the between-turns hook
                 // (§4.3 followUp drain) before closing. When the
                 // hook returns `true`, the transcript has new
@@ -546,6 +546,14 @@ fn runTurn(
                     .http_status = e.http_status,
                     .retry_after_ms = e.retry_after_ms,
                 };
+            },
+            .provider_retry => |r| {
+                try out.push(io, .{ .provider_retry = .{
+                    .attempt = r.attempt,
+                    .max_attempts = r.max_attempts,
+                    .delay_ms = r.delay_ms,
+                    .reason = r.reason,
+                } });
             },
             else => {},
         }

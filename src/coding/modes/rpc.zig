@@ -128,7 +128,7 @@ const Session = struct {
     /// lifetime — referenced by `bash.toolWithState`.
     bash_state: tools_mod.bash.SessionBashState,
     web_search_ctx: tools_mod.web_search.WebSearchCtx = .{},
-    /// v2.10.0 — harness-enforced guardrails (stuck detection, compilation guard,
+    /// §6.10 — harness-enforced guardrails (stuck detection, compilation guard,
     /// finish_task). Wired at session init; passed to loop.Config in runPrompt.
     guardrail_state: agent.guardrails.GuardrailState = undefined,
 
@@ -273,7 +273,7 @@ fn initSession(
         session.tools = try role_mod.filterTools(session.role_arena.allocator(), &all_tools_with_state, session.role_gate.set);
     }
 
-    // v2.10.0 — harness-enforced guardrails (stuck detection, compilation guard, finish_task).
+    // §6.10 — harness-enforced guardrails (stuck detection, compilation guard, finish_task).
     session.guardrail_state = try agent.guardrails.GuardrailState.init(
         allocator,
         .{ .workspace_dir = environ.getPosix("PWD") orelse "." },
@@ -312,7 +312,7 @@ fn initSession(
     });
 
     // v1.24.0 — append subagent + list_subagent_presets tools.
-    // v2.5 — preset registry lives in role_arena alongside ctx.
+    // §5 — preset registry lives in role_arena alongside ctx.
     //
     // v1.28.0 — RPC reuses the same synthesized rpc-<startup_ms>
     // dir that bash_state already points at (set via
@@ -351,7 +351,7 @@ fn initSession(
         // so the slot holds the live prompter).
         .permission_prompter_slot = &session.current_prompter,
         .parent_session_dir = parent_session_dir,
-        // v2.6 — forward sub-agent events as JSON-RPC `event` notifications.
+        // §6.6 — forward sub-agent events as JSON-RPC `event` notifications.
         .progress_fn = subagentProgressForward,
         .progress_userdata = session,
     };
@@ -369,7 +369,7 @@ fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     try fp.runSync(ctx.io, ctx.context, ctx.out);
 }
 
-// ─── v2.6 — sub-agent progress forwarding ────────────────────────
+// ─── §6.6 — sub-agent progress forwarding ────────────────────────
 //
 // Called from the sub-agent's worker thread. Encodes a
 // `tool_execution_update` event and emits it as a JSON-RPC
@@ -631,7 +631,7 @@ fn runPrompt(
 
     session.cancel = .{}; // reset per-prompt
 
-    // v2.10.0 — extend tools with finish_task guardrail tool.
+    // §6.10 — extend tools with finish_task guardrail tool.
     {
         const tools_with_guardrail = try allocator.alloc(at.AgentTool, session.tools.len + 1);
         @memcpy(tools_with_guardrail[0..session.tools.len], session.tools);
@@ -669,6 +669,7 @@ fn runPrompt(
                 .environ_map = session.environ_map,
                 .thinking = session.cfg.thinking,
                 .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
+                .retry_policy = print_mode.resolveRetryPolicyFromMap(session.cfg, null),
                 .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
             },
         },

@@ -481,7 +481,7 @@ fn atomicWrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
 
 var tmp_counter: std.atomic.Value(u32) = .init(0);
 
-// ─── Unified diff generation (v2.8) ────────────────────────────────
+// ─── Unified diff generation (§6.8) ───────────────────────────────
 
 /// Compute a standard unified diff between `original` and `modified`.
 /// Returns the full diff including `--- a/<path>` / `+++ b/<path>` headers
@@ -1106,7 +1106,7 @@ test "execute: wrong edits type includes type name in error" {
     try testing.expect(std.mem.indexOf(u8, res.content[0].text.text, "got number") != null);
 }
 
-// ─── §v2.8 — wire-format contract tests for the web UI diff view ────────
+// ─── §6.8 — wire-format contract tests for the web UI diff view ─────────
 //
 // These two tests pin the contract between `computeUnifiedDiff` (this
 // file) and `parseUnifiedDiff` in `src/coding/modes/web/app.js`. A
@@ -1199,7 +1199,7 @@ test "applyEdits: details_json carries the format version field" {
     try testing.expect(std.mem.indexOf(u8, res.details_json.?, "\"format\":\"unified-diff-v1\"") != null);
 }
 
-test "edit tool: refuses to modify contextignored file (v2.9)" {
+test "edit tool: refuses to modify contextignored file (§6.9)" {
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();

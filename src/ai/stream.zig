@@ -78,9 +78,12 @@ pub const EventKind = enum {
     /// v1.29.0 — non-terminal "side-channel" event. Providers push
     /// these to populate `Message.Diagnostics` on the final message
     /// without conflating them with the content-stream proper.
-    /// Multiple may fire per turn; the Reducer absorbs whichever
-    /// fields are present and last-write-wins.
     diagnostic,
+    /// §6.13 — emitted between retry attempts so the harness, sibling
+    /// apps, and UI can display "retrying in Ns" while the retry
+    /// backoff sleep runs. Fires BEFORE each sleep (per Q2 decision).
+    /// Non-terminal — the stream is still alive.
+    provider_retry,
     done,
     error_ev,
 };
@@ -128,6 +131,19 @@ pub const StreamEvent = union(EventKind) {
         candidates_tokens: ?u64 = null,
         thoughts_tokens: ?u64 = null,
     },
+    /// §6.13 — retry attempt info. Fires before each backoff sleep.
+    /// Strings (provider_code, provider_message) are owned by the
+    /// producer's allocator and freed via `deinit`.
+    provider_retry: struct {
+        /// 1-indexed; attempt 1 = first retry (second call overall).
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u32,
+        reason: errors.Code,
+        provider_code: ?[]const u8 = null,
+        provider_message: ?[]const u8 = null,
+        http_status: ?u16 = null,
+    },
     /// Terminal: stream ended successfully. The final Message is produced
     /// by calling `drainToMessage` or `Reducer.finalize()` after the
     /// terminal — the `done` event intentionally carries no payload so the
@@ -152,6 +168,10 @@ pub const StreamEvent = union(EventKind) {
         switch (self) {
             .start, .usage, .done => {},
             .text_delta => |d| allocator.free(d.delta),
+            .provider_retry => |r| {
+                if (r.provider_code) |v| allocator.free(v);
+                if (r.provider_message) |v| allocator.free(v);
+            },
             .thinking_delta => |d| allocator.free(d.delta),
             .toolcall_start => |s| {
                 allocator.free(s.id);
@@ -281,7 +301,7 @@ pub const Reducer = struct {
     /// observe other consumers).
     pub fn apply(self: *Reducer, ev: StreamEvent) !void {
         switch (ev) {
-            .start => {},
+            .start, .provider_retry => {},
             .text_delta => |d| {
                 try self.ensureTextBlock(d.block_index);
                 try self.text_blocks.items[d.block_index].appendSlice(self.allocator, d.delta);

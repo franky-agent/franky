@@ -256,7 +256,7 @@ pub fn grepTree(
     // Mirror the find/ls pattern: load both ignore stacks once and
     // consult them per entry. See `gitignore.loadIgnoreStacks` for
     // the contract (gitignore is gated by `respect_gitignore`;
-    // contextignore is v2.9-unconditional).
+    // contextignore is §6.9-unconditional).
     var stacks = gitignore.loadIgnoreStacks(allocator, io, cwd, respect_gitignore);
     defer stacks.deinit();
 
@@ -890,8 +890,8 @@ test "grep tool: respectGitignore drops ignored matches (v1.26.2 regression)" {
     try testing.expect(std.mem.indexOf(u8, text2, "cache/leak.txt") != null);
 }
 
-test "grep tool: .contextignore is enforced unconditionally (v2.9)" {
-    // Pin the v2.9 contract: contextignored paths never appear in
+test "grep tool: .contextignore is enforced unconditionally (§6.9)" {
+    // Pin the §6.9 contract: contextignored paths never appear in
     // `grep` output, even with `respect_gitignore=false`. The needle
     // is the same in every file so we can prove suppression by
     // looking only at filenames in the result.

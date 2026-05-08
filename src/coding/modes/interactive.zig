@@ -1104,6 +1104,7 @@ fn runOneTurn(
                     .environ_map = session.environ_map,
                     .thinking = session.cfg.thinking,
                     .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
+                    .retry_policy = print_mode.resolveRetryPolicyFromMap(session.cfg, null),
                     .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
                 },
             };
@@ -1823,7 +1824,7 @@ const SessionBinding = struct {
             .stream_fn = ai.providers.google_gemini.streamFn,
         });
 
-        // v2.5 — subagent + list_subagent_presets tools.
+        // §5 — subagent + list_subagent_presets tools.
         // Extensions may have already registered custom presets
         // (via ext_manager.presets). Register built-in presets now,
         // then build the combined parameters JSON from the arena.

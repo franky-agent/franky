@@ -170,6 +170,14 @@ pub const Config = struct {
     /// Default 60_000.
     event_gap_timeout_ms: ?u32 = null,
 
+    /// v2.13 — `--retry-max-attempts N` — override retry attempt count
+    /// (default 3). Settings key: `tools.retry.maxAttempts`.
+    retry_max_attempts: ?u32 = null,
+    /// v2.13 — `--retry-max-total-ms N` — wall-time cap on retry delay
+    /// in ms (default 180_000 = 3 min). 0 = unlimited. Settings key:
+    /// `tools.retry.maxTotalMs`.
+    retry_max_total_ms: ?u64 = null,
+
     /// `--max-turns N` — hard cap on agent-loop turns per prompt.
     /// Default 50. When the cap is reached, the loop emits
     /// `agent_error{max_turns_exceeded}` (interactive mode prompts
@@ -391,6 +399,12 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
         } else if (std.mem.eql(u8, name, "--event-gap-timeout-ms")) {
             const v = try take_value(argv, &i, inline_value);
             cfg.event_gap_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+        } else if (std.mem.eql(u8, name, "--retry-max-attempts")) {
+            const v = try take_value(argv, &i, inline_value);
+            cfg.retry_max_attempts = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+        } else if (std.mem.eql(u8, name, "--retry-max-total-ms")) {
+            const v = try take_value(argv, &i, inline_value);
+            cfg.retry_max_total_ms = std.fmt.parseInt(u64, v, 10) catch return error.UnknownMode;
         } else if (std.mem.eql(u8, name, "--max-turns")) {
             const v = try take_value(argv, &i, inline_value);
             cfg.max_turns = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;

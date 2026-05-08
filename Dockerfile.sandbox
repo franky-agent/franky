@@ -6,7 +6,7 @@ USER root
 #  Install libbtrfs-dev libgpgme-dev needed by podman for https://github.com/containifyci/engine-ci 
 # linux-tools-common needed for perf (CPU profiling), heaptrack (Memory profiling), cargo needed for inferno (CPU and Memory profiling reporting)
 RUN sudo apt-get update && \
-    sudo apt-get install -y wget gnupg podman xz-utils tcpdump libbtrfs-dev libgpgme-dev cargo linux-tools-common heaptrack && \
+    sudo apt-get install -y wget gnupg podman xz-utils tcpdump xxd libbtrfs-dev libgpgme-dev cargo linux-tools-common heaptrack && \
     sudo apt-get clean && \
     sudo rm -rf /var/lib/apt/lists/*
 

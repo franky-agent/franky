@@ -124,6 +124,8 @@ pub const AgentEventKind = enum {
     /// "turn ended naturally" vs "turn cancelled". The transcript
     /// up to this point is preserved; no error is logged.
     agent_interrupted,
+    /// §6.13 — provider retry in progress.
+    provider_retry,
     agent_error,
 };
 
@@ -171,6 +173,19 @@ pub const AgentEvent = union(AgentEventKind) {
     },
     turn_end: void,
     agent_interrupted: void,
+    /// §6.13 — provider is being retried after a retryable error.
+    /// Non-terminal; loop forwards this from the stream to the
+    /// agent event channel so subscribers see \"retrying in Ns\".
+    /// String fields are owned and freed via `deinit`.
+    provider_retry: struct {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u32,
+        reason: ai.errors.Code,
+        provider_code: ?[]const u8 = null,
+        provider_message: ?[]const u8 = null,
+        http_status: ?u16 = null,
+    },
     agent_error: ai.errors.ErrorDetails,
 
     pub fn isTerminal(self: AgentEvent) bool {
@@ -184,6 +199,10 @@ pub const AgentEvent = union(AgentEventKind) {
     pub fn deinit(self: AgentEvent, allocator: std.mem.Allocator) void {
         switch (self) {
             .turn_start, .turn_end, .agent_interrupted => {},
+            .provider_retry => |r| {
+                if (r.provider_code) |v| allocator.free(v);
+                if (r.provider_message) |v| allocator.free(v);
+            },
             .message_start => |s| if (s.custom_role) |v| allocator.free(v),
             .message_update => |m| switch (m) {
                 .text => |t| allocator.free(t.delta),

@@ -80,7 +80,7 @@ var concurrency_mutex: std.Io.Mutex = .init;
 var concurrency_active: u32 = 0;
 var concurrency_cond: std.Io.Condition = .init;
 
-// ─── v2.6 — sub-agent progress forwarding ─────────────────────────
+// ─── §6.6 — sub-agent progress forwarding ─────────────────────────
 
 /// Per-call state for `subagentProgressHandler`. Lives on the
 /// `runSubagent` stack frame — valid for the lifetime of the
@@ -178,7 +178,7 @@ fn subagentProgressHandler(userdata: ?*anyopaque, ev: at.AgentEvent) void {
     var stack_buf: [512]u8 = undefined;
 
     switch (ev) {
-        .turn_start, .turn_end => {},
+        .turn_start, .turn_end, .provider_retry => {},
         .tool_execution_start => |s| {
             // Store name by call_id so tool_execution_end can include it.
             fwd.names_mutex.lockUncancelable(fwd.io);
@@ -384,7 +384,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "research",
         .description = "Reads files, greps for patterns, summarises findings within the workspace.",
-        .default_profile = "ollama-gemma4",
+        .default_profile = "ollama-deepseek-pro",
         .default_role = .read,
         .default_system_prompt =
         \\You are a research sub-agent. Your job is to read, search, and summarise.
@@ -397,7 +397,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "code-audit",
         .description = "Audits a stated quality or security concern read-only across the workspace.",
-        .default_profile = "ollama-gemma4",
+        .default_profile = "ollama-deepseek-pro",
         .default_role = .read,
         .default_system_prompt =
         \\You are a code-audit sub-agent. Focus on the single concern stated in the prompt.
@@ -410,7 +410,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "file-ops",
         .description = "Performs targeted file edits given clear instructions.",
-        .default_profile = "ollama-gemma4",
+        .default_profile = "ollama-deepseek-pro",
         .default_role = .plan,
         .default_system_prompt =
         \\You are a file-ops sub-agent. Apply the edits described in the prompt exactly.
@@ -422,7 +422,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "bash-runner",
         .description = "Runs a bounded shell task and reports stdout, stderr, and exit code.",
-        .default_profile = "ollama-gemma4",
+        .default_profile = "ollama-deepseek-pro",
         .default_role = .code,
         .default_system_prompt =
         \\You are a bash-runner sub-agent. Execute the shell task described in the prompt.
@@ -608,7 +608,7 @@ pub const Ctx = struct {
     /// field is reserved for future per-sub-agent isolation.
     faux_userdata: ?*anyopaque = null,
 
-    // ── v2.6 — sub-agent progress forwarding ──────────────────────
+    // ── §6.6 — sub-agent progress forwarding ──────────────────────
     //
     // When set, `subagentProgressHandler` subscribes to the sub-agent
     // and calls this function for every forwarded event. Must be
@@ -912,7 +912,16 @@ fn runSubagent(
     };
 
     // System prompt: per-call override > preset default.
-    const sys_prompt = parsed.system_prompt orelse preset.default_system_prompt;
+    const sys_prompt_base = parsed.system_prompt orelse preset.default_system_prompt;
+
+    // Inject "Current folder: <pwd>" so the sub-agent has an authoritative
+    // cwd reference independent of what the parent LLM writes in the prompt.
+    const pwd = ctx.environ.getPosix("PWD");
+    const sys_prompt: []const u8 = if (pwd) |p|
+        try std.fmt.allocPrint(allocator, "Current folder: {s}\n\n{s}", .{ p, std.mem.trimEnd(u8, sys_prompt_base, &std.ascii.whitespace) })
+    else
+        sys_prompt_base;
+    defer if (pwd != null) allocator.free(sys_prompt);
 
     // Build the sub-agent.
     const sub_model: ai.types.Model = .{
@@ -934,6 +943,7 @@ fn runSubagent(
             .auth_token = provider_info.auth_token,
             .base_url = provider_info.base_url,
             .timeouts = print_mod.resolveTimeoutsFromMap(&sub_cfg, &local_env_map),
+            .retry_policy = print_mod.resolveRetryPolicyFromMap(&sub_cfg, null),
             // Use the per-call cloned env so the sub-agent's HTTP
             // client sees the profile's `env: {}` block (e.g.
             // FRANKY_FIRST_BYTE_TIMEOUT_MS overrides) without
@@ -948,7 +958,7 @@ fn runSubagent(
     });
     defer sub_agent.deinit();
 
-    // v2.6 — subscribe to sub-agent events for progress forwarding.
+    // §6.6 — subscribe to sub-agent events for progress forwarding.
     // `ForwardState` lives on the stack here and is valid until after
     // `waitForIdle` returns. The defer unsubscribes before the frame exits.
     var fwd: ForwardState = .{
@@ -1151,8 +1161,6 @@ fn supervisorMain(args: SupervisorArgs) void {
         args.io.sleep(.fromMilliseconds(1000), .awake) catch {};
     }
 }
-
-
 
 // ─── arg parsing ───────────────────────────────────────────────────
 
@@ -1819,7 +1827,7 @@ test "cloneEnvironMap: produces an independent copy (v1.24.2 race fix)" {
     try testing.expect(src.get("NEW") == null);
 }
 
-// ─── v2.6 progress handler tests ─────────────────────────────────
+// ─── §6.6 progress handler tests ──────────────────────────────────
 
 test "subagentProgressHandler: turn_start/turn_end are no-ops (turn removed)" {
     const gpa = testing.allocator;

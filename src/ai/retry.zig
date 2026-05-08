@@ -29,6 +29,18 @@ const std = @import("std");
 const stream_mod = @import("stream.zig");
 const errors_mod = @import("errors.zig");
 
+/// §6.13 — fired before each retry sleep. `reason` is the error
+/// code that triggered the retryable verdict (e.g. .transient,
+/// .rate_limited). Fits the same taxonomy as `errors_mod.Code`
+/// but we use the module-level enum to avoid a circular import.
+pub const OnRetryFn = *const fn (
+    userdata: ?*anyopaque,
+    attempt: u32,
+    max_attempts: u32,
+    delay_ms: u32,
+    reason: errors_mod.Code,
+) void;
+
 pub const Policy = struct {
     /// Maximum number of *extra* attempts after the first one. Default
     /// matches §F.1: up to 3 retries means up to 4 total calls.
@@ -40,6 +52,21 @@ pub const Policy = struct {
     /// Optional seed for deterministic tests. `null` → seed from the
     /// wall-clock millisecond timestamp.
     seed: ?u64 = null,
+    /// §6.13 — wall-time cap on total retry delay. When adding the
+    /// next computed delay would exceed this budget, the helper
+    /// returns terminal with the remaining budget as `retry_after_ms`.
+    /// 0 = unlimited (use with care). Default 180s = 3 minutes,
+    /// matching the implicit budget of 3 retries × ≤60s caps.
+    max_total_delay_ms: u64 = 180_000,
+    /// §6.13 — optional callback fired BEFORE each retry sleep (per Q2
+    /// decision). Passes the 1-indexed attempt number, total allowed,
+    /// the delay about to be slept, and the error code that triggered
+    /// the retryable verdict. The caller (e.g. http.zig) uses this to
+    /// push a `provider_retry` event onto the stream channel.
+    on_retry: ?struct {
+        ctx: ?*anyopaque,
+        func: OnRetryFn,
+    } = null,
 };
 
 pub const Outcome = enum {
@@ -60,6 +87,9 @@ pub const AttemptResult = struct {
     /// `.terminal` and propagates the hint so the caller can emit
     /// `rate_limited_hard` with `ErrorDetails.retry_after_ms` set.
     retry_after_ms: ?u32 = null,
+    /// §6.13 — error code that produced the `.retryable` outcome.
+    /// Fired through `on_retry` before the backoff sleep.
+    reason: errors_mod.Code = .transient,
 };
 
 pub const AttemptFn = *const fn (userdata: ?*anyopaque, attempt: u32) AttemptResult;
@@ -144,6 +174,23 @@ pub fn run(
             delay = nextDelay(policy, prev_delay, &prng);
         }
         prev_delay = delay;
+
+        // §6.13 — wall-time cap check. If adding this delay would
+        // exceed `max_total_delay_ms`, return terminal with the
+        // remaining budget as `retry_after_ms` so the caller can
+        // surface `rate_limited_hard`.
+        if (policy.max_total_delay_ms > 0) {
+            const exceeded = total_delay_ms + delay > policy.max_total_delay_ms;
+            if (exceeded) {
+                const remaining = policy.max_total_delay_ms -| total_delay_ms;
+                return .{
+                    .outcome = .terminal,
+                    .attempts = attempts,
+                    .total_delay_ms = total_delay_ms,
+                    .retry_after_ms = @as(u32, @intCast(@min(remaining, std.math.maxInt(u32)))),
+                };
+            }
+        }
         total_delay_ms += delay;
 
         if (cancel.isFired()) {
@@ -152,6 +199,10 @@ pub fn run(
                 .attempts = attempts,
                 .total_delay_ms = total_delay_ms,
             };
+        }
+        // Fire on_retry callback BEFORE sleep (Q2 decision).
+        if (policy.on_retry) |cb| {
+            cb.func(cb.ctx, attempts, policy.max_retries + 1, delay, result.reason);
         }
         sleep_fn(sleep_ctx, delay);
     }
@@ -319,8 +370,46 @@ test "run: cancel during backoff short-circuits the next attempt" {
     try testing.expectEqual(@as(u32, 1), sctx.called);
 }
 
+test "run: wall-time cap terminates before max_retries is reached" {
+    // 2 retryables, each with at least base=500ms delay.
+    // Wall-time cap of 300ms should kill after the first delay.
+    var verdicts = Verdicts{ .list = &.{
+        .{ .outcome = .retryable },
+        .{ .outcome = .retryable },
+        .{ .outcome = .success }, // never reached
+    } };
+    var cancel: stream_mod.Cancel = .{};
+    const r = run(.{
+        .max_retries = 5,
+        .base_delay_ms = 500,
+        .max_retry_delay_ms = 60_000,
+        .max_total_delay_ms = 300, // tight cap — first delay alone exceeds it
+        .seed = 42,
+    }, &cancel, noSleep, null, Verdicts.run, @ptrCast(&verdicts));
+    try testing.expectEqual(Outcome.terminal, r.outcome);
+    try testing.expectEqual(@as(u32, 1), r.attempts); // only first attempt, no retry sleep
+    try testing.expectEqual(@as(u64, 0), r.total_delay_ms);
+}
+
+test "run: wall-time cap zero means unlimited" {
+    var verdicts = Verdicts{ .list = &.{
+        .{ .outcome = .retryable },
+        .{ .outcome = .retryable },
+        .{ .outcome = .retryable },
+        .{ .outcome = .success },
+    } };
+    var cancel: stream_mod.Cancel = .{};
+    const r = run(.{
+        .max_retries = 5,
+        .base_delay_ms = 10,
+        .max_retry_delay_ms = 50,
+        .max_total_delay_ms = 0, // unlimited
+        .seed = 99,
+    }, &cancel, noSleep, null, Verdicts.run, @ptrCast(&verdicts));
+    try testing.expectEqual(Outcome.success, r.outcome);
+    try testing.expectEqual(@as(u32, 4), r.attempts);
+}
 test "every retryable Code triggers a retry path when wrapped in run" {
-    // Sanity: retry.zig is agnostic of Code; we spot-check that the
     // documented retryable codes from §F all produce `.retryable` when
     // the caller maps them correctly.
     const retryable_codes: []const errors_mod.Code = &.{

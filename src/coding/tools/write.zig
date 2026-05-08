@@ -190,7 +190,7 @@ test "write overwrite=true replaces file" {
     try testing.expect(!r2.is_error);
 }
 
-test "write tool: refuses to create at contextignored path (v2.9)" {
+test "write tool: refuses to create at contextignored path (§6.9)" {
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();

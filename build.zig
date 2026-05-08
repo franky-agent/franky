@@ -125,6 +125,30 @@ pub fn build(b: *std.Build) void {
     anchor_step.dependOn(&check_anchors_run.step);
     test_step.dependOn(&check_anchors_run.step);
 
+    // `zig build check-doc-links` — verify every relative Markdown link in
+    // docs/spec/v*.md resolves to an existing file. Catches broken paths
+    // when design docs move between open/, decided/, and archive/design/.
+    const check_links_module = b.createModule(.{
+        .root_source_file = b.path("src/bin/check_doc_links.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const check_links_exe = b.addExecutable(.{
+        .name = "franky-check-doc-links",
+        .root_module = check_links_module,
+        .use_llvm = use_llvm,
+        .use_lld = use_lld,
+    });
+    const check_links_run = b.addRunArtifact(check_links_exe);
+    const links_step = b.step("check-doc-links", "Verify relative links in docs/spec/v*.md resolve to existing files");
+    links_step.dependOn(&check_links_run.step);
+    test_step.dependOn(&check_links_run.step);
+
+    // `zig build check-doc` — composite: spec-anchor check + doc-link check.
+    const check_doc_step = b.step("check-doc", "Run check-spec-anchors and check-doc-links");
+    check_doc_step.dependOn(&check_anchors_run.step);
+    check_doc_step.dependOn(&check_links_run.step);
+
     const integration_files = [_][]const u8{
         "test/agent_loop_test.zig",
         "test/agent_class_test.zig",

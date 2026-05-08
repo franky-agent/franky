@@ -764,6 +764,25 @@ pub fn fetchWithRetryAndTimeouts(
     return fetchWithRetryAndTimeoutsAndHooks(client, options, body_writer, cancel, policy, timeouts, .{});
 }
 
+/// §6.13 — heap-allocated context owned by `hooksFromOptionsWithRetry`.
+/// Freed by `fetchWithRetryAndTimeoutsAndHooksAndPhases` via `owned_retry_ctx`.
+/// Lives at module scope so the fetch function can reference its type for cleanup.
+const StreamRetryCtx = struct {
+    out: *stream_mod.Channel,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+
+    fn callback(ud: ?*anyopaque, attempt: u32, max_attempts: u32, delay_ms: u32, reason: errors_mod.Code) void {
+        const self: *StreamRetryCtx = @ptrCast(@alignCast(ud.?));
+        self.out.push(self.io, .{ .provider_retry = .{
+            .attempt = attempt,
+            .max_attempts = max_attempts,
+            .delay_ms = delay_ms,
+            .reason = reason,
+        } }) catch {};
+    }
+};
+
 /// v1.7.2 — §3.5 hooks: fires `on_payload` before every attempt,
 /// `on_response` after each one. When both hooks are null this is
 /// byte-for-byte equivalent to `fetchWithRetryAndTimeouts`.
@@ -771,6 +790,13 @@ pub const Hooks = struct {
     userdata: ?*anyopaque = null,
     on_payload: ?*const fn (userdata: ?*anyopaque, payload: []const u8) void = null,
     on_response: ?*const fn (userdata: ?*anyopaque, status: u16) void = null,
+    /// §6.13 — fired before each retry sleep with the 1-indexed
+    /// attempt number, total allowed attempts, and the delay about
+    /// to be slept. Wired into `Policy.on_retry`.
+    on_retry: ?retry_mod.OnRetryFn = null,
+    /// §6.13 — non-null only when set by `hooksFromOptionsWithRetry`.
+    /// Owned by this Hooks value; freed by `fetchWithRetryAndTimeoutsAndHooksAndPhases`.
+    owned_retry_ctx: ?*StreamRetryCtx = null,
 };
 
 /// v1.3.0 R5 — pull the hooks out of a `StreamOptions` (from
@@ -781,7 +807,23 @@ pub fn hooksFromOptions(opts: anytype) Hooks {
         .userdata = opts.hooks.userdata,
         .on_payload = opts.hooks.on_payload,
         .on_response = opts.hooks.on_response,
+        .on_retry = opts.hooks.on_retry,
     };
+}
+
+/// §6.13 — same as `hooksFromOptions` but also wires `on_retry` to
+/// push a `provider_retry` event onto `ctx.out` before each retry
+/// sleep. Providers that use the HTTP fetch path call this instead
+/// of `hooksFromOptions` to get retry visibility for free.
+/// The allocated `StreamRetryCtx` is owned by the returned `Hooks.owned_retry_ctx`
+/// and freed by `fetchWithRetryAndTimeoutsAndHooksAndPhases` after the fetch.
+pub fn hooksFromOptionsWithRetry(ctx: anytype) Hooks {
+    var hooks = hooksFromOptions(ctx.options);
+    const rc = ctx.allocator.create(StreamRetryCtx) catch return hooks;
+    rc.* = .{ .out = ctx.out, .io = ctx.io, .allocator = ctx.allocator };
+    hooks.owned_retry_ctx = rc;
+    hooks.on_retry = StreamRetryCtx.callback;
+    return hooks;
 }
 
 /// v1.3.0 R5 — push the canonical `.start` → `error_ev(...)` →
@@ -922,8 +964,16 @@ pub fn fetchWithRetryAndTimeoutsAndHooksAndPhases(
         .phase_info = phase_info,
     };
 
+    defer if (hooks.owned_retry_ctx) |rc| rc.allocator.destroy(rc);
+
+    var effective_policy = policy;
+    effective_policy.on_retry = if (hooks.on_retry) |func| .{
+        .ctx = hooks.owned_retry_ctx,
+        .func = func,
+    } else null;
+
     const result = retry_mod.run(
-        policy,
+        effective_policy,
         cancel,
         defaultSleep,
         null,

@@ -136,7 +136,7 @@ pub fn listPath(
     try out.append(allocator, '\n');
 
     // Load `.gitignore` (gated by `respect_gitignore`) and
-    // `.contextignore` (v2.9 — always on) up front. See
+    // `.contextignore` (§6.9 — always on) up front. See
     // `gitignore.loadIgnoreStacks` for the contract.
     var stacks = gitignore.loadIgnoreStacks(allocator, io, path, respect_gitignore);
     defer stacks.deinit();
@@ -372,8 +372,8 @@ test "ls tool: hard-skips .git directory regardless of respectGitignore" {
     try testing.expect(std.mem.indexOf(u8, text_flat, ".git") == null);
 }
 
-test "ls tool: .contextignore is enforced unconditionally (v2.9)" {
-    // Pin the v2.9 contract: `.contextignore` paths are hidden from `ls`
+test "ls tool: .contextignore is enforced unconditionally (§6.9)" {
+    // Pin the §6.9 contract: `.contextignore` paths are hidden from `ls`
     // regardless of any argument the model passes. We run with
     // `respect_gitignore=false` so contextignore behavior is observably
     // independent of the gitignore stack.

@@ -224,6 +224,17 @@ pub fn eventToJsonLine(allocator: std.mem.Allocator, ev: stream_mod.StreamEvent)
             try utils.appendJsonStr(&out, allocator, @tagName(d.stop_reason));
             try out.append(allocator, '}');
         },
+        .provider_retry => |r| {
+            try out.appendSlice(allocator, "{\"kind\":\"provider_retry\",\"attempt\":");
+            try writeIntField(&out, allocator, "", r.attempt);
+            try out.appendSlice(allocator, ",\"max_attempts\":");
+            try writeIntField(&out, allocator, "", r.max_attempts);
+            try out.appendSlice(allocator, ",\"delay_ms\":");
+            try writeIntField(&out, allocator, "", r.delay_ms);
+            try out.appendSlice(allocator, ",\"reason\":");
+            try utils.appendJsonStr(&out, allocator, @tagName(r.reason));
+            try out.append(allocator, '}');
+        },
         .error_ev => |e| {
             try out.appendSlice(allocator, "{\"kind\":\"error_ev\",\"code\":");
             try utils.appendJsonStr(&out, allocator, @tagName(e.code));

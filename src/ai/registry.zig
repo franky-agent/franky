@@ -13,6 +13,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const channel_mod = @import("channel.zig");
 const stream_mod = @import("stream.zig");
+const retry_mod = @import("retry.zig");
 
 pub const Channel = channel_mod.Channel(stream_mod.StreamEvent);
 
@@ -35,6 +36,10 @@ pub const StreamOptions = struct {
     thinking: types.ThinkingLevel = .off,
     /// HTTP phase deadlines — §G.4. Zero means "no timeout on this phase".
     timeouts: Timeouts = .{},
+    /// §6.13 — retry policy overrides. When non-null providers use
+    /// this instead of the hard-coded defaults. Loop sets this from
+    /// settings `tools.retry.*` and CLI `--retry-max-*` flags.
+    retry_policy: ?retry_mod.Policy = null,
     /// Override the provider's default endpoint. Used by §A.6
     /// OpenAI-compatible gateways (Ollama, LM Studio, vLLM,
     /// Cerebras, OpenRouter, …) to retarget `openai_chat.streamFn`'s
@@ -68,6 +73,10 @@ pub const StreamOptions = struct {
         userdata: ?*anyopaque = null,
         on_payload: ?*const fn (userdata: ?*anyopaque, payload: []const u8) void = null,
         on_response: ?*const fn (userdata: ?*anyopaque, status: u16) void = null,
+        /// §6.13 — fired before each retry sleep with the 1-indexed
+        /// attempt number, total allowed attempts, and the delay about
+        /// to be slept. Wired through http_mod to `Policy.on_retry`.
+        on_retry: ?retry_mod.OnRetryFn = null,
     };
 };
 

@@ -636,7 +636,7 @@ fn initSession(
     });
 
     // v1.24.0 — append subagent + list_subagent_presets tools.
-    // v2.5 — preset registry lives in role_arena alongside ctx.
+    // §5 — preset registry lives in role_arena alongside ctx.
     //
     // v1.28.0 — wire `parent_session_dir` so the sub-agent's
     // transcript persists to
@@ -672,10 +672,10 @@ fn initSession(
             // the session struct so its address is stable.
             .permission_prompter_slot = &session.current_prompter,
             .parent_session_dir = parent_session_dir,
-            // v2.6 — forward sub-agent events to SSE subscribers.
+            // §6.6 — forward sub-agent events to SSE subscribers.
             .progress_fn = subagentProgressForward,
             .progress_userdata = session,
-            // v2.7 — enable full text/thinking deltas for the panel.
+            // §6.7 — enable full text/thinking deltas for the panel.
             .verbose_progress = true,
         };
         const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 3);
@@ -1200,6 +1200,7 @@ fn compactHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!vo
             .environ_map = session.environ_map,
             .thinking = session.cfg.thinking,
             .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
+            .retry_policy = print_mode.resolveRetryPolicyFromMap(session.cfg, null),
             .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
         },
         .pinned = pinned,
@@ -1478,7 +1479,7 @@ fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     try fp.runSync(ctx.io, ctx.context, ctx.out);
 }
 
-// ─── v2.6 — sub-agent progress forwarding ────────────────────────
+// ─── §6.6 — sub-agent progress forwarding ────────────────────────
 //
 // Called from the sub-agent's worker thread for each forwarded event.
 // Must only call `broadcastEvent` (mutex-protected) — must not touch
@@ -2012,6 +2013,7 @@ fn runOneTurnInternal(
                 .environ_map = session.environ_map,
                 .thinking = session.cfg.thinking,
                 .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
+                .retry_policy = print_mode.resolveRetryPolicyFromMap(session.cfg, null),
                 .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
             },
         },

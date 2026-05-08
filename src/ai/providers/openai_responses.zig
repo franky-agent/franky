@@ -422,7 +422,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         .method = .POST,
         .payload = body,
         .extra_headers = http_headers,
-    }, &bw, cancel, .{}, ctx.options.timeouts, http_mod.hooksFromOptions(ctx.options), &phase_info) catch |e| {
+    }, &bw, cancel, ctx.options.retry_policy orelse .{}, ctx.options.timeouts, http_mod.hooksFromOptionsWithRetry(ctx), &phase_info) catch |e| {
         try http_mod.reportTransportErrorWithPhase(ctx.out, ctx.io, ctx.allocator, e, phase_info.timed_out_phase, ctx.options.timeouts);
         return;
     };

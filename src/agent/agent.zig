@@ -62,7 +62,7 @@ pub const Agent = struct {
     /// per-run. SDK consumers override the default by setting
     /// `Agent.Config.max_turns`; mode drivers override via
     /// `--max-turns` / settings / profile.
-    max_turns: u32 = 50,
+    max_turns: u32 = 100,
     /// Optional hook fired when the loop reaches `max_turns`. Returns
     /// `.extend(N)` to bump the cap additively or `.stop` to terminate.
     /// Without a hook the loop emits `max_turns_exceeded`. Wired the

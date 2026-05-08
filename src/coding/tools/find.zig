@@ -418,8 +418,8 @@ test "find tool: respectGitignore drops ignored matches" {
     try testing.expect(std.mem.indexOf(u8, text, ".gitignore") != null);
 }
 
-test "find tool: .contextignore is enforced unconditionally (v2.9)" {
-    // Pin the v2.9 contract: contextignored paths never appear in
+test "find tool: .contextignore is enforced unconditionally (§6.9)" {
+    // Pin the §6.9 contract: contextignored paths never appear in
     // `find` output. We pass `respect_gitignore=false` here so the
     // behaviour is observably independent of the gitignore stack.
     var threaded = test_h.threadedIo();

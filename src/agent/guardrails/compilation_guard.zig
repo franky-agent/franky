@@ -1,4 +1,4 @@
-//! Compilation Guard — §2 of v2.10 spec.
+//! Compilation Guard — §6.10.
 //!
 //! Counts edit/write mutations; after `threshold` mutations runs the
 //! configured build stages. On failure the compiler output is injected as a
@@ -170,6 +170,8 @@ pub const CompilationGuard = struct {
         const result = try self.runBuildStages(allocator, io);
         defer allocator.free(result.output);
 
+        ai.log.log(.debug, "guardrails", "build_ran", "success={} output_bytes={d}", .{ result.success, result.output.len });
+
         if (result.success) return false;
 
         const hint = try std.fmt.allocPrint(
@@ -197,7 +199,7 @@ pub const CompilationGuard = struct {
             } });
         }
 
-        // v2.10.0 — emit typed agent_error alongside the tool-execution event
+        // §6.10 — emit typed agent_error alongside the tool-execution event
         // so SDK consumers can subscribe to guardrail events generically.
         try out.push(io, .{ .agent_error = .{
             .code = .compilation_failed,

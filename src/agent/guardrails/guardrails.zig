@@ -1,4 +1,4 @@
-//! Guardrail aggregate — §7 of v2.10 spec.
+//! Guardrail aggregate — §6.10.
 //!
 //! `GuardrailState` owns a `StuckDetector`, a `CompilationGuard`, and a
 //! `FinishTaskState`. It is wired directly into the loop via
@@ -143,6 +143,7 @@ pub const GuardrailState = struct {
             // Force a compilation run regardless of the mutation threshold.
             const compile_failed = try self.compilation_guard.betweenTurns(allocator, io, transcript, out, true);
             if (compile_failed) {
+                ai.log.log(.debug, "guardrails", "compilation_guard_fired", "source=finish_task", .{});
                 self.finish_task_state.reset();
                 return true;
             }
@@ -160,11 +161,13 @@ pub const GuardrailState = struct {
 
         // ── compilation guard ────────────────────────────────────────────
         if (try self.compilation_guard.betweenTurns(allocator, io, transcript, out, false)) {
+            ai.log.log(.debug, "guardrails", "compilation_guard_fired", "source=threshold", .{});
             return true;
         }
 
         // ── stuck detector ───────────────────────────────────────────────
         if (try self.stuck_detector.betweenTurns(allocator, io, transcript, out)) {
+            ai.log.log(.debug, "guardrails", "stuck_detector_fired", "", .{});
             return true;
         }
 

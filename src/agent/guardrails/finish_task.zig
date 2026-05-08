@@ -1,4 +1,4 @@
-//! finish_task tool — §5 of v2.10 spec.
+//! finish_task tool — §6.10.
 //!
 //! The model calls `finish_task` to signal task completion. The tool:
 //!   1. Validates and stores the commit_message and summary.

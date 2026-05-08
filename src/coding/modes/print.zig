@@ -299,6 +299,7 @@ fn runPrint(
         applyBashSettingsOverlay(&bash_state, &settings);
         applyReadSettingsOverlay(&read_ctx, &settings);
         applyMaxTurnsSettingsOverlay(cfg, &settings);
+        applyRetrySettingsOverlay(cfg, &settings);
     }
     var bash_ctx = tools_mod.bash.BashCtx{
         .state = &bash_state,
@@ -381,9 +382,9 @@ fn runPrint(
         .permissions = if (prompts_enabled) &permission_store else null,
     };
 
-    // v2.5 — preset registry. Populated once at session-init.
+    // §5 — preset registry. Populated once at session-init.
     // SDK consumers can extend before this point by passing a
-    // callback; v2.5 ships built-ins only.
+    // callback; §5 ships built-ins only.
     var preset_registry = tools_mod.subagent.PresetRegistry.init(allocator);
     defer preset_registry.deinit();
     try tools_mod.subagent.registerBuiltinPresets(&preset_registry);
@@ -560,6 +561,7 @@ fn runPrint(
             .environ_map = environ_map,
             .thinking = cfg.thinking,
             .timeouts = resolveTimeoutsFromMap(cfg, environ_map),
+            .retry_policy = resolveRetryPolicyFromMap(cfg, null),
             .http_trace_dir = resolveHttpTraceDirFromMap(cfg, environ_map),
         },
     };
@@ -766,6 +768,27 @@ pub fn resolveMaxTurnsFromMap(
     return null;
 }
 
+/// v2.13 — resolve retry policy from CLI flags, settings, or defaults.
+/// Callers pass their `cfg` and settings to build a `retry_mod.Policy`
+/// that providers can use instead of the hard-coded defaults.
+pub fn resolveRetryPolicyFromMap(
+    cfg: *const cli_mod.Config,
+    settings: ?*const settings_mod.Settings,
+) ai.retry.Policy {
+    var p: ai.retry.Policy = .{};
+    if (cfg.retry_max_attempts) |v| {
+        p.max_retries = v;
+    } else if (settings) |s| {
+        if (s.retry_max_attempts) |v| p.max_retries = v;
+    }
+    if (cfg.retry_max_total_ms) |v| {
+        p.max_total_delay_ms = v;
+    } else if (settings) |s| {
+        if (s.retry_max_total_ms) |v| p.max_total_delay_ms = v;
+    }
+    return p;
+}
+
 /// v1.13.0 — resolve the log-file destination for this run.
 /// Precedence: `--log-file` flag → `FRANKY_LOG_FILE` env var → null.
 /// Returned slice is borrowed from `cfg` (CLI arena) or
@@ -939,6 +962,22 @@ pub fn applyMaxTurnsSettingsOverlay(
 ) void {
     if (cfg.max_turns != null) return; // CLI / profile already set it.
     if (settings.max_turns) |v| cfg.max_turns = v;
+}
+
+/// v2.13 — apply `settings.retry_max_attempts` and
+/// `settings.retry_max_total_ms` to `cfg` when the CLI didn't
+/// set them (or a profile didn't). Follows the same pattern as
+/// `applyMaxTurnsSettingsOverlay`.
+pub fn applyRetrySettingsOverlay(
+    cfg: *cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) void {
+    if (cfg.retry_max_attempts == null) {
+        cfg.retry_max_attempts = settings.retry_max_attempts;
+    }
+    if (cfg.retry_max_total_ms == null) {
+        cfg.retry_max_total_ms = settings.retry_max_total_ms;
+    }
 }
 
 /// True when `base_url` parses to a loopback host. Whole-host
@@ -1635,7 +1674,7 @@ pub fn buildSystemPromptIo(
     }
     defer if (hint_owned) allocator.free(with_hint);
 
-    // Skills layer (v2.1.0). Each active skill's body is appended
+    // Skills layer (§6.1). Each active skill's body is appended
     // verbatim under `## Active skills`. Activation is deterministic:
     // explicit `--skill NAME` and/or `auto_apply` glob match against
     // the workspace tree. Skipped silently when no `io` (pure-logic
@@ -2879,7 +2918,7 @@ test "buildSystemPromptIo: missing system.md falls back to default + appends sub
     try testing.expect(std.mem.indexOf(u8, out, "trust") != null);
 }
 
-test "buildSystemPromptIo: --skill NAME injects body under Active skills (v2.1.0)" {
+test "buildSystemPromptIo: --skill NAME injects body under Active skills (§6.1)" {
     const gpa = testing.allocator;
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
@@ -2922,7 +2961,7 @@ test "buildSystemPromptIo: --skill NAME injects body under Active skills (v2.1.0
     try testing.expect(std.mem.indexOf(u8, out, "WORKSPACE-SPECIFIC GUIDANCE") != null);
 }
 
-test "buildSystemPromptIo: skill stays out when not selected and no auto_apply (v2.1.0)" {
+test "buildSystemPromptIo: skill stays out when not selected and no auto_apply (§6.1)" {
     const gpa = testing.allocator;
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
