@@ -2837,10 +2837,16 @@ function highlightCodeBlocks(container) {
             if (tipTools) {
                 const tools = data.allowed_tools || [];
                 if (tools.length > 0) {
-                    tipTools.innerHTML = 'Available tools: ' +
-                        tools.map(function (t) {
-                            return '<span class="rt-tool-name">' + t + '</span>';
-                        }).join(', ');
+                    tipTools.textContent = '';
+                    const prefix = document.createTextNode('Available tools: ');
+                    tipTools.appendChild(prefix);
+                    for (let i = 0; i < tools.length; i++) {
+                        if (i > 0) tipTools.appendChild(document.createTextNode(', '));
+                        const span = document.createElement('span');
+                        span.className = 'rt-tool-name';
+                        span.textContent = tools[i];
+                        tipTools.appendChild(span);
+                    }
                 } else {
                     tipTools.textContent = 'No tools available.';
                 }

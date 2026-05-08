@@ -90,7 +90,7 @@
         "mistral": {
             "provider": "gateway",
             "base-url": "https://api.mistral.ai/v1/chat/completions",
-            "model": "codestral-latest",
+            "model": "devstral-2512",
             "api-key-env": "MISTRAL_KEY",
             "ask-tools": "all",
             "role": "full",

@@ -317,6 +317,10 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
         if (rev_v.object.get("timeoutMs")) |t| if (t == .integer and t.integer >= 1) {
             settings.review_timeout_ms = @intCast(t.integer);
         };
+        // v2.16 — validate that minModels <= maxModels; clamp if not.
+        if (settings.review_min_models > settings.review_max_models) {
+            settings.review_min_models = settings.review_max_models;
+        }
     };
 }
 

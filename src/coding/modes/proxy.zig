@@ -1396,10 +1396,9 @@ fn reviewHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!
     // (passing null for text since we already appended it).
     const content = try ctx.allocator.alloc(ai.types.ContentBlock, 1);
     errdefer ctx.allocator.free(content);
-    content[0] = ai.types.ContentBlock{ .text = .{
-        .text = try ctx.allocator.dupe(u8, text),
-    } };
-    errdefer ctx.allocator.free(content[0].text.text);
+    const text_owned = try ctx.allocator.dupe(u8, text);
+    errdefer ctx.allocator.free(text_owned);
+    content[0] = ai.types.ContentBlock{ .text = .{ .text = text_owned } };
     try session.transcript.append(.{
         .role = .user,
         .content = content,
