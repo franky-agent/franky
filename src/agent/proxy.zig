@@ -144,6 +144,9 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
             try appendJsonStr(&buf, allocator, d.code.toString());
             try buf.appendSlice(allocator, ",\"message\":");
             try appendJsonStr(&buf, allocator, d.message);
+            if (!d.is_fatal) {
+                try buf.appendSlice(allocator, ",\"isFatal\":false");
+            }
             if (d.http_status) |s| {
                 try buf.appendSlice(allocator, ",\"httpStatus\":");
                 try appendJsonInt(&buf, allocator, @intCast(s));
@@ -274,6 +277,19 @@ test "encodeEventJson: agent_error carries code + message + status" {
     defer gpa.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\"code\":\"rate_limited_hard\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"httpStatus\":429") != null);
+    // Fatal errors (default) must NOT emit isFatal — omission means true.
+    try testing.expect(std.mem.indexOf(u8, json, "isFatal") == null);
+}
+
+test "encodeEventJson: agent_error omits isFatal when true, includes false when non-fatal" {
+    const gpa = testing.allocator;
+    const json = try encodeEventJson(gpa, .{ .agent_error = .{
+        .code = .compilation_failed,
+        .message = "build error",
+        .is_fatal = false,
+    } });
+    defer gpa.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"isFatal\":false") != null);
 }
 
 test "writeEvent: full SSE framing lands on the writer" {

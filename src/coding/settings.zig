@@ -91,6 +91,17 @@ pub const Settings = struct {
     retry_max_attempts: ?u32 = null,
     retry_max_total_ms: ?u64 = null,
 
+    /// v2.16 — multi-model code review settings.
+    /// `review.profiles` — ordered list of profile names for multi-model review.
+    /// Concatenated across user → project layers. Empty = auto-discovery at runtime.
+    review_profiles: [][]const u8 = &.{},
+    /// `review.minModels` — abort if fewer than this many models respond. Default 2.
+    review_min_models: u32 = 2,
+    /// `review.maxModels` — cap on concurrent subagents even if more profiles are listed. Default 4.
+    review_max_models: u32 = 4,
+    /// `review.timeoutMs` — per-subagent wall-clock timeout in ms. Default 180 000 (3 min).
+    review_timeout_ms: u64 = 180_000,
+
     pub fn deinit(self: *Settings) void {
         self.allocator.free(self.default_provider);
         self.allocator.free(self.default_model_anthropic);

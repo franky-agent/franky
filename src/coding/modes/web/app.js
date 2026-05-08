@@ -261,6 +261,11 @@ function highlightCodeBlocks(container) {
     const helpCmdsEl = document.getElementById('help-commands');
     // vN — Abort button in header. Always visible; just POSTs /interrupt.
     const abortBtn = document.getElementById('abort-btn');
+    // v2.19 — design documents panel (right-side drawer)
+    const designPanelEl    = document.getElementById('design-panel');
+    const designPanelBtn   = document.getElementById('design-panel-btn');
+    const designPanelClose = document.getElementById('design-panel-close');
+    const designPanelBody  = document.getElementById('design-panel-body');
     // v2.7 — subagent panel (right-side drawer)
     const subagentPanelEl      = document.getElementById('subagent-panel');
     const subagentPanelBody    = document.getElementById('subagent-panel-body');
@@ -565,6 +570,207 @@ function highlightCodeBlocks(container) {
         // them even if they were reading earlier content.
         scrollToBottom(true);
     }
+
+    // ─── v2.19 — design documents panel ──────────────────────────
+
+    let dpPendingDoc = null;    // doc object waiting for toast Replace
+    let dpPendingPrompt = null; // raw prompt string when no doc object is involved
+
+    function dpPromptFor(doc) {
+        const templates = {
+            decided: `Please implement the design described in ${doc.path}.\nRead the document first, then follow the implementation plan closely.\nStart with the scope marked as v1 / first milestone.`,
+            open:    `Let's work through the open design questions in ${doc.path}.\nPlease read the document, summarise the open questions, and help me decide each one.\nAfter every question has a decision mark it with "✓ decided:" and the chosen answer inline.`,
+            draft:   `Let's discuss the design in ${doc.path}.\nPlease read the document, identify any open questions or missing decisions, and help me flesh them out.`,
+        };
+        return templates[doc.category] ?? templates.draft;
+    }
+
+    function dpAssessPrompt(doc) {
+        return `Read ${doc.path} and check what has been implemented.\nCompare the implementation plan against the code in the files listed under **Affects:**.\nThen:\n- If fully implemented: update the **Status:** line to \`**Status:** implemented\`.\n- If partially implemented: list what is done and what remains, then update to \`**Status:** partially implemented\`.\n- If not started: confirm and leave the status unchanged.`;
+    }
+
+    function dpSplitPrompt(doc) {
+        return `Read ${doc.path} — it is partially implemented.\nPlease:\n1. Move this file to docs/archive/design/ keeping only the sections that are fully implemented.\n2. Create a new design doc at docs/design/decided/ with only the remaining unimplemented sections, preserving the original decisions and **Affects:** list.\nUpdate the **Status:** line in both files accordingly.`;
+    }
+
+    function dpToggle() {
+        if (!designPanelEl) return;
+        const opening = designPanelEl.hidden;
+        designPanelEl.hidden = !opening;
+        if (designPanelBtn) designPanelBtn.classList.toggle('is-active', opening);
+        if (opening) dpFetch();
+    }
+
+    async function dpFetch() {
+        if (!designPanelBody) return;
+        designPanelBody.innerHTML = '<div class="dp-empty">Loading…</div>';
+        let docs;
+        try {
+            const r = await fetch('/design-docs');
+            ({ docs } = await r.json());
+        } catch (_) {
+            designPanelBody.innerHTML = '<div class="dp-empty">Failed to load.</div>';
+            return;
+        }
+        dpRender(docs || []);
+    }
+
+    // Status indicator: dot + tooltip for decided-category docs.
+    const dpStatusMeta = {
+        decided:     { dot: 'dp-dot-pending',     title: 'Not yet implemented' },
+        implemented: { dot: 'dp-dot-implemented',  title: 'Implemented — ready to archive' },
+        partial:     { dot: 'dp-dot-partial',      title: 'Partially implemented' },
+        unknown:     { dot: 'dp-dot-unknown',      title: 'Implementation status unknown' },
+    };
+
+    function dpRender(docs) {
+        if (!designPanelBody) return;
+        if (docs.length === 0) {
+            designPanelBody.innerHTML = '<div class="dp-empty">No design docs found.</div>';
+            return;
+        }
+        const groups = { decided: [], open: [], draft: [] };
+        for (const d of docs) {
+            const g = groups[d.category] ?? groups.draft;
+            g.push(d);
+        }
+        designPanelBody.innerHTML = '';
+        for (const [cat, items] of [['decided', groups.decided], ['open', groups.open], ['draft', groups.draft]]) {
+            if (items.length === 0) continue;
+            const hdr = document.createElement('div');
+            hdr.className = 'dp-group-header';
+            hdr.innerHTML = `${cat} <span class="dp-group-count">${items.length}</span>`;
+            designPanelBody.appendChild(hdr);
+            for (const doc of items) {
+                const row = document.createElement('div');
+                row.className = 'dp-row';
+
+                // Status dot — only for decided-category docs.
+                if (cat === 'decided') {
+                    const meta = dpStatusMeta[doc.status] ?? dpStatusMeta.unknown;
+                    const dot = document.createElement('span');
+                    dot.className = `dp-dot ${meta.dot}`;
+                    dot.title = meta.title;
+                    row.appendChild(dot);
+                }
+
+                const name = document.createElement('span');
+                name.className = 'dp-row-name';
+                name.textContent = doc.name;
+                name.title = doc.path;
+                row.appendChild(name);
+
+                // Action buttons — decided-category only, shown on hover via CSS.
+                if (cat === 'decided') {
+                    const actions = document.createElement('span');
+                    actions.className = 'dp-row-actions';
+
+                    if (doc.status === 'implemented') {
+                        const archBtn = document.createElement('button');
+                        archBtn.className = 'dp-action-btn dp-action-archive';
+                        archBtn.textContent = '📦';
+                        archBtn.title = 'Archive (move to docs/archive/design/)';
+                        archBtn.addEventListener('click', (e) => { e.stopPropagation(); dpArchiveDoc(doc); });
+                        actions.appendChild(archBtn);
+                    } else if (doc.status === 'partial') {
+                        const splitBtn = document.createElement('button');
+                        splitBtn.className = 'dp-action-btn dp-action-split';
+                        splitBtn.textContent = '✂️';
+                        splitBtn.title = 'Split into archive + remaining design doc';
+                        splitBtn.addEventListener('click', (e) => { e.stopPropagation(); dpFillComposer(dpSplitPrompt(doc)); });
+                        actions.appendChild(splitBtn);
+                    } else {
+                        const assessBtn = document.createElement('button');
+                        assessBtn.className = 'dp-action-btn dp-action-assess';
+                        assessBtn.textContent = '🔍';
+                        assessBtn.title = 'Assess implementation status';
+                        assessBtn.addEventListener('click', (e) => { e.stopPropagation(); dpFillComposer(dpAssessPrompt(doc)); });
+                        actions.appendChild(assessBtn);
+                    }
+                    row.appendChild(actions);
+                } else {
+                    const badge = document.createElement('span');
+                    badge.className = `dp-badge dp-badge-${cat}`;
+                    badge.textContent = cat;
+                    row.appendChild(badge);
+                }
+
+                row.addEventListener('click', () => dpSelectDoc(doc));
+                designPanelBody.appendChild(row);
+            }
+        }
+    }
+
+    function dpClose() {
+        if (designPanelEl) designPanelEl.hidden = true;
+        if (designPanelBtn) designPanelBtn.classList.remove('is-active');
+    }
+
+    function dpFillComposer(prompt) {
+        dpClose();
+        if (!input.value.trim()) {
+            input.value = prompt;
+            input.focus();
+            input.setSelectionRange(0, 0);
+        } else {
+            dpPendingPrompt = prompt;
+            dpShowToast('action');
+        }
+    }
+
+    async function dpArchiveDoc(doc) {
+        dpClose();
+        try {
+            const r = await fetch('/design-docs/archive', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: doc.path }),
+            });
+            const data = await r.json();
+            if (!data.ok) throw new Error('archive failed');
+            appendSystemMessage('/design archive', `Archived **${doc.name}** → \`${data.archived}\``, false);
+        } catch (err) {
+            appendError('Archive failed: ' + (err.message || err));
+        }
+    }
+
+    function dpSelectDoc(doc) {
+        dpFillComposer(dpPromptFor(doc));
+    }
+
+    let dpToastNameEl = null;
+    function dpShowToast(docName) {
+        let toast = document.getElementById('dp-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'dp-toast';
+            toast.innerHTML =
+                '<span class="dp-toast-body"><strong id="dp-toast-name"></strong>Composer not empty — replace?</span>' +
+                '<button class="dp-toast-replace">Replace</button>' +
+                '<button class="dp-toast-close">×</button>';
+            document.body.appendChild(toast);
+            dpToastNameEl = toast.querySelector('#dp-toast-name');
+            toast.querySelector('.dp-toast-replace').addEventListener('click', () => {
+                const prompt = dpPendingPrompt ?? (dpPendingDoc ? dpPromptFor(dpPendingDoc) : '');
+                dpPendingPrompt = null;
+                dpPendingDoc = null;
+                input.value = prompt;
+                input.focus();
+                input.setSelectionRange(0, 0);
+                toast.hidden = true;
+            });
+            toast.querySelector('.dp-toast-close').addEventListener('click', () => {
+                dpPendingPrompt = null;
+                dpPendingDoc = null;
+                toast.hidden = true;
+            });
+        }
+        dpToastNameEl.textContent = docName + ' — ';
+        toast.hidden = false;
+    }
+
+    if (designPanelBtn) designPanelBtn.addEventListener('click', dpToggle);
+    if (designPanelClose) designPanelClose.addEventListener('click', dpClose);
 
     function showTurnIndicator() {
         if (turnIndicator) return;
@@ -1674,9 +1880,10 @@ function highlightCodeBlocks(container) {
             noteEvent();
             const data = parseData(e.data);
             const msg = data ? `${data.code}: ${data.message}` : 'agent error';
-            // v1.7.2 — `code=aborted` is the user-driven Stop case;
-            // surface it gently, not as a red error banner.
-            if (!(data && data.code === 'aborted')) {
+            // Suppress the banner for aborted (user-driven stop) and for
+            // non-fatal advisory errors (isFatal===false) — those already
+            // appear in the guardrail tool card.
+            if (!(data && (data.code === 'aborted' || data.isFatal === false))) {
                 appendError(msg);
             }
             setStreaming(false);            // v1.7.2
@@ -1916,6 +2123,9 @@ function highlightCodeBlocks(container) {
                     loadSessions();
                 });
                 break;
+            case 'open_design_panel':
+                dpToggle();
+                break;
             case 'quit':
                 // Browsers won't always allow window.close(); fall
                 // back to a banner if blocked.
@@ -2084,6 +2294,7 @@ function highlightCodeBlocks(container) {
         { name: 'compact',  desc: 'Compact older messages into a summary', argHint: '' },
         // v1.29.2 — diagnostic report (saved to ~/.franky/diagnostics/<sid>/<ts>.txt)
         { name: 'diagnostics', desc: 'Per-turn anomaly report (see docs/reference/diagnostics.md)', argHint: '' },
+        { name: 'design',   desc: 'Open the Design Documents panel', argHint: '' },
         { name: 'quit',     desc: 'Close this browser tab', argHint: '' },
     ];
 
@@ -2183,9 +2394,99 @@ function highlightCodeBlocks(container) {
 
     let statusTimer = null;
     let statusStartedAt = 0;
+    // vN — cached usage data for the popover
+    let cachedUsageData = null;
+    let cachedTranscriptUsage = null;
 
     function setStatusLine(text) {
         if (statusLineEl) statusLineEl.textContent = text;
+    }
+
+    /** Format a token count: 1234 → "1234", 5200 → "5.2k", 1500000 → "1.5m" */
+    function formatTokenCount(n) {
+        if (n >= 1000000) return (n / 1000000).toFixed(1) + 'm';
+        if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+        return String(n);
+    }
+
+    /** Sum tool counts into a total */
+    function sumToolCounts(tools) {
+        let total = 0;
+        for (const name of Object.keys(tools)) total += tools[name];
+        return total;
+    }
+
+    /** Render the popover body from cached data */
+    function renderStatusPopover() {
+        const body = document.getElementById('status-popover-body');
+        if (!body) return;
+        body.innerHTML = '';
+
+        if (cachedUsageData) {
+            const tools = cachedUsageData.tools;
+            const toolTotal = tools ? sumToolCounts(tools) : 0;
+            const guardrails = cachedUsageData.guardrails || 0;
+
+            // Heading
+            const head = document.createElement('span');
+            head.className = 'st-popover-heading';
+            head.textContent = 'Session usage';
+            body.appendChild(head);
+
+            // Tool calls
+            if (toolTotal > 0 && tools) {
+                const section = document.createElement('span');
+                section.className = 'st-popover-section';
+
+                const title = document.createElement('div');
+                title.className = 'st-popover-row';
+                title.innerHTML = '<span class="st-label">Tool calls</span><span class="st-value">' + toolTotal + '</span>';
+                section.appendChild(title);
+
+                // Sort tools by count descending, show top tools
+                const sorted = Object.keys(tools).sort(function (a, b) { return tools[b] - tools[a]; });
+                for (const name of sorted) {
+                    if (tools[name] <= 0) continue;
+                    const row = document.createElement('div');
+                    row.className = 'st-popover-row';
+                    row.innerHTML = '<span class="st-label">' + name + '</span><span class="st-value">' + tools[name] + '</span>';
+                    section.appendChild(row);
+                }
+                body.appendChild(section);
+            }
+
+            // Guardrails
+            if (guardrails > 0) {
+                const row = document.createElement('div');
+                row.className = 'st-popover-row';
+                row.style.marginTop = '6px';
+                row.innerHTML = '<span class="st-label">Guards</span><span class="st-value">' + guardrails + '</span>';
+                body.appendChild(row);
+            }
+        }
+
+        if (cachedTranscriptUsage) {
+            const u = cachedTranscriptUsage;
+            const sep = document.createElement('span');
+            sep.className = 'st-popover-heading';
+            sep.style.marginTop = '6px';
+            sep.textContent = 'Tokens';
+            body.appendChild(sep);
+
+            const inRow = document.createElement('div');
+            inRow.className = 'st-popover-row';
+            inRow.innerHTML = '<span class="st-label">Input</span><span class="st-value">' + formatTokenCount(u.input || 0) + '</span>';
+            body.appendChild(inRow);
+
+            const outRow = document.createElement('div');
+            outRow.className = 'st-popover-row';
+            outRow.innerHTML = '<span class="st-label">Output</span><span class="st-value">' + formatTokenCount(u.output || 0) + '</span>';
+            body.appendChild(outRow);
+        }
+
+        if (!cachedUsageData && !cachedTranscriptUsage) {
+            body.textContent = 'No usage data yet.';
+        }
     }
 
     function startStatusLineTimer() {
@@ -2206,32 +2507,48 @@ function highlightCodeBlocks(container) {
         }
     }
 
-    /**
-     * After a turn ends, fetch the latest transcript and surface
-     * the last assistant message's usage on the status line. The
-     * server emits `usage` on the message in `renderTranscriptForUi`
-     * (v1.7.7); models without usage just leave the line at the
-     * elapsed time.
-     */
     async function refreshStatusLineUsage() {
         const elapsed = Math.floor((Date.now() - statusStartedAt) / 1000);
+        var parts = [elapsed + 's'];
+        cachedUsageData = null;
+        cachedTranscriptUsage = null;
+
         try {
-            const r = await fetch('/transcript');
-            if (!r.ok) { setStatusLine(elapsed + 's'); return; }
-            const data = await r.json();
-            const msgs = (data && Array.isArray(data.messages)) ? data.messages : [];
-            // Walk from the end; pick the last assistant with usage.
-            for (let i = msgs.length - 1; i >= 0; i--) {
-                if (msgs[i].role === 'assistant' && msgs[i].usage) {
-                    const u = msgs[i].usage;
-                    setStatusLine(elapsed + 's · in ' + (u.input || 0) + ' / out ' + (u.output || 0));
-                    return;
+            const ur = await fetch('/usage');
+            if (ur.ok) {
+                const udata = await ur.json();
+                cachedUsageData = udata;
+                if (udata) {
+                    const tools = udata.tools;
+                    if (tools) {
+                        const total = sumToolCounts(tools);
+                        if (total > 0) parts.push(total + ' tools');
+                    }
+                    if (udata.guardrails && udata.guardrails > 0) {
+                        parts.push('guards: ' + udata.guardrails);
+                    }
                 }
             }
-            setStatusLine(elapsed + 's');
-        } catch (_) {
-            setStatusLine(elapsed + 's');
-        }
+        } catch (_) {}
+
+        try {
+            const r = await fetch('/transcript');
+            if (r.ok) {
+                const data = await r.json();
+                const msgs = (data && Array.isArray(data.messages)) ? data.messages : [];
+                for (let i = msgs.length - 1; i >= 0; i--) {
+                    if (msgs[i].role === 'assistant' && msgs[i].usage) {
+                        const u = msgs[i].usage;
+                        cachedTranscriptUsage = u;
+                        parts.push('in ' + formatTokenCount(u.input || 0) + ' / out ' + formatTokenCount(u.output || 0));
+                        break;
+                    }
+                }
+            }
+        } catch (_) {}
+
+        setStatusLine(parts.join(' · '));
+        renderStatusPopover();
     }
 
     // ─── v1.7.7 — help overlay ──────────────────────────────────
@@ -2488,12 +2805,13 @@ function highlightCodeBlocks(container) {
     // server-side and never changes for the proxy's lifetime.
     async function loadRole() {
         const el = document.getElementById('role-pill');
+        const labelEl = document.getElementById('role-label');
         const mEl = document.getElementById('model-pill');
         if (!el) return;
         try {
             const r = await fetch('/role');
             if (!r.ok) {
-                el.textContent = 'role: ?';
+                if (labelEl) labelEl.textContent = 'role: ?';
                 if (mEl) mEl.textContent = 'model: ?';
                 return;
             }
@@ -2501,9 +2819,33 @@ function highlightCodeBlocks(container) {
             const role = data.role || 'plan';
             const provider = data.provider || '?';
             const model = data.model || '?';
-            el.textContent = 'role: ' + role + (data.sandbox ? ' · sandboxed' : '');
-            el.title = (data.description || role) + ' — allowed: ' +
-                ((data.allowed_tools || []).join(', ') || '(none)');
+            if (labelEl) {
+                labelEl.textContent = 'role: ' + role + (data.sandbox ? ' · sandboxed' : '');
+            }
+
+            // Populate the custom tooltip with description + allowed tools.
+            const tipHeading = document.getElementById('role-tooltip-heading');
+            const tipSandbox = document.getElementById('role-tooltip-sandbox');
+            const tipTools   = document.getElementById('role-tooltip-tools');
+            if (tipHeading) {
+                tipHeading.textContent = data.description || (role + ' role');
+            }
+            if (tipSandbox) {
+                tipSandbox.textContent = data.sandbox ? '✅ running in sandbox' : '';
+                tipSandbox.style.display = data.sandbox ? 'block' : 'none';
+            }
+            if (tipTools) {
+                const tools = data.allowed_tools || [];
+                if (tools.length > 0) {
+                    tipTools.innerHTML = 'Available tools: ' +
+                        tools.map(function (t) {
+                            return '<span class="rt-tool-name">' + t + '</span>';
+                        }).join(', ');
+                } else {
+                    tipTools.textContent = 'No tools available.';
+                }
+            }
+
             el.classList.remove(
                 'role-pill-read', 'role-pill-plan', 'role-pill-code', 'role-pill-full');
             el.classList.add('role-pill-' + role);
@@ -2512,7 +2854,7 @@ function highlightCodeBlocks(container) {
                 mEl.title = 'provider: ' + provider + ' · model: ' + model;
             }
         } catch (_) {
-            el.textContent = 'role: ?';
+            if (labelEl) labelEl.textContent = 'role: ?';
             if (mEl) mEl.textContent = 'model: ?';
         }
     }

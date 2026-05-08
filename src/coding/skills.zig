@@ -435,6 +435,20 @@ pub fn loadAll(
             else => return e,
         };
     }
+
+    // v2.16 — append builtin skills that were not shadowed by a
+    // higher-precedence root. The `seen` map already tracks every
+    // name that won via the roots loop.
+    for (builtins) |b| {
+        if (seen.contains(b.name)) continue;
+        const skill = parseSkill(allocator, "(builtin)", b.content) catch |err| {
+            ai_log.log(.warn, "skills", "builtin.skip", "name={s} err={s}", .{ b.name, @errorName(err) });
+            continue;
+        };
+        try out.append(allocator, skill);
+        try seen.put(skill.meta.name, {});
+    }
+
     return out;
 }
 
@@ -507,6 +521,25 @@ pub fn selectActive(
 
     return active;
 }
+
+pub const BuiltinSkill = struct {
+    name: []const u8,
+    content: []const u8,
+};
+
+/// Built-in skills shipped with the franky binary. These are embedded
+/// via `@embedFile` and loaded as fallbacks when no file with the same
+/// name exists in any skill root (explicit → workspace → user).
+/// A user placing their own `<root>/multimodel-review.md` overrides
+/// the builtin — dedup by name already works in `loadAll`.
+///
+/// Extend this list when adding new built-in skills.
+pub const builtins: []const BuiltinSkill = &.{
+    .{
+        .name = "multimodel-review",
+        .content = @embedFile("skills/multimodel-review.md"),
+    },
+};
 
 fn containsName(names: []const []const u8, want: []const u8) bool {
     for (names) |n| if (std.mem.eql(u8, n, want)) return true;
@@ -781,6 +814,9 @@ test "loadAll: scans roots, skips index.md, dedup by name across roots" {
         for (loaded.items) |*s| s.deinit(t.allocator);
         loaded.deinit(t.allocator);
     }
-    try t.expectEqual(@as(usize, 1), loaded.items.len);
+    try t.expectEqual(@as(usize, 2), loaded.items.len);
     try t.expectEqualStrings("zig", loaded.items[0].meta.name);
+    // v2.16 — the builtin multimodel-review skill is appended when no
+    // user-supplied skill shadows it.
+    try t.expectEqualStrings("multimodel-review", loaded.items[1].meta.name);
 }

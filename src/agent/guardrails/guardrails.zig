@@ -30,7 +30,7 @@ pub const Config = struct {
     compilation_threshold: u32 = 5,
     /// Max milliseconds per build stage.
     compilation_timeout_ms: u64 = 120_000,
-    /// Workspace root directory (for `.frank-workflow.yaml` lookup and build cwd).
+    /// Workspace root directory (for `.franky-workflow.yaml` lookup and build cwd).
     workspace_dir: []const u8 = ".",
     /// Whether to run `git add -A && git commit` after a successful finish_task.
     auto_commit: bool = false,
@@ -42,6 +42,10 @@ pub const GuardrailState = struct {
     stuck_detector: stuck_mod.StuckDetector,
     compilation_guard: compile_mod.CompilationGuard,
     finish_task_state: finish_mod.FinishTaskState,
+    /// vN — total number of guardrail firings (stuck_detector hints +
+    /// compilation_guard failure hints). Incremented each time
+    /// `betweenTurns` returns true. Exposed via GET /usage in proxy mode.
+    guardrail_fire_count: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config, io: std.Io) !GuardrailState {
         const comp_guard = try compile_mod.CompilationGuard.init(
@@ -58,6 +62,7 @@ pub const GuardrailState = struct {
             .stuck_detector = stuck_mod.StuckDetector.init(allocator, cfg.stuck_hint_threshold),
             .compilation_guard = comp_guard,
             .finish_task_state = finish_mod.FinishTaskState.init(allocator),
+            .guardrail_fire_count = 0,
         };
         state.setupAutoCommitBranch(allocator, io);
         return state;
@@ -144,6 +149,7 @@ pub const GuardrailState = struct {
             const compile_failed = try self.compilation_guard.betweenTurns(allocator, io, transcript, out, true);
             if (compile_failed) {
                 ai.log.log(.debug, "guardrails", "compilation_guard_fired", "source=finish_task", .{});
+                self.guardrail_fire_count += 1;
                 self.finish_task_state.reset();
                 return true;
             }
@@ -162,12 +168,14 @@ pub const GuardrailState = struct {
         // ── compilation guard ────────────────────────────────────────────
         if (try self.compilation_guard.betweenTurns(allocator, io, transcript, out, false)) {
             ai.log.log(.debug, "guardrails", "compilation_guard_fired", "source=threshold", .{});
+            self.guardrail_fire_count += 1;
             return true;
         }
 
         // ── stuck detector ───────────────────────────────────────────────
         if (try self.stuck_detector.betweenTurns(allocator, io, transcript, out)) {
             ai.log.log(.debug, "guardrails", "stuck_detector_fired", "", .{});
+            self.guardrail_fire_count += 1;
             return true;
         }
 

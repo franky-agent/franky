@@ -171,22 +171,35 @@ tool: read done
 {"path":"src/ai/http.zig","offset":1275,"limit":100}
 ```
 
-# Tool Status bar
+# Tool Status bar (Done)
 
-During one session show the user which tool was used how often like
+During one session show the user which tool was used how often also count the fired guardrails (int total not by type). like
 ```
-bash: 4 read: 5 edit: 6 ...
+guardrails: 2 bash: 4 read: 5 edit: 6 ...
 ```
 
-Make 3 wireframes to show different styles and different locations for teh tool status bar
+Implemented: GuardrailState.guardrail_fire_count, Session.tool_usage map (StringHashMap(u32)), GET /usage endpoint in proxy.zig, async refreshStatusLineUsage() fetches /usage + /transcript on turn_end.
 
-# Franky restarts itself
+# Auto Commit Message (Done)
 
-How can a running franky process restarts itself after for example the binary was re-compiled.
+Updated finish_task tool:
+- Tool description now teaches the Conventional Commits format (<type>(<scope>): <subject>)
+- Parameter JSON description includes the format + example + allowed types
+- Server-side validation enforces colon-separated type: subject with valid type characters
+- Allowed type characters: a-z, A-Z, 0-9, _, -, (, ), !
+- Enforces a space after the colon
 
-This would enable a full feedback loop. Example
-* franky is started with the prompt to implement a new feature
-* its finished and everything compiles and test passes
-* now it would need to restart it self to do for example a ende2end test or
-  just to have the new feature enabled for the next session
+# Role tool tip (Done)
 
+Add a role tool tip to the Web-UI the tool tip shows the available tools for this role.
+
+Done: replaced the native browser `title` attribute on `.role-pill` with a custom-positioned
+styled tooltip (`#role-tooltip`) that appears on hover. It shows:
+- The role description as a heading
+- A sandbox badge when running inside a sandbox
+- The list of allowed tools, each rendered as a styled monospace name
+- Tool names use the `.rt-tool-name` class (accent colour, monospace font)
+
+The tooltip lives as a child of `.role-pill` in the HTML, positioned absolutely below the
+pill via CSS. The server-side `/role` endpoint (`renderRoleStatusJson` in `role.zig`) already
+provided all the necessary data — the JS side just needed to route it into the new DOM elements.

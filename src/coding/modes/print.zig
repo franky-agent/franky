@@ -300,6 +300,35 @@ fn runPrint(
         applyReadSettingsOverlay(&read_ctx, &settings);
         applyMaxTurnsSettingsOverlay(cfg, &settings);
         applyRetrySettingsOverlay(cfg, &settings);
+
+        // v2.16 — pre-render the review config block for system-prompt injection.
+        // Only populate when profiles are configured so the block is non-empty.
+        if (settings.review_profiles.len > 0) {
+            const ca = cfg.arena.allocator();
+            // Build a comma-separated profile list for readability.
+            var pb: std.ArrayList(u8) = .empty;
+            defer pb.deinit(ca);
+            for (settings.review_profiles, 0..) |p, i| {
+                if (i > 0) try pb.appendSlice(ca, ", ");
+                try pb.appendSlice(ca, p);
+            }
+            const profiles_csv = try pb.toOwnedSlice(ca);
+            defer ca.free(profiles_csv);
+            cfg.review_config_block = try std.fmt.allocPrint(
+                ca,
+                "## Review configuration\n" ++
+                "profiles: {s}\n" ++
+                "min_models: {d}\n" ++
+                "max_models: {d}\n" ++
+                "timeout_ms: {d}",
+                .{
+                    profiles_csv,
+                    settings.review_min_models,
+                    settings.review_max_models,
+                    settings.review_timeout_ms,
+                },
+            );
+        }
     }
     var bash_ctx = tools_mod.bash.BashCtx{
         .state = &bash_state,
@@ -1738,10 +1767,62 @@ pub fn buildSystemPromptIo(
     }
     defer if (skills_owned) allocator.free(with_skills);
 
+    // v2.16 — inject review configuration block when the multimodel-review
+    // skill is active and profiles are configured. Append after skills so
+    // the model sees both the skill instructions and the config in order.
+    var with_review: []u8 = with_skills;
+    var review_owned = false;
+    if (cfg.review_config_block) |block| {
+        if (io) |ioref| review_check: {
+            // Check whether multimodel-review is among the loaded (and thus
+            // active) skills by scanning the loaded list via a fresh load.
+            const pwd = environ.getPosix("PWD");
+            var workspace_skills_r: ?[]u8 = null;
+            defer if (workspace_skills_r) |b| allocator.free(b);
+            if (pwd) |p| {
+                workspace_skills_r = std.fs.path.join(allocator, &.{ p, "skills" }) catch null;
+            }
+            var user_skills_r: ?[]u8 = null;
+            defer if (user_skills_r) |b| allocator.free(b);
+            if (environ.getPosix("FRANKY_HOME")) |h| {
+                user_skills_r = std.fs.path.join(allocator, &.{ h, "skills" }) catch null;
+            } else if (environ.getPosix("HOME")) |h| {
+                user_skills_r = std.fs.path.join(allocator, &.{ h, ".franky", "skills" }) catch null;
+            }
+            var loaded = skills_mod.loadAll(allocator, ioref, .{
+                .explicit_root = cfg.skills_path,
+                .workspace_root = workspace_skills_r,
+                .user_root = user_skills_r,
+            }) catch break :review_check;
+            defer {
+                for (loaded.items) |*s| s.deinit(allocator);
+                loaded.deinit(allocator);
+            }
+            const skill_active = for (loaded.items) |s| {
+                if (std.mem.eql(u8, s.meta.name, "multimodel-review")) break true;
+            } else false;
+
+            if (skill_active) {
+                const trimmed = std.mem.trimEnd(u8, with_skills, &std.ascii.whitespace);
+                with_review = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}\n\n{s}\n",
+                    .{ trimmed, block },
+                );
+                review_owned = true;
+            }
+        }
+    }
+    defer if (review_owned) allocator.free(with_review);
+
     if (cfg.append_system_prompt) |extra| {
-        const trimmed = std.mem.trimEnd(u8, with_skills, &std.ascii.whitespace);
+        const trimmed = std.mem.trimEnd(u8, if (review_owned) with_review else with_skills, &std.ascii.whitespace);
         const out = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed, extra });
         return out;
+    }
+    if (review_owned) {
+        review_owned = false;
+        return with_review;
     }
     if (skills_owned) {
         skills_owned = false;
@@ -1796,7 +1877,7 @@ fn writeOut(io: std.Io, s: []const u8) !void {
     w.interface.flush() catch {};
 }
 
-fn exitWithMessage(io: std.Io, msg: []const u8, code: u8) !void {
+pub fn exitWithMessage(io: std.Io, msg: []const u8, code: u8) !void {
     var buf: [1024]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &buf);
     w.interface.writeAll(msg) catch {};

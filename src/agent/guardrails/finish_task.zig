@@ -20,7 +20,7 @@ pub const parameters_json: []const u8 =
     \\  "properties": {
     \\    "commit_message": {
     \\      "type": "string",
-    \\      "description": "Git commit message for this task's changes."
+    \\      "description": "Follow the Conventional Commits format: <type>(<scope>): <subject> — e.g. \"fix(api): handle null pointer in user lookup\". Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert."
     \\    },
     \\    "summary": {
     \\      "type": "string",
@@ -72,6 +72,10 @@ pub fn tool(state: *FinishTaskState) at.AgentTool {
         \\check before committing (when --auto-commit is active). The loop ends
         \\after this tool fires unless compilation fails (in which case the model
         \\must fix the error and call finish_task again).
+        \\
+        \\commit_message must follow the Conventional Commits format:
+        \\<type>(<scope>): <subject>  — e.g. "fix(api): handle null pointer".
+        \\Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.
         ,
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
@@ -111,6 +115,22 @@ fn execute(
     for (commit_msg) |c| {
         if (c < 0x20 or c > 0x7e)
             return toolError(allocator, "invalid_args", "commit_message must contain only printable ASCII");
+    }
+
+    // Validate conventional commit format: "type(scope): subject" or "type: subject"
+    {
+        const colon_idx = std.mem.indexOfScalar(u8, commit_msg, ':')
+            orelse return toolError(allocator, "invalid_args", "commit_message must be in conventional commit format: <type>(<scope>): <subject>");
+        const type_part = commit_msg[0..colon_idx];
+        if (type_part.len == 0) return toolError(allocator, "invalid_args", "commit_message type is empty");
+        for (type_part) |c| {
+            switch (c) {
+                'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '(', ')', '!' => {},
+                else => return toolError(allocator, "invalid_args", "commit_message type contains invalid characters"),
+            }
+        }
+        if (commit_msg.len <= colon_idx + 2 or commit_msg[colon_idx + 1] != ' ')
+            return toolError(allocator, "invalid_args", "commit_message must have a space after the colon: <type>: <subject>");
     }
 
     const sum_val = root.object.get("summary") orelse

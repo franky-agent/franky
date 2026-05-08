@@ -5,7 +5,7 @@
 //! harness-synthesised tool result so the model can decide whether to fix now
 //! or continue. On success the counter resets silently.
 //!
-//! Build configuration is read from `.frank-workflow.yaml` in the workspace
+//! Build configuration is read from `.franky-workflow.yaml` in the workspace
 //! root. Falls back to auto-detection: build.zig → make → cargo.
 
 const std = @import("std");
@@ -265,7 +265,7 @@ fn runStage(
 // ─── Workflow YAML parser ──────────────────────────────────────────────────────
 
 fn loadWorkflow(allocator: std.mem.Allocator, io: std.Io, workspace_dir: []const u8) !?OwnedWorkflow {
-    const yaml_path = try std.fs.path.join(allocator, &.{ workspace_dir, ".frank-workflow.yaml" });
+    const yaml_path = try std.fs.path.join(allocator, &.{ workspace_dir, ".franky-workflow.yaml" });
     defer allocator.free(yaml_path);
 
     if (readFile(allocator, io, yaml_path)) |text| {
@@ -335,7 +335,7 @@ const CurStage = struct {
     }
 };
 
-/// Minimal YAML parser for the .frank-workflow.yaml subset.
+/// Minimal YAML parser for the .franky-workflow.yaml subset.
 ///
 /// Supports:
 ///   stages:

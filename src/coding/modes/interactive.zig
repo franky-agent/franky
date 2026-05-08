@@ -1722,6 +1722,35 @@ const SessionBinding = struct {
             defer settings.deinit();
             print_mode.applyBashSettingsOverlay(&binding.bash_state, &settings);
             print_mode.applyReadSettingsOverlay(&binding.read_ctx, &settings);
+
+            // v2.16 — pre-render the review config block for system-prompt injection.
+            // Only populate when profiles are configured so the block is non-empty.
+            if (settings.review_profiles.len > 0) {
+                const ca = cfg.arena.allocator();
+                // Build a comma-separated profile list for readability.
+                var pb: std.ArrayList(u8) = .empty;
+                defer pb.deinit(ca);
+                for (settings.review_profiles, 0..) |p, i| {
+                    if (i > 0) try pb.appendSlice(ca, ", ");
+                    try pb.appendSlice(ca, p);
+                }
+                const profiles_csv = try pb.toOwnedSlice(ca);
+                defer ca.free(profiles_csv);
+                cfg.review_config_block = try std.fmt.allocPrint(
+                    ca,
+                    "## Review configuration\n" ++
+                    "profiles: {s}\n" ++
+                    "min_models: {d}\n" ++
+                    "max_models: {d}\n" ++
+                    "timeout_ms: {d}",
+                    .{
+                        profiles_csv,
+                        settings.review_min_models,
+                        settings.review_max_models,
+                        settings.review_timeout_ms,
+                    },
+                );
+            }
         }
         binding.bash_ctx = .{
             .state = &binding.bash_state,
@@ -1767,6 +1796,35 @@ const SessionBinding = struct {
             try print_mode.applyPermissionsSettingsOverlay(&binding.permission_store, &settings);
             binding.prompts_enabled = print_mode.resolvePromptsDefault(cfg, &settings);
             print_mode.applyMaxTurnsSettingsOverlay(cfg, &settings);
+
+            // v2.16 — pre-render the review config block for system-prompt injection.
+            // Only populate when profiles are configured so the block is non-empty.
+            if (settings.review_profiles.len > 0) {
+                const ca = cfg.arena.allocator();
+                // Build a comma-separated profile list for readability.
+                var pb: std.ArrayList(u8) = .empty;
+                defer pb.deinit(ca);
+                for (settings.review_profiles, 0..) |p, i| {
+                    if (i > 0) try pb.appendSlice(ca, ", ");
+                    try pb.appendSlice(ca, p);
+                }
+                const profiles_csv = try pb.toOwnedSlice(ca);
+                defer ca.free(profiles_csv);
+                cfg.review_config_block = try std.fmt.allocPrint(
+                    ca,
+                    "## Review configuration\n" ++
+                    "profiles: {s}\n" ++
+                    "min_models: {d}\n" ++
+                    "max_models: {d}\n" ++
+                    "timeout_ms: {d}",
+                    .{
+                        profiles_csv,
+                        settings.review_min_models,
+                        settings.review_max_models,
+                        settings.review_timeout_ms,
+                    },
+                );
+            }
         }
         if (cfg.yes) binding.permission_store.yes_to_all = true;
         if (cfg.allow_tools_csv) |s| try binding.permission_store.addAllowList(s);

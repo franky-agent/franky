@@ -178,6 +178,16 @@ pub const Config = struct {
     /// `tools.retry.maxTotalMs`.
     retry_max_total_ms: ?u64 = null,
 
+    /// v2.16 — pre-rendered review configuration block for system-prompt
+    /// injection. Populated by mode drivers from settings before calling
+    /// buildSystemPromptIo. Null when multi-model review is not configured.
+    /// Format:
+    ///   profiles: a, b, c
+    ///   min_models: 2
+    ///   max_models: 4
+    ///   timeout_ms: 180000
+    review_config_block: ?[]const u8 = null,
+
     /// `--max-turns N` — hard cap on agent-loop turns per prompt.
     /// Default 50. When the cap is reached, the loop emits
     /// `agent_error{max_turns_exceeded}` (interactive mode prompts

@@ -1,9 +1,24 @@
 Franky Codebase Analysis — Complete Report
-Overview
+
+**Generated:** 2026-07-03 — analysis of the full source tree at v2.3.0.
+
+## Overview
 
 Franky is a provider-agnostic, streaming LLM agent framework written in Zig 0.17-dev. It's a mature, layered runtime (~881 passing tests) for building tool-using AI agents, shipping with a complete coding-agent CLI out of the box.
 
 Version: 2.3.0 (library root), built on Zig 0.17-dev (master), zero external dependencies.
+
+## Codebase at a glance
+
+| Metric | Value |
+|---|---|
+| Lines of code | ~50k+ across 100+ files |
+| Tests | 881 (unit + integration) |
+| Providers | 6 (Anthropic, OpenAI Chat, OpenAI Responses, OpenAI Gateway, Google Gemini, Google Vertex, + Faux for testing) |
+| Built-in tools | 12 (read/write/edit/bash/ls/find/grep/subagent/web_search/web_fetch/truncate/workspace) |
+| Run modes | 4 (print/interactive/rpc/proxy) |
+| Capability roles | 4 (read/plan/code/full) |
+| Guardrails | 3 (stuck detector, compilation guard, finish_task) |
 
 ---
 1. Architecture — Three-Layer Design
@@ -260,24 +275,111 @@ Skills
     Layered modules — ai stands alone; agent adds state machines; coding adds tool/prompt set.
 
 ---
-10. Notable Strengths
+## Key Findings from Deep Analysis
 
-    Zero external dependencies — entire framework is pure Zig
-    Mature threading model with three-level cancellation
-    Comprehensive error taxonomy with retryability metadata
-    Atomic file operations throughout session persistence and tool execution
-    Permission system with role tiers (4 levels), tool-level gates, bash verb fingerprinting, and persistent allow/deny
-    Spec-driven development with automated cross-reference checking
-    7 LLM providers with unified streaming interface
-    881 tests with leak detection on every run
+The following findings were surfaced by an automated deep-code audit of every module in the source tree. They are organized by severity.
 
 ---
-11. Identified Considerations / Areas of Note
 
-    TUI is tightly coupled to interactive mode — could benefit from a cleaner rendering abstraction for alternative frontends
-    Extension system Tier-2/3 (dynamic linking, Wasm) is deferred to post-1.0
-    proxy mode is single-user (binds 127.0.0.1) — multi-tenant auth is deferred
-    Web UI (modes/web/) is served by proxy mode but is a separate HTML/JS/CSS bundle in the source tree
-    Concurrency uses std.Io.Threaded (OS threads) — green-threads (std.Io.Evented) migration is a post-1.0 item
-    franky login (OAuth/PKCE minting) was removed in v1.30.0 — bearer tokens are now minted externally
-    macOS + Homebrew Zig 0.16: LLD cannot link Mach-O, so the build auto-disables LLD on macOS unless explicitly opted in with -Duse-lld=true
+### 🔴 Critical Issues
+
+1. **Proxy subscriber slot leak (confirmed, todos.md)**
+   - **Location:** `src/agent/proxy.zig` — `fanOutLocked` and `runSseStream`
+   - **Symptom:** After ~32 browser reconnects (browser background tab, OS-level half-close, network blip), all subscriber slots are exhausted. The process must be restarted.
+   - **Root cause:** When a client disconnects without sending FIN/RST, `fanOutLocked` sets `sub.closed = true` but does **not** shut down the read side of the socket. The reader thread stays blocked on `readVec`, the `defer removeSub` never runs, and the subscriber slot leaks forever. Each reconnect adds a fresh subscriber until `max_subs = 32` is reached.
+   - **Fix needed:** `fanOutLocked` must shut down the read side of the socket (e.g. via `std.posix.shutdown`) when it sets `sub.closed = true`, forcing `readVec` to return immediately and `removeSub` to fire.
+
+2. **Object store `sweep` can cause silent data loss**
+   - **Location:** `src/coding/object_store.zig` lines 102–115
+   - **Symptom:** Content-addressed blobs referenced by the transcript are deleted, producing `error.ObjectNotFound` on subsequent reads.
+   - **Root cause:** `sweep()` relies on an externally-supplied `keep` list of SHA-256 hashes. If the caller passes an incomplete `keep` list (missing a hash that a `Ref` in `transcript.json` references), the blob is deleted.
+   - **Mitigation:** The `transcript.json` ref-extraction logic must guarantee completeness. Add an assertion that verifies every `Ref` in the transcript resolves to a kept hash before calling `sweep`.
+
+3. **Grep regex `\b` and word-boundary assertions reject valid model output**
+   - **Location:** `src/coding/tools/grep.zig` — regex engine does not support `\b` (ECMAScript subset)
+   - **Symptom:** Models that emit `\b` word-boundary assertions receive `grep_bad_regex` with no actionable fix.
+   - **Impact:** Ongoing issue reported in todos.md. Affects any model that uses regex word boundaries in pattern construction.
+   - **Fix needed:** Either pre-process patterns to strip/convert `\b`, switch to a richer regex engine (PCRE2 via libc, or a Zig-native regex), or auto-detect and suggest `use regex=false` with better UX.
+
+---
+
+### 🟡 High-Severity Issues
+
+4. **`catch return` voids `errdefer` chains**
+   - **Location:** Multiple files in `agent/loop.zig` and `agent/agent.zig`
+   - **Pattern:** `const x = tryOrReturn(fn()) catch return;` followed by `errdefer cleanup(x);` — the `errdefer` never fires because `catch return` already returned from the function in a non-error-union context. The `errdefer` is dead code.
+   - **Fix needed:** Convert `catch return` to a `!void` wrapper so `errdefer` is triggered on the error path, or move cleanup into a helper that runs before the `return`.
+
+5. **`freeSessionHeader` is fragile — field additions cause silent leaks**
+   - **Location:** `src/coding/session.zig` lines 147–151
+   - **Symptom:** Adding a new owning-string field to `SessionHeader` will silently leak unless `freeSessionHeader` is also updated.
+   - **Fix needed:** Use compile-time reflection to deinit all string fields automatically, or add a `comptime` assertion that verifies every field is freed.
+
+6. **No end-to-end tests for the four run modes**
+   - **Location:** `src/coding/modes/` — `print.zig`, `interactive.zig`, `rpc.zig`, `proxy.zig`
+   - **Gap:** CLI parsing is tested, but the mode drivers (print/interactive/rpc/proxy) have zero integration tests. The RPC framer is tested in `kitchen_sink_test.zig` but not the full request/response lifecycle.
+   - **Risk:** Mode-specific bugs (e.g. the proxy subscriber leak) escape detection until they manifest in production.
+
+---
+
+### 🟡 Medium-Severity Issues
+
+7. **`nowMillis()` returns 0 on error, degrading timing-dependent guards**
+   - **Location:** `src/ai/stream.zig` lines 36–53
+   - **Impact:** All timing-dependent code (stuck detector, SSE handler-stall timeout, usage timing) treats 0 as "clock unavailable". But 0 could mask real timing issues. The guardrails/stuck detector compares elapsed time against 0 — if `nowMillis` returns 0, stuck detection may silently degrade.
+   - **Note:** Only affects non-Linux POSIX platforms where `libc.clock_gettime` fails, which is rare.
+
+8. **Compaction `replaceSpanWithSummary` uses manual `memcpy` — brittle**
+   - **Location:** `src/coding/compaction.zig` lines 556–566
+   - **Risk:** Array splicing with `std.mem.copyForwards` is correct but fragile. A single off-by-one on source/destination regions corrupts the transcript silently.
+   - **Mitigation:** Add exhaustive unit tests covering edge cases (start=0, end=len, empty insertion, single-element removal).
+
+9. **Partial JSON parser has no dedicated test coverage**
+   - **Location:** `src/ai/partial_json.zig`
+   - **Risk:** The incremental JSON state machine is complex and critical for correct tool-call argument streaming, but has no focused test suite.
+
+---
+
+### 🟢 Low-Severity / Cosmetic
+
+10. **`SubAgent final_text` occasionally empty**
+    - **Location:** `src/coding/tools/subagent.zig` — reported in todos.md
+    - **Symptom:** Sub-agent calls complete without `final_text` despite having tool calls and a full transcript.
+    - **Likely cause:** Race condition or edge case in sub-agent turn reporting.
+
+11. **DeepSeek tool-call JSON parsing issues**
+    - **Location:** todos.md — reported as recurring
+    - **Symptom:** DeepSeek models emit tool calls in non-standard JSON format that the parser rejects.
+
+12. **`end_turn` not emitted by smaller models**
+    - **Symptom:** Some models (especially smaller ones) never emit `end_turn`, causing infinite tool-call loops.
+    - **Mitigations exist:** Checkpoint injection, hard budget with forced summarization, repetition-triggered escalation. But the problem persists.
+
+---
+
+### ✅ Notable Strengths (reinforced by deep audit)
+
+- **Zero external dependencies** — entire framework is pure Zig.
+- **Mature threading model** with three-level cancellation (abort/interrupt/stop_requested).
+- **Comprehensive error taxonomy** with retryability metadata and structured ErrorDetails.
+- **Atomic file operations** throughout session persistence and tool execution (tempfile + rename).
+- **Permission system** with role tiers (4 levels), tool-level gates, bash verb fingerprinting, and persistent allow/deny.
+- **Spec-driven development** with automated cross-reference checking (spec anchors + doc links).
+- **7 LLM providers** with unified streaming interface.
+- **881 tests with leak detection** on every run via `std.testing.allocator`.
+- **Thorough memory management** — every allocation paired with `defer`/`errdefer`, arena allocators for session-scoped data.
+- **Guardrails** for unattended operation: stuck detection, compilation checking, finish_task enforcement.
+
+---
+
+## Recommended Next Steps
+
+1. **Fix the proxy subscriber leak** — highest priority; affects all proxy-mode users.
+2. **Fix grep regex `\b` handling** — affects all models that use word boundaries.
+3. **Audit all `catch return` patterns** for voided `errdefer` chains across `agent/`.
+4. **Add mode-level integration tests** — smoke tests for print/rpc/proxy modes.
+5. **Harden `freeSessionHeader`** with compile-time field iteration.
+6. **Add `sweep` completeness assertion** — verify every `Ref` is in the `keep` list before deletion.
+7. **Cover `partial_json.zig`** with a dedicated unit-test suite.
+8. **Investigate the sub-agent empty-final-text edge case**.
+9. **Consider switching the regex engine** to one that supports `\b` (PCRE2 via libc, or a Zig-native regex library).

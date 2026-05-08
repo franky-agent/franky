@@ -1,4 +1,10 @@
 {
+    "tools": {
+        "retry": {
+            "maxAttempts": 3,
+            "maxTotalMs": 180000
+        }
+    },
     "profiles": {
         "cerebras": {
             "provider": "gateway",
@@ -62,7 +68,7 @@
         },
         "ollama-home": {
             "provider": "gateway",
-            "base-url": "http://192.168.1.107:11434/v1/chat/completions",
+            "base-url": "http://192.168.1.115:11434/v1/chat/completions",
             "model": "gemma4:latest",
             "api-key": "ollama",
             "ask-tools": "all",
@@ -94,7 +100,7 @@
             "provider": "gateway",
             "base-url": "https://ollama.com/v1/chat/completions",
             "model": "deepseek-v4-flash:cloud",
-            "api-key-env": "OLLAMA_KEY",
+            "api-key-env": "OLLAMA_API_KEY",
             "role": "full",
             "ask-tools": "all",
             "prompts": true,

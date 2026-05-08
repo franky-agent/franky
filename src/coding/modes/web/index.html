@@ -12,13 +12,25 @@
         <button id="sidebar-toggle" type="button" aria-label="Toggle sidebar" title="Toggle sidebar">☰</button>
         <h1>franky</h1>
         <span id="status" class="status status-idle">disconnected</span>
-        <span id="role-pill" class="role-pill role-pill-plan" title="capability role" aria-live="polite">role: …</span>
+        <span id="role-pill" class="role-pill role-pill-plan" aria-live="polite"><span id="role-label">role: …</span>
+            <span id="role-tooltip" class="role-tooltip" role="tooltip">
+                <span id="role-tooltip-heading"></span>
+                <span id="role-tooltip-sandbox"></span>
+                <span id="role-tooltip-tools"></span>
+            </span>
+        </span>
         <span id="model-pill" class="model-pill" title="provider and model" aria-live="polite">…</span>
         <span id="activity" class="activity activity-idle" aria-live="polite">
             <span class="activity-dot"></span>
             <span class="activity-label">idle</span>
         </span>
-        <span id="status-line" class="status-line" aria-live="polite"></span>
+        <span class="status-line-wrap">
+            <span id="status-line" class="status-line" aria-live="polite"></span>
+            <span id="status-line-popover" class="status-line-popover" role="tooltip">
+                <span id="status-popover-body"></span>
+            </span>
+        </span>
+        <button id="design-panel-btn" type="button" title="Design documents panel">📐</button>
         <button id="sa-panel-btn" type="button" hidden title="Show sub-agent activity">⚙</button>
         <button id="abort-btn" type="button" aria-label="Abort the current turn gracefully" title="Abort (graceful interrupt)">⏹ Abort</button>
         <button id="help-toggle" type="button" aria-label="Show help" title="Help (?)">?</button>
@@ -75,6 +87,13 @@
                 </form>
             </div>
         </div>
+        <aside id="design-panel" aria-label="Design documents" hidden>
+            <div class="dp-head">
+                <span class="dp-title">Design docs</span>
+                <button id="design-panel-close" type="button" aria-label="Close design panel">×</button>
+            </div>
+            <div id="design-panel-body"></div>
+        </aside>
         <aside id="subagent-panel" aria-label="Sub-agent activity" hidden>
             <div class="sa-panel-head">
                 <span class="sa-panel-title">Sub-agents</span>

@@ -253,6 +253,10 @@ const Session = struct {
     web_search_ctx: tools_mod.web_search.WebSearchCtx = .{},
     guardrail_state: agent.guardrails.GuardrailState = undefined,
 
+    /// vN — per-tool call counters, reset at session init.
+    /// Indexed by tool name, tracked via afterTurnUsage snapshot.
+    tool_usage: std.StringHashMap(u32) = undefined,
+
     /// Single-flight gate around the agent loop. Concurrent
     /// `POST /prompt` requests queue here.
     run_mutex: std.Io.Mutex = .init,
@@ -306,6 +310,11 @@ const Session = struct {
         self.allocator.free(self.session_id);
         if (self.parent_dir) |p| self.allocator.free(p);
         self.bash_state.deinit();
+        {
+            var it = self.tool_usage.iterator();
+            while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            self.tool_usage.deinit();
+        }
         self.guardrail_state.deinit();
         self.registry.deinit();
         self.faux.deinit();
@@ -492,7 +501,9 @@ fn initSession(
     errdefer allocator.free(session_id);
 
     const active_role = if (cfg.role) |s|
-        role_mod.Role.fromString(s) catch return error.UnknownRole
+        role_mod.Role.fromString(s) catch |err| switch (err) {
+            error.UnknownRole => return print_mode.exitWithMessage(io, "unknown --role; pick one of read, plan, code, full\n", 2),
+        }
     else
         role_mod.Role.plan;
     const role_gate = role_mod.RoleGate.init(active_role);
@@ -521,6 +532,35 @@ fn initSession(
         try print_mode.applyPermissionsSettingsOverlay(&permission_store, &settings);
         prompts_enabled = print_mode.resolvePromptsDefault(cfg, &settings);
         print_mode.applyMaxTurnsSettingsOverlay(cfg, &settings);
+
+        // v2.16 — pre-render the review config block for system-prompt injection.
+        // Only populate when profiles are configured so the block is non-empty.
+        if (settings.review_profiles.len > 0) {
+            const ca = cfg.arena.allocator();
+            // Build a comma-separated profile list for readability.
+            var pb: std.ArrayList(u8) = .empty;
+            defer pb.deinit(ca);
+            for (settings.review_profiles, 0..) |p, i| {
+                if (i > 0) try pb.appendSlice(ca, ", ");
+                try pb.appendSlice(ca, p);
+            }
+            const profiles_csv = try pb.toOwnedSlice(ca);
+            defer ca.free(profiles_csv);
+            cfg.review_config_block = try std.fmt.allocPrint(
+                ca,
+                "## Review configuration\n" ++
+                "profiles: {s}\n" ++
+                "min_models: {d}\n" ++
+                "max_models: {d}\n" ++
+                "timeout_ms: {d}",
+                .{
+                    profiles_csv,
+                    settings.review_min_models,
+                    settings.review_max_models,
+                    settings.review_timeout_ms,
+                },
+            );
+        }
     }
     if (cfg.yes) permission_store.yes_to_all = true;
     if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
@@ -553,6 +593,7 @@ fn initSession(
         .created_at_ms = created_at_ms,
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
         .prompts_enabled = prompts_enabled,
+        .tool_usage = std.StringHashMap(u32).init(allocator),
     };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.guardrail_state = try agent.guardrails.GuardrailState.init(
@@ -719,6 +760,10 @@ pub const SlashSideEffect = enum {
     /// browser sets the composer input to that text so the user
     /// can edit + resubmit.
     fill_input,
+    /// v2.19 — `/design` opens the design-documents drawer in the
+    /// web UI. The handler has no server state to touch; the side
+    /// effect is purely a client-side signal.
+    open_design_panel,
 };
 
 pub const ProxySlashCtx = struct {
@@ -757,6 +802,7 @@ fn helpHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void 
         \\| `/diagnostics` | Per-turn anomaly report — saved to `~/.franky/diagnostics/<sid>/<ts>.txt` (see `docs/reference/diagnostics.md`) |
         \\| `/improve` | Cross-session self-improvement report (mines past summaries) |
         \\| `/skills` | List loaded skills + which are active for this workspace |
+        \\| `/design` | Open the Design Documents panel |
         \\| `/quit` | Close this browser tab |
         \\
     );
@@ -1325,6 +1371,12 @@ fn renderTranscriptMarkdown(
     }
 }
 
+fn designHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
+    const px = proxySlashCtx(ctx);
+    px.side_effect = .open_design_panel;
+    try ctx.output.appendSlice(ctx.allocator, "Opening design documents panel.");
+}
+
 /// Build the proxy's slash registry. Caller owns the registry +
 /// must call `deinit`. The handlers above all cast
 /// `ctx.userdata` to `*ProxySlashCtx`.
@@ -1345,6 +1397,7 @@ fn buildProxySlashRegistry(allocator: std.mem.Allocator) !slash_mod.Registry {
     try reg.register(.{ .name = "diagnostics", .description = "Per-turn diagnostic report (anomalies + trace pointers)", .handler = diagnosticsHandler });
     try reg.register(.{ .name = "improve", .description = "Cross-session self-improvement report (mines past summaries)", .handler = improveHandler });
     try reg.register(.{ .name = "skills", .description = "List loaded skills + which are active for this workspace", .handler = skillsHandler });
+    try reg.register(.{ .name = "design", .description = "Open the Design Documents panel", .handler = designHandler });
     try reg.register(.{ .name = "quit", .description = "Close this browser tab", .handler = quitHandler });
     return reg;
 }
@@ -1562,6 +1615,10 @@ fn handleConnection(arg: ConnArg) void {
         respondRole(arg.session, &stream, arg.io, arg.allocator);
         return;
     }
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/usage")) {
+        respondUsage(arg.session, &stream, arg.io, arg.allocator);
+        return;
+    }
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/abort")) {
         // v1.7.2 — fire `session.cancel` so the in-flight agent
         // loop terminates with `agent_error{code=aborted}`. Best-
@@ -1621,6 +1678,15 @@ fn handleConnection(arg: ConnArg) void {
         // past `\r\n\r\n` — they belong to the body.
         const carry = hdr_buf[hdr_len.consumed..hdr_len.total];
         runPrompt(arg.session, &stream, arg.io, arg.allocator, req, carry);
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/design-docs")) {
+        respondDesignDocs(&stream, arg.io, arg.allocator);
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/design-docs/archive")) {
+        const carry = hdr_buf[hdr_len.consumed..hdr_len.total];
+        respondArchiveDesignDoc(&stream, arg.io, arg.allocator, req, carry);
         return;
     }
     if (std.mem.eql(u8, req.method, "GET")) {
@@ -2036,6 +2102,18 @@ fn runOneTurnInternal(
     };
 
     while (ch.next(io)) |ev| {
+        // vN — count tool executions for the usage bar
+        if (ev == .tool_execution_start) {
+            const name = ev.tool_execution_start.name;
+            if (session.tool_usage.getOrPut(name)) |gop| {
+                if (gop.found_existing) {
+                    gop.value_ptr.* += 1;
+                } else {
+                    gop.key_ptr.* = allocator.dupe(u8, name) catch continue;
+                    gop.value_ptr.* = 1;
+                }
+            } else |_| {}
+        }
         const frame = renderFrame(allocator, ev) catch {
             ev.deinit(allocator);
             continue;
@@ -2372,6 +2450,217 @@ fn respondRole(
     respondJson(stream, io, 200, body);
 }
 
+/// `GET /usage` — per-tool call counters and guardrail firings.
+/// Returns JSON like `{"guardrails":2,"tools":{"bash":4,"read":5,"edit":6}}`.
+fn respondUsage(
+    session: *Session,
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+) void {
+    const gcount = session.guardrail_state.guardrail_fire_count;
+    // Build the tools JSON fragment via simple string concatenation
+    // with bufPrint for the numeric values, matching proxy.zig patterns.
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    body.appendSlice(allocator, "{\"guardrails\":") catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    {
+        var num: [32]u8 = undefined;
+        body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{gcount}) catch unreachable) catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    }
+    body.appendSlice(allocator, ",\"tools\":{") catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    var first = true;
+    var it = session.tool_usage.iterator();
+    while (it.next()) |entry| {
+        if (!first) body.append(allocator, ',') catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        first = false;
+        body.append(allocator, '"') catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        body.appendSlice(allocator, entry.key_ptr.*) catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        body.appendSlice(allocator, "\":") catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        {
+            var num: [32]u8 = undefined;
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{entry.value_ptr.*}) catch unreachable) catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        }
+    }
+    body.append(allocator, '}') catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    body.append(allocator, '}') catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    const json = body.items;
+    respondJson(stream, io, 200, json);
+}
+
+/// `GET /design-docs` — scan `docs/design/` relative to the
+/// workspace root (CWD) and return a categorised list.
+///
+/// Response: `{"docs":[{"path":"…","name":"…","category":"…","status":"…"}]}`
+/// Categories: "decided" | "open" | "draft" (root-level .md files).
+/// Status: "decided" | "implemented" | "partial" | "unknown".
+/// If `docs/design/` does not exist, returns `{"docs":[]}`.
+fn respondDesignDocs(
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+) void {
+    const body = renderDesignDocsJson(allocator, io) catch {
+        respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
+    defer allocator.free(body);
+    respondJson(stream, io, 200, body);
+}
+
+/// `POST /design-docs/archive` — move a design doc to docs/archive/design/.
+/// Body: `{"path":"docs/design/decided/<file>.md"}`.
+/// Response: `{"ok":true,"archived":"docs/archive/design/<file>.md"}`.
+fn respondArchiveDesignDoc(
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    req: Request,
+    carry: []const u8,
+) void {
+    const body_bytes = readBody(allocator, stream, io, req, carry, 1024) catch {
+        respondStatus(stream, io, 400, "Bad Request");
+        return;
+    };
+    defer allocator.free(body_bytes);
+
+    const src = extractJsonStringField(body_bytes, "path") orelse {
+        respondStatus(stream, io, 400, "Bad Request");
+        return;
+    };
+
+    if (!std.mem.startsWith(u8, src, "docs/design/") or
+        !std.mem.endsWith(u8, src, ".md") or
+        std.mem.indexOf(u8, src, "..") != null)
+    {
+        respondStatus(stream, io, 400, "Bad Request");
+        return;
+    }
+
+    const basename = std.fs.path.basename(src);
+    const dest = std.fmt.allocPrint(allocator, "docs/archive/design/{s}", .{basename}) catch {
+        respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
+    defer allocator.free(dest);
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, "docs/archive/design") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        },
+    };
+    cwd.rename(src, cwd, dest, io) catch {
+        respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
+
+    const resp = std.fmt.allocPrint(allocator, "{{\"ok\":true,\"archived\":\"{s}\"}}", .{dest}) catch {
+        respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
+    defer allocator.free(resp);
+    respondJson(stream, io, 200, resp);
+}
+
+/// Read the first 512 bytes of `path` and parse the `**Status:**` marker.
+/// Returns one of: "decided", "implemented", "partial", "unknown".
+fn readDocStatus(io: std.Io, path: []const u8) []const u8 {
+    const cwd = std.Io.Dir.cwd();
+    var f = cwd.openFile(io, path, .{}) catch return "unknown";
+    defer f.close(io);
+    var peek: [512]u8 = undefined;
+    const n = f.readPositionalAll(io, &peek, 0) catch return "unknown";
+    const content = peek[0..n];
+    const marker = "**Status:**";
+    const idx = std.mem.indexOf(u8, content, marker) orelse return "unknown";
+    const after = std.mem.trim(u8, content[idx + marker.len ..], " \t");
+    if (std.mem.startsWith(u8, after, "partially implemented") or
+        std.mem.startsWith(u8, after, "partial")) return "partial";
+    if (std.mem.startsWith(u8, after, "implemented") or
+        std.mem.startsWith(u8, after, "shipped")) return "implemented";
+    if (std.mem.startsWith(u8, after, "decided") or
+        std.mem.startsWith(u8, after, "ready")) return "decided";
+    return "unknown";
+}
+
+/// Append one `{"path":…,"name":…,"category":…,"status":…}` entry to `buf`.
+fn appendDesignDocEntry(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    name: []const u8,
+    category: []const u8,
+    first: *bool,
+) !void {
+    if (!first.*) try buf.append(allocator, ',');
+    first.* = false;
+    try buf.appendSlice(allocator, "{\"path\":");
+    try appendUiJsonStr(buf, allocator, path);
+    try buf.appendSlice(allocator, ",\"name\":");
+    try appendUiJsonStr(buf, allocator, name);
+    try buf.appendSlice(allocator, ",\"category\":\"");
+    try buf.appendSlice(allocator, category);
+    try buf.appendSlice(allocator, "\",\"status\":\"");
+    try buf.appendSlice(allocator, readDocStatus(io, path));
+    try buf.appendSlice(allocator, "\"}");
+}
+
+fn renderDesignDocsJson(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"docs\":[");
+    var first = true;
+
+    const cwd = std.Io.Dir.cwd();
+
+    const subdirs = [_]struct { path: []const u8, category: []const u8 }{
+        .{ .path = "docs/design/decided", .category = "decided" },
+        .{ .path = "docs/design/open", .category = "open" },
+    };
+    for (subdirs) |sub| {
+        var dir = cwd.openDir(io, sub.path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => continue,
+            else => return err,
+        };
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+            const stem = entry.name[0 .. entry.name.len - 3];
+            const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sub.path, entry.name });
+            defer allocator.free(path);
+            try appendDesignDocEntry(&buf, allocator, io, path, stem, sub.category, &first);
+        }
+    }
+
+    // Root-level .md files in docs/design/ — "draft" category.
+    var root = cwd.openDir(io, "docs/design", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => {
+            try buf.appendSlice(allocator, "]}");
+            return try buf.toOwnedSlice(allocator);
+        },
+        else => return err,
+    };
+    defer root.close(io);
+    var root_it = root.iterate();
+    while (try root_it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+        const stem = entry.name[0 .. entry.name.len - 3];
+        const path = try std.fmt.allocPrint(allocator, "docs/design/{s}", .{entry.name});
+        defer allocator.free(path);
+        try appendDesignDocEntry(&buf, allocator, io, path, stem, "draft", &first);
+    }
+
+    try buf.appendSlice(allocator, "]}");
+    return try buf.toOwnedSlice(allocator);
+}
+
 /// `GET /sessions` — enumerate sessions on disk. Walks
 /// `parent_dir`, opens each subdir with a name longer than 0,
 /// reads its `session.json` header, accumulates into a sorted
@@ -2692,6 +2981,7 @@ fn respondSlashCommand(
         .quit => "\"quit\"",
         .turn_restarted => "\"turn_restarted\"",
         .fill_input => "\"fill_input\"",
+        .open_design_panel => "\"open_design_panel\"",
     };
 
     // v1.7.8 — `/retry` swapped the live transcript shape; tell
@@ -3027,6 +3317,7 @@ fn initSessionForTestWithDir(
         .parent_dir = owned_parent,
         .created_at_ms = ai.stream.nowMillis(),
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
+        .tool_usage = std.StringHashMap(u32).init(allocator),
     };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.guardrail_state = try agent.guardrails.GuardrailState.init(allocator, .{ .workspace_dir = "." }, io);

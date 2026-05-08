@@ -16,6 +16,7 @@ const std = @import("std");
 const ai = struct {
     pub const types = @import("../../ai/types.zig");
     pub const stream = @import("../../ai/stream.zig");
+    pub const partial_json = @import("../../ai/partial_json.zig");
 };
 const at = @import("../../agent/types.zig");
 const common = @import("common.zig");
@@ -118,25 +119,19 @@ fn execute(
         return common.toolError(allocator, "invalid_args", "missing edits");
     };
 
-    // Some models (e.g. Gemini 3.1 Pro) emit `edits: {old, new}` instead of
-    // `edits: [{old, new}]` — wrap the lone object in an array.
+    // Some models double-serialize `edits` as a JSON string; some also append
+    // trailing garbage — parsePartial handles both by returning the leading value.
+    if (edits_val == .string) {
+        if (ai.partial_json.parsePartial(arena.allocator(), edits_val.string)) |pr| {
+            if (pr.value) |v| edits_val = v;
+        } else |_| {}
+    }
+
+    // Some models emit `edits: {old, new}` instead of `[{old, new}]` — wrap.
     if (edits_val == .object) {
         var arr = std.json.Array.init(arena.allocator());
         try arr.append(edits_val);
-        edits_val = std.json.Value{ .array = arr };
-    }
-
-    // Some models (e.g. DeepSeek) double-serialize `edits` as a JSON string
-    // instead of an inline array — parse and re-apply the object→array coercion.
-    if (edits_val == .string) {
-        if (std.json.parseFromSlice(std.json.Value, arena.allocator(), edits_val.string, .{})) |pv| {
-            edits_val = pv.value;
-            if (edits_val == .object) {
-                var arr = std.json.Array.init(arena.allocator());
-                try arr.append(edits_val);
-                edits_val = std.json.Value{ .array = arr };
-            }
-        } else |_| {}
+        edits_val = .{ .array = arr };
     }
 
     if (edits_val != .array) {
@@ -1015,6 +1010,29 @@ test "execute: string-encoded edits (DeepSeek double-serialization)" {
     try writeTempFile(io, path, "hello world\n");
     var res = try callTool(gpa, io,
         \\{"path":"/tmp/franky_edit_str_edits.txt","edits":"[{\"old\":\"hello\",\"new\":\"goodbye\"}]"}
+    );
+    defer res.deinit(gpa);
+    try testing.expect(!res.is_error);
+    const got = try readAllAlloc(gpa, io, path);
+    defer gpa.free(got);
+    try testing.expectEqualStrings("goodbye world\n", got);
+}
+
+test "execute: string-encoded edits with trailing garbage (DeepSeek batch)" {
+    // Some DeepSeek configs append `, "path": "..."}]` after the array when
+    // building multi-file edits, producing an invalid JSON string that still
+    // has a valid array at the front.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const path = "/tmp/franky_edit_str_trailing.txt";
+    defer _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeTempFile(io, path, "hello world\n");
+    var res = try callTool(gpa, io,
+        \\{"path":"/tmp/franky_edit_str_trailing.txt","edits":"[{\"old\":\"hello\",\"new\":\"goodbye\"}], \"path\": \"src/coding/modes/proxy.zig\"}]"}
     );
     defer res.deinit(gpa);
     try testing.expect(!res.is_error);

@@ -909,6 +909,65 @@ The `ai/log.zig` v1.13.0 tests are a worked example —
 (Zig version × OS) that read-back-and-substring-match tests
 have a long tail of platform-specific failures.
 
+## Deep codebase analysis (2026-07-03)
+
+A comprehensive automated audit of every module in the source tree was performed.
+
+### 🔴 Critical issues found
+
+1. **Proxy subscriber slot leak** (`src/agent/proxy.zig`) — When a client disconnects without sending FIN/RST (browser background tab, network blip), `fanOutLocked` sets `sub.closed = true` but does **not** shut down the read side of the socket. The reader thread stays blocked on `readVec`, the `defer removeSub` never runs, and after ~32 cycles (`max_subs = 32`) all slots are exhausted. **Fix:** shut down the read side of the socket when flagging `sub.closed`.
+
+2. **Object store `sweep` can cause silent data loss** (`src/coding/object_store.zig:102-115`) — `sweep()` relies on an externally-supplied `keep` list of SHA-256 hashes. If the caller passes an incomplete list, referenced blobs are deleted. **Fix:** verify every `Ref` in the transcript is in the `keep` list before deletion.
+
+3. **Grep regex `\b` assertions reject valid model output** (`src/coding/tools/grep.zig`) — The regex engine uses ECMAScript which doesn't support `\b`. Models that emit word-boundary assertions receive `grep_bad_regex`. **Fix:** pre-process patterns or switch to a richer regex engine.
+
+### 🟡 High-severity issues
+
+4. **`catch return` voids `errdefer` chains** (`agent/loop.zig`, `agent/agent.zig`) — Pattern `const x = fn() catch return; errdefer cleanup(x);` makes the `errdefer` dead code. **Fix:** convert to `!void` wrapper so `errdefer` fires on error path.
+
+5. **`freeSessionHeader` is fragile** (`src/coding/session.zig:147-151`) — Adding a new owning-string field to `SessionHeader` silently leaks unless `freeSessionHeader` is updated. **Fix:** use compile-time reflection or add a comptime assertion.
+
+6. **No end-to-end tests for the four run modes** (`src/coding/modes/`) — `print.zig`, `interactive.zig`, `rpc.zig`, `proxy.zig` have zero mode-level integration tests.
+
+### 🟡 Medium-severity issues
+
+7. **`nowMillis()` returns 0 on error** (`src/ai/stream.zig:36-53`) — Degrades timing-dependent guards (stuck detector, SSE handler-stall timeout). Rare non-Linux POSIX edge case.
+
+8. **Compaction `replaceSpanWithSummary` uses manual `memcpy`** (`src/coding/compaction.zig:556-566`) — Array splicing is brittle; a single off-by-one corrupts the transcript silently.
+
+9. **Partial JSON parser has no dedicated test coverage** (`src/ai/partial_json.zig`) — Complex state machine for streaming tool-call args with no focused test suite.
+
+### 🟢 Low-severity
+
+10. **`SubAgent final_text` occasionally empty** — Sub-agent calls complete without `final_text` despite full transcripts.
+11. **DeepSeek tool-call JSON parsing** — Non-standard JSON format from DeepSeek models causes parse failures.
+12. **`end_turn` not emitted by smaller models** — Causes infinite tool-call loops; guardrail mitigations exist but the problem persists.
+
+### ✅ Strengths confirmed by deep audit
+
+- **Zero external dependencies** — entire framework is pure Zig.
+- **Thorough memory management** — every allocation paired with `defer`/`errdefer`.
+- **Mature threading model** with three-level cancellation.
+- **Comprehensive error taxonomy** with retryability metadata.
+- **Atomic file operations** throughout (tempfile + rename).
+- **Permission system** with 4 role tiers, tool-level gates, bash verb fingerprinting.
+- **Spec-driven development** with automated cross-reference checking.
+- **7 LLM providers** with unified streaming interface.
+- **881 tests with leak detection** on every run.
+- **Guardrails** for unattended operation (stuck detection, compilation check, finish_task).
+
+### Recommended next steps
+
+1. Fix the proxy subscriber leak — highest priority.
+2. Fix grep regex `\b` handling.
+3. Audit all `catch return` patterns for voided `errdefer` chains.
+4. Add mode-level integration tests.
+5. Harden `freeSessionHeader` with compile-time field iteration.
+6. Add `sweep` completeness assertion.
+7. Cover `partial_json.zig` with a dedicated unit-test suite.
+8. Investigate the sub-agent empty-final-text edge case.
+9. Consider switching the regex engine.
+
 ## License
 
 See the repository root for license information.

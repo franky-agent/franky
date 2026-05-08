@@ -63,6 +63,9 @@ pub const Profile = struct {
     /// wins; this is the per-profile default for users who routinely
     /// run a slow / verbose model and want a higher cap baked in.
     max_turns: ?u32 = null,
+    /// Per-profile retry policy overrides. CLI `--retry-max-*` always wins.
+    retry_max_attempts: ?u32 = null,
+    retry_max_total_ms: ?u64 = null,
     /// Process-env-var assignments. Applied via `environ_map.put`
     /// before any mode reads timeouts, log vars, or other knobs.
     /// Values support `${VAR}` interpolation against the **caller's
@@ -229,7 +232,9 @@ fn parseProfileObject(
     if (try optString(arena, environ_map, obj, "append_system_prompt")) |v| p.append_system_prompt = v;
     if (optBool(obj, "text_tool_call_fallback")) |v| p.text_tool_call_fallback = v;
     if (try optString(arena, environ_map, obj, "http_trace_dir")) |v| p.http_trace_dir = v;
-    if (optU32(obj, "max_turns")) |v| p.max_turns = v;
+    if (optInt(u32, obj, "max_turns")) |v| p.max_turns = v;
+    if (optInt(u32, obj, "retry_max_attempts")) |v| p.retry_max_attempts = v;
+    if (optInt(u64, obj, "retry_max_total_ms")) |v| p.retry_max_total_ms = v;
 
     if (obj.get("env")) |env_v| if (env_v == .object) {
         var env_map = std.StringHashMap([]const u8).init(arena);
@@ -263,11 +268,11 @@ fn optBool(obj: std.json.ObjectMap, key: []const u8) ?bool {
     return v.bool;
 }
 
-fn optU32(obj: std.json.ObjectMap, key: []const u8) ?u32 {
+fn optInt(comptime T: type, obj: std.json.ObjectMap, key: []const u8) ?T {
     const v = lookupField(obj, key) orelse return null;
     if (v != .integer) return null;
     if (v.integer < 0) return null;
-    if (v.integer > std.math.maxInt(u32)) return null;
+    if (v.integer > std.math.maxInt(T)) return null;
     return @intCast(v.integer);
 }
 
@@ -428,6 +433,12 @@ pub fn applyToCfg(
     // u32 fields: only apply if cfg's field is still null (CLI didn't set it).
     if (cfg.max_turns == null) if (profile.max_turns) |v| {
         cfg.max_turns = v;
+    };
+    if (cfg.retry_max_attempts == null) if (profile.retry_max_attempts) |v| {
+        cfg.retry_max_attempts = v;
+    };
+    if (cfg.retry_max_total_ms == null) if (profile.retry_max_total_ms) |v| {
+        cfg.retry_max_total_ms = v;
     };
 
     // Thinking: only apply if user didn't pass --thinking on CLI.

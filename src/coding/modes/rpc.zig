@@ -153,7 +153,9 @@ fn initSession(
     cfg: *cli_mod.Config,
 ) !void {
     const active_role = if (cfg.role) |s|
-        role_mod.Role.fromString(s) catch return error.UnknownRole
+        role_mod.Role.fromString(s) catch |err| switch (err) {
+            error.UnknownRole => return print_mode.exitWithMessage(io, "unknown --role; pick one of read, plan, code, full\n", 2),
+        }
     else
         role_mod.Role.plan;
     const role_gate = role_mod.RoleGate.init(active_role);
@@ -184,6 +186,35 @@ fn initSession(
         try print_mode.applyPermissionsSettingsOverlay(&permission_store, &settings);
         prompts_enabled = print_mode.resolvePromptsDefault(cfg, &settings);
         print_mode.applyMaxTurnsSettingsOverlay(cfg, &settings);
+
+        // v2.16 — pre-render the review config block for system-prompt injection.
+        // Only populate when profiles are configured so the block is non-empty.
+        if (settings.review_profiles.len > 0) {
+            const ca = cfg.arena.allocator();
+            // Build a comma-separated profile list for readability.
+            var pb: std.ArrayList(u8) = .empty;
+            defer pb.deinit(ca);
+            for (settings.review_profiles, 0..) |p, i| {
+                if (i > 0) try pb.appendSlice(ca, ", ");
+                try pb.appendSlice(ca, p);
+            }
+            const profiles_csv = try pb.toOwnedSlice(ca);
+            defer ca.free(profiles_csv);
+            cfg.review_config_block = try std.fmt.allocPrint(
+                ca,
+                "## Review configuration\n" ++
+                "profiles: {s}\n" ++
+                "min_models: {d}\n" ++
+                "max_models: {d}\n" ++
+                "timeout_ms: {d}",
+                .{
+                    profiles_csv,
+                    settings.review_min_models,
+                    settings.review_max_models,
+                    settings.review_timeout_ms,
+                },
+            );
+        }
     }
     if (cfg.yes) permission_store.yes_to_all = true;
     if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
