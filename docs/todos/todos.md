@@ -135,3 +135,15 @@ Also check if we can set it in the settings.json and as cli arg.
 
 
 # Compile Guard has to run after finish_task
+
+# Add retry the base_delay_ms to the settings.json profiles.models
+
+Lets set it for mistral models to 40 seconds.
+
+
+# Model Provider Feature Batch
+
+THe mistral api have trhe batch feature https://docs.mistral.ai/studio-api/batch-processing
+CHeck if this is a unified standard across other providers like opanai, ollama, openrouter.
+
+Do a web research.

@@ -46,6 +46,9 @@ pub const GuardrailState = struct {
     /// compilation_guard failure hints). Incremented each time
     /// `betweenTurns` returns true. Exposed via GET /usage in proxy mode.
     guardrail_fire_count: u32 = 0,
+    /// Set to true when finish_task is triggered; causes compilation guard
+    /// to run with force=true in the next betweenTurns call.
+    finish_task_pending_compilation: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config, io: std.Io) !GuardrailState {
         const comp_guard = try compile_mod.CompilationGuard.init(
@@ -131,9 +134,10 @@ pub const GuardrailState = struct {
     /// and another turn should run; false to let the loop close normally.
     ///
     /// Priority order:
-    ///   1. finish_task pending → run final compilation → commit or continue.
-    ///   2. Compilation guard triggered → run build → inject hint if failed.
-    ///   3. Stuck detector pending hint → inject hint.
+    ///   1. finish_task pending → schedule final compilation for next iteration.
+    ///   2. finish_task compilation → run forced compilation → commit or continue.
+    ///   3. Compilation guard triggered → run build → inject hint if failed.
+    ///   4. Stuck detector pending hint → inject hint.
     pub fn betweenTurns(
         self: *GuardrailState,
         allocator: std.mem.Allocator,
@@ -142,8 +146,17 @@ pub const GuardrailState = struct {
         out: *at.AgentChannel,
     ) !bool {
         // ── finish_task handling ─────────────────────────────────────────
+        // If finish_task was just triggered, mark that we need to run compilation
+        // in the next iteration, then return false to let the loop continue.
         if (self.finish_task_state.triggered) {
             self.finish_task_state.triggered = false;
+            self.finish_task_pending_compilation = true;
+            return true;
+        }
+
+        // ── finish_task compilation (scheduled from previous iteration) ──
+        if (self.finish_task_pending_compilation) {
+            self.finish_task_pending_compilation = false;
 
             // Force a compilation run regardless of the mutation threshold.
             const compile_failed = try self.compilation_guard.betweenTurns(allocator, io, transcript, out, true);
@@ -162,6 +175,7 @@ pub const GuardrailState = struct {
                     };
                 }
             }
+            self.finish_task_state.reset();
             return false;
         }
 

@@ -546,6 +546,7 @@ fn initSession(
         try print_mode.applyPermissionsSettingsOverlay(&permission_store, &settings);
         prompts_enabled = print_mode.resolvePromptsDefault(cfg, &settings);
         print_mode.applyMaxTurnsSettingsOverlay(cfg, &settings);
+        print_mode.applyRetrySettingsOverlay(cfg, &settings);
 
         // v2.16 — pre-render the review config block for system-prompt injection.
         // Only populate when profiles are configured so the block is non-empty.

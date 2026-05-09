@@ -1000,14 +1000,7 @@ pub fn deadlineExpired(now_ms: i64, start_ms: i64, deadline_ms: u64) bool {
 }
 
 fn defaultSleep(_: ?*anyopaque, ms: u32) void {
-    // `std.time.sleep` is gone in 0.17-dev; fall back to a busy
-    // spin for small delays (tests) or io-aware sleeps in the
-    // provider-integration wrapper. Here we use the nanosleep
-    // path via std.posix if available.
-    _ = ms;
-    // Provider-side integration supplies a real sleep via a custom
-    // SleepFn; this default is used only by tests that already
-    // pin deterministic policies (no retries or cancel-on-first).
+    nanoSleepMs(ms);
 }
 
 /// Narrow std.http client errors into the spec's canonical codes.

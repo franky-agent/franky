@@ -28,6 +28,7 @@
 const std = @import("std");
 const stream_mod = @import("stream.zig");
 const errors_mod = @import("errors.zig");
+const log = @import("log.zig");
 
 /// §6.13 — fired before each retry sleep. `reason` is the error
 /// code that triggered the retryable verdict (e.g. .transient,
@@ -46,7 +47,7 @@ pub const Policy = struct {
     /// matches §F.1: up to 3 retries means up to 4 total calls.
     max_retries: u32 = 3,
     /// Floor for backoff delay.
-    base_delay_ms: u32 = 500,
+    base_delay_ms: u32 = 10000,
     /// Ceiling on any delay (whether computed or server-supplied).
     max_retry_delay_ms: u32 = 60_000,
     /// Optional seed for deterministic tests. `null` → seed from the
@@ -136,18 +137,38 @@ pub fn run(
         attempts += 1;
         const result = attempt_fn(attempt_ctx, attempts - 1);
         switch (result.outcome) {
-            .success => return .{ .outcome = .success, .attempts = attempts, .total_delay_ms = total_delay_ms },
-            .terminal => return .{
-                .outcome = .terminal,
-                .attempts = attempts,
-                .total_delay_ms = total_delay_ms,
-                .retry_after_ms = result.retry_after_ms,
+            .success => {
+                log.log(.debug, "retry", "success", "attempt={d} succeeded", .{attempts});
+                return .{ .outcome = .success, .attempts = attempts, .total_delay_ms = total_delay_ms };
             },
-            .retryable => {},
+            .terminal => {
+                log.log(.debug, "retry", "terminal", "attempt={d} terminal reason={s}", .{
+                    attempts,
+                    @tagName(result.reason),
+                });
+                return .{
+                    .outcome = .terminal,
+                    .attempts = attempts,
+                    .total_delay_ms = total_delay_ms,
+                    .retry_after_ms = result.retry_after_ms,
+                };
+            },
+            .retryable => {
+                log.log(.debug, "retry", "retryable", "attempt={d} reason={s} retry_after_ms={?}", .{
+                    attempts,
+                    @tagName(result.reason),
+                    result.retry_after_ms,
+                });
+            },
         }
 
         // Out of retries?
         if (attempts > policy.max_retries) {
+            log.log(.warn, "retry", "exhausted", "attempt={d}/{d} giving up after {d}ms total delay", .{
+                attempts,
+                policy.max_retries + 1,
+                total_delay_ms,
+            });
             return .{
                 .outcome = .terminal,
                 .attempts = attempts,
@@ -204,22 +225,44 @@ pub fn run(
         if (policy.on_retry) |cb| {
             cb.func(cb.ctx, attempts, policy.max_retries + 1, delay, result.reason);
         }
+
+        // v2.13 — debug log so operators can see retry activity.
+        log.log(
+            .debug,
+            "retry",
+            "backoff",
+            "attempt={d}/{d} delay={d}ms reason={s} total_delay_so_far={d}ms max_total={d}ms",
+            .{
+                attempts,
+                policy.max_retries + 1,
+                delay,
+                @tagName(result.reason),
+                total_delay_ms,
+                policy.max_total_delay_ms,
+            },
+        );
+
         sleep_fn(sleep_ctx, delay);
     }
 }
 
 /// Compute the next backoff delay per the decorrelated-jitter formula.
 /// Pure function — exposed for testing.
+///
+/// For retries after connection-level rate limiting (no HTTP response
+/// received), the delay must be **monotonic** — it never decreases.
+/// The lower bound is the previous delay (or `base` on the first call)
+/// so jitter can only expand, never contract.
 pub fn nextDelay(policy: Policy, prev_delay_ms: u32, prng: *std.Random.DefaultPrng) u32 {
     const base = policy.base_delay_ms;
     const prev = if (prev_delay_ms == 0) base else prev_delay_ms;
     // Upper bound: min(cap, prev * 3).
     const tripled = @as(u64, prev) * 3;
     const upper_raw = @min(@as(u64, policy.max_retry_delay_ms), tripled);
-    if (upper_raw <= base) return base;
-    const span = upper_raw - base;
+    if (upper_raw <= prev) return prev;
+    const span = upper_raw - prev;
     const r = prng.random().uintLessThan(u64, span + 1);
-    return @intCast(base + r);
+    return @intCast(prev + r);
 }
 
 // ─── tests ────────────────────────────────────────────────────────
@@ -258,13 +301,14 @@ test "nextDelay: grows with prev (monotonic upper bound)" {
     try testing.expect(d2 <= 15_000); // upper = 5000*3
 }
 
-test "nextDelay: capped by max_retry_delay_ms" {
+test "nextDelay: capped by max_retry_delay_ms — monotonic preserves prev" {
     const pol: Policy = .{ .base_delay_ms = 500, .max_retry_delay_ms = 2_000 };
     var prng = std.Random.DefaultPrng.init(3);
     // prev=10_000 → tripled=30_000, but cap clamps to 2_000.
+    // Since upper_raw (2000) <= prev (10000), the monotonic rule
+    // returns prev unchanged (never decrease delay).
     const d = nextDelay(pol, 10_000, &prng);
-    try testing.expect(d >= pol.base_delay_ms);
-    try testing.expect(d <= pol.max_retry_delay_ms);
+    try testing.expectEqual(@as(u32, 10_000), d);
 }
 
 test "run: success on first attempt" {
@@ -324,10 +368,12 @@ test "run: Retry-After above cap → terminal with retry_after_ms propagated" {
 }
 
 test "run: terminal outcome short-circuits — no further attempts" {
-    var verdicts = Verdicts{ .list = &.{
-        .{ .outcome = .terminal },
-        .{ .outcome = .success }, // never reached
-    } };
+    var verdicts = Verdicts{
+        .list = &.{
+            .{ .outcome = .terminal },
+            .{ .outcome = .success }, // never reached
+        },
+    };
     var cancel: stream_mod.Cancel = .{};
     const r = run(.{ .seed = 1 }, &cancel, noSleep, null, Verdicts.run, @ptrCast(&verdicts));
     try testing.expectEqual(Outcome.terminal, r.outcome);
@@ -358,10 +404,12 @@ test "run: cancel during backoff short-circuits the next attempt" {
     };
     var cancel: stream_mod.Cancel = .{};
     var sctx = SleepCtx{ .cancel = &cancel };
-    var verdicts = Verdicts{ .list = &.{
-        .{ .outcome = .retryable },
-        .{ .outcome = .success }, // never reached — cancel fired during sleep
-    } };
+    var verdicts = Verdicts{
+        .list = &.{
+            .{ .outcome = .retryable },
+            .{ .outcome = .success }, // never reached — cancel fired during sleep
+        },
+    };
     const r = run(.{ .seed = 1 }, &cancel, SleepCtx.call, @ptrCast(&sctx), Verdicts.run, @ptrCast(&verdicts));
     try testing.expectEqual(Outcome.terminal, r.outcome);
     // One attempt happened; the mock sleep completed before the helper
@@ -373,11 +421,13 @@ test "run: cancel during backoff short-circuits the next attempt" {
 test "run: wall-time cap terminates before max_retries is reached" {
     // 2 retryables, each with at least base=500ms delay.
     // Wall-time cap of 300ms should kill after the first delay.
-    var verdicts = Verdicts{ .list = &.{
-        .{ .outcome = .retryable },
-        .{ .outcome = .retryable },
-        .{ .outcome = .success }, // never reached
-    } };
+    var verdicts = Verdicts{
+        .list = &.{
+            .{ .outcome = .retryable },
+            .{ .outcome = .retryable },
+            .{ .outcome = .success }, // never reached
+        },
+    };
     var cancel: stream_mod.Cancel = .{};
     const r = run(.{
         .max_retries = 5,
