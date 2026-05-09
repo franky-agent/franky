@@ -177,7 +177,7 @@ pub fn run(
     }
     if (cfg.mode == .proxy) {
         const proxy_mode = @import("proxy.zig");
-        return proxy_mode.run(allocator, io, environ, environ_map, &cfg);
+        return proxy_mode.run(allocator, io, environ, environ_map, &cfg, argv);
     }
     if (cfg.mode == .interactive) {
         // Interactive mode doesn't require a prompt — the REPL

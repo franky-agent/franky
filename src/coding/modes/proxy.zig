@@ -67,6 +67,7 @@ const slash_mod = franky.coding.slash;
 const diagnostics_mod = franky.coding.diagnostics;
 const improvement_mod = franky.coding.improvement;
 const skills_mod = franky.coding.skills;
+const restart_mod = franky.coding.restart;
 
 pub const default_port: u16 = 8787;
 // pub const default_host: []const u8 = "127.0.0.1";
@@ -97,9 +98,10 @@ pub fn run(
     environ: std.process.Environ,
     environ_map: *std.process.Environ.Map,
     cfg: *cli_mod.Config,
+    original_argv: []const []const u8,
 ) !void {
     var session: Session = undefined;
-    try initSession(&session, allocator, io, environ, environ_map, cfg);
+    try initSession(&session, allocator, io, environ, environ_map, cfg, original_argv);
     defer session.deinit();
 
     // v1.18.0 — re-init the logger to a per-session path now that
@@ -112,7 +114,10 @@ pub fn run(
         .kernel_backlog = 32,
         .reuse_address = true,
     }) catch return error.BindFailed;
-    defer server.deinit(io);
+    // Track whether we already closed the server for restart (to
+    // avoid the deferred deinit double-closing).
+    var server_closed: bool = false;
+    defer if (!server_closed) server.deinit(io);
 
     // Stderr banner so operators see where to point their client.
     var sb: [256]u8 = undefined;
@@ -126,8 +131,18 @@ pub fn run(
     sw.interface.flush() catch {};
 
     while (true) {
+        // v2.17 — poll restart flag. If set, the main thread breaks
+        // out of the accept loop, closes the listen socket, spawns a
+        // fresh instance, and exits.
+        if (session.restart_requested.load(.acquire)) break;
+
         var stream = server.accept(io) catch |err| switch (err) {
-            error.Canceled => return,
+            error.Canceled => {
+                // v2.17 — the cancel was triggered by `/restart` to
+                // wake up the accept loop; loop back and pick up the
+                // restart_requested flag.
+                continue;
+            },
             else => continue,
         };
         // Each connection owns its own thread. `handleConnection`
@@ -143,6 +158,25 @@ pub fn run(
             continue;
         };
         t.detach();
+    }
+
+    // v2.17 — restart sequence: close listen socket, broadcast close
+    // event to SSE subscribers, spawn fresh binary, exit.
+    if (session.restart_requested.load(.acquire)) {
+        // Close the listen socket FIRST so the child can bind.
+        server.deinit(io);
+        server_closed = true;
+        // Broadcast a `close` SSE frame so browsers stop reconnecting.
+        session.broadcastEvent(allocator, "event: close\ndata: {}\n\n");
+        // Spawn the new binary and exit. Never returns on success.
+        restart_mod.spawnAndExit(io) catch {
+            // spawn failed (OOM?), log and continue so the old
+            // process stays up — callers can retry.
+            ai.log.log(.err, "proxy", "restart", "spawnAndExit failed — continuing with old binary", .{});
+            // Cannot accept connections anymore — the listen socket
+            // is closed. Return to let the process exit cleanly.
+            return;
+        };
     }
 }
 
@@ -236,6 +270,10 @@ const Session = struct {
     /// finishes the current turn and then exits with an
     /// `agent_interrupted` event.
     stop_requested: std.atomic.Value(bool) = .init(false),
+    /// v2.17 — restart signal. Set by `/restart` or `POST /restart`.
+    /// The accept loop polls this flag and breaks out to perform the
+    /// spawn-and-exit restart sequence.
+    restart_requested: std.atomic.Value(bool) = .init(false),
     /// v1.19.0 — resolved per-tool-prompt toggle. CLI `--prompts`
     /// wins; otherwise honors settings.json `prompts: bool`.
     prompts_enabled: bool = false,
@@ -334,6 +372,8 @@ const Session = struct {
         self.faux.deinit();
         self.permission_store.deinit();
         self.role_arena.deinit();
+        // v2.17 — release restart module globals (owned dupes).
+        restart_mod.deinit(self.allocator);
         // v1.16.0 — release any retained replay frames.
         for (self.replay_ring[0..]) |maybe| {
             if (maybe) |entry| self.allocator.free(entry.frame);
@@ -474,7 +514,14 @@ fn initSession(
     environ: std.process.Environ,
     environ_map: *std.process.Environ.Map,
     cfg: *cli_mod.Config,
+    original_argv: []const []const u8,
 ) !void {
+    // v2.17 — cache argv + exe path so a later `/restart` can
+    // spawn a fresh binary. Best-effort; restart simply won't work
+    // if this fails.
+    restart_mod.init(original_argv, io, allocator) catch {
+        ai.log.log(.warn, "proxy", "restart.init", "failed to cache argv — restart will not be available", .{});
+    };
     // Resolve where (or whether) sessions live on disk. Mirrors
     // print mode's SessionState.init policy: explicit `--session-dir`
     // > `$FRANKY_HOME/sessions` > `~/.franky/sessions` > `./.franky-sessions`.
@@ -779,6 +826,9 @@ pub const SlashSideEffect = enum {
     /// web UI. The handler has no server state to touch; the side
     /// effect is purely a client-side signal.
     open_design_panel,
+    /// v2.17 — process will restart (spawn-and-exit). The browser
+    /// should expect a disconnect + reconnect.
+    restarting,
 };
 
 pub const ProxySlashCtx = struct {
@@ -1114,6 +1164,19 @@ fn quitHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void 
     const px = proxySlashCtx(ctx);
     px.side_effect = .quit;
     try ctx.output.appendSlice(ctx.allocator, "Goodbye.");
+}
+
+fn restartHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
+    const px = proxySlashCtx(ctx);
+    px.side_effect = .restarting;
+    px.session.restart_requested.store(true, .release);
+    // Connect a localhost socket to kick the main loop's blocking
+    // accept() so it polls the restart flag promptly.
+    const port = px.session.cfg.proxy_port orelse default_port;
+    var kick = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return;
+    var stream = std.Io.net.IpAddress.connect(&kick, px.session.io, .{ .mode = .stream }) catch return;
+    stream.close(px.session.io);
+    try ctx.output.appendSlice(ctx.allocator, "Restarting…");
 }
 
 // ─── v1.7.8 — /retry + /edit ────────────────────────────────────
@@ -1463,6 +1526,7 @@ fn buildProxySlashRegistry(allocator: std.mem.Allocator) !slash_mod.Registry {
     try reg.register(.{ .name = "design", .description = "Open the Design Documents panel", .handler = designHandler });
     try reg.register(.{ .name = "review", .description = "Multi-model code review (requires --skill multimodel-review)", .handler = reviewHandler });
     try reg.register(.{ .name = "quit", .description = "Close this browser tab", .handler = quitHandler });
+    try reg.register(.{ .name = "restart", .description = "Restart the franky process (spawn-and-exit)", .handler = restartHandler });
     return reg;
 }
 
@@ -1700,6 +1764,14 @@ fn handleConnection(arg: ConnArg) void {
         ai.log.log(.info, "proxy", "interrupt", "graceful stop requested via POST /interrupt", .{});
         arg.session.stop_requested.store(true, .release);
         respondJson(&stream, arg.io, 200, "{\"ok\":true,\"interrupted\":true}");
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/restart")) {
+        // v2.17 — set the restart flag; the accept loop picks it up
+        // on the main thread, closes the listen socket, spawns a
+        // fresh binary, and calls exit(0).
+        arg.session.restart_requested.store(true, .release);
+        respondJson(&stream, arg.io, 200, "{\"ok\":true,\"restarting\":true}");
         return;
     }
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/permission/resolve")) {
@@ -3046,6 +3118,7 @@ fn respondSlashCommand(
         .turn_restarted => "\"turn_restarted\"",
         .fill_input => "\"fill_input\"",
         .open_design_panel => "\"open_design_panel\"",
+        .restarting => "\"restarting\"",
     };
 
     // v1.7.8 — `/retry` swapped the live transcript shape; tell
