@@ -3332,7 +3332,8 @@ test "ModalState.arm: re-arming releases previous strings (no leak)" {
 
 test "argsPreviewSlice: short input returns whole, long input truncates" {
     try testing.expectEqualStrings("{}", argsPreviewSlice("{}"));
-    const long = "x" ** 200;
+    var long_buf: [200]u8 = @splat('x');
+    const long: []const u8 = long_buf[0..];
     const preview = argsPreviewSlice(long);
     try testing.expectEqual(@as(usize, 160), preview.len);
 }

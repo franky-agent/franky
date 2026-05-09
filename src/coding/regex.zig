@@ -84,8 +84,7 @@ pub const Op = union(enum) {
 pub const SplitArgs = struct { a: i32, b: i32 };
 
 pub const CharClass = struct {
-    bits: [32]u8 = [_]u8{0} ** 32,
-
+    bits: [32]u8 = @splat(0),
     pub fn set(self: *CharClass, c: u8) void {
         self.bits[c >> 3] |= @as(u8, 1) << @intCast(c & 7);
     }
@@ -897,6 +896,7 @@ test "regex: step budget bounds pathological patterns" {
     // budget it just returns false quickly rather than hanging.
     var r = try compile(testing.allocator, "(a*)*b");
     defer r.deinit();
-    const victim = "a" ** 40; // 40 a's, no b
+    var victim_buf: [40]u8 = @splat('a');
+    const victim = victim_buf[0..];
     try testing.expect(!r.matches(victim));
 }

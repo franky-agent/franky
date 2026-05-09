@@ -689,7 +689,7 @@ test "selectSpan: preserves first user + tail budget — compacts the middle" {
             .tool_call_id = null,
         };
     }
-    const pinned = [_]bool{false} ** 12;
+    const pinned: [12]bool = @splat(false);
 
     // Context window 100 → tail budget ≈ 15 tokens. With ~6 tokens
     // per message, only the last 2-3 messages before anchor survive
@@ -716,7 +716,7 @@ test "selectSpan: pinned messages are preserved" {
     }
     // Pin index 2; tail budget is tiny so everything else is
     // compactable candidate.
-    var pinned = [_]bool{false} ** 6;
+    var pinned: [6]bool = @splat(false);
     pinned[2] = true;
 
     const d = try selectSpan(testing.allocator, &msgs, 100, &pinned);

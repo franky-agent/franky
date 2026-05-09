@@ -201,6 +201,7 @@ const Session = struct {
     role_arena: std.heap.ArenaAllocator,
     role_gate: role_mod.RoleGate,
     permission_store: permissions_mod.Store,
+
     session_gates: permissions_mod.SessionGates = .{},
     /// v1.11.4 — set during `runPrompt` so the HTTP
     /// `POST /permission/resolve` handler (running on the
@@ -271,7 +272,7 @@ const Session = struct {
 
     /// Active `/events` subscribers. Capped at `max_subs` so a
     /// runaway client doesn't unbounded-allocate the listener.
-    subs: [max_subs]?*SseSubscriber = .{null} ** max_subs,
+    subs: [max_subs]?*SseSubscriber = @splat(null),
 
     // ── v1.16.0 — SSE event-replay state (closes v2 §2.3) ─────────
     //
@@ -290,7 +291,7 @@ const Session = struct {
     /// Recent replay-eligible frames keyed by `id % capacity`.
     /// Owned by the session — entries are freed on overwrite and
     /// on `deinit`.
-    replay_ring: [replay_ring_capacity]?ReplayEvent = .{null} ** replay_ring_capacity,
+    replay_ring: [replay_ring_capacity]?ReplayEvent = @splat(null),
 
     events_mutex: std.Io.Mutex = .init,
 
@@ -5232,7 +5233,7 @@ test "broadcastEvent: concurrent calls from two threads produce no duplicate or 
     // (b) + (c) Scan the ring and collect all ids. With 2*N = 200 events
     // and a ring capacity of 4096, there is no eviction — every event
     // survives in the ring.
-    var seen: [2 * N + 1]bool = .{false} ** (2 * N + 1);
+    var seen: [2 * N + 1]bool = @splat(false);
     var found: usize = 0;
 
     for (ts.session.replay_ring) |maybe_entry| {

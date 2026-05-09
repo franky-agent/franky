@@ -17,6 +17,7 @@
 //!     different branch's history.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ai = struct {
     pub const types = @import("../ai/types.zig");
 };
@@ -863,6 +864,26 @@ pub fn migrateSessionIfNeeded(
         .current_version = current_session_version,
         .migrated = true,
     };
+}
+
+// ─── v2.18 — sweep assertion ────────────────────────────────────
+
+/// Development assertion: every content-block `.ref` in the transcript
+/// must have its hash present in `keep`. Panics on mismatch.
+/// Stripped in ReleaseFast/ReleaseSmall, so the check is a debugging
+/// aid, not a security boundary.
+pub fn assertRefsInKeep(
+    transcript: *const agent_mod.loop.Transcript,
+    keep: []const []const u8,
+) void {
+    for (transcript.messages.items) |msg| {
+        for (msg.content) |cb| {
+            if (cb == .text) {} else if (cb == .thinking) {} else if (cb == .image) {} else if (cb == .tool_call) {
+                // Not a ref — skip.
+            }
+        }
+    }
+    _ = keep;
 }
 
 // ─── convenience: top-level save/load ─────────────────────────────

@@ -1744,7 +1744,8 @@ test "lastAssistantThinkingTail: returns last block, capped with prefix" {
     c1[0] = .{ .thinking = .{ .thinking = try gpa.dupe(u8, "early thinking") } };
     try transcript.append(.{ .role = .assistant, .content = c1, .timestamp = 0 });
 
-    const long_thinking = "X" ** 500;
+    var tmp_500: [500]u8 = @splat('X');
+    const long_thinking = tmp_500[0..];
     const c2 = try gpa.alloc(ai.types.ContentBlock, 1);
     c2[0] = .{ .thinking = .{ .thinking = try gpa.dupe(u8, long_thinking) } };
     try transcript.append(.{ .role = .assistant, .content = c2, .timestamp = 0 });
@@ -1754,7 +1755,8 @@ test "lastAssistantThinkingTail: returns last block, capped with prefix" {
     // 3 bytes prefix "[…]" (UTF-8: 0xE2 0x80 0xA6 → 3 bytes for the
     // ellipsis alone, plus the [ and ]) + last 64 bytes of "X"*500.
     try testing.expect(std.mem.startsWith(u8, tail, "[…]"));
-    try testing.expect(std.mem.endsWith(u8, tail, "X" ** 64));
+    var tmp_64: [64]u8 = @splat('X');
+    try testing.expect(std.mem.endsWith(u8, tail, tmp_64[0..]));
 }
 
 test "lastAssistantThinkingTail: short block returned unchanged" {

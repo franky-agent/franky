@@ -285,7 +285,8 @@ test "Agent: does NOT deadlock when a turn produces > 128 events (v1.21.0 regres
     // of turn_start / message_start / message_end / turn_end. Old
     // 128-cap channel would deadlock; 4096-cap handles this with
     // ample headroom.
-    const long_text = "x" ** 200;
+    var tmp_200: [200]u8 = @splat('x');
+    const long_text = tmp_200[0..];
     try faux.push(.{ .events = &.{
         .{ .text = .{ .text = long_text, .chunk_size = 1 } },
     } });
