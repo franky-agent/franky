@@ -306,6 +306,22 @@ fn runInteractive(
         }
     }
 
+    // v2.17 — merge extension-registered tools into session.tools.
+    // SessionBinding.init finalized the tool list before extensions
+    // loaded; now append any tools the extensions registered via
+    // the Host view. The merge copies ext_manager.tools() into the
+    // session's arena so tool lifetimes match session lifetime.
+    {
+        const ext_tools = ext_manager.tools();
+        if (ext_tools.len > 0) {
+            const arena = session.arena.allocator();
+            const merged = try arena.alloc(at.AgentTool, session.tools.len + ext_tools.len);
+            @memcpy(merged[0..session.tools.len], session.tools);
+            @memcpy(merged[session.tools.len..], ext_tools);
+            session.tools = merged;
+        }
+    }
+
     // If the user passed a prompt on the command line, submit it
     // immediately — matches print-mode semantics.
     var pending_prompt: ?[]u8 = null;

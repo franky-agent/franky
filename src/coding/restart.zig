@@ -25,7 +25,9 @@ var cached_exe_path: ?[]const u8 = null;
 var cached_argv: ?[]const []const u8 = null;
 
 pub fn init(argv: []const []const u8, io: std.Io, allocator: std.mem.Allocator) !void {
-    cached_exe_path = try std.process.executablePathAlloc(io, allocator);
+    const exe_path = try std.process.executablePathAlloc(io, allocator);
+    cached_exe_path = try allocator.dupe(u8, exe_path);
+    allocator.free(exe_path);
     var argv_copy = try allocator.alloc([]const u8, argv.len);
     for (argv, 0..) |arg, i| {
         argv_copy[i] = try allocator.dupe(u8, arg);

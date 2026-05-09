@@ -167,3 +167,26 @@ Then save an open design doc in docs/design/open/
 # List subagents/preset based on the available API KEYS.
 
 Also if a subagent was started with profile gemini but gemini api key is not there return hint with please use one of the following or change the subagent model without telling the parent agent.
+
+
+# Deepseek multiple tool calls
+```
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="bash">
+<｜DSML｜parameter name="command" string="true">cd /Users/frankittermann/github/franky && git show HEAD:src/ai/registry.zig | head -160</｜DSML｜parameter>
+<｜DSML｜parameter name="cwd" string="true">/Users/frankittermann/github/franky</｜DSML｜parameter>
+</｜DSML｜invoke>
+<｜DSML｜invoke name="bash">
+<｜DSML｜parameter name="command" string="true">cd /Users/frankittermann/github/franky && git show HEAD:src/ai/providers/faux.zig | head -100</｜DSML｜parameter>
+<｜DSML｜parameter name="cwd" string="true">/Users/frankittermann/github/franky</｜DSML｜parameter>
+</｜DSML｜invoke>
+<｜DSML｜invoke name="bash">
+<｜DSML｜parameter name="command" string="true">cd /Users/frankittermann/github/franky && git show HEAD:src/ai/channel.zig | head -60</｜DSML｜parameter>
+<｜DSML｜parameter name="cwd" string="true">/Users/frankittermann/github/franky</｜DSML｜parameter>
+</｜DSML｜invoke>
+<｜DSML｜invoke name="bash">
+<｜DSML｜parameter name="command" string="true">cd /Users/frankittermann/github/franky && git show HEAD:src/agent/types.zig | head -80</｜DSML｜parameter>
+<｜DSML｜parameter name="cwd" string="true">/Users/frankittermann/github/franky</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>
+```

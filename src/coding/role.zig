@@ -247,6 +247,7 @@ pub fn renderRoleStatusJson(
     sandboxed: bool,
     provider_name: []const u8,
     model_id: []const u8,
+    extra_tools: []const []const u8,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -266,6 +267,16 @@ pub fn renderRoleStatusJson(
         first = false;
         try buf.append(allocator, '"');
         try buf.appendSlice(allocator, entry.name);
+        try buf.append(allocator, '"');
+    }
+    // Extension tools are not in tool_table (hardcoded built-ins);
+    // they are unconditionally allowed since no role gate applies
+    // to them (role filtering happens before extension loading).
+    for (extra_tools) |name| {
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.append(allocator, '"');
+        try buf.appendSlice(allocator, name);
         try buf.append(allocator, '"');
     }
     try buf.appendSlice(allocator, "]}");
@@ -335,7 +346,7 @@ test "minRoleFor: bash needs code; read needs read" {
 }
 
 test "renderRoleStatusJson: plan emits the wire shape" {
-    const json = try renderRoleStatusJson(testing.allocator, .plan, ToolSet.forRole(.plan), false, "anthropic", "claude-sonnet-4-6");
+    const json = try renderRoleStatusJson(testing.allocator, .plan, ToolSet.forRole(.plan), false, "anthropic", "claude-sonnet-4-6", &.{});
     defer testing.allocator.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\"role\":\"plan\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"sandbox\":false") != null);

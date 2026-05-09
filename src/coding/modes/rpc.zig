@@ -812,6 +812,7 @@ fn writeRoleResult(
         sandboxed,
         session.provider.provider_name,
         session.provider.model_id,
+        &.{},
     );
     defer allocator.free(body);
     try writeResultFrame(allocator, io, stdout, id, body);

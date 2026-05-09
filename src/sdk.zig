@@ -103,6 +103,7 @@ pub const settings = coding.settings;
 pub const auth = coding.auth;
 pub const templates = coding.templates;
 pub const extensions = coding.extensions;
+pub const ext_catalog = coding.extensions_builtin.catalog;
 
 // ─── version surface ─────────────────────────────────────────────
 pub const version = @import("root.zig").version;

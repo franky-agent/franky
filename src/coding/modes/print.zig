@@ -32,6 +32,9 @@ const models_mod = franky.coding.models;
 const branching_mod = franky.coding.branching;
 const skills_mod = franky.coding.skills;
 const diagnostics_mod = franky.coding.diagnostics;
+const slash_mod = franky.coding.slash;
+const extensions_mod = franky.coding.extensions;
+const ext_catalog = franky.coding.extensions_builtin.catalog;
 
 /// Default model when the user didn't pass `--model`. Sonnet 4.6 is
 /// the current cost/latency sweet spot; Opus 4.6 is reachable via
@@ -418,6 +421,16 @@ fn runPrint(
     defer preset_registry.deinit();
     try tools_mod.subagent.registerBuiltinPresets(&preset_registry);
 
+    // ── Extension loading (print mode) ───────────────────────────────
+    // Tier-1 extensions opt-in via `--extensions <csv>`. Each activated
+    // extension registers slash commands, tools, presets, and event
+    // subscriptions through a `Host` view. Tools contributed by
+    // extensions are merged into `final_tools` below.
+    var ext_manager = extensions_mod.Manager.init(allocator);
+    ext_manager.presets = &preset_registry;
+    defer ext_manager.deinit();
+    try ext_manager.loadFromConfig(io, cfg.extensions, ext_catalog.lookup);
+
     const subagent_params_json = try tools_mod.subagent.buildParametersJson(
         allocator, &preset_registry);
     defer allocator.free(subagent_params_json);
@@ -453,11 +466,16 @@ fn runPrint(
     defer guardrail_state.deinit();
 
     const final_tools = blk: {
-        const slice = try allocator.alloc(at.AgentTool, filtered_tools.len + 3);
+        const ext_tools = ext_manager.tools();
+        const slice = try allocator.alloc(at.AgentTool, filtered_tools.len + ext_tools.len + 3);
         @memcpy(slice[0..filtered_tools.len], filtered_tools);
-        slice[filtered_tools.len] = tools_mod.subagent.toolWithCtx(&subagent_ctx);
-        slice[filtered_tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(&preset_registry);
-        slice[filtered_tools.len + 2] = guardrail_state.finishTaskTool();
+        if (ext_tools.len > 0) {
+            @memcpy(slice[filtered_tools.len..][0..ext_tools.len], ext_tools);
+        }
+        const off = filtered_tools.len + ext_tools.len;
+        slice[off] = tools_mod.subagent.toolWithCtx(&subagent_ctx);
+        slice[off + 1] = tools_mod.subagent.listPresetsToolWithCtx(&preset_registry);
+        slice[off + 2] = guardrail_state.finishTaskTool();
         break :blk slice;
     };
     defer allocator.free(final_tools);

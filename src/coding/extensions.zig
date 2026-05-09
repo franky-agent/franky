@@ -130,6 +130,41 @@ pub const Manager = struct {
         for (self.host_subs.items) |s| s.on_event(s.userdata, event_kind, event_json);
     }
 
+    /// Activate extensions from a `--extensions` CSV string.
+    /// For each name, calls `lookup_fn(name)` — which must return
+    /// an optional with a `.factory: *const fn () Extension` field.
+    /// Unknown names are logged to stderr and skipped.
+    pub fn loadFromConfig(
+        self: *Manager,
+        io: std.Io,
+        cfg_extensions: ?[]const u8,
+        lookup_fn: anytype,
+    ) !void {
+        const csv = cfg_extensions orelse return;
+        const names = try parseOptIn(self.allocator, csv);
+        defer self.allocator.free(names);
+        for (names) |name| {
+            const maybe_entry = lookup_fn(name);
+            const entry = maybe_entry orelse {
+                var stderr_buf: [512]u8 = undefined;
+                var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
+                stderr.interface.print("extension '{s}' not in built-in catalog; ignored\n", .{name}) catch {};
+                stderr.interface.flush() catch {};
+                continue;
+            };
+            const ext = entry.factory();
+            var slash_registry_tmp = slash.Registry.init(self.allocator);
+            defer slash_registry_tmp.deinit();
+            self.register(ext, &slash_registry_tmp) catch |err| {
+                var stderr_buf: [512]u8 = undefined;
+                var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
+                stderr.interface.print("extension '{s}' failed to init: {s}\n", .{ name, @errorName(err) }) catch {};
+                stderr.interface.flush() catch {};
+                continue;
+            };
+        }
+    }
+
     /// Parse `"a,b,c"` into the set of extension names that should
     /// be activated. Caller-allocated, caller-freed.
     pub fn parseOptIn(allocator: std.mem.Allocator, csv: []const u8) ![][]const u8 {

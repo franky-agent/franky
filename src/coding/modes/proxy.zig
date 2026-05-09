@@ -68,6 +68,8 @@ const diagnostics_mod = franky.coding.diagnostics;
 const improvement_mod = franky.coding.improvement;
 const skills_mod = franky.coding.skills;
 const restart_mod = franky.coding.restart;
+const extensions_mod = franky.coding.extensions;
+const ext_catalog = franky.coding.extensions_builtin.catalog;
 
 pub const default_port: u16 = 8787;
 // pub const default_host: []const u8 = "127.0.0.1";
@@ -752,6 +754,18 @@ fn initSession(
         preset_reg.* = tools_mod.subagent.PresetRegistry.init(ra);
         try tools_mod.subagent.registerBuiltinPresets(preset_reg);
 
+        // ── Extension loading (proxy mode) ───────────────────────────
+        // Same extension loading as print mode — opt-in via
+        // `--extensions <csv>`. Tools and presets contributed by
+        // extensions are merged into `final_tools` below. The
+        // ext_manager is arena-allocated so it lives as long as the
+        // session.
+        const ext_manager = try ra.create(extensions_mod.Manager);
+        ext_manager.* = extensions_mod.Manager.init(ra);
+        ext_manager.presets = preset_reg;
+        try ext_manager.loadFromConfig(io, cfg.extensions, ext_catalog.lookup);
+        const ext_tools = ext_manager.tools();
+
         const params_json = try tools_mod.subagent.buildParametersJson(ra, preset_reg);
 
         const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
@@ -781,11 +795,15 @@ fn initSession(
             // §6.7 — enable full text/thinking deltas for the panel.
             .verbose_progress = true,
         };
-        const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 3);
+        const final_tools = try ra.alloc(at.AgentTool, session.tools.len + @as(u32, @intCast(ext_tools.len)) + 3);
         @memcpy(final_tools[0..session.tools.len], session.tools);
-        final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-        final_tools[session.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
-        final_tools[session.tools.len + 2] = session.guardrail_state.finishTaskTool();
+        if (ext_tools.len > 0) {
+            @memcpy(final_tools[session.tools.len..][0..ext_tools.len], ext_tools);
+        }
+        const off = session.tools.len + ext_tools.len;
+        final_tools[off] = tools_mod.subagent.toolWithCtx(subagent_ctx);
+        final_tools[off + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
+        final_tools[off + 2] = session.guardrail_state.finishTaskTool();
         session.tools = final_tools;
     }
 
@@ -2576,6 +2594,15 @@ fn respondRole(
     allocator: std.mem.Allocator,
 ) void {
     const sandboxed = role_mod.detectSandboxFromMap(session.environ_map);
+    // Collect extension tool names so the web UI tooltip shows
+    // them alongside the built-in core tools.
+    var ext_tool_names: std.ArrayList([]const u8) = .empty;
+    defer ext_tool_names.deinit(allocator);
+    for (session.tools) |t| {
+        if (session.role_gate.set.allows(t.name)) continue;
+        if (session.role_gate.set.isKnownButDisabled(t.name)) continue;
+        ext_tool_names.append(allocator, t.name) catch {};
+    }
     const body = role_mod.renderRoleStatusJson(
         allocator,
         session.role_gate.role,
@@ -2583,6 +2610,7 @@ fn respondRole(
         sandboxed,
         session.provider.provider_name,
         session.provider.model_id,
+        ext_tool_names.items,
     ) catch {
         respondStatus(stream, io, 500, "Internal Server Error");
         return;
