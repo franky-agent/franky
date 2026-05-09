@@ -444,7 +444,7 @@ fn isPrefixOf(input: []const u8, full: []const u8) bool {
 // ─── tests ────────────────────────────────────────────────────────────
 
 fn makeArena() std.heap.ArenaAllocator {
-    return std.heap.ArenaAllocator.init(std.testing.allocator);
+    return std.heap.ArenaAllocator.init(@import("../global_allocator.zig").gpa);
 }
 
 test "empty / whitespace input → null, incomplete" {

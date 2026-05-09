@@ -194,7 +194,7 @@ pub const Parser = struct {
 // ─── tests ────────────────────────────────────────────────────────────
 
 test "simple event with data line" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed("data: hello\n\n");
@@ -205,7 +205,7 @@ test "simple event with data line" {
 }
 
 test "event + data fields together" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed("event: message_start\ndata: {\"a\":1}\n\n");
@@ -215,7 +215,7 @@ test "event + data fields together" {
 }
 
 test "multi-data concatenates with newline" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed("data: line1\ndata: line2\n\n");
@@ -224,7 +224,7 @@ test "multi-data concatenates with newline" {
 }
 
 test "comment lines ignored" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed(":keepalive\ndata: x\n:another comment\n\n");
@@ -233,7 +233,7 @@ test "comment lines ignored" {
 }
 
 test "CRLF and bare CR line terminators" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed("data: a\r\n\r\ndata: b\r\rdata: c\n\n");
@@ -246,7 +246,7 @@ test "CRLF and bare CR line terminators" {
 }
 
 test "chunked feed across event boundaries" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed("event: start\ndata: he");
@@ -263,7 +263,7 @@ test "chunked feed across event boundaries" {
 }
 
 test "leading single space stripped from value" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed("data:x\ndata: y\ndata:  z\n\n");
@@ -273,7 +273,7 @@ test "leading single space stripped from value" {
 }
 
 test "empty event (blank lines only) is skipped" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed("\n\n\n\ndata: after\n\n");
@@ -282,7 +282,7 @@ test "empty event (blank lines only) is skipped" {
 }
 
 test "id and retry fields are ignored" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed("id: 42\nretry: 1000\nevent: ping\ndata: {}\n\n");
@@ -292,7 +292,7 @@ test "id and retry fields are ignored" {
 }
 
 test "flush emits buffered event with final line but no blank terminator" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed("data: complete\n");
@@ -303,7 +303,7 @@ test "flush emits buffered event with final line but no blank terminator" {
 }
 
 test "flush on incomplete line (no terminator) returns null" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed("data: partial_no_nl");
@@ -313,7 +313,7 @@ test "flush on incomplete line (no terminator) returns null" {
 }
 
 test "[DONE] sentinel is surfaced like any data" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var p = Parser.init(gpa);
     defer p.deinit();
     try p.feed("data: [DONE]\n\n");

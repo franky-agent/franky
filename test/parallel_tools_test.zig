@@ -123,7 +123,7 @@ fn slowTool(name: []const u8, ctx: *SlowCtx) at.AgentTool {
 }
 
 test "parallel tools: three calls complete in ~max(individual), not sum" {
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
     var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
@@ -274,7 +274,7 @@ fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
 }
 
 test "parallel tools: cancel mid-batch tears down workers promptly and without leaks" {
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
     var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
@@ -411,7 +411,7 @@ test "parallel tools: cancel mid-batch tears down workers promptly and without l
 // ─── v1.7.3 — completion-order events (§4.4) ──────────────────────
 
 test "parallel tools: end events fire in completion order; results stay source-ordered" {
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
     var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();

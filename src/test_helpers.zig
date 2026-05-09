@@ -14,11 +14,11 @@
 const std = @import("std");
 
 /// Returns a fresh `std.Io.Threaded` wired to
-/// `std.testing.allocator` with empty argv + environ. Every test
+/// `@import("global_allocator.zig").gpa` with empty argv + environ. Every test
 /// that needs an `io` handle calls `threadedIo()` + defers
 /// `.deinit()`.
 pub fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.testing.allocator, .{
+    return std.Io.Threaded.init(@import("global_allocator.zig").gpa, .{
         .argv0 = .empty,
         .environ = .empty,
     });

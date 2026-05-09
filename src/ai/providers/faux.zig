@@ -282,7 +282,7 @@ test "faux emits streamed text and auto-done" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../../global_allocator.zig").gpa;
     var faux = FauxProvider.init(gpa);
     defer faux.deinit();
 
@@ -307,7 +307,7 @@ test "faux emits tool call with streamed args" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../../global_allocator.zig").gpa;
     var faux = FauxProvider.init(gpa);
     defer faux.deinit();
 
@@ -338,7 +338,7 @@ test "faux emits error event instead of done" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../../global_allocator.zig").gpa;
     var faux = FauxProvider.init(gpa);
     defer faux.deinit();
 
@@ -361,7 +361,7 @@ test "faux matcher selects by last_user_text_equals" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../../global_allocator.zig").gpa;
     var faux = FauxProvider.init(gpa);
     defer faux.deinit();
 
@@ -409,7 +409,7 @@ test "channel deinit with undrained faux events does not leak" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../../global_allocator.zig").gpa;
     var faux = FauxProvider.init(gpa);
     defer faux.deinit();
 

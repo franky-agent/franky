@@ -52,7 +52,7 @@ test "agent loop: text-only assistant produces message_end + turn_end" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
 
     var faux = faux_mod.FauxProvider.init(gpa);
     defer faux.deinit();
@@ -120,7 +120,7 @@ test "agent loop: tool call round-trips — text then tool then text" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
 
     var faux = faux_mod.FauxProvider.init(gpa);
     defer faux.deinit();
@@ -219,7 +219,7 @@ test "agent loop: before_tool_call can block a call" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
 
     var faux = faux_mod.FauxProvider.init(gpa);
     defer faux.deinit();
@@ -385,7 +385,7 @@ test "agent loop: max_turns cap emits max_turns_exceeded with no hook" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
 
     var faux = faux_mod.FauxProvider.init(gpa);
     defer faux.deinit();
@@ -467,7 +467,7 @@ test "agent loop: max_turns hook .extend(N) is additive across calls" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
 
     var faux = faux_mod.FauxProvider.init(gpa);
     defer faux.deinit();
@@ -533,7 +533,7 @@ test "agent loop: max_turns hook returning .stop emits max_turns_exceeded immedi
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
 
     var faux = faux_mod.FauxProvider.init(gpa);
     defer faux.deinit();
@@ -602,7 +602,7 @@ test "agent loop: max_turns_summarize runs one tool-disabled summary turn before
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
 
     var faux = faux_mod.FauxProvider.init(gpa);
     defer faux.deinit();
@@ -699,7 +699,7 @@ test "agent loop: max_turns_summarize=false preserves legacy behavior" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
 
     var faux = faux_mod.FauxProvider.init(gpa);
     defer faux.deinit();

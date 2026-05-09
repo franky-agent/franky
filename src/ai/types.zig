@@ -429,7 +429,7 @@ pub const ThinkingLevel = enum {
 // ─── tests ────────────────────────────────────────────────────────────
 
 test "TextContent.dupe owns memory" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     const src: TextContent = .{ .text = "hello", .text_signature = "sig" };
     const dst = try src.dupe(gpa);
     defer dst.deinit(gpa);
@@ -438,7 +438,7 @@ test "TextContent.dupe owns memory" {
 }
 
 test "ContentBlock.dupe round-trips each variant" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     {
         var cb: ContentBlock = .{ .text = .{ .text = try gpa.dupe(u8, "t") } };
         defer cb.deinit(gpa);

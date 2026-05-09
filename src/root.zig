@@ -22,6 +22,11 @@ pub const sdk = @import("sdk.zig");
 /// `test_helpers.zig` relatively.
 pub const test_helpers = @import("test_helpers.zig");
 
+/// v2.4.0 — centralized allocator. All tests and production code
+/// that doesn't thread an allocator explicitly gets it from here.
+/// Change `src/global_allocator.zig` to swap the allocator project-wide.
+pub const global_allocator = @import("global_allocator.zig");
+
 pub const version = "2.3.0";
 
 test {

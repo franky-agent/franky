@@ -111,7 +111,7 @@ test "sdk aliases resolve" {
     // If the facade aliases drift from the source modules the tests
     // in the source modules will catch behavioral regressions; this
     // test is just a type-wiring smoke check.
-    const gpa = std.testing.allocator;
+    const gpa = @import("global_allocator.zig").gpa;
     var reg = Registry.init(gpa);
     defer reg.deinit();
     var ch = try Channel.init(gpa, 4);
@@ -121,7 +121,7 @@ test "sdk aliases resolve" {
 }
 
 test "sdk: one-shot faux round-trip via drainToMessage" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("global_allocator.zig").gpa;
 
     var threaded = std.Io.Threaded.init(gpa, .{ .argv0 = .empty, .environ = .empty });
     defer threaded.deinit();

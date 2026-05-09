@@ -186,7 +186,7 @@ test "Registry dispatches by API tag" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var reg = Registry.init(gpa);
     defer reg.deinit();
     try reg.register(.{ .api = "faux", .provider = "faux", .stream_fn = countingStream });
@@ -218,7 +218,7 @@ test "Registry returns error for unknown API tag" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var reg = Registry.init(gpa);
     defer reg.deinit();
 

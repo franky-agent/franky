@@ -32,7 +32,7 @@ const find_tool = franky.coding.tools.find;
 ///         deep.log          (ignored)
 fn buildTree(io: std.Io, base: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
     _ = cwd.deleteTree(io, base) catch {};
     try cwd.createDirPath(io, base);
     try mkdir(io, base, "build");
@@ -55,14 +55,14 @@ fn buildTree(io: std.Io, base: []const u8) !void {
 }
 
 fn mkdir(io: std.Io, base: []const u8, rel: []const u8) !void {
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
     const path = try std.fs.path.join(gpa, &.{ base, rel });
     defer gpa.free(path);
     try std.Io.Dir.cwd().createDirPath(io, path);
 }
 
 fn writeFile(io: std.Io, base: []const u8, rel: []const u8, contents: []const u8) !void {
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
     const path = try std.fs.path.join(gpa, &.{ base, rel });
     defer gpa.free(path);
     var f = try std.Io.Dir.cwd().createFile(io, path, .{});
@@ -75,7 +75,7 @@ fn runTool(
     io: std.Io,
     args_json: []const u8,
 ) !at.ToolResult {
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
     var cancel: ai.stream.Cancel = .{};
     const t = tool_module.tool();
     return try t.execute(&t, gpa, io, "call-1", args_json, &cancel, .{});
@@ -89,13 +89,13 @@ test "integration: ls respects nested .gitignore" {
     defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
     try buildTree(io, base);
 
-    const args = try std.fmt.allocPrint(std.testing.allocator,
+    const args = try std.fmt.allocPrint(franky.global_allocator.gpa,
         \\{{"path":"{s}","recursive":true,"maxDepth":10,"respectGitignore":true}}
     , .{base});
-    defer std.testing.allocator.free(args);
+    defer franky.global_allocator.gpa.free(args);
 
     var res = try runTool(ls_tool, io, args);
-    defer res.deinit(std.testing.allocator);
+    defer res.deinit(franky.global_allocator.gpa);
     const text = res.content[0].text.text;
 
     // Included: unignored code files and the .gitignore files themselves.
@@ -124,13 +124,13 @@ test "integration: find respects nested .gitignore" {
     defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
     try buildTree(io, base);
 
-    const args = try std.fmt.allocPrint(std.testing.allocator,
+    const args = try std.fmt.allocPrint(franky.global_allocator.gpa,
         \\{{"pattern":"**/*","cwd":"{s}","respectGitignore":true,"limit":500}}
     , .{base});
-    defer std.testing.allocator.free(args);
+    defer franky.global_allocator.gpa.free(args);
 
     var res = try runTool(find_tool, io, args);
-    defer res.deinit(std.testing.allocator);
+    defer res.deinit(franky.global_allocator.gpa);
     const text = res.content[0].text.text;
 
     try std.testing.expect(std.mem.indexOf(u8, text, "main.zig") != null);
@@ -153,13 +153,13 @@ test "integration: respectGitignore=false restores full tree" {
     defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
     try buildTree(io, base);
 
-    const args = try std.fmt.allocPrint(std.testing.allocator,
+    const args = try std.fmt.allocPrint(franky.global_allocator.gpa,
         \\{{"pattern":"**/*","cwd":"{s}","respectGitignore":false,"limit":500}}
     , .{base});
-    defer std.testing.allocator.free(args);
+    defer franky.global_allocator.gpa.free(args);
 
     var res = try runTool(find_tool, io, args);
-    defer res.deinit(std.testing.allocator);
+    defer res.deinit(franky.global_allocator.gpa);
     const text = res.content[0].text.text;
 
     try std.testing.expect(std.mem.indexOf(u8, text, "debug.log") != null);

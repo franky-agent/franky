@@ -217,7 +217,7 @@ test "Channel push/next round-trips in order" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var ch = try Channel(u32).init(gpa, 4);
     defer ch.deinit();
     try ch.push(io, 1);
@@ -233,7 +233,7 @@ test "closeWithFinal bypasses capacity" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var ch = try Channel(u32).init(gpa, 2);
     defer ch.deinit();
     try ch.push(io, 1);
@@ -250,7 +250,7 @@ test "push after close errors" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var ch = try Channel(u32).init(gpa, 4);
     defer ch.deinit();
     ch.close(io);
@@ -263,7 +263,7 @@ test "tryNext reports empty / event / closed without blocking" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var ch = try Channel(u32).init(gpa, 2);
     defer ch.deinit();
 
@@ -284,7 +284,7 @@ test "closeWithFinal is idempotent" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var ch = try Channel(u32).init(gpa, 2);
     defer ch.deinit();
     ch.closeWithFinal(io, 42);
@@ -307,7 +307,7 @@ test "deinit frees undrained items via drop_fn" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     DropRecording.drop_count = 0;
     var ch = try Channel([]u8).initWithDrop(gpa, 4, DropRecording.drop, gpa);
 
@@ -327,7 +327,7 @@ test "producer/consumer on separate threads" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var ch = try Channel(u32).init(gpa, 4);
     defer ch.deinit();
 

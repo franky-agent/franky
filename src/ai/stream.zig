@@ -749,7 +749,7 @@ fn writeFieldUint(
 // ─── tests ────────────────────────────────────────────────────────────
 
 test "Reducer accumulates text deltas into final message" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var r = Reducer.init(gpa);
     defer r.deinit();
 
@@ -769,7 +769,7 @@ test "Reducer accumulates text deltas into final message" {
 }
 
 test "Reducer handles tool call sequence" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var r = Reducer.init(gpa);
     defer r.deinit();
 
@@ -791,7 +791,7 @@ test "Reducer handles tool call sequence" {
 }
 
 test "Reducer interleaves thinking, text, tool-call by open order" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var r = Reducer.init(gpa);
     defer r.deinit();
 
@@ -817,7 +817,7 @@ test "Cancel is observable across threads" {
 }
 
 test "Reducer.apply absorbs .diagnostic events, finalize attaches non-empty (v1.29.0)" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var r = Reducer.init(gpa);
     defer r.deinit();
 
@@ -845,7 +845,7 @@ test "Reducer.apply absorbs .diagnostic events, finalize attaches non-empty (v1.
 }
 
 test "Reducer.finalize sets was_degenerate when message has zero content (v1.29.0)" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var r = Reducer.init(gpa);
     defer r.deinit();
     try r.apply(.{ .done = .{ .stop_reason = .stop } });
@@ -858,7 +858,7 @@ test "Reducer.finalize sets was_degenerate when message has zero content (v1.29.
 }
 
 test "Reducer.isLikelyDegenerate flips false on tool_call (v1.29.0)" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var r = Reducer.init(gpa);
     defer r.deinit();
     try std.testing.expect(r.isLikelyDegenerate());
@@ -867,7 +867,7 @@ test "Reducer.isLikelyDegenerate flips false on tool_call (v1.29.0)" {
 }
 
 test "Reducer.snapshotJson contains structural keys + diagnostics (v1.29.0)" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     var r = Reducer.init(gpa);
     defer r.deinit();
     try r.apply(.{ .text_delta = .{ .block_index = 0, .delta = "abc" } });

@@ -21,7 +21,7 @@ const replay = franky.coding.replay;
 const fixtures_root = "test/fixtures";
 
 test "fixtures: every <provider>/<scenario> trace replays to its events.jsonl" {
-    const gpa = std.testing.allocator;
+    const gpa = franky.global_allocator.gpa;
     var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
     const io = threaded.io();

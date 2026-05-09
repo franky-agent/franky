@@ -231,7 +231,7 @@ test "ErrorDetails.toError maps codes" {
 }
 
 test "ErrorDetails.dupe owns memory" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     const src: ErrorDetails = .{
         .code = .rate_limited,
         .message = "slow down",

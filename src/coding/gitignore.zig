@@ -704,7 +704,7 @@ test "gitignore: character class" {
 }
 
 test "gitignore: loadFromTree walks and composes files on disk" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{
+    var threaded = std.Io.Threaded.init(@import("../global_allocator.zig").gpa, .{
         .argv0 = .empty,
         .environ = .empty,
     });
@@ -744,7 +744,7 @@ test "gitignore: loadFromTree walks and composes files on disk" {
 // (2) both files coexist in the same tree without interference.
 
 test "gitignore: loadFromTreeNamed loads .contextignore files (§6.9)" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{
+    var threaded = std.Io.Threaded.init(@import("../global_allocator.zig").gpa, .{
         .argv0 = .empty,
         .environ = .empty,
     });
@@ -785,7 +785,7 @@ test "gitignore: loadFromTreeNamed loads .contextignore files (§6.9)" {
 }
 
 test "gitignore: .gitignore and .contextignore coexist as independent stacks (§6.9)" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{
+    var threaded = std.Io.Threaded.init(@import("../global_allocator.zig").gpa, .{
         .argv0 = .empty,
         .environ = .empty,
     });
@@ -822,7 +822,7 @@ test "gitignore: .gitignore and .contextignore coexist as independent stacks (§
 }
 
 test "gitignore: loadFromTreeNamed on a tree without that file returns an empty stack (§6.9)" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{
+    var threaded = std.Io.Threaded.init(@import("../global_allocator.zig").gpa, .{
         .argv0 = .empty,
         .environ = .empty,
     });

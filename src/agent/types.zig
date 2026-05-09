@@ -244,7 +244,7 @@ pub const AgentEvent = union(AgentEventKind) {
 };
 
 test "AgentEvent.deinit round-trips" {
-    const gpa = std.testing.allocator;
+    const gpa = @import("../global_allocator.zig").gpa;
     const ev = AgentEvent{
         .tool_execution_start = .{
             .call_id = try gpa.dupe(u8, "id-1"),
