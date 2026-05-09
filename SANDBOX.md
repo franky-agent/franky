@@ -23,7 +23,8 @@ teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host ollama.com 
 sbx secret set-custom -g --host openrouter.ai --env OPENROUTER_KEY --value ${OPENROUTER_KEY}
 
 # gemini
-echo "$GEMINI_API_KEY" | sbx secret set -g google
+teller run --reset --shell -- sh -c 'echo "$GEMINI_API_KEY" | sbx secret set -g google'
+teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host googleapis.com --env OLLAMA_KEY --value ${GEMINI_API_KEY}'
 
 # openai
 echo "$OPENAI_API_KEY" | sbx secret set -g openai

@@ -868,6 +868,7 @@ fn helpHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void 
         \\| `/improve` | Cross-session self-improvement report (mines past summaries) |
         \\| `/skills` | List loaded skills + which are active for this workspace |
         \\| `/design` | Open the Design Documents panel |
+        \\| `/restart` | Restart the franky process (spawn-and-exit) |
         \\| `/quit` | Close this browser tab |
         \\
     );
@@ -1171,11 +1172,15 @@ fn restartHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!vo
     px.side_effect = .restarting;
     px.session.restart_requested.store(true, .release);
     // Connect a localhost socket to kick the main loop's blocking
-    // accept() so it polls the restart flag promptly.
+    // accept() so it polls the restart flag promptly. Best-effort;
+    // if the connection fails (e.g. port mismatch in test) the flag
+    // will be picked up on the next external connection.
     const port = px.session.cfg.proxy_port orelse default_port;
-    var kick = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return;
-    var stream = std.Io.net.IpAddress.connect(&kick, px.session.io, .{ .mode = .stream }) catch return;
-    stream.close(px.session.io);
+    if (std.Io.net.IpAddress.parseIp4("127.0.0.1", port)) |kick| {
+        if (std.Io.net.IpAddress.connect(&kick, px.session.io, .{ .mode = .stream })) |stream| {
+            stream.close(px.session.io);
+        } else |_| {}
+    } else |_| {}
     try ctx.output.appendSlice(ctx.allocator, "Restarting…");
 }
 
@@ -4119,7 +4124,7 @@ test "slash: /help lists all batch-1 commands" {
     const r = try dispatchSlashForTest(gpa, io, &cfg, &environ_map, "/help", null);
     defer gpa.free(r.output);
     try testing.expect(r.err == null);
-    inline for (.{ "/help", "/clear", "/model", "/tools", "/tool", "/thinking", "/cost", "/export", "/quit" }) |needle| {
+    inline for (.{ "/help", "/clear", "/model", "/tools", "/tool", "/thinking", "/cost", "/export", "/quit", "/restart" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, r.output, needle) != null);
     }
 }
@@ -4579,6 +4584,29 @@ test "slash: /compact on short transcript reports not-yet-compactable" {
     try testing.expectEqual(SlashSideEffect.none, px.side_effect);
     // Transcript untouched.
     try testing.expectEqual(orig_len, session.transcript.messages.items.len);
+}
+
+test "slash: /restart sets side_effect + flag" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var cfg = try cli_mod.parse(gpa, &.{ "franky", "--port", "0" });
+    defer cfg.deinit();
+    var environ_map = std.process.Environ.Map.init(gpa);
+    defer environ_map.deinit();
+
+    var session_ptr: *Session = undefined;
+    const r = try dispatchSlashForTest(gpa, io, &cfg, &environ_map, "/restart", &session_ptr);
+    defer {
+        session_ptr.deinit();
+        gpa.destroy(session_ptr);
+    }
+    defer gpa.free(r.output);
+    try testing.expect(r.err == null);
+    try testing.expectEqual(SlashSideEffect.restarting, r.side_effect);
+    try testing.expect(session_ptr.restart_requested.load(.acquire));
+    try testing.expect(std.mem.indexOf(u8, r.output, "Restarting") != null);
 }
 
 test "slash: /compact registered + listed in /help" {
