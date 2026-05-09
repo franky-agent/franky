@@ -4687,6 +4687,30 @@ test "proxy: POST /command end-to-end via HTTP" {
     try testing.expect(std.mem.indexOf(u8, resp.items, "Available slash commands") != null);
 }
 
+test "proxy: POST /restart returns 200 and sets restart flag" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var setup = bindLoopback(io) orelse return;
+    defer setup.server.deinit(io);
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--port", "0" });
+    defer ts.deinit();
+
+    const req = "POST /restart HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(gpa);
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, req, &resp);
+
+    try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.items, "\"ok\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.items, "\"restarting\":true") != null);
+    try testing.expect(ts.session.restart_requested.load(.acquire));
+}
+
 test "proxy: keepalive thread broadcasts ping frames to subscribers" {
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
