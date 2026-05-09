@@ -128,7 +128,7 @@ git stash pop
 ```
 May also define other commands as well
 
-# Lets increase max_turn
+# Lets increase max_turn (Done)
 
 Increase max_turn = 100 by default and also check i think its defined in to many places.
 Also check if we can set it in the settings.json and as cli arg.
@@ -155,7 +155,7 @@ Lets have a brainstorimg session about how add lsp (language server protocol) su
 
 Do a detail web research spawn sub agent to speed up the research.
 
-# Check the Intent Integrity Chain Approach (Deep Research)
+# Check the Intent Integrity Chain Approach (Done)
 
 Use web search if need. https://github.com/intent-integrity-chain/kit
 The headline is never trust a monkey how to verify code without reading it.

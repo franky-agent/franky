@@ -19,7 +19,8 @@ RUN sudo sed -i 's|^pub const allocator = allocator_instance.allocator();$|pub c
 
 COPY --chown=agent:agent settings.json /home/agent/.franky/settings.json
 RUN wget https://github.com/fr12k/franky/releases/latest/download/franky_${TARGETOS}_${TARGETARCH} && \
-    mv franky_${TARGETOS}_${TARGETARCH} /usr/local/bin/franky
+    mv franky_${TARGETOS}_${TARGETARCH} /usr/local/bin/franky && \
+    chmod +x /usr/local/bin/franky
 
 USER agent
 RUN go install golang.org/x/vuln/cmd/govulncheck@latest
