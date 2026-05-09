@@ -156,6 +156,7 @@ pub fn build(b: *std.Build) void {
         "test/parallel_tools_test.zig",
         "test/kitchen_sink_test.zig",
         "test/replay_test.zig",
+        "test/mode_test.zig",
     };
     for (integration_files) |path| {
         const mod = b.createModule(.{

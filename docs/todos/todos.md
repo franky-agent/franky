@@ -119,3 +119,19 @@ ool: bash done
 ./.git/packed-refs
 ./.git/COMMIT_EDITMSG
 ```
+
+# Prevent possible destructive bash commands
+
+Prevent destructive bash commands like
+```
+git stash pop
+```
+May also define other commands as well
+
+# Lets increase max_turn
+
+Increase max_turn = 100 by default and also check i think its defined in to many places.
+Also check if we can set it in the settings.json and as cli arg.
+
+
+# Compile Guard has to run after finish_task

@@ -630,13 +630,13 @@ test "loadLayered: review.profiles + scalars parse correctly (A1)" {
         var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.franky/settings.json", .{});
         defer f.close(io);
         try f.writeStreamingAll(io,
-            \\{"review":{"profiles":["ollama-gemma4","ollama-deepseek-flash"],"minModels":3,"maxModels":5,"timeoutMs":120000}}
+            \\{"review":{"profiles":["mistral-medium-3-5","ollama-deepseek-flash"],"minModels":3,"maxModels":5,"timeoutMs":120000}}
         );
     }
     var s = try loadLayered(testing.allocator, io, base, null);
     defer s.deinit();
     try testing.expectEqual(@as(usize, 2), s.review_profiles.len);
-    try testing.expectEqualStrings("ollama-gemma4", s.review_profiles[0]);
+    try testing.expectEqualStrings("mistral-medium-3-5", s.review_profiles[0]);
     try testing.expectEqualStrings("ollama-deepseek-flash", s.review_profiles[1]);
     try testing.expectEqual(@as(u32, 3), s.review_min_models);
     try testing.expectEqual(@as(u32, 5), s.review_max_models);
@@ -660,14 +660,14 @@ test "loadLayered: review.profiles concatenate across layers (A2)" {
         var f = try std.Io.Dir.cwd().createFile(io, proj ++ "/.franky/settings.json", .{});
         defer f.close(io);
         try f.writeStreamingAll(io,
-            \\{"review":{"profiles":["gemini"]}}
+            \\{"review":{"profiles":["mistral-medium-3-5"]}}
         );
     }
     {
         var f = try std.Io.Dir.cwd().createFile(io, home ++ "/.franky/settings.json", .{});
         defer f.close(io);
         try f.writeStreamingAll(io,
-            \\{"review":{"profiles":["ollama-gemma4","claude-sonnet"]}}
+            \\{"review":{"profiles":["mistral-medium-3-5","claude-sonnet"]}}
         );
     }
     var s = try loadLayered(testing.allocator, io, proj, home);

@@ -559,6 +559,15 @@ fn replaceSpanWithSummary(
         if (drop_count > 0) {
             // Shift-left the tail [end..len) into [start+1..].
             const len = transcript.messages.items.len;
+            // v2.18 — invariant check: the tail [end..len) must fit
+            // exactly into the destination range [start+1..len-drop_count).
+            const dst_start = start + 1;
+            const dst_end = len - drop_count;
+            const src_start = end;
+            const src_end = len;
+            std.debug.assert(src_start <= src_end);
+            std.debug.assert(dst_start <= dst_end);
+            std.debug.assert(dst_end - dst_start == src_end - src_start);
             std.mem.copyForwards(
                 agent_loop.AgentMessage,
                 transcript.messages.items[start + 1 .. len - drop_count],
@@ -960,4 +969,147 @@ test "findToolResult: matches on id, ignores other roles" {
     try testing.expectEqual(@as(u32, 1), findToolResult(&messages, "abc").?);
     try testing.expectEqual(@as(u32, 2), findToolResult(&messages, "xyz").?);
     try testing.expect(findToolResult(&messages, "nope") == null);
+}
+
+// ─── v2.18 — replaceSpanWithSummary unit tests ──────────────────
+
+/// Helper: build a user/assistant message with heap-allocated content
+/// so that `replaceSpanWithSummary` can safely deinit replaced slots.
+fn buildMsg(gpa: std.mem.Allocator, text: []const u8, role: types.Role, ts: i64) !types.Message {
+    const owned_text = try gpa.dupe(u8, text);
+    const content = try gpa.alloc(types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = owned_text } };
+    return .{
+        .role = role,
+        .content = content,
+        .timestamp = ts,
+    };
+}
+
+test "replaceSpanWithSummary: replaces first N messages (start=0)" {
+    const gpa = testing.allocator;
+    var transcript = agent_loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.append(try buildMsg(gpa, "user 0", .user, 100));
+    try transcript.append(try buildMsg(gpa, "asst 0", .assistant, 101));
+    try transcript.append(try buildMsg(gpa, "user 1", .user, 102));
+    try transcript.append(try buildMsg(gpa, "asst 1", .assistant, 103));
+    try transcript.append(try buildMsg(gpa, "user 2", .user, 104));
+    try transcript.append(try buildMsg(gpa, "asst 2", .assistant, 105));
+
+    const summary_text = try gpa.dupe(u8, "SUMMARY: first two messages compacted");
+    try replaceSpanWithSummary(gpa, &transcript, 0, 2, summary_text, 200, types.Model{ .id = "test", .provider = "faux", .api = "faux" }, 2);
+
+    // Length: 6 - (2 - 1) = 5
+    try testing.expectEqual(@as(usize, 5), transcript.messages.items.len);
+
+    // First message is the summary
+    try testing.expectEqualStrings("SUMMARY: first two messages compacted", transcript.messages.items[0].content[0].text.text);
+    try testing.expectEqual(types.Role.custom, transcript.messages.items[0].role);
+    try testing.expectEqualStrings("compaction_summary", transcript.messages.items[0].custom_role.?);
+
+    // Remaining messages shifted correctly
+    try testing.expectEqualStrings("user 1", transcript.messages.items[1].content[0].text.text);
+    try testing.expectEqualStrings("asst 1", transcript.messages.items[2].content[0].text.text);
+    try testing.expectEqualStrings("user 2", transcript.messages.items[3].content[0].text.text);
+    try testing.expectEqualStrings("asst 2", transcript.messages.items[4].content[0].text.text);
+}
+
+test "replaceSpanWithSummary: replaces last N messages (end=len)" {
+    const gpa = testing.allocator;
+    var transcript = agent_loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.append(try buildMsg(gpa, "user 0", .user, 100));
+    try transcript.append(try buildMsg(gpa, "asst 0", .assistant, 101));
+    try transcript.append(try buildMsg(gpa, "user 1", .user, 102));
+    try transcript.append(try buildMsg(gpa, "asst 1", .assistant, 103));
+    try transcript.append(try buildMsg(gpa, "user 2", .user, 104));
+    try transcript.append(try buildMsg(gpa, "asst 2", .assistant, 105));
+
+    const summary_text = try gpa.dupe(u8, "SUMMARY: last two messages compacted");
+    try replaceSpanWithSummary(gpa, &transcript, 4, 6, summary_text, 200, types.Model{ .id = "test", .provider = "faux", .api = "faux" }, 2);
+
+    // Length: 6 - (2 - 1) = 5
+    try testing.expectEqual(@as(usize, 5), transcript.messages.items.len);
+
+    // Last message is the summary
+    try testing.expectEqualStrings("SUMMARY: last two messages compacted", transcript.messages.items[4].content[0].text.text);
+
+    // Earlier messages unchanged
+    try testing.expectEqualStrings("user 0", transcript.messages.items[0].content[0].text.text);
+    try testing.expectEqualStrings("asst 0", transcript.messages.items[1].content[0].text.text);
+}
+
+test "replaceSpanWithSummary: replaces a middle span" {
+    const gpa = testing.allocator;
+    var transcript = agent_loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.append(try buildMsg(gpa, "user 0", .user, 100));
+    try transcript.append(try buildMsg(gpa, "asst 0", .assistant, 101));
+    try transcript.append(try buildMsg(gpa, "user 1", .user, 102));
+    try transcript.append(try buildMsg(gpa, "asst 1", .assistant, 103));
+    try transcript.append(try buildMsg(gpa, "user 2", .user, 104));
+    try transcript.append(try buildMsg(gpa, "asst 2", .assistant, 105));
+    try transcript.append(try buildMsg(gpa, "user 3", .user, 106));
+
+    const summary_text = try gpa.dupe(u8, "SUMMARY: middle messages compacted");
+    try replaceSpanWithSummary(gpa, &transcript, 2, 5, summary_text, 200, types.Model{ .id = "test", .provider = "faux", .api = "faux" }, 3);
+
+    // Length: 7 - (3 - 1) = 5
+    try testing.expectEqual(@as(usize, 5), transcript.messages.items.len);
+
+    // Summary is at index 2 (start)
+    try testing.expectEqualStrings("SUMMARY: middle messages compacted", transcript.messages.items[2].content[0].text.text);
+
+    // First two messages unchanged
+    try testing.expectEqualStrings("user 0", transcript.messages.items[0].content[0].text.text);
+    try testing.expectEqualStrings("asst 0", transcript.messages.items[1].content[0].text.text);
+
+    // Tail shifted correctly
+    try testing.expectEqualStrings("asst 2", transcript.messages.items[3].content[0].text.text);
+    try testing.expectEqualStrings("user 3", transcript.messages.items[4].content[0].text.text);
+}
+
+test "replaceSpanWithSummary: replaces a single message" {
+    const gpa = testing.allocator;
+    var transcript = agent_loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.append(try buildMsg(gpa, "user 0", .user, 100));
+    try transcript.append(try buildMsg(gpa, "asst 0", .assistant, 101));
+    try transcript.append(try buildMsg(gpa, "user 1", .user, 102));
+
+    const summary_text = try gpa.dupe(u8, "SUMMARY: single message replaced");
+    try replaceSpanWithSummary(gpa, &transcript, 1, 2, summary_text, 200, types.Model{ .id = "test", .provider = "faux", .api = "faux" }, 1);
+
+    // Length: 3 - (1 - 1) = 3 — single message replaced in place
+    try testing.expectEqual(@as(usize, 3), transcript.messages.items.len);
+
+    try testing.expectEqualStrings("SUMMARY: single message replaced", transcript.messages.items[1].content[0].text.text);
+    try testing.expectEqualStrings("user 0", transcript.messages.items[0].content[0].text.text);
+    try testing.expectEqualStrings("user 1", transcript.messages.items[2].content[0].text.text);
+}
+
+test "replaceSpanWithSummary: zero-length span (start == end) inserts without removal" {
+    const gpa = testing.allocator;
+    var transcript = agent_loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.append(try buildMsg(gpa, "user 0", .user, 100));
+    try transcript.append(try buildMsg(gpa, "asst 0", .assistant, 101));
+    try transcript.append(try buildMsg(gpa, "user 1", .user, 102));
+
+    const summary_text = try gpa.dupe(u8, "SUMMARY: inserted at position 1");
+    try replaceSpanWithSummary(gpa, &transcript, 1, 1, summary_text, 200, types.Model{ .id = "test", .provider = "faux", .api = "faux" }, 0);
+
+    // Length: 3 - (0 - 1) = 4 — summary inserted at index 1, others shifted right
+    try testing.expectEqual(@as(usize, 4), transcript.messages.items.len);
+
+    try testing.expectEqualStrings("user 0", transcript.messages.items[0].content[0].text.text);
+    try testing.expectEqualStrings("SUMMARY: inserted at position 1", transcript.messages.items[1].content[0].text.text);
+    try testing.expectEqualStrings("asst 0", transcript.messages.items[2].content[0].text.text);
+    try testing.expectEqualStrings("user 1", transcript.messages.items[3].content[0].text.text);
 }

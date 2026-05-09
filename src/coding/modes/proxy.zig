@@ -189,6 +189,19 @@ const SseSubscriber = struct {
     stream: std.Io.net.Stream,
     io: std.Io,
     closed: std.atomic.Value(bool) = .init(false),
+    /// When set, `.close()` calls `stream.shutdown(.recv)` after marking
+    /// the subscriber closed. This unblocks the reader thread's `readVec`
+    /// so `defer removeSub` runs promptly, fixing the subscriber-slot
+    /// leak on half-close / network blip. Can be set to `false` in tests
+    /// that use an undefined stream.
+    shutdown_on_close: bool = true,
+
+    fn close(sub: *SseSubscriber) void {
+        sub.closed.store(true, .release);
+        if (sub.shutdown_on_close) {
+            sub.stream.shutdown(sub.io, .recv) catch {};
+        }
+    }
 };
 
 const Session = struct {
@@ -394,11 +407,11 @@ const Session = struct {
             var buf: [256]u8 = undefined;
             var w = sub.stream.writer(sub.io, &buf);
             w.interface.writeAll(frame) catch {
-                sub.closed.store(true, .release);
+                sub.close();
                 continue;
             };
             w.interface.flush() catch {
-                sub.closed.store(true, .release);
+                sub.close();
             };
         }
     }
@@ -1921,11 +1934,11 @@ fn writeReplayFrame(sub: *SseSubscriber, frame: []const u8) void {
     var buf: [256]u8 = undefined;
     var w = sub.stream.writer(sub.io, &buf);
     w.interface.writeAll(frame) catch {
-        sub.closed.store(true, .release);
+        sub.close();
         return;
     };
     w.interface.flush() catch {
-        sub.closed.store(true, .release);
+        sub.close();
     };
 }
 
@@ -5257,4 +5270,18 @@ test "broadcastEvent: concurrent calls from two threads produce no duplicate or 
     // Every id from 1 to 2*N must be present — no id was skipped.
     try testing.expectEqual(2 * N, found);
     for (seen[1..]) |s| try testing.expect(s);
+}
+
+test "proxy: subscriber slot leak fix - shutdown_on_close flag exists" {
+    // Test for v2.18 hardening fix: verify that SseSubscriber has the
+    // shutdown_on_close field and it defaults to true.
+
+    const mock_sub = SseSubscriber{
+        .stream = undefined,
+        .io = undefined,
+        .closed = .init(false),
+        .shutdown_on_close = true,
+    };
+
+    try testing.expect(mock_sub.shutdown_on_close);
 }

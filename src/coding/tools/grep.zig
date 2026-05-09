@@ -154,10 +154,22 @@ fn execute(
     // `grep_bad_regex` tool error before we touch the filesystem.
     var matcher: Matcher = undefined;
     if (use_regex) {
+        // v2.18 — strip unsupported ECMAScript assertions (\\b, \\B) that
+        // models reliably emit because every other regex engine supports them.
+        // Lookaround assertions ((?=, (?!, (?<=, (?<!) are also unsupported
+        // and cause a fallback to literal-substring mode.
+        const stripped = stripUnsupportedAssertions(pattern, allocator) catch {
+            // Fall through to literal mode when lookaround is present.
+            matcher = .{ .literal = .{ .pattern = pattern, .case_sensitive = case_sensitive } };
+            defer matcher.deinit();
+            return try grepTree(allocator, io, path, &matcher, files_glob, context_before, context_after, max_matches, respect_gitignore, cancel);
+        };
+        defer allocator.free(stripped);
+
         var report: regex_mod.ErrorReport = .{};
         matcher = .{ .regex = regex_mod.compileOpts(
             allocator,
-            pattern,
+            stripped,
             .{ .case_insensitive = !case_sensitive },
             &report,
         ) catch |e| {
@@ -223,6 +235,79 @@ fn badRegexError(
     );
     defer allocator.free(msg);
     return common.toolError(allocator, "grep_bad_regex", msg);
+}
+
+/// v2.18 — strip word-boundary assertions (`\b`, `\B`) unsupported
+/// by Zig's ECMAScript-subset regex engine. These are the most common
+/// patterns that models emit from PCRE/JavaScript/Go muscle memory.
+///
+/// Returns `error.UnsupportedRegexAssertion` for lookaround assertions
+/// (`(?=`, `(?!`, `(?<=`, `(?<!`) which cannot be stripped without
+/// changing semantics — callers should fall back to literal-substring mode.
+fn stripUnsupportedAssertions(
+    pattern: []const u8,
+    allocator: std.mem.Allocator,
+) (error{UnsupportedRegexAssertion} || std.mem.Allocator.Error)![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < pattern.len) {
+        if (pattern[i] == '\\') {
+            // Count consecutive backslashes.
+            var bs_count: usize = 1;
+            while (i + bs_count < pattern.len and pattern[i + bs_count] == '\\') : (bs_count += 1) {}
+
+            if (i + bs_count < pattern.len and (pattern[i + bs_count] == 'b' or pattern[i + bs_count] == 'B')) {
+                // `\b` / `\B` — word boundary assertion.
+                // In ECMAScript regex, `\b` is a word boundary iff the
+                // number of preceding backslashes is odd (meaning the `\`
+                // sequence is the escape). If even, the last backslash
+                // escapes the backslash before it, and `b` is literal.
+                if (bs_count % 2 == 1) {
+                    // Odd backslashes: the `\b` is a word boundary.
+                    // Strip the entire sequence (backslashes + b/B).
+                    i += bs_count + 1;
+                    continue;
+                } else {
+                    // Even backslashes: `\\` escapes itself, so `b`/`B` is
+                    // a literal char. Copy backslashes then the literal char.
+                    for (0..bs_count) |_| {
+                        try out.append(allocator, '\\');
+                    }
+                    try out.append(allocator, pattern[i + bs_count]);
+                    i += bs_count + 1;
+                    continue;
+                }
+            } else {
+                // Not a `\b`/`\B` sequence — copy all backslashes.
+                for (0..bs_count) |_| {
+                    try out.append(allocator, '\\');
+                }
+                i += bs_count;
+                continue;
+            }
+        }
+        // Lookaround assertions — cannot strip without semantic change.
+        if (i + 3 < pattern.len) {
+            if (std.mem.eql(u8, pattern[i..i+3], "(?=") or
+                std.mem.eql(u8, pattern[i..i+3], "(?!"))
+            {
+                return error.UnsupportedRegexAssertion;
+            }
+        }
+        // Lookbehind assertions are 4 chars: (?<=, (?<!
+        if (i + 4 < pattern.len) {
+            if (std.mem.eql(u8, pattern[i..i+4], "(?<=") or
+                std.mem.eql(u8, pattern[i..i+4], "(?<!"))
+            {
+                return error.UnsupportedRegexAssertion;
+            }
+        }
+        try out.append(allocator, pattern[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn grepTree(
@@ -1081,4 +1166,51 @@ test "grep tool: total output is byte-capped at default_max_bytes (v1.27.1)" {
     // Cap is 50 KB; allow some headroom for the notice trailer.
     try testing.expect(text.len <= 60 * 1024);
     try testing.expect(std.mem.indexOf(u8, text, "byte limit reached") != null);
+}
+
+test "stripUnsupportedAssertions: strips \\b and \\B" {
+    const gpa = testing.allocator;
+
+    const stripped = try stripUnsupportedAssertions("fn foo\\b", gpa);
+    defer gpa.free(stripped);
+    try testing.expectEqualStrings("fn foo", stripped);
+
+    const stripped_b = try stripUnsupportedAssertions("foo\\Bbar", gpa);
+    defer gpa.free(stripped_b);
+    try testing.expectEqualStrings("foobar", stripped_b);
+
+    const both = try stripUnsupportedAssertions("\\b\\B", gpa);
+    defer gpa.free(both);
+    try testing.expectEqualStrings("", both);
+}
+
+test "stripUnsupportedAssertions: plain pattern passes through unchanged" {
+    const gpa = testing.allocator;
+    const plain = try stripUnsupportedAssertions("fn grep", gpa);
+    defer gpa.free(plain);
+    try testing.expectEqualStrings("fn grep", plain);
+
+    const with_meta = try stripUnsupportedAssertions("foo.*bar\\d+", gpa);
+    defer gpa.free(with_meta);
+    try testing.expectEqualStrings("foo.*bar\\d+", with_meta);
+}
+
+test "stripUnsupportedAssertions: literal backslash before b is preserved" {
+    const gpa = testing.allocator;
+    // Double-backslash = literal backslash followed by b — not \\b.
+    const lit = try stripUnsupportedAssertions("\\\\b", gpa);
+    defer gpa.free(lit);
+    try testing.expectEqualStrings("\\\\b", lit);
+}
+
+test "stripUnsupportedAssertions: lookaround assertions trigger UnsupportedRegexAssertion" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.UnsupportedRegexAssertion, stripUnsupportedAssertions("(?=foo)", gpa));
+    try testing.expectError(error.UnsupportedRegexAssertion, stripUnsupportedAssertions("(?!foo)", gpa));
+}
+
+test "stripUnsupportedAssertions: lookbehind assertions trigger UnsupportedRegexAssertion" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.UnsupportedRegexAssertion, stripUnsupportedAssertions("(?<=foo)", gpa));
+    try testing.expectError(error.UnsupportedRegexAssertion, stripUnsupportedAssertions("(?<!foo)", gpa));
 }

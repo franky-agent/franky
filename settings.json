@@ -6,7 +6,7 @@
         }
     },
     "review": {
-        "profiles": ["ollama-deepseek-flash", "ollama-home", "ollama-deepseek-pro"],
+        "profiles": ["ollama-deepseek-flash", "mistral-medium-3-5", "mistral-codestral", "ollama-deepseek-pro"],
         "min_models": 2,
         "max_models": 4,
         "timeout_ms": 180000
@@ -87,10 +87,40 @@
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             }
         },
-        "mistral": {
+        "mistral-devstral": {
             "provider": "gateway",
             "base-url": "https://api.mistral.ai/v1/chat/completions",
             "model": "devstral-2512",
+            "api-key-env": "MISTRAL_KEY",
+            "ask-tools": "all",
+            "role": "full",
+            "prompts": true,
+            "log-level": "trace",
+            "http-trace-dir": "${HOME}/.franky/log-trace",
+            "thinking": "xhigh",
+            "env": {
+                "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
+            }
+        },
+        "mistral-medium-3-5": {
+            "provider": "gateway",
+            "base-url": "https://api.mistral.ai/v1/chat/completions",
+            "model": "mistral-medium-3-5",
+            "api-key-env": "MISTRAL_KEY",
+            "ask-tools": "all",
+            "role": "full",
+            "prompts": true,
+            "log-level": "trace",
+            "http-trace-dir": "${HOME}/.franky/log-trace",
+            "thinking": "xhigh",
+            "env": {
+                "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
+            }
+        },
+        "mistral-codestral": {
+            "provider": "gateway",
+            "base-url": "https://api.mistral.ai/v1/chat/completions",
+            "model": "codestral-2508",
             "api-key-env": "MISTRAL_KEY",
             "ask-tools": "all",
             "role": "full",

@@ -135,15 +135,15 @@ pub fn readSessionHeader(
 }
 
 /// Free all strings allocated by `readSessionHeader`.
+/// v2.18 — uses comptime reflection to discover all `[]const u8` fields
+/// so adding a new owning-string field to `SessionHeader` automatically
+/// frees it without updating this function.
 pub fn freeSessionHeader(allocator: std.mem.Allocator, h: SessionHeader) void {
-    allocator.free(h.id);
-    allocator.free(h.title);
-    allocator.free(h.provider);
-    allocator.free(h.model);
-    allocator.free(h.api);
-    allocator.free(h.thinking_level);
-    allocator.free(h.active_branch);
-    allocator.free(h.system_prompt_hash);
+    inline for (@typeInfo(SessionHeader).@"struct".fields) |field| {
+        if (field.type == []const u8) {
+            allocator.free(@field(h, field.name));
+        }
+    }
 }
 
 /// Render a transcript's canonical JSON into `out`. Oversize
@@ -872,18 +872,44 @@ pub fn migrateSessionIfNeeded(
 /// must have its hash present in `keep`. Panics on mismatch.
 /// Stripped in ReleaseFast/ReleaseSmall, so the check is a debugging
 /// aid, not a security boundary.
+///
+/// Since in-memory `ContentBlock` does not carry a `.ref` variant
+/// (refs are created during serialization via `appendContentBlockJsonMaybeExtern`),
+/// this function re-serializes each content block and, if the rendered JSON
+/// exceeds `object_store.inline_threshold_bytes`, computes its SHA-256 hex
+/// and asserts it is present in `keep`. This catches call-site bugs where
+/// the `keep` list is assembled incompletely.
 pub fn assertRefsInKeep(
+    allocator: std.mem.Allocator,
     transcript: *const agent_mod.loop.Transcript,
     keep: []const []const u8,
 ) void {
+    if (builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall) return;
+
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(allocator);
     for (transcript.messages.items) |msg| {
         for (msg.content) |cb| {
-            if (cb == .text) {} else if (cb == .thinking) {} else if (cb == .image) {} else if (cb == .tool_call) {
-                // Not a ref — skip.
+            tmp.clearRetainingCapacity();
+            appendContentBlockJson(&tmp, allocator, cb) catch @panic("assertRefsInKeep: appendContentBlockJson failed");
+
+            if (tmp.items.len < object_store.inline_threshold_bytes) continue;
+
+            const hex = sha256Hex(allocator, tmp.items) catch @panic("assertRefsInKeep: sha256Hex failed");
+            defer allocator.free(hex);
+
+            var found = false;
+            for (keep) |h| {
+                if (std.mem.eql(u8, h, hex)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                @panic("object_store ref hash not in keep list — data loss risk");
             }
         }
     }
-    _ = keep;
 }
 
 // ─── convenience: top-level save/load ─────────────────────────────
@@ -1477,4 +1503,40 @@ test "Diagnostics round-trips through writeTranscript / readTranscript (v1.29.0)
     try testing.expectEqual(@as(?u64, 12), d.candidates_tokens);
     try testing.expectEqual(@as(?u64, 561), d.thoughts_tokens);
     try testing.expectEqual(@as(u32, 3), d.text_event_count);
+}
+
+test "assertRefsInKeep: large content block hash is verified in keep list" {
+    const gpa = testing.allocator;
+
+    // Build a text block whose re-serialized JSON crosses the threshold
+    // so that `appendContentBlockJsonMaybeExtern` would spill it.
+    const payload_len = object_store.inline_threshold_bytes + 100;
+    const big = try gpa.alloc(u8, payload_len);
+    defer gpa.free(big);
+    @memset(big, 'x');
+
+    var transcript = agent_mod.loop.Transcript.init(gpa);
+    defer transcript.deinit();
+    const content = try gpa.alloc(ai.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, big) } };
+    try transcript.append(.{ .role = .user, .content = content, .timestamp = 1 });
+
+    // Compute the expected hash by re-serializing (same logic as assertRefsInKeep).
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(gpa);
+    appendContentBlockJson(&tmp, gpa, transcript.messages.items[0].content[0]) catch @panic("test: appendContentBlockJson failed");
+
+    try testing.expect(tmp.items.len >= object_store.inline_threshold_bytes);
+
+    const hex = try sha256Hex(gpa, tmp.items);
+    defer gpa.free(hex);
+
+    // Assertion passes when the hash is in the keep list.
+    assertRefsInKeep(gpa, &transcript, &.{hex});
+
+    // We cannot test the negative case (empty keep) because
+    // assertRefsInKeep panics in Debug mode, which is not catchable
+    // in the test framework. The panic path is exercised implicitly
+    // by running tests: if the function ever panics here, the test
+    // binary crashes and CI fails.
 }
