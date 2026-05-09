@@ -130,10 +130,10 @@ pub const Agent = struct {
         /// pre-v1.22 semantics (no per-tool gate).
         tool_gate: ?ToolGate = null,
         /// Hard cap on the agent loop's turn count for every prompt.
-        /// SDK default matches `loop.Config.max_turns` (50). Mode
+        /// SDK default matches `loop.Config.max_turns` (100). Mode
         /// drivers may override via CLI / settings / profile before
         /// constructing the Agent.
-        max_turns: u32 = 50,
+        max_turns: u32 = 100,
         /// Optional max-turns hook. When the loop hits the cap, this
         /// callback is invoked; returning `.extend(N)` adds N more
         /// turns to the cap (additive — credits accumulate). Returning

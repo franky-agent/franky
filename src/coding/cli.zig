@@ -177,6 +177,9 @@ pub const Config = struct {
     /// in ms (default 180_000 = 3 min). 0 = unlimited. Settings key:
     /// `tools.retry.maxTotalMs`.
     retry_max_total_ms: ?u64 = null,
+    /// v2.13 — base delay for retry backoff in ms (default 10_000).
+    /// Read from profile `base_delay_ms` in settings.json.
+    retry_base_delay_ms: ?u32 = null,
 
     /// v2.16 — pre-rendered review configuration block for system-prompt
     /// injection. Populated by mode drivers from settings before calling
@@ -189,7 +192,7 @@ pub const Config = struct {
     review_config_block: ?[]const u8 = null,
 
     /// `--max-turns N` — hard cap on agent-loop turns per prompt.
-    /// Default 50. When the cap is reached, the loop emits
+    /// Default 100. When the cap is reached, the loop emits
     /// `agent_error{max_turns_exceeded}` (interactive mode prompts
     /// the user to extend; other modes terminate). Env fallback:
     /// `FRANKY_MAX_TURNS`. Settings/profile keys: `max_turns`.
@@ -541,7 +544,7 @@ pub const usage_text: []const u8 =
     \\  --first-byte-timeout-ms N    Max wait for first response byte (default 30000;
     \\                               raise for slow local LLMs e.g. Ollama on CPU)
     \\  --event-gap-timeout-ms N     Max gap between SSE events (default 60000)
-    \\  --max-turns N                Cap agent-loop turns per prompt (default 50).
+    \\  --max-turns N                Cap agent-loop turns per prompt (default 100).
     \\                               Reaching the cap emits agent_error{max_turns_exceeded};
     \\                               interactive mode prompts to extend.
     \\  --prompts                    Enable per-tool permission gate (Approach A)

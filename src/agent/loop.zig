@@ -253,7 +253,7 @@ pub const Config = struct {
     /// SDK field. When the loop reaches this cap, `on_max_turns` is
     /// called (if set); without a hook, or when the hook returns
     /// `.stop`, the loop emits `max_turns_exceeded` and closes.
-    max_turns: u32 = 50,
+    max_turns: u32 = 100,
     /// Optional hook fired when `turn_count == max_turns`. Returns
     /// either `.extend(N)` (additive — `max_turns += N`, loop continues)
     /// or `.stop` (loop emits `max_turns_exceeded` and closes).

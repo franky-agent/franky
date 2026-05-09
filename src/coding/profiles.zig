@@ -66,6 +66,9 @@ pub const Profile = struct {
     /// Per-profile retry policy overrides. CLI `--retry-max-*` always wins.
     retry_max_attempts: ?u32 = null,
     retry_max_total_ms: ?u64 = null,
+    /// Base delay for retry backoff in ms (default 10_000).
+    /// Read from `base_delay_ms` in the profile JSON.
+    base_delay_ms: ?u32 = null,
     /// Process-env-var assignments. Applied via `environ_map.put`
     /// before any mode reads timeouts, log vars, or other knobs.
     /// Values support `${VAR}` interpolation against the **caller's
@@ -235,6 +238,7 @@ fn parseProfileObject(
     if (optInt(u32, obj, "max_turns")) |v| p.max_turns = v;
     if (optInt(u32, obj, "retry_max_attempts")) |v| p.retry_max_attempts = v;
     if (optInt(u64, obj, "retry_max_total_ms")) |v| p.retry_max_total_ms = v;
+    if (optInt(u32, obj, "base_delay_ms")) |v| p.base_delay_ms = v;
 
     if (obj.get("env")) |env_v| if (env_v == .object) {
         var env_map = std.StringHashMap([]const u8).init(arena);
@@ -439,6 +443,9 @@ pub fn applyToCfg(
     };
     if (cfg.retry_max_total_ms == null) if (profile.retry_max_total_ms) |v| {
         cfg.retry_max_total_ms = v;
+    };
+    if (cfg.retry_base_delay_ms == null) if (profile.base_delay_ms) |v| {
+        cfg.retry_base_delay_ms = v;
     };
 
     // Thinking: only apply if user didn't pass --thinking on CLI.

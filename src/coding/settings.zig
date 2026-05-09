@@ -83,7 +83,7 @@ pub const Settings = struct {
 
     /// `max_turns: int` — settings-layer cap on agent-loop turn count
     /// per prompt. Precedence: CLI `--max-turns` > env `FRANKY_MAX_TURNS`
-    /// > profile `max_turns` > settings `max_turns` > built-in default 50.
+    /// > profile `max_turns` > settings `max_turns` > built-in default 100.
     max_turns: ?u32 = null,
 
     /// v2.13 — retry policy overrides. Parsed from `tools.retry.*`.

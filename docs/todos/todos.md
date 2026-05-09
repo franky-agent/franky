@@ -134,9 +134,9 @@ Increase max_turn = 100 by default and also check i think its defined in to many
 Also check if we can set it in the settings.json and as cli arg.
 
 
-# Compile Guard has to run after finish_task
+# Compile Guard has to run after finish_task (Done)
 
-# Add retry the base_delay_ms to the settings.json profiles.models
+# Add retry the base_delay_ms to the settings.json profiles.models (Done)
 
 Lets set it for mistral models to 40 seconds.
 
@@ -147,3 +147,23 @@ THe mistral api have trhe batch feature https://docs.mistral.ai/studio-api/batch
 CHeck if this is a unified standard across other providers like opanai, ollama, openrouter.
 
 Do a web research.
+
+
+# add lsp (language server protocol) support for zig
+
+Lets have a brainstorimg session about how add lsp (language server protocol) support atleast for ziglang and what it brings in terms of efficientcy compared to a llm that just uses plain text edit.
+
+Do a detail web research spawn sub agent to speed up the research.
+
+# Check the Intent Integrity Chain Approach (Deep Research)
+
+Use web search if need. https://github.com/intent-integrity-chain/kit
+The headline is never trust a monkey how to verify code without reading it.
+
+How we can add the core idea as guardrail implementation to franky agent.
+
+Then save an open design doc in docs/design/open/
+
+# List subagents/preset based on the available API KEYS.
+
+Also if a subagent was started with profile gemini but gemini api key is not there return hint with please use one of the following or change the subagent model without telling the parent agent.

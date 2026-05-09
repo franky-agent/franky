@@ -814,6 +814,9 @@ pub fn resolveRetryPolicyFromMap(
     } else if (settings) |s| {
         if (s.retry_max_total_ms) |v| p.max_total_delay_ms = v;
     }
+    if (cfg.retry_base_delay_ms) |v| {
+        p.base_delay_ms = v;
+    }
     return p;
 }
 
