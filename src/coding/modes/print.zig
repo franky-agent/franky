@@ -35,6 +35,7 @@ const diagnostics_mod = franky.coding.diagnostics;
 const slash_mod = franky.coding.slash;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
+const config_mod = franky.coding.config.resolver;
 
 /// Default model when the user didn't pass `--model`. Sonnet 4.6 is
 /// the current cost/latency sweet spot; Opus 4.6 is reachable via
@@ -205,296 +206,43 @@ fn runPrint(
     var stdout_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
 
-    // v1.7.5 — logger init moved up to `run()` so every mode
-    // (not just print) honors `--log-level`. See the parent
-    // dispatcher for the lifecycle.
-
-    // ── Provider selection ────────────────────────────────────────
-    // Use the io-aware resolver so `auth.json` + `settings.json`
-    // layers actually participate in the decision.
-    const provider_info = try resolveProviderIo(allocator, io, environ, cfg);
+    // v2.22 Phase 2 — use the unified config resolver instead of
+    // duplicating the 200-line init inline. All provider resolution,
+    // registry setup, workspace, bash/read state, tool filtering,
+    // permission store, preset registry, extensions, guardrails,
+    // subagent context, settings overlay, and review config block
+    // come from the single `config.resolve()` call.
+    var resolved = try config_mod.resolve(allocator, io, cfg, environ, environ_map, &.{});
+    defer resolved.deinit();
 
     {
-        const auth_scheme: []const u8 = if (provider_info.auth_token != null)
+        const auth_scheme: []const u8 = if (resolved.auth_token != null)
             "bearer"
-        else if (provider_info.api_key != null)
+        else if (resolved.api_key != null)
             "x-api-key"
         else
             "none";
         ai.log.log(.info, "cfg", "resolved", "provider={s} model={s} auth={s} thinking={s}", .{
-            provider_info.provider_name,
-            provider_info.model_id,
+            resolved.provider_name,
+            resolved.model_id,
             auth_scheme,
-            cfg.thinking.toString(),
+            resolved.thinking_level.toString(),
         });
     }
 
-    // ── Registry setup ────────────────────────────────────────────
-    var reg = ai.registry.Registry.init(allocator);
-    defer reg.deinit();
-
-    var faux = ai.providers.faux.FauxProvider.init(allocator);
-    defer faux.deinit();
-    try reg.register(.{
-        .api = "faux",
-        .provider = "faux",
-        .stream_fn = fauxShim,
-        .userdata = @ptrCast(&faux),
-    });
-    try reg.register(.{
-        .api = "anthropic-messages",
-        .provider = "anthropic",
-        .stream_fn = ai.providers.anthropic.streamFn,
-    });
-    try reg.register(.{
-        .api = "openai-chat-completions",
-        .provider = "openai",
-        .stream_fn = ai.providers.openai_chat.streamFn,
-    });
-    try reg.register(.{
-        .api = "openai-compatible-gateway",
-        .provider = "gateway",
-        .stream_fn = ai.providers.openai_gateway.streamFn,
-    });
-    try reg.register(.{
-        .api = "google-gemini",
-        .provider = "google-gemini",
-        .stream_fn = ai.providers.google_gemini.streamFn,
-    });
-
-    // If we're running the faux provider, seed a scripted response so the
-    // demo stays self-contained without an API key. The allocations below
-    // live until end-of-function; faux stores the event slice by
-    // reference without copying.
-    const faux_reply: ?[]u8 = if (std.mem.eql(u8, provider_info.provider_name, "faux"))
-        try std.fmt.allocPrint(allocator, "you said: {s}", .{cfg.prompt})
-    else
-        null;
-    defer if (faux_reply) |r| allocator.free(r);
-
-    var faux_events: [1]ai.providers.faux.Event = undefined;
-    if (faux_reply) |r| {
-        faux_events[0] = .{ .text = .{ .text = r, .chunk_size = 8 } };
-        try faux.push(.{ .events = faux_events[0..] });
-    }
-
-    // ── Workspace + env policy ─────────────────────────────────────
-    // Path-taking tools get canonicalized against `workspace_root`;
-    // bash filters subprocess env through the `env_denylist`. When
-    // `PWD` is absent (piped invocations, etc.) we skip the §R
-    // wiring and fall back to the v0.4.* behavior so we don't
-    // silently block every path with a `workspace_root_invalid`
-    // error.
-    const workspace_root: ?[]const u8 = environ.getPosix("PWD");
-    var workspace_state: ?tools_mod.workspace.Workspace = if (workspace_root) |root|
-        tools_mod.workspace.Workspace{ .root = root, .host_env = environ_map }
-    else
-        null;
-
-    var bash_state = tools_mod.bash.SessionBashState.init(allocator);
-    defer bash_state.deinit();
-    var read_ctx = tools_mod.read.ReadCtx{
-        .workspace = if (workspace_state) |*ws| ws else null,
-    };
-    {
-        var settings = try loadSettingsForOverlay(allocator, io, environ);
-        defer settings.deinit();
-        applyBashSettingsOverlay(&bash_state, &settings);
-        applyReadSettingsOverlay(&read_ctx, &settings);
-        applyMaxTurnsSettingsOverlay(cfg, &settings);
-        applyRetrySettingsOverlay(cfg, &settings);
-
-        // v2.16 — pre-render the review config block for system-prompt injection.
-        // Only populate when profiles are configured so the block is non-empty.
-        if (settings.review_profiles.len > 0) {
-            const ca = cfg.arena.allocator();
-            // Build a comma-separated profile list for readability.
-            var pb: std.ArrayList(u8) = .empty;
-            defer pb.deinit(ca);
-            for (settings.review_profiles, 0..) |p, i| {
-                if (i > 0) try pb.appendSlice(ca, ", ");
-                try pb.appendSlice(ca, p);
-            }
-            const profiles_csv = try pb.toOwnedSlice(ca);
-            defer ca.free(profiles_csv);
-            cfg.review_config_block = try std.fmt.allocPrint(
-                ca,
-                "## Review configuration\n" ++
-                "profiles: {s}\n" ++
-                "min_models: {d}\n" ++
-                "max_models: {d}\n" ++
-                "timeout_ms: {d}",
-                .{
-                    profiles_csv,
-                    settings.review_min_models,
-                    settings.review_max_models,
-                    settings.review_timeout_ms,
-                },
-            );
-        }
-    }
-    var bash_ctx = tools_mod.bash.BashCtx{
-        .state = &bash_state,
-        .workspace = if (workspace_state) |*ws| ws else null,
-    };
-    var web_search_ctx = tools_mod.web_search.WebSearchCtx{
-        .environ_map = environ_map,
-    };
-
-    // ── Tool registration ──────────────────────────────────────────
-    // When a workspace root is known, each path-taking tool routes
-    // user-supplied paths through `path_safety.canonicalize`; bash
-    // gets the combined state+workspace ctx and read gets the
-    // ReadCtx (workspace + settings overlay). Otherwise we keep the
-    // v0.4.* plain factories.
-    const all_tools = if (workspace_state) |*ws| [_]at.AgentTool{
-        tools_mod.read.toolWithCtx(&read_ctx),
-        tools_mod.write.toolWithWorkspace(ws),
-        tools_mod.edit.toolWithWorkspace(ws),
-        tools_mod.bash.toolWithStateAndWorkspace(&bash_ctx),
-        tools_mod.ls.toolWithWorkspace(ws),
-        tools_mod.find.toolWithWorkspace(ws),
-        tools_mod.grep.toolWithWorkspace(ws),
-        tools_mod.web_search.toolWithCtx(&web_search_ctx),
-        tools_mod.web_fetch.toolWithCtx(&web_search_ctx),
-    } else [_]at.AgentTool{
-        tools_mod.read.tool(),
-        tools_mod.write.tool(),
-        tools_mod.edit.tool(),
-        tools_mod.bash.toolWithState(&bash_state),
-        tools_mod.ls.tool(),
-        tools_mod.find.tool(),
-        tools_mod.grep.tool(),
-        tools_mod.web_search.toolWithCtx(&web_search_ctx),
-        tools_mod.web_fetch.toolWithCtx(&web_search_ctx),
-    };
-
-    const active_role = if (cfg.role) |s|
-        role_mod.Role.fromString(s) catch return exitWithMessage(
-            io,
-            "unknown --role; pick one of read, plan, code, full\n",
-            2,
-        )
-    else
-        role_mod.Role.plan;
-    var role_gate = role_mod.RoleGate.init(active_role);
-    const filtered_tools = try role_mod.filterTools(allocator, &all_tools, role_gate.set);
-    defer allocator.free(filtered_tools);
-
-    // Permission gate (Approach A). Disabled by default to keep
-    // backward compat; `--prompts` opts in. Print mode has no
-    // pause-and-prompt UI, so any "ask" decision falls through to
-    // deny with a hint pointing at --yes / --allow-tools.
-    var permission_store = permissions_mod.Store.init(allocator);
-    defer permission_store.deinit();
-    // v1.19.0 — settings-layer overlay applies first; CLI overlay
-    // below additively augments it. Precedence works out because
-    // CLI flags only *lift* (set scalars to true / append to sets);
-    // they never clear values the settings layer set.
-    var prompts_enabled: bool = cfg.prompts;
-    {
-        var settings = try loadSettingsForOverlay(allocator, io, environ);
-        defer settings.deinit();
-        try applyPermissionsSettingsOverlay(&permission_store, &settings);
-        prompts_enabled = resolvePromptsDefault(cfg, &settings);
-    }
-    if (cfg.yes) permission_store.yes_to_all = true;
-    if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
-    if (cfg.deny_tools_csv) |s| try permission_store.addDenyList(s);
-    if (cfg.ask_tools_csv) |s| try permission_store.addAskList(s);
-    try permissions_mod.maybeAttachPersistence(
-        &permission_store,
-        cfg.remember_permissions,
-        cfg.arena.allocator(),
-        io,
-        environ_map,
-    );
-    var session_gates: permissions_mod.SessionGates = .{
-        .role = &role_gate,
-        .permissions = if (prompts_enabled) &permission_store else null,
-    };
-
-    // §5 — preset registry. Populated once at session-init.
-    // SDK consumers can extend before this point by passing a
-    // callback; §5 ships built-ins only.
-    var preset_registry = tools_mod.subagent.PresetRegistry.init(allocator);
-    defer preset_registry.deinit();
-    try tools_mod.subagent.registerBuiltinPresets(&preset_registry);
-
-    // ── Extension loading (print mode) ───────────────────────────────
-    // Tier-1 extensions opt-in via `--extensions <csv>`. Each activated
-    // extension registers slash commands, tools, presets, and event
-    // subscriptions through a `Host` view. Tools contributed by
-    // extensions are merged into `final_tools` below.
-    var ext_manager = extensions_mod.Manager.init(allocator);
-    ext_manager.presets = &preset_registry;
-    defer ext_manager.deinit();
-    try ext_manager.loadFromConfig(io, cfg.extensions, ext_catalog.lookup);
-
-    const subagent_params_json = try tools_mod.subagent.buildParametersJson(
-        allocator, &preset_registry);
-    defer allocator.free(subagent_params_json);
-
-    // v1.24.0 — subagent tool. Always available (not subject to
-    // role gating itself; the role demotion applies to the
-    // SUB-agent's tool set, not whether the parent can spawn one).
-    //
-    // v1.28.0 — `parent_session_dir` is populated AFTER
-    // `session_state.init` runs (a few sections below), so the
-    // sub-agent's transcript is persisted to
-    // `<session>/subagents/<call_id>/transcript.json` and the
-    // result includes the path. Held as `var` so the late-bound
-    // assignment is allowed.
-    var subagent_ctx = tools_mod.subagent.Ctx{
-        .registry = &reg,
-        .environ = environ,
-        .environ_map = environ_map,
-        .parent_tools = filtered_tools,
-        .parent_role = active_role,
-        .parent_profile = cfg.profile orelse "",
-        .presets = &preset_registry,
-        .parameters_json_owned = subagent_params_json,
-        .permission_store = if (prompts_enabled) &permission_store else null,
-        .permission_prompter_slot = null, // print mode has no interactive prompter; sub-agents un-gate
-        .parent_session_dir = null,
-    };
-    var guardrail_state = try agent.guardrails.GuardrailState.init(
-        allocator,
-        .{ .workspace_dir = workspace_root orelse "." },
-        io,
-    );
-    defer guardrail_state.deinit();
-
-    const final_tools = blk: {
-        const ext_tools = ext_manager.tools();
-        const slice = try allocator.alloc(at.AgentTool, filtered_tools.len + ext_tools.len + 3);
-        @memcpy(slice[0..filtered_tools.len], filtered_tools);
-        if (ext_tools.len > 0) {
-            @memcpy(slice[filtered_tools.len..][0..ext_tools.len], ext_tools);
-        }
-        const off = filtered_tools.len + ext_tools.len;
-        slice[off] = tools_mod.subagent.toolWithCtx(&subagent_ctx);
-        slice[off + 1] = tools_mod.subagent.listPresetsToolWithCtx(&preset_registry);
-        slice[off + 2] = guardrail_state.finishTaskTool();
-        break :blk slice;
-    };
-    defer allocator.free(final_tools);
-
-    // The sandbox warning fires only when role is `code`/`full`
-    // outside a detected sandbox — host filesystem reachable from
-    // a shell is the dangerous combination.
+    // Sandbox warning (mode-specific — no reason to move into resolver).
     {
         const sandbox_active = role_mod.detectSandbox(environ);
         var stderr_buf: [512]u8 = undefined;
         var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
         stderr.interface.print(
             "franky · role={s} · sandbox={s}\n",
-            .{ active_role.toString(), if (sandbox_active) "yes" else "no" },
+            .{ resolved.active_role.toString(), if (sandbox_active) "yes" else "no" },
         ) catch {};
-        if (!sandbox_active and (active_role == .code or active_role == .full)) {
+        if (!sandbox_active and (resolved.active_role == .code or resolved.active_role == .full)) {
             stderr.interface.print(
                 "⚠ Running outside a sandbox with role={s}. Tool calls execute on the host filesystem.\n  Consider:  zerobox -- franky --role {s} ...   (or --role plan to disable bash)\n",
-                .{ active_role.toString(), active_role.toString() },
+                .{ resolved.active_role.toString(), resolved.active_role.toString() },
             ) catch {};
         }
         stderr.interface.flush() catch {};
@@ -513,18 +261,7 @@ fn runPrint(
 
     // v1.27.2 + v1.28.0 — once `session_state.parent_dir +
     // session_id` is known, plumb the on-disk session directory
-    // into:
-    //   - `bash_state` so over-50KB bash captures spill to
-    //     `<session>/bash/<call_id>.log` (v1.27.2)
-    //   - `subagent_ctx.parent_session_dir` so each sub-agent
-    //     persists its full transcript to
-    //     `<session>/subagents/<call_id>/transcript.json` and
-    //     surfaces the path in its result (v1.28.0)
-    // `session_dir_path` lives the rest of `runPrint` because
-    // `subagent_ctx` borrows the slice — a per-block defer-free
-    // would dangle. Best-effort: a join failure leaves both
-    // null and bash falls back to `/tmp` while sub-agent
-    // persistence is skipped.
+    // into `bash_state` and `subagent_ctx.parent_session_dir`.
     var session_dir_path: ?[]u8 = null;
     defer if (session_dir_path) |p| allocator.free(p);
     var events_dir_path: ?[]u8 = null;
@@ -532,8 +269,8 @@ fn runPrint(
     if (session_state.parent_dir) |parent| {
         session_dir_path = std.fs.path.join(allocator, &.{ parent, session_state.id() }) catch null;
         if (session_dir_path) |sd| {
-            bash_state.setSessionDir(sd) catch {};
-            subagent_ctx.parent_session_dir = sd;
+            resolved.bash_state.setSessionDir(sd) catch {};
+            resolved.subagent_ctx.parent_session_dir = sd;
             // v1.29.0 — `<session>/events` for reducer-state dumps
             // when a turn ends degenerate (clean STOP, zero content).
             events_dir_path = std.fs.path.join(allocator, &.{ sd, "events" }) catch null;
@@ -560,22 +297,15 @@ fn runPrint(
     defer allocator.free(system_prompt);
 
     const model: ai.types.Model = .{
-        .id = provider_info.model_id,
-        .provider = provider_info.provider_name,
-        .api = provider_info.api_tag,
-        .context_window = provider_info.context_window,
-        .max_output = provider_info.max_output,
-        // capabilities come from the models-catalog entry (via
-        // `finalize` in `resolveProviderIo`); force `reasoning`
-        // when the user passed `--thinking <level>` explicitly.
-        .capabilities = provider_info.capabilities,
+        .id = resolved.model_id,
+        .provider = resolved.provider_name,
+        .api = resolved.api_tag,
+        .context_window = resolved.context_window,
+        .max_output = resolved.max_output,
+        .capabilities = resolved.capabilities,
     };
 
     var cancel = ai.stream.Cancel{};
-    // 65536-event burst buffer: deep enough for any multi-thousand-token
-    // SSE stream's worth of text/tool-arg deltas (observed peak ~5300,
-    // 12× margin). Memory cost is transient (per-turn arena): ~3.5 MB at
-    // 54 B/slot. Backpressure still kicks in if the consumer genuinely stalls.
     var ch = try agent.loop.AgentChannel.initWithDrop(
         allocator,
         65536,
@@ -584,34 +314,30 @@ fn runPrint(
     );
     defer ch.deinit();
 
-    // Run the agent loop on a worker thread so the caller can drain
-    // events concurrently. Running inline deadlocks on the 128-event
-    // channel cap as soon as a session produces more events than the
-    // buffer holds — which, with tool-heavy turns, happens immediately.
     var loop_cfg: agent.loop.Config = .{
         .model = model,
         .system_prompt = system_prompt,
-        .tools = final_tools,
-        .registry = &reg,
+        .tools = resolved.tools,
+        .registry = &resolved.registry,
         .cancel = &cancel,
-        .guardrails = &guardrail_state,
-        .hook_userdata = @ptrCast(&session_gates),
+        .guardrails = &resolved.guardrail_state,
+        .hook_userdata = @ptrCast(&resolved.session_gates),
         .role_denied = permissions_mod.SessionGates.roleDenied,
         .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
         .text_tool_call_fallback = cfg.text_tool_call_fallback,
         .reducer_dump_dir = events_dir_path,
         .stream_options = .{
-            .api_key = provider_info.api_key,
-            .auth_token = provider_info.auth_token,
-            .base_url = provider_info.base_url,
+            .api_key = resolved.api_key,
+            .auth_token = resolved.auth_token,
+            .base_url = resolved.base_url,
             .environ_map = environ_map,
             .thinking = cfg.thinking,
-            .timeouts = resolveTimeoutsFromMap(cfg, environ_map),
-            .retry_policy = resolveRetryPolicyFromMap(cfg, null),
-            .http_trace_dir = resolveHttpTraceDirFromMap(cfg, environ_map),
+            .timeouts = config_mod.resolveTimeouts(cfg, environ_map),
+            .retry_policy = resolved.retry_policy,
+            .http_trace_dir = config_mod.resolveHttpTraceDir(cfg, environ_map),
         },
     };
-    if (resolveMaxTurnsFromMap(cfg, environ_map)) |v| loop_cfg.max_turns = v;
+    if (config_mod.resolveMaxTurns(cfg, environ_map)) |v| loop_cfg.max_turns = v;
     const worker_args: WorkerArgs = .{
         .allocator = allocator,
         .io = io,
@@ -652,7 +378,17 @@ fn runPrint(
 
     // ── Persist session ───────────────────────────────────────────
     if (!cfg.no_session) {
-        session_state.persist(allocator, io, provider_info, cfg) catch |err| {
+        session_state.persist(allocator, io, .{
+            .provider_name = resolved.provider_name,
+            .api_tag = resolved.api_tag,
+            .model_id = resolved.model_id,
+            .api_key = resolved.api_key,
+            .auth_token = resolved.auth_token,
+            .base_url = resolved.base_url,
+            .context_window = resolved.context_window,
+            .max_output = resolved.max_output,
+            .capabilities = resolved.capabilities,
+        }, cfg) catch |err| {
             ai.log.log(.err, "session", "persist_failed", "error={s}", .{@errorName(err)});
         };
     }

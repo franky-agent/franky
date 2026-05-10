@@ -54,6 +54,8 @@ pub const config = struct {
     pub const cli = @import("config/cli.zig");
     pub const settings = @import("config/settings.zig");
     pub const profiles = @import("config/profiles.zig");
+    /// v2.22 — unified config resolver.
+    pub const resolver = @import("config.zig");
 };
 pub const security = struct {
     pub const role = @import("security/role.zig");

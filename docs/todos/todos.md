@@ -190,3 +190,23 @@ Also if a subagent was started with profile gemini but gemini api key is not the
 </｜DSML｜invoke>
 </｜DSML｜tool_calls>
 ```
+
+# Edit Diff View (Web-UI)
+
+Add the following header in the richt edit view.
+
+This example is from the edit fallback view
+```
+applied 1 edit(s) to /Users/frankittermann/github/franky/src/coding/modes/print.zig
+```
+
+# Sub Agent Header View improvement
+
+Lets add the used preset to the subagent overlay view in the header. 
+```
+<div class="sa-overlay-head">
+    <span class="sa-badge sa-overlay-badge done">done</span>
+    <span class="sa-overlay-title">go-dev</span>
+    <button class="sa-overlay-close" id="sa-overlay-close" aria-label="Close">×</button>
+</div>
+```
