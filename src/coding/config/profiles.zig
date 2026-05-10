@@ -352,21 +352,30 @@ pub fn applyToCfg(
     profile: Profile,
     environ_map: *std.process.Environ.Map,
 ) ProfileError!void {
-    const arena = cfg.arena.allocator();
+    try applyProfileEnv(profile, environ_map);
+    try applyProfileStringFields(cfg, profile, environ_map);
+    applyProfileBoolFields(cfg, profile);
+    applyProfileNumericFields(cfg, profile);
+    try applyProfileThinking(cfg, profile);
+    try applyProfileMode(cfg, profile);
+}
 
-    // Apply `env: {}` first — some downstream string fields might
-    // reference these via FRANKY_* knobs, and the env block runs
-    // before mode-dispatch reads them.
+fn applyProfileEnv(profile: Profile, environ_map: *std.process.Environ.Map) !void {
     if (profile.env) |env_map| {
         var it = env_map.iterator();
         while (it.next()) |entry| {
-            // dupe both key and value via the environ_map's allocator
-            // ownership model (it owns whatever you `put` into it).
             try environ_map.put(entry.key_ptr.*, entry.value_ptr.*);
         }
     }
+}
 
-    // Strings: only apply if cfg's field is still null.
+fn applyProfileStringFields(
+    cfg: *cli.Config,
+    profile: Profile,
+    environ_map: *std.process.Environ.Map,
+) !void {
+    const arena = cfg.arena.allocator();
+
     if (cfg.provider == null) if (profile.provider) |v| {
         cfg.provider = try arena.dupe(u8, v);
     };
@@ -374,7 +383,6 @@ pub fn applyToCfg(
         cfg.model = try arena.dupe(u8, v);
     };
     if (cfg.api_key == null) {
-        // Direct api_key wins; otherwise resolve api_key_env.
         if (profile.api_key) |v| {
             cfg.api_key = try arena.dupe(u8, v);
         } else if (profile.api_key_env) |env_name| {
@@ -422,8 +430,9 @@ pub fn applyToCfg(
     if (cfg.deny_tools_csv == null) if (profile.deny_tools) |v| {
         cfg.deny_tools_csv = try arena.dupe(u8, v);
     };
+}
 
-    // Bool flags: only apply if cfg is still false (default).
+fn applyProfileBoolFields(cfg: *cli.Config, profile: Profile) void {
     if (!cfg.prompts) if (profile.prompts) |v| {
         cfg.prompts = v;
     };
@@ -433,8 +442,9 @@ pub fn applyToCfg(
     if (!cfg.text_tool_call_fallback) if (profile.text_tool_call_fallback) |v| {
         cfg.text_tool_call_fallback = v;
     };
+}
 
-    // u32 fields: only apply if cfg's field is still null (CLI didn't set it).
+fn applyProfileNumericFields(cfg: *cli.Config, profile: Profile) void {
     if (cfg.max_turns == null) if (profile.max_turns) |v| {
         cfg.max_turns = v;
     };
@@ -447,21 +457,20 @@ pub fn applyToCfg(
     if (cfg.retry_base_delay_ms == null) if (profile.base_delay_ms) |v| {
         cfg.retry_base_delay_ms = v;
     };
+}
 
-    // Thinking: only apply if user didn't pass --thinking on CLI.
+fn applyProfileThinking(cfg: *cli.Config, profile: Profile) ProfileError!void {
     if (!cfg.thinking_explicit) if (profile.thinking) |v| {
         cfg.thinking = parseThinking(v) catch return error.UnknownThinkingLevel;
     };
+}
 
-    // Mode: cli.Config.mode defaults to .print. We can't tell if
-    // the user explicitly set it or not, so we only apply the
-    // profile's mode when cfg.mode is .print AND the profile says
-    // something different. This is imperfect — a CLI `--mode print`
-    // would be silently overridden — but matches the common case.
+fn applyProfileMode(cfg: *cli.Config, profile: Profile) ProfileError!void {
     if (cfg.mode == .print) if (profile.mode) |v| {
         cfg.mode = parseMode(v) catch return error.UnknownMode;
     };
 }
+
 
 fn parseThinking(s: []const u8) !ait.ThinkingLevel {
     if (std.mem.eql(u8, s, "off")) return .off;

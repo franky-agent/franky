@@ -809,62 +809,73 @@ pub fn toJson(
 
     try buf.appendSlice(allocator, "{\"schema_version\":1,");
 
-    // Identity fields — null when caller didn't supply.
+    try writeIdentityFields(&buf, allocator, &opts, report_path);
+    try writeTotalsFields(&buf, allocator, report);
+    try writeAnomalyCounts(&buf, allocator, report);
+    try writeTokenTotals(&buf, allocator, report);
+    try writeToolFailures(&buf, allocator, report);
+
+    try buf.appendSlice(allocator, "]}");
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn writeIdentityFields(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, opts: *const Options, report_path: ?[]const u8) !void {
     try buf.appendSlice(allocator, "\"session_id\":");
-    try writeOptStr(&buf, allocator, opts.session_label);
+    try writeOptStr(buf, allocator, opts.session_label);
     try buf.appendSlice(allocator, ",\"model\":");
-    try writeOptStr(&buf, allocator, opts.model);
+    try writeOptStr(buf, allocator, opts.model);
     try buf.appendSlice(allocator, ",\"provider\":");
-    try writeOptStr(&buf, allocator, opts.provider);
+    try writeOptStr(buf, allocator, opts.provider);
     try buf.appendSlice(allocator, ",\"mode\":");
-    try writeOptStr(&buf, allocator, opts.mode_name);
-
-    // Pointer back to the human-rendered TXT. Aggregator follows
-    // this when surfacing a finding so the user sees the rendered
-    // per-turn detail, not just the rolled-up counts.
+    try writeOptStr(buf, allocator, opts.mode_name);
     try buf.appendSlice(allocator, ",\"report_path\":");
-    try writeOptStr(&buf, allocator, report_path);
+    try writeOptStr(buf, allocator, report_path);
+}
 
-    // Totals.
+fn writeTotalsFields(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, report: *const Report) !void {
     const tool_calls = report.totalToolCalls();
     const tool_failures = report.totalToolFailures();
     try buf.appendSlice(allocator, ",\"totals\":{");
-    try writeIntField(&buf, allocator, "messages", @intCast(report.total_messages));
+    try writeIntField(buf, allocator, "messages", @intCast(report.total_messages));
     try buf.appendSlice(allocator, ",");
-    try writeIntField(&buf, allocator, "assistant_turns", @intCast(report.total_assistant_turns));
+    try writeIntField(buf, allocator, "assistant_turns", @intCast(report.total_assistant_turns));
     try buf.appendSlice(allocator, ",");
-    try writeIntField(&buf, allocator, "tool_calls", @intCast(tool_calls));
+    try writeIntField(buf, allocator, "tool_calls", @intCast(tool_calls));
     try buf.appendSlice(allocator, ",");
-    try writeIntField(&buf, allocator, "tool_failures", @intCast(tool_failures));
+    try writeIntField(buf, allocator, "tool_failures", @intCast(tool_failures));
     try buf.appendSlice(allocator, ",");
-    try writeIntField(&buf, allocator, "anomalies", @intCast(report.total_anomalies));
+    try writeIntField(buf, allocator, "anomalies", @intCast(report.total_anomalies));
     try buf.appendSlice(allocator, "}");
+}
 
-    // Anomaly histogram.
+fn writeAnomalyCounts(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, report: *const Report) !void {
     const ac = report.anomalyCounts();
     try buf.appendSlice(allocator, ",\"anomaly_counts\":{");
-    try writeIntField(&buf, allocator, "degenerate", @intCast(ac[@intFromEnum(Anomaly.degenerate)]));
+    try writeIntField(buf, allocator, "degenerate", @intCast(ac[@intFromEnum(Anomaly.degenerate)]));
     try buf.appendSlice(allocator, ",");
-    try writeIntField(&buf, allocator, "prose_tool_call", @intCast(ac[@intFromEnum(Anomaly.prose_tool_call)]));
+    try writeIntField(buf, allocator, "prose_tool_call", @intCast(ac[@intFromEnum(Anomaly.prose_tool_call)]));
     try buf.appendSlice(allocator, ",");
-    try writeIntField(&buf, allocator, "thinking_budget_exhaustion", @intCast(ac[@intFromEnum(Anomaly.thinking_budget_exhaustion)]));
+    try writeIntField(buf, allocator, "thinking_budget_exhaustion", @intCast(ac[@intFromEnum(Anomaly.thinking_budget_exhaustion)]));
     try buf.appendSlice(allocator, ",");
-    try writeIntField(&buf, allocator, "saved_error", @intCast(ac[@intFromEnum(Anomaly.saved_error)]));
+    try writeIntField(buf, allocator, "saved_error", @intCast(ac[@intFromEnum(Anomaly.saved_error)]));
     try buf.appendSlice(allocator, ",");
-    try writeIntField(&buf, allocator, "tool_error", @intCast(ac[@intFromEnum(Anomaly.tool_error)]));
+    try writeIntField(buf, allocator, "tool_error", @intCast(ac[@intFromEnum(Anomaly.tool_error)]));
     try buf.appendSlice(allocator, "}");
+}
 
-    // Token totals.
+fn writeTokenTotals(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, report: *const Report) !void {
     const tt = report.tokenTotals();
     try buf.appendSlice(allocator, ",\"tokens\":{");
-    try writeIntField(&buf, allocator, "candidates", @intCast(tt.candidates));
+    try writeIntField(buf, allocator, "candidates", @intCast(tt.candidates));
     try buf.appendSlice(allocator, ",");
-    try writeIntField(&buf, allocator, "thoughts", @intCast(tt.thoughts));
+    try writeIntField(buf, allocator, "thoughts", @intCast(tt.thoughts));
     try buf.appendSlice(allocator, ",");
-    try writeIntField(&buf, allocator, "parts_seen", @intCast(tt.parts_seen));
+    try writeIntField(buf, allocator, "parts_seen", @intCast(tt.parts_seen));
     try buf.appendSlice(allocator, "}");
+}
 
-    // Per-failure detail. Each entry: turn_index, tool_name, code, message, hint.
+fn writeToolFailures(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, report: *const Report) !void {
     try buf.appendSlice(allocator, ",\"tool_failures\":[");
     var first = true;
     for (report.turns.items, 0..) |turn, turn_ord| {
@@ -872,21 +883,18 @@ pub fn toJson(
             if (!first) try buf.appendSlice(allocator, ",");
             first = false;
             try buf.appendSlice(allocator, "{");
-            try writeIntField(&buf, allocator, "turn_index", @intCast(turn_ord));
+            try writeIntField(buf, allocator, "turn_index", @intCast(turn_ord));
             try buf.appendSlice(allocator, ",\"tool_name\":");
-            try utils.appendJsonStr(&buf, allocator, f.tool_name);
+            try utils.appendJsonStr(buf, allocator, f.tool_name);
             try buf.appendSlice(allocator, ",\"code\":");
-            try writeOptStr(&buf, allocator, f.code);
+            try writeOptStr(buf, allocator, f.code);
             try buf.appendSlice(allocator, ",\"message\":");
-            try writeOptStr(&buf, allocator, f.message);
+            try writeOptStr(buf, allocator, f.message);
             try buf.appendSlice(allocator, ",\"hint\":");
-            try writeOptStr(&buf, allocator, f.hint);
+            try writeOptStr(buf, allocator, f.hint);
             try buf.appendSlice(allocator, "}");
         }
     }
-    try buf.appendSlice(allocator, "]}");
-
-    return buf.toOwnedSlice(allocator);
 }
 
 fn writeOptStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: ?[]const u8) !void {

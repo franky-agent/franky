@@ -31,7 +31,7 @@ RUN cargo install inferno
 # COPY --chown=agent:agent franky /usr/local/bin/franky
 ENV ZIG_LOCAL_CACHE_DIR=/tmp/zig-cache
 ENV ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
-ENV PATH="/home/agent/.cargo/bin:${PATH}"
+ENV PATH="/home/agent/.cargo/bin:/home/agent/go/bin:${PATH}"
 RUN echo 'alias claude="claude --allow-dangerously-skip-permissions --dangerously-skip-permissions"' >> ~/.bashrc && \
     echo 'alias clauder="claude --allow-dangerously-skip-permissions --dangerously-skip-permissions --resume"' >> ~/.bashrc && \
     echo 'alias franky-deepseek="./zig-out/bin/franky --profile ollama-deepseek-flash --mode proxy" >> ~/.bashrc'

@@ -35,16 +35,26 @@ pub fn render(
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
+    try writePreamble(&buf, allocator, &opts);
+    for (sorted, 0..) |e, i| {
+        try writeModelEntry(&buf, allocator, e, &opts);
+        if (i + 1 < sorted.len) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, if (opts.pretty) "\n" else "");
+    }
+    try writeEpilogue(&buf, allocator, sorted.len, &opts);
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn writePreamble(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, opts: *const RenderOptions) !void {
     const nl: []const u8 = if (opts.pretty) "\n" else "";
     const ind1: []const u8 = if (opts.pretty) "  " else "";
-    const ind2: []const u8 = if (opts.pretty) "    " else "";
-    const ind3: []const u8 = if (opts.pretty) "      " else "";
     const sp: []const u8 = if (opts.pretty) " " else "";
 
     try buf.appendSlice(allocator, "{");
     try buf.appendSlice(allocator, nl);
 
-    try writeKv(&buf, allocator, ind1,"version", .{ .integer = 1 }, opts.pretty);
+    try writeKv(buf, allocator, ind1, "version", .{ .integer = 1 }, opts.pretty);
     try buf.appendSlice(allocator, ",");
     try buf.appendSlice(allocator, nl);
 
@@ -52,7 +62,7 @@ pub fn render(
     try buf.appendSlice(allocator, "\"generatedAt\":");
     try buf.appendSlice(allocator, sp);
     try buf.append(allocator, '"');
-    try appendJsonString(&buf, allocator, opts.generated_at);
+    try appendJsonString(buf, allocator, opts.generated_at);
     try buf.append(allocator, '"');
     try buf.appendSlice(allocator, ",");
     try buf.appendSlice(allocator, nl);
@@ -61,56 +71,61 @@ pub fn render(
     try buf.appendSlice(allocator, "\"models\":");
     try buf.appendSlice(allocator, sp);
     try buf.appendSlice(allocator, "[");
-    if (sorted.len > 0) try buf.appendSlice(allocator, nl);
+}
 
-    for (sorted, 0..) |e, i| {
-        try buf.appendSlice(allocator, ind2);
-        try buf.appendSlice(allocator, "{");
-        try buf.appendSlice(allocator, nl);
+fn writeModelEntry(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, e: models.Entry, opts: *const RenderOptions) !void {
+    const nl: []const u8 = if (opts.pretty) "\n" else "";
+    const ind2: []const u8 = if (opts.pretty) "    " else "";
+    const ind3: []const u8 = if (opts.pretty) "      " else "";
 
-        try writeStringField(&buf, allocator, ind3,"id", e.id, opts.pretty);
-        try buf.appendSlice(allocator, ",");
-        try buf.appendSlice(allocator, nl);
-        try writeStringField(&buf, allocator, ind3,"provider", e.provider, opts.pretty);
-        try buf.appendSlice(allocator, ",");
-        try buf.appendSlice(allocator, nl);
-        try writeStringField(&buf, allocator, ind3,"api", e.api, opts.pretty);
-        try buf.appendSlice(allocator, ",");
-        try buf.appendSlice(allocator, nl);
-        try writeStringField(&buf, allocator, ind3,"displayName", e.display_name, opts.pretty);
-        try buf.appendSlice(allocator, ",");
-        try buf.appendSlice(allocator, nl);
+    try buf.appendSlice(allocator, nl);
+    try buf.appendSlice(allocator, ind2);
+    try buf.appendSlice(allocator, "{");
+    try buf.appendSlice(allocator, nl);
 
-        try writeKv(&buf, allocator, ind3,"contextWindow", .{ .integer = e.context_window }, opts.pretty);
-        try buf.appendSlice(allocator, ",");
-        try buf.appendSlice(allocator, nl);
-        try writeKv(&buf, allocator, ind3,"maxOutput", .{ .integer = e.max_output }, opts.pretty);
-        try buf.appendSlice(allocator, ",");
-        try buf.appendSlice(allocator, nl);
+    try writeStringField(buf, allocator, ind3, "id", e.id, opts.pretty);
+    try buf.appendSlice(allocator, ",");
+    try buf.appendSlice(allocator, nl);
+    try writeStringField(buf, allocator, ind3, "provider", e.provider, opts.pretty);
+    try buf.appendSlice(allocator, ",");
+    try buf.appendSlice(allocator, nl);
+    try writeStringField(buf, allocator, ind3, "api", e.api, opts.pretty);
+    try buf.appendSlice(allocator, ",");
+    try buf.appendSlice(allocator, nl);
+    try writeStringField(buf, allocator, ind3, "displayName", e.display_name, opts.pretty);
+    try buf.appendSlice(allocator, ",");
+    try buf.appendSlice(allocator, nl);
 
-        try writeCapabilities(&buf, allocator, ind3,e.capabilities, opts.pretty);
-        try buf.appendSlice(allocator, ",");
-        try buf.appendSlice(allocator, nl);
-        try writeCost(&buf, allocator, ind3,e.cost, opts.pretty);
-        try buf.appendSlice(allocator, ",");
-        try buf.appendSlice(allocator, nl);
+    try writeKv(buf, allocator, ind3, "contextWindow", .{ .integer = e.context_window }, opts.pretty);
+    try buf.appendSlice(allocator, ",");
+    try buf.appendSlice(allocator, nl);
+    try writeKv(buf, allocator, ind3, "maxOutput", .{ .integer = e.max_output }, opts.pretty);
+    try buf.appendSlice(allocator, ",");
+    try buf.appendSlice(allocator, nl);
 
-        try writeStringField(&buf, allocator, ind3,"knowledgeCutoff", e.knowledge_cutoff, opts.pretty);
-        try buf.appendSlice(allocator, nl);
+    try writeCapabilities(buf, allocator, ind3, e.capabilities, opts.pretty);
+    try buf.appendSlice(allocator, ",");
+    try buf.appendSlice(allocator, nl);
+    try writeCost(buf, allocator, ind3, e.cost, opts.pretty);
+    try buf.appendSlice(allocator, ",");
+    try buf.appendSlice(allocator, nl);
 
-        try buf.appendSlice(allocator, ind2);
-        try buf.append(allocator, '}');
-        if (i + 1 < sorted.len) try buf.append(allocator, ',');
-        try buf.appendSlice(allocator, nl);
-    }
+    try writeStringField(buf, allocator, ind3, "knowledgeCutoff", e.knowledge_cutoff, opts.pretty);
+    try buf.appendSlice(allocator, nl);
 
-    if (sorted.len > 0) try buf.appendSlice(allocator, ind1);
+    try buf.appendSlice(allocator, ind2);
+    try buf.append(allocator, '}');
+}
+
+fn writeEpilogue(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, entry_count: usize, opts: *const RenderOptions) !void {
+    const nl: []const u8 = if (opts.pretty) "\n" else "";
+    const ind1: []const u8 = if (opts.pretty) "  " else "";
+
+    if (entry_count > 0) try buf.appendSlice(allocator, ind1);
     try buf.appendSlice(allocator, "]");
     try buf.appendSlice(allocator, nl);
     try buf.appendSlice(allocator, "}");
     if (opts.pretty) try buf.append(allocator, '\n');
-
-    return buf.toOwnedSlice(allocator);
 }
 
 fn lessThanById(_: void, a: models.Entry, b: models.Entry) bool {

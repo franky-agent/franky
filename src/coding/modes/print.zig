@@ -827,73 +827,82 @@ pub fn resolveProviderIo(
 ) !ProviderInfo {
     const a = cfg.arena.allocator();
 
-    // ── Layered settings ─────────────────────────────────────────
-    // Defaults → $HOME/.franky/settings.json → cwd/.franky/settings.json.
-    // Missing files fall through silently; CLI flags take precedence
-    // over everything below.
-    var settings = blk: {
-        if (io) |ioref| {
-            const home = environ.getPosix("FRANKY_HOME") orelse environ.getPosix("HOME");
-            // Use `$PWD` rather than a getcwd syscall — it's what
-            // shells export and it avoids `std.posix.getcwd` (gone
-            // in 0.17-dev). The resolver treats a missing project
-            // dir as "no project layer", which is the correct
-            // behavior for non-interactive invocations anyway.
-            const pwd = environ.getPosix("PWD");
-            break :blk settings_mod.loadLayered(allocator, ioref, pwd, home) catch try settings_mod.defaults(allocator);
-        }
-        break :blk try settings_mod.defaults(allocator);
-    };
+    var settings = try resolvePrintSettings(allocator, io, environ);
     defer settings.deinit();
+    applyPrintThinkingOverride(cfg, &settings);
 
-    // Settings.thinking overrides the default `cfg.thinking` only
-    // when the CLI didn't set it explicitly. `cfg.thinking` starts
-    // at `.off`, which could be either "user chose off" or "user
-    // didn't say"; the `thinking_explicit` flag disambiguates.
+    var auth_state = try loadPrintAuthState(a, allocator, io, environ);
+    defer if (auth_state) |*as| as.deinit();
+
+    const models_extras = try loadPrintModelsExtras(a, allocator, io, environ);
+
+    const creds = try resolvePrintCredentials(a, cfg, environ, auth_state);
+    const chosen = choosePrintProvider(cfg, &creds, &settings);
+
+    if (std.mem.eql(u8, chosen, "faux")) return buildPrintFauxConfig(a, cfg, models_extras);
+    if (std.mem.eql(u8, chosen, "anthropic")) return buildPrintAnthropicConfig(a, cfg, &creds, &settings, models_extras);
+    if (std.mem.eql(u8, chosen, "openai")) return buildPrintOpenaiConfig(a, cfg, &creds, &settings, models_extras);
+    if (std.mem.eql(u8, chosen, "gateway")) return buildPrintGatewayConfig(a, cfg, environ, &creds, auth_state, models_extras);
+    if (std.mem.eql(u8, chosen, "google-gemini") or std.mem.eql(u8, chosen, "gemini") or std.mem.eql(u8, chosen, "google")) return buildPrintGeminiConfig(a, cfg, &creds, models_extras);
+
+    return error.UnknownProvider;
+}
+
+const PrintCredentials = struct {
+    api_key: ?[]const u8 = null,
+    auth_token: ?[]const u8 = null,
+    openai_api_key: ?[]const u8 = null,
+    gemini_api_key: ?[]const u8 = null,
+    gemini_auth_token: ?[]const u8 = null,
+    has_anthropic: bool = false,
+    has_openai: bool = false,
+    has_gemini: bool = false,
+};
+
+fn resolvePrintSettings(allocator: std.mem.Allocator, io: ?std.Io, environ: std.process.Environ) !settings_mod.Settings {
+    if (io) |ioref| {
+        const home = environ.getPosix("FRANKY_HOME") orelse environ.getPosix("HOME");
+        const pwd = environ.getPosix("PWD");
+        return settings_mod.loadLayered(allocator, ioref, pwd, home) catch try settings_mod.defaults(allocator);
+    }
+    return try settings_mod.defaults(allocator);
+}
+
+fn applyPrintThinkingOverride(cfg: *cli_mod.Config, settings: *const settings_mod.Settings) void {
     if (!cfg.thinking_explicit) {
         if (ai.types.ThinkingLevel.fromString(settings.thinking)) |lvl| {
             cfg.thinking = lvl;
         }
     }
+}
 
-    // ── auth.json as a third credential tier ─────────────────────
-    // Precedence: CLI flag > env var > auth.json > (nothing).
-    // We load auth.json once and feed its contents into each
-    // provider branch below via `resolveApiKey`/`resolveAuthToken`.
-    var auth_state: ?auth_mod.Auth = null;
-    defer if (auth_state) |*a_state| a_state.deinit();
+fn loadPrintAuthState(a: std.mem.Allocator, allocator: std.mem.Allocator, io: ?std.Io, environ: std.process.Environ) !?auth_mod.Auth {
     if (io) |ioref| {
         const auth_path = try authJsonPath(a, environ);
         if (auth_path) |p| {
-            auth_state = auth_mod.load(allocator, ioref, p) catch null;
+            return auth_mod.load(allocator, ioref, p) catch null;
         }
     }
+    return null;
+}
 
-    // ── $FRANKY_HOME/models.json disk overlay ────────────────────
-    // Parsed entries override the built-in catalog on id collision
-    // (§H.3). Entries owned by `cfg.arena` so freed with the config.
-    const models_extras: []const models_mod.Entry = blk: {
-        if (io) |ioref| {
-            const franky_home: ?[]const u8 = environ.getPosix("FRANKY_HOME");
-            const home: ?[]const u8 = environ.getPosix("HOME");
-            const models_path = try modelsJsonPathFrom(a, franky_home, home);
-            if (models_path) |p| {
-                const bytes = readWholeFileOpt(allocator, ioref, p) orelse break :blk &.{};
-                defer allocator.free(bytes);
-                const entries = models_mod.parseFromSlice(a, bytes) catch break :blk &.{};
-                break :blk entries;
-            }
+fn loadPrintModelsExtras(a: std.mem.Allocator, allocator: std.mem.Allocator, io: ?std.Io, environ: std.process.Environ) ![]const models_mod.Entry {
+    if (io) |ioref| {
+        const franky_home: ?[]const u8 = environ.getPosix("FRANKY_HOME");
+        const home: ?[]const u8 = environ.getPosix("HOME");
+        const models_path = try modelsJsonPathFrom(a, franky_home, home);
+        if (models_path) |p| {
+            const bytes = readWholeFileOpt(allocator, ioref, p) orelse return &.{};
+            defer allocator.free(bytes);
+            return models_mod.parseFromSlice(a, bytes) catch &.{};
         }
-        break :blk &.{};
-    };
+    }
+    return &.{};
+}
 
-    // Credential resolution, matching the Claude Code precedence list
-    // (see src/ai/providers/AUTH.md). CLI flags beat env vars beat
-    // auth.json; bearer tokens and API keys are tracked separately
-    // so the Anthropic provider can pick the right header scheme.
+fn resolvePrintCredentials(a: std.mem.Allocator, cfg: *const cli_mod.Config, environ: std.process.Environ, auth_state: ?auth_mod.Auth) !PrintCredentials {
     const anthropic_file = if (auth_state) |as| as.get("anthropic") else null;
     const openai_file = if (auth_state) |as| as.get("openai") else null;
-    const gateway_file = if (auth_state) |as| as.get("gateway") else null;
     const gemini_file = if (auth_state) |as| as.get("google-gemini") else null;
 
     const api_key: ?[]const u8 = blk: {
@@ -909,22 +918,11 @@ pub fn resolveProviderIo(
         if (anthropic_file) |rec| if (rec.access_token) |t| break :blk try a.dupe(u8, t);
         break :blk null;
     };
-    // OpenAI credential is tracked separately — `--api-key` double-binds
-    // to the Anthropic lookup first for back-compat, so the OpenAI env
-    // var is the primary path; users can still pass `--api-key` with
-    // `--provider openai` and it routes through here when the Anthropic
-    // branch doesn't claim it.
     const openai_api_key: ?[]const u8 = blk: {
         if (environ.getPosix("OPENAI_API_KEY")) |k| break :blk try a.dupe(u8, k);
         if (openai_file) |rec| if (rec.api_key) |k| break :blk try a.dupe(u8, k);
         break :blk null;
     };
-    // v1.23.0 — Gemini credentials. AI Studio API key
-    // (`GEMINI_API_KEY` / `GOOGLE_API_KEY`) goes through the
-    // `?key=` query param; an externally-minted bearer token
-    // (stored in auth.json under "google-gemini") goes through
-    // `Authorization: Bearer`. Resolved separately so the provider
-    // streamFn can pick the right transport.
     const gemini_api_key: ?[]const u8 = blk: {
         if (environ.getPosix("GEMINI_API_KEY")) |k| break :blk try a.dupe(u8, k);
         if (environ.getPosix("GOOGLE_API_KEY")) |k| break :blk try a.dupe(u8, k);
@@ -936,146 +934,122 @@ pub fn resolveProviderIo(
         break :blk null;
     };
 
-    const has_anthropic_credential = api_key != null or auth_token != null;
-    const has_openai_credential = openai_api_key != null or (cfg.api_key != null and !has_anthropic_credential);
-    const has_gemini_credential = gemini_api_key != null or gemini_auth_token != null;
+    const has_anthropic = api_key != null or auth_token != null;
+    const has_openai = openai_api_key != null or (cfg.api_key != null and !has_anthropic);
+    const has_gemini = gemini_api_key != null or gemini_auth_token != null;
 
-    // Settings supplies the default provider when the user didn't
-    // pass `--provider` and no credentials tell us what to pick.
-    // `--offline` forces faux regardless.
-    const chosen: []const u8 = blk: {
-        if (cfg.offline) break :blk "faux";
-        if (cfg.provider) |p| break :blk p;
-        if (has_anthropic_credential) break :blk "anthropic";
-        if (has_openai_credential) break :blk "openai";
-        if (has_gemini_credential) break :blk "google-gemini";
-        // Respect settings.default_provider if it points at one we
-        // can actually satisfy with available credentials; else faux.
-        if (std.mem.eql(u8, settings.default_provider, "faux")) break :blk "faux";
-        break :blk "faux";
+    return .{
+        .api_key = api_key,
+        .auth_token = auth_token,
+        .openai_api_key = openai_api_key,
+        .gemini_api_key = gemini_api_key,
+        .gemini_auth_token = gemini_auth_token,
+        .has_anthropic = has_anthropic,
+        .has_openai = has_openai,
+        .has_gemini = has_gemini,
     };
+}
 
-    if (std.mem.eql(u8, chosen, "faux")) {
-        const model = cfg.model orelse try a.dupe(u8, "faux-1");
-        return finalize(a, .{
-            .provider_name = "faux",
-            .api_tag = "faux",
-            .model_id = model,
-            .api_key = null,
-            .auth_token = null,
-            .base_url = null,
-            .context_window = default_context_window,
-            .max_output = default_max_output,
-        }, cfg, models_extras);
-    }
+fn choosePrintProvider(cfg: *const cli_mod.Config, creds: *const PrintCredentials, settings: *const settings_mod.Settings) []const u8 {
+    if (cfg.offline) return "faux";
+    if (cfg.provider) |p| return p;
+    if (creds.has_anthropic) return "anthropic";
+    if (creds.has_openai) return "openai";
+    if (creds.has_gemini) return "google-gemini";
+    if (std.mem.eql(u8, settings.default_provider, "faux")) return "faux";
+    return "faux";
+}
 
-    if (std.mem.eql(u8, chosen, "anthropic")) {
-        if (!has_anthropic_credential) {
-            const msg = "anthropic provider requires one of: --api-key, --auth-token, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, or an `anthropic` entry in auth.json\n";
-            return exitWithMessageErr(allocator, msg, 2);
-        }
-        // Model precedence: --model > settings.default_model_anthropic > default_anthropic_model.
-        const model_input = cfg.model orelse settings.default_model_anthropic;
-        const model = try a.dupe(u8, resolveAnthropicAlias(model_input));
-        return finalize(a, .{
-            .provider_name = "anthropic",
-            .api_tag = "anthropic-messages",
-            .model_id = model,
-            .api_key = api_key,
-            .auth_token = auth_token,
-            .base_url = null,
-            .context_window = default_context_window,
-            .max_output = default_max_output,
-        }, cfg, models_extras);
-    }
+fn buildPrintFauxConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, models_extras: []const models_mod.Entry) !ProviderInfo {
+    const model = cfg.model orelse try a.dupe(u8, "faux-1");
+    return finalize(a, .{
+        .provider_name = "faux",
+        .api_tag = "faux",
+        .model_id = model,
+        .api_key = null,
+        .auth_token = null,
+        .base_url = null,
+        .context_window = 1_000_000,
+        .max_output = 8192,
+        .capabilities = undefined,
+    }, cfg, models_extras);
+}
 
-    if (std.mem.eql(u8, chosen, "openai")) {
-        const effective_key: ?[]const u8 = openai_api_key orelse cfg.api_key;
-        if (effective_key == null) {
-            const msg = "openai provider requires --api-key or OPENAI_API_KEY, or an `openai` entry in auth.json\n";
-            return exitWithMessageErr(allocator, msg, 2);
-        }
-        const model = cfg.model orelse try a.dupe(u8, settings.default_model_openai);
-        return finalize(a, .{
-            .provider_name = "openai",
-            .api_tag = "openai-chat-completions",
-            .model_id = model,
-            .api_key = effective_key,
-            .auth_token = null,
-            .base_url = null,
-            .context_window = default_context_window,
-            .max_output = default_max_output,
-        }, cfg, models_extras);
-    }
+fn buildPrintAnthropicConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const PrintCredentials, settings: *const settings_mod.Settings, models_extras: []const models_mod.Entry) !ProviderInfo {
+    if (creds.api_key == null and creds.auth_token == null) return error.MissingApiKey;
+    const model = cfg.model orelse try a.dupe(u8, resolveAnthropicAlias(settings.default_model_anthropic));
+    const resolved_model = resolveAnthropicAlias(model);
+    return finalize(a, .{
+        .provider_name = "anthropic",
+        .api_tag = "anthropic-messages",
+        .model_id = resolved_model,
+        .api_key = creds.api_key,
+        .auth_token = creds.auth_token,
+        .base_url = null,
+        .context_window = 1_000_000,
+        .max_output = 8192,
+        .capabilities = undefined,
+    }, cfg, models_extras);
+}
 
-    if (std.mem.eql(u8, chosen, "gateway")) {
-        const base_url_str: []const u8 = cfg.base_url orelse blk: {
-            if (environ.getPosix("FRANKY_GATEWAY_URL")) |u| break :blk try a.dupe(u8, u);
-            if (environ.getPosix("OPENAI_BASE_URL")) |u| break :blk try a.dupe(u8, u);
-            if (gateway_file) |rec| if (rec.api_key) |_| {
-                // If the user put a gateway cred in auth.json, they
-                // also need to have set a base_url — otherwise we
-                // can't reach the server.
-            };
-            const msg = "gateway provider requires --base-url (or FRANKY_GATEWAY_URL / OPENAI_BASE_URL env)\n";
-            return exitWithMessageErr(allocator, msg, 2);
-        };
-        // Credential optional — local gateways (Ollama, LM Studio)
-        // accept anonymous traffic. Remote gateways (Groq, Cerebras,
-        // OpenRouter, …) want --api-key.
-        const effective_key: ?[]const u8 = cfg.api_key orelse openai_api_key orelse blk: {
-            if (environ.getPosix("FRANKY_GATEWAY_TOKEN")) |t| break :blk try a.dupe(u8, t);
-            if (gateway_file) |rec| if (rec.api_key) |k| break :blk try a.dupe(u8, k);
-            break :blk null;
-        };
-        if (cfg.model == null) {
-            const msg = "gateway provider requires --model <id> (e.g. llama3.2 for Ollama, llama-3.1-70b for Groq)\n";
-            return exitWithMessageErr(allocator, msg, 2);
-        }
-        const model = cfg.model.?;
-        return finalize(a, .{
-            .provider_name = "gateway",
-            .api_tag = "openai-compatible-gateway",
-            .model_id = model,
-            .api_key = effective_key,
-            .auth_token = null,
-            .base_url = base_url_str,
-            .context_window = default_context_window,
-            .max_output = default_max_output,
-        }, cfg, models_extras);
-    }
+fn buildPrintOpenaiConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const PrintCredentials, settings: *const settings_mod.Settings, models_extras: []const models_mod.Entry) !ProviderInfo {
+    if (creds.openai_api_key == null and creds.api_key == null) return error.MissingApiKey;
+    const actual_key = creds.openai_api_key orelse creds.api_key;
+    const model = cfg.model orelse try a.dupe(u8, settings.default_model_openai);
+    return finalize(a, .{
+        .provider_name = "openai",
+        .api_tag = "openai-chat-completions",
+        .model_id = model,
+        .api_key = actual_key,
+        .auth_token = null,
+        .base_url = null,
+        .context_window = 1_000_000,
+        .max_output = 8192,
+        .capabilities = undefined,
+    }, cfg, models_extras);
+}
 
-    if (std.mem.eql(u8, chosen, "google-gemini") or std.mem.eql(u8, chosen, "gemini") or std.mem.eql(u8, chosen, "google")) {
-        // v1.23.0 — native Gemini provider. API key from
-        // GEMINI_API_KEY / GOOGLE_API_KEY (sent as `?key=`) OR
-        // an externally-minted bearer token from auth.json (sent
-        // as `Authorization: Bearer`). `--api-key` on the CLI
-        // double-binds to the api-key path so users can pass it
-        // ad-hoc.
-        const effective_key: ?[]const u8 = gemini_api_key orelse cfg.api_key;
-        const effective_token: ?[]const u8 = gemini_auth_token;
-        if (effective_key == null and effective_token == null) {
-            const msg =
-                "google-gemini provider requires one of: --api-key, GEMINI_API_KEY, GOOGLE_API_KEY, " ++
-                "or --auth-token / a bearer-token record in $FRANKY_HOME/auth.json\n";
-            return exitWithMessageErr(allocator, msg, 2);
-        }
-        const model = cfg.model orelse try a.dupe(u8, "gemini-2.5-pro");
-        return finalize(a, .{
-            .provider_name = "google-gemini",
-            .api_tag = "google-gemini",
-            .model_id = model,
-            .api_key = effective_key,
-            .auth_token = effective_token,
-            .base_url = null,
-            .context_window = default_context_window,
-            .max_output = default_max_output,
-        }, cfg, models_extras);
-    }
+fn buildPrintGatewayConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, environ: std.process.Environ, creds: *const PrintCredentials, auth_state: ?auth_mod.Auth, models_extras: []const models_mod.Entry) !ProviderInfo {
+    const gateway_file = if (auth_state) |as| as.get("gateway") else null;
+    const base_url_str: ?[]const u8 = cfg.base_url orelse blk: {
+        if (environ.getPosix("FRANKY_GATEWAY_URL")) |u| break :blk try a.dupe(u8, u);
+        if (environ.getPosix("OPENAI_BASE_URL")) |u| break :blk try a.dupe(u8, u);
+        break :blk null;
+    };
+    const effective_key: ?[]const u8 = cfg.api_key orelse creds.openai_api_key orelse blk: {
+        if (environ.getPosix("FRANKY_GATEWAY_TOKEN")) |t| break :blk try a.dupe(u8, t);
+        if (gateway_file) |rec| if (rec.api_key) |k| break :blk try a.dupe(u8, k);
+        break :blk null;
+    };
+    const model = cfg.model orelse try a.dupe(u8, "gpt-4o");
+    return finalize(a, .{
+        .provider_name = "gateway",
+        .api_tag = "openai-compatible-gateway",
+        .model_id = model,
+        .api_key = effective_key,
+        .auth_token = cfg.auth_token,
+        .base_url = base_url_str,
+        .context_window = 1_000_000,
+        .max_output = 8192,
+        .capabilities = undefined,
+    }, cfg, models_extras);
+}
 
-    const msg = try std.fmt.allocPrint(allocator, "unknown --provider '{s}'; use faux, anthropic, openai, gateway, or google-gemini\n", .{chosen});
-    defer allocator.free(msg);
-    return exitWithMessageErr(allocator, msg, 2);
+fn buildPrintGeminiConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const PrintCredentials, models_extras: []const models_mod.Entry) !ProviderInfo {
+    const model = cfg.model orelse try a.dupe(u8, "gemini-2.5-pro");
+    const actual_key = creds.gemini_api_key orelse
+        if (cfg.api_key) |k| k else null;
+    return finalize(a, .{
+        .provider_name = "google-gemini",
+        .api_tag = "google-gemini",
+        .model_id = model,
+        .api_key = actual_key,
+        .auth_token = creds.gemini_auth_token,
+        .base_url = null,
+        .context_window = 1_000_000,
+        .max_output = 8192,
+        .capabilities = undefined,
+    }, cfg, models_extras);
 }
 
 /// Post-process a `ProviderInfo`: consult the models catalog for

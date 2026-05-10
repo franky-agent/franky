@@ -288,161 +288,14 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             inline_value = arg[eq + 1 ..];
         }
 
-        // Short-form --help / --version / --verbose / --no-session / -h.
-        if (std.mem.eql(u8, name, "-h") or std.mem.eql(u8, name, "--help")) {
-            cfg.show_help = true;
-            continue;
-        }
-        if (std.mem.eql(u8, name, "--version")) {
-            cfg.show_version = true;
-            continue;
-        }
-        if (std.mem.eql(u8, name, "--verbose")) {
-            cfg.verbose = true;
-            continue;
-        }
-        if (std.mem.eql(u8, name, "--no-session")) {
-            cfg.no_session = true;
-            continue;
-        }
-        if (std.mem.eql(u8, name, "--prompts")) {
-            cfg.prompts = true;
-            continue;
-        }
-        if (std.mem.eql(u8, name, "-y") or std.mem.eql(u8, name, "--yes")) {
-            cfg.yes = true;
-            continue;
-        }
-        if (std.mem.eql(u8, name, "--remember-permissions")) {
-            cfg.remember_permissions = true;
-            continue;
-        }
+        if (try dispatchFlag(&cfg, name, inline_value, &i, argv, a)) continue;
 
-        // Valued flags.
-        const take_value = struct {
-            fn next(argv2: []const []const u8, idx: *usize, inline_v: ?[]const u8) ParseError![]const u8 {
-                if (inline_v) |v| return v;
-                idx.* += 1;
-                if (idx.* >= argv2.len) return error.MissingValue;
-                return argv2[idx.*];
-            }
-        }.next;
-
-        if (std.mem.eql(u8, name, "--provider")) {
-            cfg.provider = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--model")) {
-            cfg.model = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--api-key")) {
-            cfg.api_key = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--auth-token")) {
-            cfg.auth_token = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--base-url")) {
-            cfg.base_url = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--system-prompt")) {
-            cfg.system_prompt = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--append-system-prompt")) {
-            cfg.append_system_prompt = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--thinking")) {
-            const v = try take_value(argv, &i, inline_value);
-            cfg.thinking = types.ThinkingLevel.fromString(v) orelse return error.UnknownThinkingLevel;
-            cfg.thinking_explicit = true;
-        } else if (std.mem.eql(u8, name, "--log-level")) {
-            cfg.log_level = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--log-file")) {
-            cfg.log_file = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--log-per-session")) {
-            cfg.log_per_session = true;
-        } else if (std.mem.eql(u8, name, "--http-trace-dir")) {
-            cfg.http_trace_dir = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--text-tool-call-fallback")) {
-            cfg.text_tool_call_fallback = true;
-        } else if (std.mem.eql(u8, name, "--profile")) {
-            cfg.profile = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--list-profiles")) {
-            cfg.list_profiles = true;
-        } else if (std.mem.eql(u8, name, "--save-profile")) {
-            cfg.save_profile = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--session")) {
-            cfg.session_id = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--session-dir")) {
-            cfg.session_dir = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--resume")) {
-            cfg.resume_id = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--continue")) {
-            cfg.continue_session = true;
-        } else if (std.mem.eql(u8, name, "--fork")) {
-            cfg.fork_branch = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--checkout")) {
-            cfg.checkout_branch = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--role")) {
-            cfg.role = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--export")) {
-            cfg.export_format = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--tools")) {
-            cfg.tools_filter = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--skills")) {
-            cfg.skills_path = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--skill")) {
-            const v = try take_value(argv, &i, inline_value);
-            if (cfg.skills_select_csv) |existing| {
-                cfg.skills_select_csv = try std.fmt.allocPrint(a, "{s},{s}", .{ existing, v });
-            } else {
-                cfg.skills_select_csv = try a.dupe(u8, v);
-            }
-        } else if (std.mem.eql(u8, name, "--prompts-dir")) {
-            cfg.prompts_dir = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--themes") or std.mem.eql(u8, name, "--theme")) {
-            cfg.theme = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--offline")) {
-            cfg.offline = true;
-        } else if (std.mem.eql(u8, name, "--extensions")) {
-            cfg.extensions = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--proxy-port")) {
-            const v = try take_value(argv, &i, inline_value);
-            cfg.proxy_port = std.fmt.parseInt(u16, v, 10) catch return error.UnknownMode;
-        } else if (std.mem.eql(u8, name, "--connect-timeout-ms")) {
-            const v = try take_value(argv, &i, inline_value);
-            cfg.connect_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
-        } else if (std.mem.eql(u8, name, "--upload-timeout-ms")) {
-            const v = try take_value(argv, &i, inline_value);
-            cfg.upload_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
-        } else if (std.mem.eql(u8, name, "--first-byte-timeout-ms")) {
-            const v = try take_value(argv, &i, inline_value);
-            cfg.first_byte_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
-        } else if (std.mem.eql(u8, name, "--event-gap-timeout-ms")) {
-            const v = try take_value(argv, &i, inline_value);
-            cfg.event_gap_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
-        } else if (std.mem.eql(u8, name, "--retry-max-attempts")) {
-            const v = try take_value(argv, &i, inline_value);
-            cfg.retry_max_attempts = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
-        } else if (std.mem.eql(u8, name, "--retry-max-total-ms")) {
-            const v = try take_value(argv, &i, inline_value);
-            cfg.retry_max_total_ms = std.fmt.parseInt(u64, v, 10) catch return error.UnknownMode;
-        } else if (std.mem.eql(u8, name, "--max-turns")) {
-            const v = try take_value(argv, &i, inline_value);
-            cfg.max_turns = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
-        } else if (std.mem.eql(u8, name, "--allow-tools")) {
-            cfg.allow_tools_csv = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--deny-tools")) {
-            cfg.deny_tools_csv = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--ask-tools")) {
-            cfg.ask_tools_csv = try a.dupe(u8, try take_value(argv, &i, inline_value));
-        } else if (std.mem.eql(u8, name, "--mode")) {
-            const v = try take_value(argv, &i, inline_value);
-            if (std.mem.eql(u8, v, "print")) cfg.mode = .print
-            else if (std.mem.eql(u8, v, "interactive")) cfg.mode = .interactive
-            else if (std.mem.eql(u8, v, "rpc")) cfg.mode = .rpc
-            else if (std.mem.eql(u8, v, "proxy")) cfg.mode = .proxy
-            else return error.UnknownMode;
-        } else {
-            // Unknown flag — treat as positional for now (no extensions yet).
-            try positionals.append(a, try a.dupe(u8, arg));
-            if (inline_value == null) {
-                // Consume a following value if the next arg doesn't look like a flag.
-                if (i + 1 < argv.len and argv[i + 1].len > 0 and argv[i + 1][0] != '-') {
-                    i += 1;
-                    try positionals.append(a, try a.dupe(u8, argv[i]));
-                }
+        // Unknown flag — treat as positional.
+        try positionals.append(a, try a.dupe(u8, arg));
+        if (inline_value == null) {
+            if (i + 1 < argv.len and argv[i + 1].len > 0 and argv[i + 1][0] != '-') {
+                i += 1;
+                try positionals.append(a, try a.dupe(u8, argv[i]));
             }
         }
     }
@@ -465,6 +318,173 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
     }
 
     return cfg;
+}
+
+fn dispatchFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i: *usize, argv: []const []const u8, a: std.mem.Allocator) ParseError!bool {
+    if (applyBoolFlag(cfg, name)) return true;
+    return applyValuedFlag(cfg, name, inline_value, i, argv, a);
+}
+
+fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "-h") or std.mem.eql(u8, name, "--help")) {
+        cfg.show_help = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--version")) {
+        cfg.show_version = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--verbose")) {
+        cfg.verbose = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-session")) {
+        cfg.no_session = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--prompts")) {
+        cfg.prompts = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "-y") or std.mem.eql(u8, name, "--yes")) {
+        cfg.yes = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--remember-permissions")) {
+        cfg.remember_permissions = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--log-per-session")) {
+        cfg.log_per_session = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--text-tool-call-fallback")) {
+        cfg.text_tool_call_fallback = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--list-profiles")) {
+        cfg.list_profiles = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--continue")) {
+        cfg.continue_session = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--offline")) {
+        cfg.offline = true;
+        return true;
+    }
+    return false;
+}
+
+fn takeValue(argv: []const []const u8, idx: *usize, inline_v: ?[]const u8) ParseError![]const u8 {
+    if (inline_v) |v| return v;
+    idx.* += 1;
+    if (idx.* >= argv.len) return error.MissingValue;
+    return argv[idx.*];
+}
+
+fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i: *usize, argv: []const []const u8, a: std.mem.Allocator) ParseError!bool {
+    if (std.mem.eql(u8, name, "--provider")) {
+        cfg.provider = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--model")) {
+        cfg.model = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--api-key")) {
+        cfg.api_key = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--auth-token")) {
+        cfg.auth_token = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--base-url")) {
+        cfg.base_url = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--system-prompt")) {
+        cfg.system_prompt = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--append-system-prompt")) {
+        cfg.append_system_prompt = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--thinking")) {
+        const v = try takeValue(argv, i, inline_value);
+        cfg.thinking = types.ThinkingLevel.fromString(v) orelse return error.UnknownThinkingLevel;
+        cfg.thinking_explicit = true;
+    } else if (std.mem.eql(u8, name, "--log-level")) {
+        cfg.log_level = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--log-file")) {
+        cfg.log_file = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--http-trace-dir")) {
+        cfg.http_trace_dir = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--profile")) {
+        cfg.profile = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--save-profile")) {
+        cfg.save_profile = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--session")) {
+        cfg.session_id = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--session-dir")) {
+        cfg.session_dir = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--resume")) {
+        cfg.resume_id = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--fork")) {
+        cfg.fork_branch = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--checkout")) {
+        cfg.checkout_branch = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--role")) {
+        cfg.role = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--export")) {
+        cfg.export_format = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--tools")) {
+        cfg.tools_filter = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--skills")) {
+        cfg.skills_path = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--skill")) {
+        const v = try takeValue(argv, i, inline_value);
+        if (cfg.skills_select_csv) |existing| {
+            cfg.skills_select_csv = try std.fmt.allocPrint(a, "{s},{s}", .{ existing, v });
+        } else {
+            cfg.skills_select_csv = try a.dupe(u8, v);
+        }
+    } else if (std.mem.eql(u8, name, "--prompts-dir")) {
+        cfg.prompts_dir = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--themes") or std.mem.eql(u8, name, "--theme")) {
+        cfg.theme = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--extensions")) {
+        cfg.extensions = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--proxy-port")) {
+        const v = try takeValue(argv, i, inline_value);
+        cfg.proxy_port = std.fmt.parseInt(u16, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--connect-timeout-ms")) {
+        const v = try takeValue(argv, i, inline_value);
+        cfg.connect_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--upload-timeout-ms")) {
+        const v = try takeValue(argv, i, inline_value);
+        cfg.upload_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--first-byte-timeout-ms")) {
+        const v = try takeValue(argv, i, inline_value);
+        cfg.first_byte_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--event-gap-timeout-ms")) {
+        const v = try takeValue(argv, i, inline_value);
+        cfg.event_gap_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--retry-max-attempts")) {
+        const v = try takeValue(argv, i, inline_value);
+        cfg.retry_max_attempts = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--retry-max-total-ms")) {
+        const v = try takeValue(argv, i, inline_value);
+        cfg.retry_max_total_ms = std.fmt.parseInt(u64, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--max-turns")) {
+        const v = try takeValue(argv, i, inline_value);
+        cfg.max_turns = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--allow-tools")) {
+        cfg.allow_tools_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--deny-tools")) {
+        cfg.deny_tools_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--ask-tools")) {
+        cfg.ask_tools_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--mode")) {
+        const v = try takeValue(argv, i, inline_value);
+        if (std.mem.eql(u8, v, "print")) cfg.mode = .print
+        else if (std.mem.eql(u8, v, "interactive")) cfg.mode = .interactive
+        else if (std.mem.eql(u8, v, "rpc")) cfg.mode = .rpc
+        else if (std.mem.eql(u8, v, "proxy")) cfg.mode = .proxy
+        else return error.UnknownMode;
+    } else {
+        return false;
+    }
+    return true;
 }
 
 pub const usage_text: []const u8 =

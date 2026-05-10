@@ -517,46 +517,71 @@ pub fn resolveProvider(
 ) !ProviderInfo {
     const a = cfg.arena.allocator();
 
-    // ── Layered settings ─────────────────────────────────────────
     var settings = try loadSettings(allocator, io, map);
     defer settings.deinit();
+    applyThinkingOverride(cfg, &settings);
 
-    // Settings.thinking overrides only when CLI didn't set it explicitly.
+    var auth_state = try loadAuthState(a, allocator, io, map);
+    defer if (auth_state) |*as| as.deinit();
+
+    const models_extras = try loadModelsExtras(a, allocator, io, map);
+
+    const creds = try resolveAllCredentials(a, cfg, map, auth_state);
+    const chosen = chooseProvider(cfg, &creds, &settings);
+
+    if (std.mem.eql(u8, chosen, "faux")) return buildFauxConfig(a, cfg, models_extras);
+    if (std.mem.eql(u8, chosen, "anthropic")) return buildAnthropicConfig(a, cfg, &creds, &settings, models_extras);
+    if (std.mem.eql(u8, chosen, "openai")) return buildOpenaiConfig(a, cfg, &creds, &settings, models_extras);
+    if (std.mem.eql(u8, chosen, "gateway")) return buildGatewayConfig(a, cfg, map, &creds, auth_state, models_extras);
+    if (std.mem.eql(u8, chosen, "google-gemini")) return buildGeminiConfig(a, cfg, &creds, models_extras);
+
+    return error.UnknownProvider;
+}
+
+const ResolvedCredentials = struct {
+    api_key: ?[]const u8 = null,
+    auth_token: ?[]const u8 = null,
+    openai_api_key: ?[]const u8 = null,
+    gemini_api_key: ?[]const u8 = null,
+    gemini_auth_token: ?[]const u8 = null,
+    has_anthropic: bool = false,
+    has_openai: bool = false,
+    has_gemini: bool = false,
+};
+
+fn applyThinkingOverride(cfg: *cli_mod.Config, settings: *const settings_mod.Settings) void {
     if (!cfg.thinking_explicit) {
         if (ai.types.ThinkingLevel.fromString(settings.thinking)) |lvl| {
             cfg.thinking = lvl;
         }
     }
+}
 
-    // ── auth.json as a third credential tier ─────────────────────
-    var auth_state: ?auth_mod.Auth = null;
-    defer if (auth_state) |*a_state| a_state.deinit();
-    {
-        const franky_home = map.get("FRANKY_HOME");
-        const home = map.get("HOME");
-        const auth_path = try authJsonPathFrom(a, franky_home, home);
-        if (auth_path) |p| {
-            auth_state = auth_mod.load(allocator, io, p) catch null;
-        }
+fn loadAuthState(a: std.mem.Allocator, allocator: std.mem.Allocator, io: std.Io, map: *const std.process.Environ.Map) !?auth_mod.Auth {
+    const franky_home = map.get("FRANKY_HOME");
+    const home = map.get("HOME");
+    const auth_path = try authJsonPathFrom(a, franky_home, home);
+    if (auth_path) |p| {
+        return auth_mod.load(allocator, io, p) catch null;
     }
+    return null;
+}
 
-    // ── $FRANKY_HOME/models.json disk overlay ────────────────────
-    const models_extras: []const models_mod.Entry = blk: {
-        const franky_home = map.get("FRANKY_HOME");
-        const home = map.get("HOME");
-        const models_path = try modelsJsonPathFrom(a, franky_home, home);
-        if (models_path) |p| {
-            const bytes = readWholeFileOpt(allocator, io, p) orelse break :blk &.{};
-            defer allocator.free(bytes);
-            const entries = models_mod.parseFromSlice(a, bytes) catch break :blk &.{};
-            break :blk entries;
-        }
-        break :blk &.{};
-    };
+fn loadModelsExtras(a: std.mem.Allocator, allocator: std.mem.Allocator, io: std.Io, map: *const std.process.Environ.Map) ![]const models_mod.Entry {
+    const franky_home = map.get("FRANKY_HOME");
+    const home = map.get("HOME");
+    const models_path = try modelsJsonPathFrom(a, franky_home, home);
+    if (models_path) |p| {
+        const bytes = readWholeFileOpt(allocator, io, p) orelse return &.{};
+        defer allocator.free(bytes);
+        return models_mod.parseFromSlice(a, bytes) catch &.{};
+    }
+    return &.{};
+}
 
+fn resolveAllCredentials(a: std.mem.Allocator, cfg: *const cli_mod.Config, map: *const std.process.Environ.Map, auth_state: ?auth_mod.Auth) !ResolvedCredentials {
     const anthropic_file = if (auth_state) |as| as.get("anthropic") else null;
     const openai_file = if (auth_state) |as| as.get("openai") else null;
-    const gateway_file = if (auth_state) |as| as.get("gateway") else null;
     const gemini_file = if (auth_state) |as| as.get("google-gemini") else null;
 
     const api_key: ?[]const u8 = blk: {
@@ -588,112 +613,122 @@ pub fn resolveProvider(
         break :blk null;
     };
 
-    const has_anthropic_credential = api_key != null or auth_token != null;
-    const has_openai_credential = openai_api_key != null or (cfg.api_key != null and !has_anthropic_credential);
-    const has_gemini_credential = gemini_api_key != null or gemini_auth_token != null;
+    const has_anthropic = api_key != null or auth_token != null;
+    const has_openai = openai_api_key != null or (cfg.api_key != null and !has_anthropic);
+    const has_gemini = gemini_api_key != null or gemini_auth_token != null;
 
-    const chosen: []const u8 = blk: {
-        if (cfg.offline) break :blk "faux";
-        if (cfg.provider) |p| break :blk p;
-        if (has_anthropic_credential) break :blk "anthropic";
-        if (has_openai_credential) break :blk "openai";
-        if (has_gemini_credential) break :blk "google-gemini";
-        if (std.mem.eql(u8, settings.default_provider, "faux")) break :blk "faux";
-        break :blk "faux";
+    return .{
+        .api_key = api_key,
+        .auth_token = auth_token,
+        .openai_api_key = openai_api_key,
+        .gemini_api_key = gemini_api_key,
+        .gemini_auth_token = gemini_auth_token,
+        .has_anthropic = has_anthropic,
+        .has_openai = has_openai,
+        .has_gemini = has_gemini,
     };
+}
 
-    if (std.mem.eql(u8, chosen, "faux")) {
-        const model = cfg.model orelse try a.dupe(u8, "faux-1");
-        return finalize(a, .{
-            .provider_name = "faux",
-            .api_tag = "faux",
-            .model_id = model,
-            .api_key = null,
-            .auth_token = null,
-            .base_url = null,
-            .context_window = 1_000_000,
-            .max_output = 8192,
-            .capabilities = undefined,
-        }, cfg, models_extras);
-    }
+fn chooseProvider(cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, settings: *const settings_mod.Settings) []const u8 {
+    if (cfg.offline) return "faux";
+    if (cfg.provider) |p| return p;
+    if (creds.has_anthropic) return "anthropic";
+    if (creds.has_openai) return "openai";
+    if (creds.has_gemini) return "google-gemini";
+    if (std.mem.eql(u8, settings.default_provider, "faux")) return "faux";
+    return "faux";
+}
 
-    if (std.mem.eql(u8, chosen, "anthropic")) {
-        if (api_key == null and auth_token == null) return error.MissingApiKey;
-        const model = cfg.model orelse try a.dupe(u8, resolveAnthropicAlias(settings.default_model_anthropic));
-        const resolved_model = resolveAnthropicAlias(model);
-        return finalize(a, .{
-            .provider_name = "anthropic",
-            .api_tag = "anthropic-messages",
-            .model_id = resolved_model,
-            .api_key = api_key,
-            .auth_token = auth_token,
-            .base_url = null,
-            .context_window = 1_000_000,
-            .max_output = 8192,
-            .capabilities = undefined,
-        }, cfg, models_extras);
-    }
+fn buildFauxConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, models_extras: []const models_mod.Entry) ProviderInfo {
+    const model = cfg.model orelse "faux-1";
+    return finalize(a, .{
+        .provider_name = "faux",
+        .api_tag = "faux",
+        .model_id = model,
+        .api_key = null,
+        .auth_token = null,
+        .base_url = null,
+        .context_window = 1_000_000,
+        .max_output = 8192,
+        .capabilities = undefined,
+    }, cfg, models_extras);
+}
 
-    if (std.mem.eql(u8, chosen, "openai")) {
-        if (openai_api_key == null and api_key == null) return error.MissingApiKey;
-        const actual_key = openai_api_key orelse api_key;
-        const model = cfg.model orelse try a.dupe(u8, settings.default_model_openai);
-        return finalize(a, .{
-            .provider_name = "openai",
-            .api_tag = "openai-chat-completions",
-            .model_id = model,
-            .api_key = actual_key,
-            .auth_token = null,
-            .base_url = null,
-            .context_window = 1_000_000,
-            .max_output = 8192,
-            .capabilities = undefined,
-        }, cfg, models_extras);
-    }
+fn buildAnthropicConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, settings: *const settings_mod.Settings, models_extras: []const models_mod.Entry) !ProviderInfo {
+    if (creds.api_key == null and creds.auth_token == null) return error.MissingApiKey;
+    const model = cfg.model orelse try a.dupe(u8, resolveAnthropicAlias(settings.default_model_anthropic));
+    const resolved_model = resolveAnthropicAlias(model);
+    return finalize(a, .{
+        .provider_name = "anthropic",
+        .api_tag = "anthropic-messages",
+        .model_id = resolved_model,
+        .api_key = creds.api_key,
+        .auth_token = creds.auth_token,
+        .base_url = null,
+        .context_window = 1_000_000,
+        .max_output = 8192,
+        .capabilities = undefined,
+    }, cfg, models_extras);
+}
 
-    if (std.mem.eql(u8, chosen, "gateway")) {
-        const base_url_str: ?[]const u8 = cfg.base_url orelse blk: {
-            if (map.get("FRANKY_GATEWAY_URL")) |u| break :blk try a.dupe(u8, u);
-            if (map.get("OPENAI_BASE_URL")) |u| break :blk try a.dupe(u8, u);
-            break :blk null;
-        };
-        const effective_key: ?[]const u8 = cfg.api_key orelse openai_api_key orelse blk: {
-            if (map.get("FRANKY_GATEWAY_TOKEN")) |t| break :blk try a.dupe(u8, t);
-            if (gateway_file) |rec| if (rec.api_key) |k| break :blk try a.dupe(u8, k);
-            break :blk null;
-        };
-        const model = cfg.model orelse try a.dupe(u8, "gpt-4o");
-        return finalize(a, .{
-            .provider_name = "gateway",
-            .api_tag = "openai-compatible-gateway",
-            .model_id = model,
-            .api_key = effective_key,
-            .auth_token = cfg.auth_token,
-            .base_url = base_url_str,
-            .context_window = 1_000_000,
-            .max_output = 8192,
-            .capabilities = undefined,
-        }, cfg, models_extras);
-    }
+fn buildOpenaiConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, settings: *const settings_mod.Settings, models_extras: []const models_mod.Entry) !ProviderInfo {
+    if (creds.openai_api_key == null and creds.api_key == null) return error.MissingApiKey;
+    const actual_key = creds.openai_api_key orelse creds.api_key;
+    const model = cfg.model orelse try a.dupe(u8, settings.default_model_openai);
+    return finalize(a, .{
+        .provider_name = "openai",
+        .api_tag = "openai-chat-completions",
+        .model_id = model,
+        .api_key = actual_key,
+        .auth_token = null,
+        .base_url = null,
+        .context_window = 1_000_000,
+        .max_output = 8192,
+        .capabilities = undefined,
+    }, cfg, models_extras);
+}
 
-    if (std.mem.eql(u8, chosen, "google-gemini")) {
-        const model = cfg.model orelse try a.dupe(u8, "gemini-2.0-flash");
-        const actual_key = gemini_api_key orelse
-            if (cfg.api_key) |k| k else null;
-        return finalize(a, .{
-            .provider_name = "google-gemini",
-            .api_tag = "google-gemini",
-            .model_id = model,
-            .api_key = actual_key,
-            .auth_token = gemini_auth_token,
-            .base_url = null,
-            .context_window = 1_000_000,
-            .max_output = 8192,
-            .capabilities = undefined,
-        }, cfg, models_extras);
-    }
+fn buildGatewayConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, map: *const std.process.Environ.Map, creds: *const ResolvedCredentials, auth_state: ?auth_mod.Auth, models_extras: []const models_mod.Entry) !ProviderInfo {
+    const gateway_file = if (auth_state) |as| as.get("gateway") else null;
+    const base_url_str: ?[]const u8 = cfg.base_url orelse blk: {
+        if (map.get("FRANKY_GATEWAY_URL")) |u| break :blk try a.dupe(u8, u);
+        if (map.get("OPENAI_BASE_URL")) |u| break :blk try a.dupe(u8, u);
+        break :blk null;
+    };
+    const effective_key: ?[]const u8 = cfg.api_key orelse creds.openai_api_key orelse blk: {
+        if (map.get("FRANKY_GATEWAY_TOKEN")) |t| break :blk try a.dupe(u8, t);
+        if (gateway_file) |rec| if (rec.api_key) |k| break :blk try a.dupe(u8, k);
+        break :blk null;
+    };
+    const model = cfg.model orelse try a.dupe(u8, "gpt-4o");
+    return finalize(a, .{
+        .provider_name = "gateway",
+        .api_tag = "openai-compatible-gateway",
+        .model_id = model,
+        .api_key = effective_key,
+        .auth_token = cfg.auth_token,
+        .base_url = base_url_str,
+        .context_window = 1_000_000,
+        .max_output = 8192,
+        .capabilities = undefined,
+    }, cfg, models_extras);
+}
 
-    return error.UnknownProvider;
+fn buildGeminiConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, models_extras: []const models_mod.Entry) !ProviderInfo {
+    const model = cfg.model orelse try a.dupe(u8, "gemini-2.0-flash");
+    const actual_key = creds.gemini_api_key orelse
+        if (cfg.api_key) |k| k else null;
+    return finalize(a, .{
+        .provider_name = "google-gemini",
+        .api_tag = "google-gemini",
+        .model_id = model,
+        .api_key = actual_key,
+        .auth_token = creds.gemini_auth_token,
+        .base_url = null,
+        .context_window = 1_000_000,
+        .max_output = 8192,
+        .capabilities = undefined,
+    }, cfg, models_extras);
 }
 
 fn finalize(

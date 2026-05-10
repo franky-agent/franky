@@ -74,8 +74,8 @@
         },
         "ollama-home": {
             "provider": "gateway",
-            "base-url": "http://192.168.1.115:11434/v1/chat/completions",
-            "model": "gemma4:latest",
+            "base-url": "http://192.168.1.107:11434/v1/chat/completions",
+            "model": "gemma4:31b",
             "api-key": "ollama",
             "ask-tools": "all",
             "role": "full",
@@ -294,7 +294,7 @@
         },
         "openai": {
             "provider": "openai",
-            "model": "gpt-5.5",
+            "model": "gpt-5.4-mini-2026-03-17",
             "api-key-env": "OPENAI_API_KEY",
             "role": "full",
             "ask-tools": "all",

@@ -195,29 +195,8 @@ pub fn loadLayered(
     return settings;
 }
 
-fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
+fn applyTopLevelFields(settings: *Settings, obj: std.json.ObjectMap) !void {
     const alloc = settings.allocator;
-    // Scratch arena for the JSON read+parse only; does not outlive
-    // this function.
-    var scratch = std.heap.ArenaAllocator.init(alloc);
-    defer scratch.deinit();
-    const sa = scratch.allocator();
-
-    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch |e| switch (e) {
-        error.FileNotFound => return,
-        else => return,
-    };
-    defer f.close(io);
-    const len = f.length(io) catch return;
-    const buf = sa.alloc(u8, @intCast(len)) catch return;
-    const n = f.readPositionalAll(io, buf, 0) catch return;
-
-    const parsed = std.json.parseFromSlice(std.json.Value, sa, buf[0..n], .{}) catch return SettingsError.MalformedJson;
-    if (parsed.value != .object) return SettingsError.MalformedJson;
-    const obj = parsed.value.object;
-
-    // Per-field update: free the old default-allocated slice, dup
-    // the new value onto `alloc`. Each field is independent.
     if (obj.get("defaultProvider")) |v| if (v == .string) {
         alloc.free(settings.default_provider);
         settings.default_provider = try alloc.dupe(u8, v.string);
@@ -247,9 +226,9 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
         alloc.free(settings.theme);
         settings.theme = try alloc.dupe(u8, v.string);
     };
+}
 
-    // v1.19.0 — settings-layer overlay parsers.
-
+fn applyToolsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
     if (obj.get("tools")) |tools_v| if (tools_v == .object) {
         if (tools_v.object.get("bash")) |bash_v| if (bash_v == .object) {
             if (bash_v.object.get("timeoutMs")) |t| if (t == .integer and t.integer >= 1) {
@@ -270,7 +249,10 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
             };
         };
     };
+}
 
+fn applyPermissionsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
+    const alloc = settings.allocator;
     if (obj.get("permissions")) |perms_v| if (perms_v == .object) {
         if (perms_v.object.get("ask_all")) |b| if (b == .bool) {
             settings.permissions_ask_all = b.bool;
@@ -295,15 +277,10 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
             };
         };
     };
+}
 
-    if (obj.get("prompts")) |v| if (v == .bool) {
-        settings.prompts_default = v.bool;
-    };
-
-    if (obj.get("max_turns")) |v| if (v == .integer and v.integer >= 1 and v.integer <= std.math.maxInt(u32)) {
-        settings.max_turns = @intCast(v.integer);
-    };
-
+fn applyReviewSection(settings: *Settings, obj: std.json.ObjectMap) !void {
+    const alloc = settings.allocator;
     if (obj.get("review")) |rev_v| if (rev_v == .object) {
         if (rev_v.object.get("profiles")) |p| if (p == .array) {
             try appendStringArray(alloc, &settings.review_profiles, p.array);
@@ -322,6 +299,42 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
             settings.review_min_models = settings.review_max_models;
         }
     };
+}
+
+fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
+    const alloc = settings.allocator;
+    // Scratch arena for the JSON read+parse only; does not outlive
+    // this function.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch |e| switch (e) {
+        error.FileNotFound => return,
+        else => return,
+    };
+    defer f.close(io);
+    const len = f.length(io) catch return;
+    const buf = sa.alloc(u8, @intCast(len)) catch return;
+    const n = f.readPositionalAll(io, buf, 0) catch return;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, sa, buf[0..n], .{}) catch return SettingsError.MalformedJson;
+    if (parsed.value != .object) return SettingsError.MalformedJson;
+    const obj = parsed.value.object;
+
+    try applyTopLevelFields(settings, obj);
+    try applyToolsSection(settings, obj);
+    try applyPermissionsSection(settings, obj);
+
+    if (obj.get("prompts")) |v| if (v == .bool) {
+        settings.prompts_default = v.bool;
+    };
+
+    if (obj.get("max_turns")) |v| if (v == .integer and v.integer >= 1 and v.integer <= std.math.maxInt(u32)) {
+        settings.max_turns = @intCast(v.integer);
+    };
+
+    try applyReviewSection(settings, obj);
 }
 
 // ─── tests ────────────────────────────────────────────────────────

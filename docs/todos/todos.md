@@ -210,3 +210,11 @@ Lets add the used preset to the subagent overlay view in the header.
     <button class="sa-overlay-close" id="sa-overlay-close" aria-label="Close">×</button>
 </div>
 ```
+
+# Finish Task
+
+It could check if the worked on document was updated recently before the finish task was called and also take hash of it before the work and compare it after finish task to check changes as well. Or just send a final hint to the model please update the document you were working on if not already happended.
+
+# Nudging Modeles
+
+Some models (gpt) need constant nudging like `go on` or `Continue` how can the agent loop decide when to send this nugdes to keep the model working. 

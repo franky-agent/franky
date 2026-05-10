@@ -27,7 +27,9 @@ teller run --reset --shell -- sh -c 'echo "$GEMINI_API_KEY" | sbx secret set -g 
 teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host googleapis.com --env OLLAMA_KEY --value ${GEMINI_API_KEY}'
 
 # openai
-echo "$OPENAI_API_KEY" | sbx secret set -g openai
+teller run --reset --shell -- sh -c 'echo "$OPENAI_API_KEY" | sbx secret set -g openai'
+teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host openai.com --env OPENAI_API_KEY --value ${OPENAI_API_KEY}'
+
 
 
 We can also wrap this up with teller so that we can have a .teller.yaml file

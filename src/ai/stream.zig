@@ -408,33 +408,53 @@ pub const Reducer = struct {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
         try buf.appendSlice(allocator, "{\"version\":1");
+
+        try appendStopReason(allocator, &buf, self);
+        try appendErrorMessage(allocator, &buf, self);
+        try appendDiagnosticsSnapshot(allocator, &buf, self);
+        try appendBlockOrderSnapshot(allocator, &buf, self);
+        try appendTextBlocksSnapshot(allocator, &buf, self);
+        try appendThinkingBlocksSnapshot(allocator, &buf, self);
+        try appendToolCallsSnapshot(allocator, &buf, self);
+
+        try buf.append(allocator, '}');
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    fn appendStopReason(_allocator: std.mem.Allocator, buf: *std.ArrayList(u8), self: *const Reducer) !void {
         if (self.stop_reason) |sr| {
-            try buf.appendSlice(allocator, ",\"stopReason\":\"");
-            try buf.appendSlice(allocator, sr.toString());
-            try buf.append(allocator, '"');
+            try buf.appendSlice(_allocator, ",\"stopReason\":\"");
+            try buf.appendSlice(_allocator, sr.toString());
+            try buf.append(_allocator, '"');
         }
+    }
+
+    fn appendErrorMessage(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), self: *const Reducer) !void {
         if (self.error_message) |m| {
             try buf.appendSlice(allocator, ",\"errorMessage\":");
-            try appendJsonStrLocal(allocator, &buf, m);
+            try appendJsonStrLocal(allocator, buf, m);
         }
-        // diagnostics
+    }
+
+    fn appendDiagnosticsSnapshot(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), self: *const Reducer) !void {
         try buf.appendSlice(allocator, ",\"diagnostics\":{");
         var first_d = true;
         if (self.diag.trace_id) |s| {
-            try writeFieldStr(allocator, &buf, &first_d, "traceId", s);
+            try writeFieldStr(allocator, buf, &first_d, "traceId", s);
         }
         if (self.diag.finish_reason_raw) |s| {
-            try writeFieldStr(allocator, &buf, &first_d, "finishReasonRaw", s);
+            try writeFieldStr(allocator, buf, &first_d, "finishReasonRaw", s);
         }
-        try writeFieldUint(allocator, &buf, &first_d, "partsSeen", self.diag.parts_seen);
-        if (self.diag.candidates_tokens) |n| try writeFieldUint(allocator, &buf, &first_d, "candidatesTokens", n);
-        if (self.diag.thoughts_tokens) |n| try writeFieldUint(allocator, &buf, &first_d, "thoughtsTokens", n);
-        try writeFieldUint(allocator, &buf, &first_d, "textEvents", self.diag.text_event_count);
-        try writeFieldUint(allocator, &buf, &first_d, "thinkingEvents", self.diag.thinking_event_count);
-        try writeFieldUint(allocator, &buf, &first_d, "toolCallEvents", self.diag.tool_call_event_count);
+        try writeFieldUint(allocator, buf, &first_d, "partsSeen", self.diag.parts_seen);
+        if (self.diag.candidates_tokens) |n| try writeFieldUint(allocator, buf, &first_d, "candidatesTokens", n);
+        if (self.diag.thoughts_tokens) |n| try writeFieldUint(allocator, buf, &first_d, "thoughtsTokens", n);
+        try writeFieldUint(allocator, buf, &first_d, "textEvents", self.diag.text_event_count);
+        try writeFieldUint(allocator, buf, &first_d, "thinkingEvents", self.diag.thinking_event_count);
+        try writeFieldUint(allocator, buf, &first_d, "toolCallEvents", self.diag.tool_call_event_count);
         try buf.append(allocator, '}');
+    }
 
-        // block_order
+    fn appendBlockOrderSnapshot(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), self: *const Reducer) !void {
         try buf.appendSlice(allocator, ",\"blockOrder\":[");
         for (self.block_order.items, 0..) |ref, i| {
             if (i > 0) try buf.append(allocator, ',');
@@ -449,8 +469,9 @@ pub const Reducer = struct {
             try buf.appendSlice(allocator, ix_str);
         }
         try buf.append(allocator, ']');
+    }
 
-        // text buffers (size + content)
+    fn appendTextBlocksSnapshot(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), self: *const Reducer) !void {
         try buf.appendSlice(allocator, ",\"textBlocks\":[");
         for (self.text_blocks.items, 0..) |b, i| {
             if (i > 0) try buf.append(allocator, ',');
@@ -459,12 +480,13 @@ pub const Reducer = struct {
             defer allocator.free(ln);
             try buf.appendSlice(allocator, ln);
             try buf.appendSlice(allocator, ",\"text\":");
-            try appendJsonStrLocal(allocator, &buf, b.items);
+            try appendJsonStrLocal(allocator, buf, b.items);
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');
+    }
 
-        // thinking buffers
+    fn appendThinkingBlocksSnapshot(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), self: *const Reducer) !void {
         try buf.appendSlice(allocator, ",\"thinkingBlocks\":[");
         for (self.thinking_blocks.items, 0..) |b, i| {
             if (i > 0) try buf.append(allocator, ',');
@@ -473,33 +495,31 @@ pub const Reducer = struct {
             defer allocator.free(ln);
             try buf.appendSlice(allocator, ln);
             try buf.appendSlice(allocator, ",\"text\":");
-            try appendJsonStrLocal(allocator, &buf, b.items);
+            try appendJsonStrLocal(allocator, buf, b.items);
             const sig = self.thinking_signatures.items[i];
             if (sig) |sv| {
                 try buf.appendSlice(allocator, ",\"signature\":");
-                try appendJsonStrLocal(allocator, &buf, sv);
+                try appendJsonStrLocal(allocator, buf, sv);
             }
             if (self.thinking_redacted.items[i]) try buf.appendSlice(allocator, ",\"redacted\":true");
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');
+    }
 
-        // tool_calls
+    fn appendToolCallsSnapshot(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), self: *const Reducer) !void {
         try buf.appendSlice(allocator, ",\"toolCalls\":[");
         for (self.tool_calls.items, 0..) |tc, i| {
             if (i > 0) try buf.append(allocator, ',');
             try buf.appendSlice(allocator, "{\"id\":");
-            try appendJsonStrLocal(allocator, &buf, tc.id);
+            try appendJsonStrLocal(allocator, buf, tc.id);
             try buf.appendSlice(allocator, ",\"name\":");
-            try appendJsonStrLocal(allocator, &buf, tc.name);
+            try appendJsonStrLocal(allocator, buf, tc.name);
             try buf.appendSlice(allocator, ",\"args\":");
-            try appendJsonStrLocal(allocator, &buf, tc.args.items);
+            try appendJsonStrLocal(allocator, buf, tc.args.items);
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');
-
-        try buf.append(allocator, '}');
-        return try buf.toOwnedSlice(allocator);
     }
 
     /// Transfer accumulated state into a `types.Message` (role = assistant).
