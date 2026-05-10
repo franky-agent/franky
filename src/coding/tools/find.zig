@@ -15,11 +15,9 @@
 //! `cwd`. Pass `false` to search the full tree.
 
 const std = @import("std");
-const ai = struct {
-    pub const types = @import("../../ai/types.zig");
-    pub const stream = @import("../../ai/stream.zig");
-};
-const at = @import("../../agent/types.zig");
+const ct = @import("../types.zig");
+const at = ct.agent.types;
+const ai = ct.ai;
 const gitignore = @import("../gitignore.zig");
 const workspace_mod = @import("workspace.zig");
 const common = @import("common.zig");

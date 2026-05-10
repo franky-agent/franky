@@ -6,11 +6,9 @@
 //! Binary files (NUL byte in first 8 KB) return `read_binary`.
 
 const std = @import("std");
-const ai = struct {
-    pub const types = @import("../../ai/types.zig");
-    pub const stream = @import("../../ai/stream.zig");
-};
-const at = @import("../../agent/types.zig");
+const ct = @import("../types.zig");
+const at = ct.agent.types;
+const ai = ct.ai;
 const workspace_mod = @import("workspace.zig");
 const common = @import("common.zig");
 const truncate_mod = @import("truncate.zig");

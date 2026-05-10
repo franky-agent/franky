@@ -5,11 +5,9 @@
 //! helpers live in `web_search.zig`.
 
 const std = @import("std");
-const ai = struct {
-    pub const types = @import("../../ai/types.zig");
-    pub const stream = @import("../../ai/stream.zig");
-};
-const at = @import("../../agent/types.zig");
+const ct = @import("../types.zig");
+const at = ct.agent.types;
+const ai = ct.ai;
 const utils = @import("../../ai/utils.zig");
 const common = @import("common.zig");
 const web_search = @import("web_search.zig");

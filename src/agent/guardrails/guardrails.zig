@@ -49,6 +49,11 @@ pub const GuardrailState = struct {
     /// Set to true when finish_task is triggered; causes compilation guard
     /// to run with force=true in the next betweenTurns call.
     finish_task_pending_compilation: bool = false,
+    /// v2.17 - optional pointer to a session restart flag. When set and
+    /// finish_task completes successfully with restart=true, the guardrail
+    /// stores true here so the mode driver can trigger the spawn-and-exit
+    /// sequence.
+    restart_requested: ?*std.atomic.Value(bool) = null,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config, io: std.Io) !GuardrailState {
         const comp_guard = try compile_mod.CompilationGuard.init(
@@ -173,6 +178,13 @@ pub const GuardrailState = struct {
                     runAutoCommit(allocator, io, self.config.workspace_dir, msg) catch |err| {
                         ai.log.log(.warn, "guardrails", "auto_commit_failed", "err={s}", .{@errorName(err)});
                     };
+                }
+            }
+            // v2.17 - if finish_task requested restart, signal the mode driver.
+            if (self.finish_task_state.restart) {
+                if (self.restart_requested) |flag| {
+                    flag.store(true, .release);
+                    ai.log.log(.info, "guardrails", "restart", "finish_task requested restart", .{});
                 }
             }
             self.finish_task_state.reset();

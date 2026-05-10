@@ -19,8 +19,8 @@
 //! unit test that calls `tool()` directly without a session root.
 
 const std = @import("std");
-const path_safety = @import("../path_safety.zig");
-const env_denylist = @import("../env_denylist.zig");
+const path_safety = @import("../security/path_safety.zig");
+const env_denylist = @import("../security/env_denylist.zig");
 
 pub const Workspace = struct {
     /// Absolute canonical path the session treats as the workspace

@@ -388,7 +388,7 @@ pub fn resolveAuthToken(
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const test_h = @import("../test_helpers.zig");
+const test_h = @import("../../test_helpers.zig");
 
 test "resolveApiKey: CLI flag beats env beats file" {
     try testing.expectEqualStrings("cli", resolveApiKey("cli", "env", "file").?);

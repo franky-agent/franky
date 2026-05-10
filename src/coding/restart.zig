@@ -45,7 +45,7 @@ pub fn deinit(allocator: std.mem.Allocator) void {
 
 /// Spawn a fresh instance and exit the current process.
 /// Never returns on success.
-pub fn spawnAndExit(io: std.Io) Error {
+pub fn spawnAndExit(io: std.Io) Error!void {
     const exe_path = cached_exe_path orelse return error.SpawnFailed;
     const argv = cached_argv orelse return error.SpawnFailed;
 

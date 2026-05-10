@@ -13,12 +13,9 @@
 //!   `edit_conflict` — a later edit's `old` was invalidated by earlier
 
 const std = @import("std");
-const ai = struct {
-    pub const types = @import("../../ai/types.zig");
-    pub const stream = @import("../../ai/stream.zig");
-    pub const partial_json = @import("../../ai/partial_json.zig");
-};
-const at = @import("../../agent/types.zig");
+const ct = @import("../types.zig");
+const at = ct.agent.types;
+const ai = ct.ai;
 const common = @import("common.zig");
 const workspace_mod = @import("workspace.zig");
 

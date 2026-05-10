@@ -327,7 +327,7 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const test_h = @import("../test_helpers.zig");
+const test_h = @import("../../test_helpers.zig");
 
 test "defaults: sensible baselines per §H.2" {
     var s = try defaults(testing.allocator);

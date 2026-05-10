@@ -13,13 +13,11 @@
 //! into them. Pass `respectGitignore=false` to force the full listing.
 
 const std = @import("std");
-const ai = struct {
-    pub const types = @import("../../ai/types.zig");
-    pub const stream = @import("../../ai/stream.zig");
-};
-const at = @import("../../agent/types.zig");
-const gitignore = @import("../gitignore.zig");
+const ct = @import("../types.zig");
+const at = ct.agent.types;
+const ai = ct.ai;
 const workspace_mod = @import("workspace.zig");
+const gitignore = @import("../gitignore.zig");
 const common = @import("common.zig");
 
 pub const parameters_json: []const u8 =

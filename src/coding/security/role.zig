@@ -25,8 +25,8 @@
 //! "zero risk of arbitrary execution out of the box").
 
 const std = @import("std");
-const at = @import("../agent/types.zig");
-const agent_loop = @import("../agent/loop.zig");
+const at = @import("../../agent/types.zig");
+const agent_loop = @import("../../agent/loop.zig");
 
 pub const Role = enum {
     read,

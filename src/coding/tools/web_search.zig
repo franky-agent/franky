@@ -15,11 +15,9 @@
 //!               Bearer token from `ctx.api_key` or `OLLAMA_API_KEY`.
 
 const std = @import("std");
-const ai = struct {
-    pub const types = @import("../../ai/types.zig");
-    pub const stream = @import("../../ai/stream.zig");
-};
-const at = @import("../../agent/types.zig");
+const ct = @import("../types.zig");
+const at = ct.agent.types;
+const ai = ct.ai;
 const http_mod = @import("../../ai/http.zig");
 const utils = @import("../../ai/utils.zig");
 const common = @import("common.zig");

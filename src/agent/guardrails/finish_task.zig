@@ -25,6 +25,10 @@ pub const parameters_json: []const u8 =
     \\    "summary": {
     \\      "type": "string",
     \\      "description": "What was done, what remains unknown, what to do next."
+    \\    },
+    \\    "restart": {
+    \\      "type": "boolean",
+    \\      "description": "When true, after committing, the process will restart itself (spawn a fresh binary and exit). Only works in proxy and interactive modes."
     \\    }
     \\  },
     \\  "additionalProperties": false
@@ -40,6 +44,8 @@ pub const FinishTaskState = struct {
     summary: ?[]const u8 = null,
     /// True from the moment finish_task fires until betweenTurns consumes it.
     triggered: bool = false,
+    /// When true, after successful compilation + commit the process restarts.
+    restart: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) FinishTaskState {
         return .{ .allocator = allocator };
@@ -60,6 +66,7 @@ pub const FinishTaskState = struct {
             self.summary = null;
         }
         self.triggered = false;
+        self.restart = false;
     }
 };
 
@@ -142,6 +149,8 @@ fn execute(
     state.reset();
     state.commit_message = try state.allocator.dupe(u8, commit_msg);
     state.summary = try state.allocator.dupe(u8, sum_val.string);
+    // v2.17 — parse optional restart flag from finish_task args.
+    state.restart = if (root.object.get("restart")) |v| v == .bool and v.bool else false;
     state.triggered = true;
 
     const text = try std.fmt.allocPrint(

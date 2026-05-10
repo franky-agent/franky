@@ -321,7 +321,7 @@ pub fn loadTree(
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const test_h = @import("../test_helpers.zig");
+const test_h = @import("../../test_helpers.zig");
 
 test "Tree: init starts on main with 0 messages" {
     var t = try Tree.init(testing.allocator);

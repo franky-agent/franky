@@ -26,12 +26,12 @@
 //! `"Earlier in this conversation:\n\n"`.
 
 const std = @import("std");
-const types = @import("../ai/types.zig");
-const registry_mod = @import("../ai/registry.zig");
-const stream_mod = @import("../ai/stream.zig");
-const channel_mod = @import("../ai/channel.zig");
-const agent_loop = @import("../agent/loop.zig");
 const branching = @import("branching.zig");
+const agent_loop = @import("../../agent/loop.zig");
+const types = @import("../../ai/types.zig");
+const registry_mod = @import("../../ai/registry.zig");
+const stream_mod = @import("../../ai/stream.zig");
+const channel_mod = @import("../../ai/channel.zig");
 
 pub const TokenKind = enum { english, code };
 
@@ -586,7 +586,7 @@ fn replaceSpanWithSummary(
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const test_h = @import("../test_helpers.zig");
+const test_h = @import("../../test_helpers.zig");
 
 test "estimateTokens: english divides bytes by 3.5 (rounded up)" {
     // 2 / 3.5 = 0.57 → 1
@@ -737,7 +737,7 @@ test "selectSpan: pinned messages are preserved" {
 
 // ─── v1.5.1 — summarization dispatch tests ────────────────────────
 
-const faux = @import("../ai/providers/faux.zig");
+const faux = @import("../../ai/providers/faux.zig");
 
 test "renderSpanAsPrompt: text, tool-call, tool-result formatted per §E.3" {
     const gpa = testing.allocator;

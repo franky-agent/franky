@@ -22,9 +22,9 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
-const ait = @import("../ai/types.zig");
-const stream = @import("../ai/stream.zig");
-const log = @import("../ai/log.zig");
+const ait = @import("../../ai/types.zig");
+const stream = @import("../../ai/stream.zig");
+const log = @import("../../ai/log.zig");
 
 pub const ProfileError = error{
     ProfileNotFound,
@@ -884,7 +884,7 @@ fn appendKey(allocator: std.mem.Allocator, out: *std.ArrayList(u8), key: []const
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const test_h = @import("../test_helpers.zig");
+const test_h = @import("../../test_helpers.zig");
 
 test "interpolate: passthrough when no ${ present" {
     const gpa = testing.allocator;

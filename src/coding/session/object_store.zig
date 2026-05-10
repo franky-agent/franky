@@ -14,7 +14,7 @@
 //! primitives below are tested end-to-end on tmpdirs.
 
 const std = @import("std");
-const session_mod = @import("session.zig");
+const session_mod = @import("persistence.zig");
 
 /// Blobs smaller than this stay inline in `transcript.json`.
 /// Blobs at or above this size are stored in `objects/`.
@@ -172,7 +172,7 @@ pub fn readObject(
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const test_h = @import("../test_helpers.zig");
+const test_h = @import("../../test_helpers.zig");
 
 test "store: small blob returned inline" {
     var threaded = test_h.threadedIo();

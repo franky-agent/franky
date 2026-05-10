@@ -35,7 +35,7 @@
 //!     this too in most cases; we model the strict form).
 
 const std = @import("std");
-const path_safety = @import("path_safety.zig");
+const path_safety = @import("security/path_safety.zig");
 
 // ─── Patterns ─────────────────────────────────────────────────────────
 

@@ -24,11 +24,9 @@
 //! megabytes of cache-internal hits and exhausting context budgets.
 
 const std = @import("std");
-const ai = struct {
-    pub const types = @import("../../ai/types.zig");
-    pub const stream = @import("../../ai/stream.zig");
-};
-const at = @import("../../agent/types.zig");
+const ct = @import("../types.zig");
+const at = ct.agent.types;
+const ai = ct.ai;
 const find_mod = @import("find.zig");
 const regex_mod = @import("../regex.zig");
 const workspace_mod = @import("workspace.zig");

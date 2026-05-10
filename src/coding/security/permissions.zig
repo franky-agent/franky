@@ -16,10 +16,10 @@
 
 const std = @import("std");
 const ai = struct {
-    pub const stream = @import("../ai/stream.zig");
+    pub const stream = @import("../../ai/stream.zig");
 };
-const at = @import("../agent/types.zig");
-const agent_loop = @import("../agent/loop.zig");
+const at = @import("../../agent/types.zig");
+const agent_loop = @import("../../agent/loop.zig");
 const role_mod = @import("role.zig");
 
 /// Per-call decision returned by `Store.check`.
@@ -1046,7 +1046,7 @@ test "renderPermissionsJson: keys are sorted (round-trip-stable)" {
 
 test "loadFromDisk → saveToDisk round-trip preserves entries" {
     const gpa = testing.allocator;
-    var threaded = @import("../test_helpers.zig").threadedIo();
+    var threaded = @import("../../test_helpers.zig").threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1072,7 +1072,7 @@ test "loadFromDisk → saveToDisk round-trip preserves entries" {
 
 test "loadFromDisk: missing file returns false (no error)" {
     const gpa = testing.allocator;
-    var threaded = @import("../test_helpers.zig").threadedIo();
+    var threaded = @import("../../test_helpers.zig").threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     var s = Store.init(gpa);
@@ -1083,7 +1083,7 @@ test "loadFromDisk: missing file returns false (no error)" {
 
 test "loadFromDisk: malformed JSON returns error.MalformedJson" {
     const gpa = testing.allocator;
-    var threaded = @import("../test_helpers.zig").threadedIo();
+    var threaded = @import("../../test_helpers.zig").threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1128,7 +1128,7 @@ test "Store auto-persists on always_allow when persist_path is set" {
     // addToSet + saveToDisk. Then reloads into a fresh store to
     // confirm the entry survived the round-trip.
     const gpa = testing.allocator;
-    var threaded = @import("../test_helpers.zig").threadedIo();
+    var threaded = @import("../../test_helpers.zig").threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1221,7 +1221,7 @@ test "Store.entryCount: sums across all six sets" {
 
 test "Store.revoke + persist_path: rewrite is observable from a fresh store" {
     const gpa = testing.allocator;
-    var threaded = @import("../test_helpers.zig").threadedIo();
+    var threaded = @import("../../test_helpers.zig").threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1399,7 +1399,7 @@ fn drainAndResolve(
 }
 
 test "PermissionPrompter: allow_once round-trip pushes event and lets call through" {
-    var threaded = @import("../test_helpers.zig").threadedIo();
+    var threaded = @import("../../test_helpers.zig").threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -1426,7 +1426,7 @@ test "PermissionPrompter: allow_once round-trip pushes event and lets call throu
 }
 
 test "PermissionPrompter: always_allow promotes to store" {
-    var threaded = @import("../test_helpers.zig").threadedIo();
+    var threaded = @import("../../test_helpers.zig").threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -1458,7 +1458,7 @@ test "PermissionPrompter: always_allow promotes to store" {
 }
 
 test "PermissionPrompter: deny_once blocks with user-denied reason" {
-    var threaded = @import("../test_helpers.zig").threadedIo();
+    var threaded = @import("../../test_helpers.zig").threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
@@ -1487,7 +1487,7 @@ test "PermissionPrompter: deny_once blocks with user-denied reason" {
 }
 
 test "PermissionPrompter.resolve on stale call_id returns NotPending" {
-    var threaded = @import("../test_helpers.zig").threadedIo();
+    var threaded = @import("../../test_helpers.zig").threadedIo();
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;

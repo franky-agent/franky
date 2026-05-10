@@ -7,7 +7,7 @@
 
 const std = @import("std");
 
-const ai = @import("../ai/mod.zig");
+const ai = @import("../../ai/mod.zig");
 const stream_mod = ai.stream;
 const utils = ai.utils;
 const Channel = ai.channel.Channel(stream_mod.StreamEvent);

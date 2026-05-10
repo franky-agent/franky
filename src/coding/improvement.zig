@@ -1104,7 +1104,7 @@ fn appendJsonEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: [
 
 fn formatIsoMs(allocator: std.mem.Allocator, ms: i64) ![]u8 {
     // Reuse the canonical formatter; takes seconds.
-    return @import("auth.zig").isoTimestampUtc(allocator, @divFloor(ms, 1000));
+    return @import("security/auth.zig").isoTimestampUtc(allocator, @divFloor(ms, 1000));
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────

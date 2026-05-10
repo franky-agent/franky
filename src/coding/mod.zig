@@ -25,30 +25,56 @@ pub const modes = struct {
 
 pub const terminal = @import("terminal.zig");
 
-pub const session = @import("session.zig");
-pub const cli = @import("cli.zig");
+pub const session = @import("session/mod.zig");
+
+// ═══════════════════════════════════════════════════
+// Backward-compatible aliases for moved modules.
+// These replicate the v2.22 flat namespace so consumers
+// (modes, bin/) resolve `franky.coding.<name>` without
+// changes. Remove after v2.24 when consumers are updated.
+// ═══════════════════════════════════════════════════
+
+pub const cli = @import("config/cli.zig");
+pub const settings = @import("config/settings.zig");
+pub const profiles = @import("config/profiles.zig");
+pub const role = @import("security/role.zig");
+pub const permissions = @import("security/permissions.zig");
+pub const auth = @import("security/auth.zig");
+pub const path_safety = @import("security/path_safety.zig");
+pub const env_denylist = @import("security/env_denylist.zig");
+pub const object_store = @import("session/object_store.zig");
+pub const branching = @import("session/branching.zig");
+pub const compaction = @import("session/compaction.zig");
+pub const replay = @import("session/replay.zig");
+pub const models = @import("model_catalog/models.zig");
+pub const models_render = @import("model_catalog/render.zig");
+pub const models_fetch = @import("model_catalog/fetch.zig");
+
+pub const config = struct {
+    pub const cli = @import("config/cli.zig");
+    pub const settings = @import("config/settings.zig");
+    pub const profiles = @import("config/profiles.zig");
+};
+pub const security = struct {
+    pub const role = @import("security/role.zig");
+    pub const permissions = @import("security/permissions.zig");
+    pub const auth = @import("security/auth.zig");
+    pub const path_safety = @import("security/path_safety.zig");
+    pub const env_denylist = @import("security/env_denylist.zig");
+};
+pub const model_catalog = struct {
+    pub const models = @import("model_catalog/models.zig");
+    pub const render = @import("model_catalog/render.zig");
+    pub const fetch = @import("model_catalog/fetch.zig");
+};
 pub const regex = @import("regex.zig");
 pub const gitignore = @import("gitignore.zig");
-pub const path_safety = @import("path_safety.zig");
-pub const env_denylist = @import("env_denylist.zig");
-pub const object_store = @import("object_store.zig");
-pub const branching = @import("branching.zig");
-pub const compaction = @import("compaction.zig");
-pub const role = @import("role.zig");
-pub const permissions = @import("permissions.zig");
-pub const settings = @import("settings.zig");
-pub const profiles = @import("profiles.zig");
-pub const auth = @import("auth.zig");
-pub const models = @import("models.zig");
-pub const models_render = @import("models_render.zig");
-pub const models_fetch = @import("models_fetch.zig");
 pub const rpc = @import("rpc.zig");
 pub const slash = @import("slash.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const improvement = @import("improvement.zig");
 pub const update = @import("update.zig");
 pub const skills = @import("skills.zig");
-pub const replay = @import("replay.zig");
 pub const restart = @import("restart.zig");
 pub const templates = @import("templates.zig");
 pub const extensions = @import("extensions.zig");
@@ -77,29 +103,40 @@ test {
     _ = modes.proxy;
     _ = terminal;
     _ = session;
-    _ = cli;
+    _ = cli;      // backward compat alias
+    _ = settings; // backward compat alias
+    _ = profiles; // backward compat alias
+    _ = role;     // backward compat alias
+    _ = permissions; // backward compat alias
+    _ = auth;     // backward compat alias
+    _ = path_safety; // backward compat alias
+    _ = env_denylist; // backward compat alias
+    _ = object_store; // backward compat alias
+    _ = branching; // backward compat alias
+    _ = compaction; // backward compat alias
+    _ = replay;   // backward compat alias
+    _ = models;   // backward compat alias
+    _ = models_render; // backward compat alias
+    _ = models_fetch;  // backward compat alias
+    _ = config.cli;
+    _ = config.settings;
+    _ = config.profiles;
+    _ = security.role;
+    _ = security.permissions;
+    _ = security.auth;
+    _ = security.path_safety;
+    _ = security.env_denylist;
+    _ = model_catalog.models;
+    _ = model_catalog.render;
+    _ = model_catalog.fetch;
     _ = regex;
     _ = gitignore;
-    _ = path_safety;
-    _ = env_denylist;
-    _ = object_store;
-    _ = branching;
-    _ = compaction;
-    _ = role;
-    _ = permissions;
-    _ = settings;
-    _ = profiles;
-    _ = auth;
-    _ = models;
-    _ = models_render;
-    _ = models_fetch;
     _ = rpc;
     _ = slash;
     _ = diagnostics;
     _ = improvement;
     _ = update;
     _ = skills;
-    _ = replay;
     _ = restart;
     _ = templates;
     _ = extensions;

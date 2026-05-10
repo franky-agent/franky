@@ -22,7 +22,7 @@
 //! joined with spaces into `prompt`.
 
 const std = @import("std");
-const types = @import("../ai/types.zig");
+const types = @import("../../ai/types.zig");
 
 pub const Mode = enum { print, interactive, rpc, proxy };
 

@@ -47,6 +47,7 @@ const branching_mod = franky.coding.branching;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
 const models_mod = franky.coding.models;
+const restart_mod = franky.coding.restart;
 const term_mod = @import("../terminal.zig");
 const print_mode = @import("print.zig");
 
@@ -244,6 +245,7 @@ fn runInteractive(
     try slash_registry.register(.{ .name = "help", .description = "Show slash-command help", .handler = slash_mod.helpHandler });
     try slash_registry.register(.{ .name = "clear", .description = "Clear transcript", .handler = interactiveClearHandler });
     try slash_registry.register(.{ .name = "quit", .description = "Exit", .handler = interactiveQuitHandler });
+    try slash_registry.register(.{ .name = "restart", .description = "Restart the process (spawn fresh binary)", .handler = interactiveRestartHandler });
     try slash_registry.register(.{ .name = "model", .description = "Print active model", .handler = interactiveModelHandler });
     try slash_registry.register(.{ .name = "template", .description = "Expand and submit a prompt template", .handler = interactiveTemplateHandler });
     // v1.5.3 — §J remainder.
@@ -386,6 +388,9 @@ fn runInteractive(
     buf.clear();
 
     while (running) {
+        // v2.17 - poll restart flag. If set, break out of the loop.
+        if (session.restart_requested.load(.acquire)) break;
+
         // Handle SIGWINCH between frames.
         if (term_mod.Resize.take()) {
             size = terminal.size();
@@ -641,6 +646,18 @@ fn runInteractive(
             // Idle — sleep a little to avoid pegging a CPU.
             io.sleep(.fromMilliseconds(10), .awake) catch {};
         }
+    }
+
+    // v2.17 - restart sequence: spawn fresh binary, exit.
+    if (session.restart_requested.load(.acquire)) {
+        restart_mod.spawnAndExit(io) catch |err| {
+            try scrollback.appendLine(try std.fmt.allocPrint(
+                allocator,
+                "restart failed: {s} - continuing without restart",
+                .{@errorName(err)},
+            ));
+        };
+        return;
     }
 
     // Leave alt-screen; `defer terminal.restore` handles the rest.
@@ -1696,6 +1713,10 @@ const SessionBinding = struct {
     /// (`interactive-<startup_ms>`) for the persist path; rpc and
     /// proxy use real session ids instead.
     startup_ms: i64 = 0,
+    /// v2.17 - restart signal. Set by `/restart` or finish_task.restart.
+    /// The main loop polls this flag and breaks out to perform the
+    /// spawn-and-exit restart sequence.
+    restart_requested: std.atomic.Value(bool) = .init(false),
     guardrail_state: agent.guardrails.GuardrailState = undefined,
 
     /// Fills `binding` in place. Taking the destination pointer is
@@ -1873,6 +1894,8 @@ const SessionBinding = struct {
             io,
         );
         errdefer binding.guardrail_state.deinit();
+        // v2.17 - wire guardrail restart signal to session flag.
+        binding.guardrail_state.restart_requested = &binding.restart_requested;
 
         binding.provider = try print_mode.resolveProvider(allocator, environ, cfg);
         try binding.registry.register(.{
@@ -2081,6 +2104,14 @@ fn interactiveQuitHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.
     const bridge = bridgeFromCtx(ctx);
     bridge.running.* = false;
     try ctx.output.appendSlice(ctx.allocator, "bye");
+}
+
+fn interactiveRestartHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
+    const bridge = bridgeFromCtx(ctx);
+    bridge.session.restart_requested.store(true, .release);
+    try ctx.output.appendSlice(ctx.allocator, "Restarting...");
+    // Set running false so the main loop breaks and picks up the restart flag.
+    bridge.running.* = false;
 }
 
 fn interactiveModelHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!void {

@@ -40,22 +40,17 @@
 //!   max_turns_exceeded / agent_error / aborted / config_error.
 
 const std = @import("std");
-const ai = struct {
-    pub const types = @import("../../ai/types.zig");
-    pub const stream = @import("../../ai/stream.zig");
-    pub const registry = @import("../../ai/registry.zig");
-    pub const log = @import("../../ai/log.zig");
-    pub const utils = @import("../../ai/utils.zig");
-};
-const at = @import("../../agent/types.zig");
+const ct = @import("../types.zig");
+const at = ct.agent.types;
+const ai = ct.ai;
 const agent_mod = @import("../../agent/agent.zig");
 const loop_mod = @import("../../agent/loop.zig");
-const cli_mod = @import("../cli.zig");
-const profiles_mod = @import("../profiles.zig");
+const cli_mod = @import("../config/cli.zig");
+const profiles_mod = @import("../config/profiles.zig");
 const print_mod = @import("../modes/print.zig");
-const role_mod = @import("../role.zig");
-const permissions_mod = @import("../permissions.zig");
-const session_mod = @import("../session.zig");
+const role_mod = @import("../security/role.zig");
+const permissions_mod = @import("../security/permissions.zig");
+const session_mod = @import("../session/mod.zig");
 const truncate_mod = @import("truncate.zig");
 
 pub const tool_name: []const u8 = "subagent";
