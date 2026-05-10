@@ -16,7 +16,7 @@
 const std = @import("std");
 const errors = @import("errors.zig");
 
-pub const Provider = enum {
+const Provider = enum {
     anthropic,
     openai,
     /// Generic OpenAI-compatible gateway. Same shape as `openai`; the
@@ -26,7 +26,7 @@ pub const Provider = enum {
     openai_gateway,
 };
 
-pub const Extracted = struct {
+const Extracted = struct {
     /// Provider-advertised "kind" string: Anthropic's `error.type`,
     /// OpenAI's `error.type`.
     kind: ?[]const u8,
@@ -40,7 +40,7 @@ pub const Extracted = struct {
 /// Decode `body` into (kind, message, retry_after). Never fails —
 /// unparseable bodies yield all-null. The caller uses the HTTP status
 /// as the fallback signal.
-pub fn extract(allocator: std.mem.Allocator, provider: Provider, body: []const u8) Extracted {
+fn extract(allocator: std.mem.Allocator, provider: Provider, body: []const u8) Extracted {
     _ = provider; // both providers share `error.{type,message}` shape
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -69,11 +69,11 @@ pub fn extract(allocator: std.mem.Allocator, provider: Provider, body: []const u
 ///
 /// Returns the `Code` + an `is_hard` bool (for 429 `Retry-After` above
 /// the cap — caller surfaces `.rate_limited_hard`).
-pub const Classified = struct {
+const Classified = struct {
     code: errors.Code,
 };
 
-pub fn classify(
+fn classify(
     provider: Provider,
     status: u16,
     ext: Extracted,

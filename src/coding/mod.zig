@@ -40,8 +40,6 @@ pub const profiles = @import("config/profiles.zig");
 pub const role = @import("security/role.zig");
 pub const permissions = @import("security/permissions.zig");
 pub const auth = @import("security/auth.zig");
-pub const path_safety = @import("security/path_safety.zig");
-pub const env_denylist = @import("security/env_denylist.zig");
 pub const object_store = @import("session/object_store.zig");
 pub const branching = @import("session/branching.zig");
 pub const compaction = @import("session/compaction.zig");
@@ -111,8 +109,6 @@ test {
     _ = role;     // backward compat alias
     _ = permissions; // backward compat alias
     _ = auth;     // backward compat alias
-    _ = path_safety; // backward compat alias
-    _ = env_denylist; // backward compat alias
     _ = object_store; // backward compat alias
     _ = branching; // backward compat alias
     _ = compaction; // backward compat alias

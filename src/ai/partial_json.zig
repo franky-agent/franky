@@ -24,15 +24,15 @@
 
 const std = @import("std");
 
-pub const max_depth: u16 = 128;
+const max_depth: u16 = 128;
 
-pub const PartialResult = struct {
+const PartialResult = struct {
     value: ?std.json.Value,
     complete: bool,
     consumed: usize,
 };
 
-pub const Error = error{
+const Error = error{
     DepthExceeded,
     OutOfMemory,
 };

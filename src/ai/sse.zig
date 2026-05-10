@@ -24,8 +24,8 @@
 
 const std = @import("std");
 
-pub const max_event_bytes: usize = 4 * 1024 * 1024;
-pub const max_line_bytes: usize = 1 * 1024 * 1024;
+const max_event_bytes: usize = 4 * 1024 * 1024;
+const max_line_bytes: usize = 1 * 1024 * 1024;
 
 pub const Event = struct {
     /// Event name (from `event:` field). null if not set.
@@ -34,7 +34,7 @@ pub const Event = struct {
     data: []const u8,
 };
 
-pub const Error = error{
+const Error = error{
     ProtocolViolation,
     OutOfMemory,
 };
