@@ -218,3 +218,7 @@ It could check if the worked on document was updated recently before the finish 
 # Nudging Modeles
 
 Some models (gpt) need constant nudging like `go on` or `Continue` how can the agent loop decide when to send this nugdes to keep the model working. 
+
+# Bench Terminal
+
+Analzye the failing jobs/2026-05-10__20-11-18/overfull-hbox__QZ7oJYr job

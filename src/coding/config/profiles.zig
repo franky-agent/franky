@@ -21,6 +21,7 @@
 //! authoritative and the profile as "named bundle of defaults."
 
 const std = @import("std");
+const build_options = @import("build_options");
 const cli = @import("cli.zig");
 const ait = @import("../../ai/types.zig");
 const stream = @import("../../ai/stream.zig");
@@ -159,6 +160,15 @@ pub fn loadFromSettings(
         return profile;
     }
 
+    // Fall back to the settings.json embedded into the binary by build.zig.
+    // This keeps local-checkout Harbor/Terminal-Bench runs able to use project
+    // profiles even after the binary is copied into an isolated task container
+    // without the host's settings.json files.
+    if ((try loadProfileFromBytes(arena, environ_map, build_options.embedded_settings_json, name))) |profile| {
+        log.log(.debug, "profile", "loaded", "name={s} source=embedded-settings", .{name});
+        return profile;
+    }
+
     // Fall back to the built-in catalog.
     if (getBuiltinBody(name)) |body| {
         log.log(.debug, "profile", "loaded", "name={s} source=builtin", .{name});
@@ -193,7 +203,16 @@ fn loadProfileFromFile(
     const buf = try arena.alloc(u8, @intCast(len));
     const n = f.readPositionalAll(io, buf, 0) catch return null;
 
-    const parsed = std.json.parseFromSlice(std.json.Value, arena, buf[0..n], .{}) catch
+    return try loadProfileFromBytes(arena, environ_map, buf[0..n], name);
+}
+
+fn loadProfileFromBytes(
+    arena: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+    bytes: []const u8,
+    name: []const u8,
+) ProfileError!?Profile {
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, bytes, .{}) catch
         return error.MalformedProfile;
     if (parsed.value != .object) return null;
     const profiles_val = parsed.value.object.get("profiles") orelse return null;

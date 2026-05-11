@@ -72,13 +72,14 @@ pub const ResolvedConfig = struct {
 
     // ── Registry (populated) ──────────────────────────────────────
     registry: ai.registry.Registry,
+    faux_provider: *ai.providers.faux.FauxProvider,
 
     // ── Tool set (filtered by role + tools_filter, merged with extensions) ─
     tools: []const at.AgentTool,
 
     // ── Permission store ──────────────────────────────────────────
-    permission_store: permissions_mod.Store,
-    session_gates: permissions_mod.SessionGates,
+    permission_store: *permissions_mod.Store,
+    session_gates: *permissions_mod.SessionGates,
 
     // ── Preset registry ──────────────────────────────────────────
     preset_registry: tools_mod.subagent.PresetRegistry,
@@ -90,7 +91,7 @@ pub const ResolvedConfig = struct {
     skills: SkillsState,
 
     // ── Guardrails (per-mode wiring differs slightly) ────────────
-    guardrail_state: agent.guardrails.GuardrailState,
+    guardrail_state: *agent.guardrails.GuardrailState,
 
     // ── Settings overlay values ──────────────────────────────────
     bash_default_timeout_ms: ?u64,
@@ -100,16 +101,16 @@ pub const ResolvedConfig = struct {
     prompts_enabled: bool,
 
     // ── Workspace ────────────────────────────────────────────────
-    workspace: ?tools_mod.workspace.Workspace,
+    workspace: ?*tools_mod.workspace.Workspace,
 
     // ── Bash state (arena-allocated, address stable) ─────────────
-    bash_state: tools_mod.bash.SessionBashState,
+    bash_state: *tools_mod.bash.SessionBashState,
 
     // ── Read ctx (arena-allocated, address stable) ───────────────
-    read_ctx: tools_mod.read.ReadCtx,
+    read_ctx: *tools_mod.read.ReadCtx,
 
     // ── Subagent context ─────────────────────────────────────────
-    subagent_ctx: tools_mod.subagent.Ctx,
+    subagent_ctx: *tools_mod.subagent.Ctx,
 
     // ── Logging ─────────────────────────────────────────────────
     log_level: ai.log.Level,
@@ -121,7 +122,7 @@ pub const ResolvedConfig = struct {
     session_state: ?SessionState,
 
     // ── Role gate ────────────────────────────────────────────────
-    role_gate: role_mod.RoleGate,
+    role_gate: *role_mod.RoleGate,
     active_role: role_mod.Role,
 
     // ── Pre-rendered review config block ─────────────────────────
@@ -137,15 +138,25 @@ pub const ResolvedConfig = struct {
         // Tools slice is arena-allocated.
         // Bash state owns its cwd tracking etc.
         self.bash_state.deinit();
+        a.destroy(self.bash_state);
+        if (self.workspace) |ws| a.destroy(ws);
+        a.destroy(self.read_ctx);
+        a.destroy(self.subagent_ctx);
         // Guardrail state owns its sub-structures.
         self.guardrail_state.deinit();
+        a.destroy(self.guardrail_state);
         // Extension manager deinits its extensions.
         self.ext_manager.deinit();
         // Preset registry deinits its presets.
         self.preset_registry.deinit();
         // Permission store deinits its internal maps.
         self.permission_store.deinit();
-        // Registry deinits its entries.
+        a.destroy(self.permission_store);
+        a.destroy(self.session_gates);
+        a.destroy(self.role_gate);
+        // Registry deinits its entries; faux provider owns any seeded scripts.
+        self.faux_provider.deinit();
+        a.destroy(self.faux_provider);
         self.registry.deinit();
         // Session state if any.
         if (self.session_state) |*s| {
@@ -913,7 +924,9 @@ pub fn resolve(
     // Faux provider — arena-allocated so the registry's userdata pointer
     // remains valid after resolve() returns.
     const faux_ptr = try a.create(ai.providers.faux.FauxProvider);
+    errdefer a.destroy(faux_ptr);
     faux_ptr.* = ai.providers.faux.FauxProvider.init(allocator);
+    errdefer faux_ptr.deinit();
     try reg.register(.{
         .api = "faux",
         .provider = "faux",
@@ -951,79 +964,95 @@ pub fn resolve(
 
     // ── Step 7: Workspace + env policy ───────────────────────────
     const workspace_root: ?[]const u8 = environ.getPosix("PWD");
-    var workspace_state: ?tools_mod.workspace.Workspace = if (workspace_root) |root|
-        tools_mod.workspace.Workspace{ .root = root, .host_env = environ_map }
-    else
-        null;
+    const workspace_state: ?*tools_mod.workspace.Workspace = if (workspace_root) |root| blk: {
+        const ws = try a.create(tools_mod.workspace.Workspace);
+        errdefer a.destroy(ws);
+        ws.* = .{ .root = root, .host_env = environ_map };
+        break :blk ws;
+    } else null;
 
-    var bash_state = tools_mod.bash.SessionBashState.init(allocator);
+    const bash_state = try a.create(tools_mod.bash.SessionBashState);
+    errdefer a.destroy(bash_state);
+    bash_state.* = tools_mod.bash.SessionBashState.init(allocator);
     errdefer bash_state.deinit();
-    var read_ctx = tools_mod.read.ReadCtx{
-        .workspace = if (workspace_state) |*ws| ws else null,
+    const read_ctx = try a.create(tools_mod.read.ReadCtx);
+    errdefer a.destroy(read_ctx);
+    read_ctx.* = .{
+        .workspace = workspace_state,
     };
 
     // Apply settings overlays to bash/read state
-    applyBashSettingsOverlay(&bash_state, &settings);
-    applyReadSettingsOverlay(&read_ctx, &settings);
+    applyBashSettingsOverlay(bash_state, &settings);
+    applyReadSettingsOverlay(read_ctx, &settings);
 
     // ── Step 8: Build tool set ───────────────────────────────────
-    var bash_ctx = tools_mod.bash.BashCtx{
-        .state = &bash_state,
-        .workspace = if (workspace_state) |*ws| ws else null,
+    const bash_ctx = try a.create(tools_mod.bash.BashCtx);
+    errdefer a.destroy(bash_ctx);
+    bash_ctx.* = .{
+        .state = bash_state,
+        .workspace = workspace_state,
     };
-    var web_search_ctx = tools_mod.web_search.WebSearchCtx{
+    const web_search_ctx = try a.create(tools_mod.web_search.WebSearchCtx);
+    errdefer a.destroy(web_search_ctx);
+    web_search_ctx.* = .{
         .environ_map = environ_map,
     };
 
-    const all_tools = if (workspace_state) |*ws| [_]at.AgentTool{
-        tools_mod.read.toolWithCtx(&read_ctx),
+    const all_tools = if (workspace_state) |ws| [_]at.AgentTool{
+        tools_mod.read.toolWithCtx(read_ctx),
         tools_mod.write.toolWithWorkspace(ws),
         tools_mod.edit.toolWithWorkspace(ws),
-        tools_mod.bash.toolWithStateAndWorkspace(&bash_ctx),
+        tools_mod.bash.toolWithStateAndWorkspace(bash_ctx),
         tools_mod.ls.toolWithWorkspace(ws),
         tools_mod.find.toolWithWorkspace(ws),
         tools_mod.grep.toolWithWorkspace(ws),
-        tools_mod.web_search.toolWithCtx(&web_search_ctx),
-        tools_mod.web_fetch.toolWithCtx(&web_search_ctx),
+        tools_mod.web_search.toolWithCtx(web_search_ctx),
+        tools_mod.web_fetch.toolWithCtx(web_search_ctx),
     } else [_]at.AgentTool{
         tools_mod.read.tool(),
         tools_mod.write.tool(),
         tools_mod.edit.tool(),
-        tools_mod.bash.toolWithState(&bash_state),
+        tools_mod.bash.toolWithState(bash_state),
         tools_mod.ls.tool(),
         tools_mod.find.tool(),
         tools_mod.grep.tool(),
-        tools_mod.web_search.toolWithCtx(&web_search_ctx),
-        tools_mod.web_fetch.toolWithCtx(&web_search_ctx),
+        tools_mod.web_search.toolWithCtx(web_search_ctx),
+        tools_mod.web_fetch.toolWithCtx(web_search_ctx),
     };
 
     const active_role = if (cfg.role) |s|
         try role_mod.Role.fromString(s)
     else
         role_mod.Role.plan;
-    var role_gate = role_mod.RoleGate.init(active_role);
+    const role_gate = try a.create(role_mod.RoleGate);
+    errdefer a.destroy(role_gate);
+    role_gate.* = role_mod.RoleGate.init(active_role);
     const role_filtered_tools = try role_mod.filterTools(allocator, &all_tools, role_gate.set);
-    errdefer allocator.free(role_filtered_tools);
+    defer allocator.free(role_filtered_tools);
 
     // ── Step 9: Permission store ─────────────────────────────────
-    var permission_store = permissions_mod.Store.init(allocator);
+    const permission_store = try a.create(permissions_mod.Store);
+    errdefer a.destroy(permission_store);
+    permission_store.* = permissions_mod.Store.init(allocator);
     errdefer permission_store.deinit();
-    try applyPermissionsSettingsOverlay(&permission_store, &settings);
+    try applyPermissionsSettingsOverlay(permission_store, &settings);
     const prompts_enabled = resolvePromptsDefault(cfg, &settings);
     if (cfg.yes) permission_store.yes_to_all = true;
     if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
     if (cfg.deny_tools_csv) |s| try permission_store.addDenyList(s);
     if (cfg.ask_tools_csv) |s| try permission_store.addAskList(s);
     try permissions_mod.maybeAttachPersistence(
-        &permission_store,
+        permission_store,
         cfg.remember_permissions,
         cfg.arena.allocator(),
         io,
         environ_map,
     );
-    const session_gates: permissions_mod.SessionGates = .{
-        .role = &role_gate,
-        .permissions = if (prompts_enabled) &permission_store else null,
+    const session_gates = try a.create(permissions_mod.SessionGates);
+    errdefer a.destroy(session_gates);
+    session_gates.* = .{
+        .role = role_gate,
+        .permissions = if (prompts_enabled) permission_store else null,
     };
 
     // ── Step 10: Preset registry + extensions ────────────────────
@@ -1050,7 +1079,9 @@ pub fn resolve(
     };
 
     // ── Step 12: Guardrail state ─────────────────────────────────
-    var guardrail_state = try agent.guardrails.GuardrailState.init(
+    const guardrail_state = try a.create(agent.guardrails.GuardrailState);
+    errdefer a.destroy(guardrail_state);
+    guardrail_state.* = try agent.guardrails.GuardrailState.init(
         allocator,
         .{ .workspace_dir = workspace_root orelse "." },
         io,
@@ -1060,10 +1091,11 @@ pub fn resolve(
     // ── Step 13: Subagent context ────────────────────────────────
     // Build the Ctx first, then wire in the tools that reference it.
     // `parent_session_dir` is late-bound by the mode after session init.
-    const subagent_params_json = try tools_mod.subagent.buildParametersJson(allocator, &preset_registry);
-    errdefer allocator.free(subagent_params_json);
+    const subagent_params_json = try tools_mod.subagent.buildParametersJson(a, &preset_registry);
 
-    var subagent_ctx = tools_mod.subagent.Ctx{
+    const subagent_ctx = try a.create(tools_mod.subagent.Ctx);
+    errdefer a.destroy(subagent_ctx);
+    subagent_ctx.* = .{
         .registry = &reg,
         .environ = environ,
         .environ_map = environ_map,
@@ -1072,7 +1104,7 @@ pub fn resolve(
         .parent_profile = cfg.profile orelse "",
         .presets = &preset_registry,
         .parameters_json_owned = subagent_params_json,
-        .permission_store = if (prompts_enabled) &permission_store else null,
+        .permission_store = if (prompts_enabled) permission_store else null,
         .permission_prompter_slot = null,
         .parent_session_dir = null,
     };
@@ -1083,7 +1115,7 @@ pub fn resolve(
         if (ext_tools.len > 0) {
             @memcpy(slice[role_filtered_tools.len..][0..ext_tools.len], ext_tools);
         }
-        slice[base_len] = tools_mod.subagent.toolWithCtx(&subagent_ctx);
+        slice[base_len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
         slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(&preset_registry);
         slice[base_len + 2] = guardrail_state.finishTaskTool();
         break :blk slice;
@@ -1130,6 +1162,7 @@ pub fn resolve(
         .event_gap_timeout_ms = resolveTimeouts(cfg, environ_map).event_gap_ms,
         .text_tool_call_fallback = cfg.text_tool_call_fallback,
         .registry = reg,
+        .faux_provider = faux_ptr,
         .tools = all_final_tools,
         .permission_store = permission_store,
         .session_gates = session_gates,

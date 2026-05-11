@@ -19,6 +19,14 @@
 //! lookups.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+
+/// Local-checkout fallback settings embedded into the binary by build.zig. This
+/// is primarily useful when Franky is copied into an isolated benchmark/container
+/// runtime where `$FRANKY_HOME/settings.json` and `$HOME/.franky/settings.json`
+/// are not present. Real on-disk project/user settings still take precedence.
+const embedded_settings_json = build_options.embedded_settings_json;
 
 pub const SettingsError = error{
     MalformedJson,
@@ -182,15 +190,24 @@ pub fn loadLayered(
     var settings = try defaults(allocator);
     errdefer settings.deinit();
 
+    var loaded_any_layer = false;
+
     if (home_dir) |hd| {
         const path = try std.fs.path.join(allocator, &.{ hd, ".franky", "settings.json" });
         defer allocator.free(path);
-        try applyLayer(&settings, io, path);
+        loaded_any_layer = (try applyLayer(&settings, io, path)) or loaded_any_layer;
     }
     if (project_dir) |pd| {
         const path = try std.fs.path.join(allocator, &.{ pd, ".franky", "settings.json" });
         defer allocator.free(path);
-        try applyLayer(&settings, io, path);
+        loaded_any_layer = (try applyLayer(&settings, io, path)) or loaded_any_layer;
+    }
+
+    // If no settings layer is readable, fall back to the settings.json that was
+    // present in the checkout at compile time. Tests keep the old pure-defaults
+    // behavior so existing fixture expectations remain local and deterministic.
+    if (!loaded_any_layer and !builtin.is_test) {
+        try applyLayerBytes(&settings, embedded_settings_json);
     }
     return settings;
 }
@@ -301,24 +318,36 @@ fn applyReviewSection(settings: *Settings, obj: std.json.ObjectMap) !void {
     };
 }
 
-fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !void {
+fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !bool {
     const alloc = settings.allocator;
-    // Scratch arena for the JSON read+parse only; does not outlive
-    // this function.
+    // Scratch arena for the file read only; JSON parsing has its own scratch in
+    // applyLayerBytes.
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
 
     var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch |e| switch (e) {
-        error.FileNotFound => return,
-        else => return,
+        error.FileNotFound => return false,
+        else => return false,
     };
     defer f.close(io);
-    const len = f.length(io) catch return;
-    const buf = sa.alloc(u8, @intCast(len)) catch return;
-    const n = f.readPositionalAll(io, buf, 0) catch return;
+    const len = f.length(io) catch return false;
+    const buf = sa.alloc(u8, @intCast(len)) catch return false;
+    const n = f.readPositionalAll(io, buf, 0) catch return false;
 
-    const parsed = std.json.parseFromSlice(std.json.Value, sa, buf[0..n], .{}) catch return SettingsError.MalformedJson;
+    try applyLayerBytes(settings, buf[0..n]);
+    return true;
+}
+
+fn applyLayerBytes(settings: *Settings, bytes: []const u8) !void {
+    const alloc = settings.allocator;
+    // Scratch arena for the JSON parse only; applied values are duped onto the
+    // Settings allocator before this function returns.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, sa, bytes, .{}) catch return SettingsError.MalformedJson;
     if (parsed.value != .object) return SettingsError.MalformedJson;
     const obj = parsed.value.object;
 

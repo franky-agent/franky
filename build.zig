@@ -15,6 +15,10 @@ pub fn build(b: *std.Build) void {
     else
         use_lld_opt;
 
+    const embedded_settings_json = @embedFile("settings.json");
+    const franky_options = b.addOptions();
+    franky_options.addOption([]const u8, "embedded_settings_json", embedded_settings_json);
+
     // Public module — exposed to dependents via `b.dependency("franky").module("franky")`.
     // The internal binary still imports through the same `franky_module`
     // so there's only one definition. This is what makes franky-do (and
@@ -25,6 +29,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    franky_module.addOptions("build_options", franky_options);
+
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/bin/main.zig"),
         .target = target,
@@ -87,12 +93,15 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| doctor_run.addArgs(args);
     b.step("doctor", "Run cross-session self-improvement analyzer").dependOn(&doctor_run.step);
 
+    const test_options = b.addOptions();
+    test_options.addOption([]const u8, "embedded_settings_json", "{}");
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    test_module.addOptions("build_options", test_options);
     const unit_tests = b.addTest(.{
         .name = "franky-test",
         .root_module = test_module,

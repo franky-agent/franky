@@ -14,17 +14,17 @@ sbx secret set-custom -g --host api.cloudflare.com --env CF_API_TOKEN --value ${
 sbx secret set-custom -g --host api.cloudflare.com --env CF_ACCOUNT_ID --value ${CF_ACCOUNT_ID}$
 
 # mistral
-teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host api.mistral.ai --env MISTRAL_KEY --value ${MISTRAL_API_KEY}'
+teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host api.mistral.ai --env MISTRAL_API_KEY --value ${MISTRAL_API_KEY}'
 
 # ollama
-teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host ollama.com --env OLLAMA_KEY --value ${OLLAMA_KEY}'
+teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host ollama.com --env OLLAMA_API_KEY --value ${OLLAMA_API_KEY}'
 
 # openrouter
 sbx secret set-custom -g --host openrouter.ai --env OPENROUTER_KEY --value ${OPENROUTER_KEY}
 
 # gemini
 teller run --reset --shell -- sh -c 'echo "$GEMINI_API_KEY" | sbx secret set -g google'
-teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host googleapis.com --env OLLAMA_KEY --value ${GEMINI_API_KEY}'
+teller run --reset --shell -- sh -c 'sbx secret set-custom -g --host googleapis.com --env OLLAMA_API_KEY --value ${GEMINI_API_KEY}'
 
 # openai
 teller run --reset --shell -- sh -c 'echo "$OPENAI_API_KEY" | sbx secret set -g openai'
