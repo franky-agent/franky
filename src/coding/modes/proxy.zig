@@ -2755,28 +2755,6 @@ fn readDocStatus(io: std.Io, path: []const u8) []const u8 {
     return "unknown";
 }
 
-/// Append one `{"path":…,"name":…,"category":…,"status":…}` entry to `buf`.
-fn appendDesignDocEntry(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-    name: []const u8,
-    category: []const u8,
-    first: *bool,
-) !void {
-    if (!first.*) try buf.append(allocator, ',');
-    first.* = false;
-    try buf.appendSlice(allocator, "{\"path\":");
-    try appendUiJsonStr(buf, allocator, path);
-    try buf.appendSlice(allocator, ",\"name\":");
-    try appendUiJsonStr(buf, allocator, name);
-    try buf.appendSlice(allocator, ",\"category\":\"");
-    try buf.appendSlice(allocator, category);
-    try buf.appendSlice(allocator, "\",\"status\":\"");
-    try buf.appendSlice(allocator, readDocStatus(io, path));
-    try buf.appendSlice(allocator, "\"}");
-}
 
 fn renderDesignDocsJson(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
@@ -2785,6 +2763,15 @@ fn renderDesignDocsJson(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     var first = true;
 
     const cwd = std.Io.Dir.cwd();
+
+    // Collect entries per category, then sort alphabetically by name.
+    const Entries = struct {
+        path: []const u8,
+        name: []const u8,
+        category: []const u8,
+    };
+    var all = std.ArrayList(Entries).empty;
+    defer all.deinit(allocator);
 
     const subdirs = [_]struct { path: []const u8, category: []const u8 }{
         .{ .path = "docs/design/decided", .category = "decided" },
@@ -2800,30 +2787,57 @@ fn renderDesignDocsJson(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
         while (try it.next(io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
-            const stem = entry.name[0 .. entry.name.len - 3];
+            const stem = try allocator.dupe(u8, entry.name[0 .. entry.name.len - 3]);
+            errdefer allocator.free(stem);
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sub.path, entry.name });
-            defer allocator.free(path);
-            try appendDesignDocEntry(&buf, allocator, io, path, stem, sub.category, &first);
+            errdefer allocator.free(path);
+            try all.append(allocator, .{ .path = path, .name = stem, .category = sub.category });
         }
     }
 
     // Root-level .md files in docs/design/ — "draft" category.
-    var root = cwd.openDir(io, "docs/design", .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => {
-            try buf.appendSlice(allocator, "]}");
-            return try buf.toOwnedSlice(allocator);
-        },
+    if (cwd.openDir(io, "docs/design", .{ .iterate = true })) |*root| {
+        defer root.close(io);
+        var root_it = root.iterate();
+        while (try root_it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+            const stem = try allocator.dupe(u8, entry.name[0 .. entry.name.len - 3]);
+            errdefer allocator.free(stem);
+            const path = try std.fmt.allocPrint(allocator, "docs/design/{s}", .{entry.name});
+            errdefer allocator.free(path);
+            try all.append(allocator, .{ .path = path, .name = stem, .category = "draft" });
+        }
+    } else |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
         else => return err,
-    };
-    defer root.close(io);
-    var root_it = root.iterate();
-    while (try root_it.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
-        const stem = entry.name[0 .. entry.name.len - 3];
-        const path = try std.fmt.allocPrint(allocator, "docs/design/{s}", .{entry.name});
-        defer allocator.free(path);
-        try appendDesignDocEntry(&buf, allocator, io, path, stem, "draft", &first);
+    }
+
+    // Sort by (category, name) so order is deterministic.
+    const Ctx = struct { items: []Entries };
+    const sort_ctx = Ctx{ .items = all.items };
+    const lessThan = struct {
+        fn lt(_: Ctx, a: Entries, b: Entries) bool {
+            if (!std.mem.eql(u8, a.category, b.category)) {
+                return std.mem.order(u8, a.category, b.category) == .lt;
+            }
+            return std.mem.order(u8, a.name, b.name) == .lt;
+        }
+    }.lt;
+    std.sort.block(Entries, all.items, sort_ctx, lessThan);
+
+    for (all.items) |doc| {
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.appendSlice(allocator, "{\"path\":");
+        try appendUiJsonStr(&buf, allocator, doc.path);
+        try buf.appendSlice(allocator, ",\"name\":");
+        try appendUiJsonStr(&buf, allocator, doc.name);
+        try buf.appendSlice(allocator, ",\"category\":\"");
+        try buf.appendSlice(allocator, doc.category);
+        try buf.appendSlice(allocator, "\",\"status\":\"");
+        try buf.appendSlice(allocator, readDocStatus(io, doc.path));
+        try buf.appendSlice(allocator, "\"}");
     }
 
     try buf.appendSlice(allocator, "]}");

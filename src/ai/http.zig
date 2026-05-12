@@ -492,6 +492,8 @@ fn classifyTransport(e: anyerror) retry_mod.Outcome {
         error.TemporaryNameServerFailure,
         error.HttpConnectionClosing,
         error.BrokenPipe,
+        error.TlsInitializationFailed,
+        error.HttpChunkTruncated,
         => .retryable,
         else => .terminal,
     };
@@ -1016,6 +1018,7 @@ pub fn mapHttpError(e: anyerror) errors_mod.AgentError {
         error.TemporaryNameServerFailure,
         error.TlsInitializationFailed,
         error.CertificateBundleLoadFailure,
+        error.HttpChunkTruncated,
         => error.Transport,
         error.HttpErrorStatus => error.Transient,
         error.OutOfMemory => error.OutOfMemory,
@@ -1135,6 +1138,8 @@ test "classifyTransport: connection resets are retryable" {
     try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.ConnectionRefused));
     try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.ConnectionTimedOut));
     try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.BrokenPipe));
+    try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.TlsInitializationFailed));
+    try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.HttpChunkTruncated));
 }
 
 test "deadlineExpired: zero deadline means never" {
