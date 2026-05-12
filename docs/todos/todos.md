@@ -222,3 +222,19 @@ Some models (gpt) need constant nudging like `go on` or `Continue` how can the a
 # Bench Terminal
 
 Analzye the failing jobs/2026-05-10__20-11-18/overfull-hbox__QZ7oJYr job
+
+# For failing http request that fail after all retries add error message
+
+When a http provider request fails add the error message to log not just the error code like transient. When the retries are exhausted also throw the error back to the user with the status and the error message if possible. This will help a lot in debugging and also in understanding what went wrong instead of just knowing that it was a transient error.
+
+Here is an example from the log
+```
+--- response body ---
+{"error":"model 'deepseek-v4-flash' is temporarily overloaded, please retry shortly or try a different model (ref: d65cad69-0c45-4e58-83bf-7c388293faa4)"}
+```
+
+# Lets add the file icon to all path args in tool calls
+
+```
+<span class="file-icon">📄</span>
+```

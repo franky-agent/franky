@@ -486,6 +486,152 @@ function highlightCodeBlocks(container) {
         conversation.appendChild(el);
     }
 
+    const toolRenderers = new Map();
+
+    function renderGenericTable(args, includeKeys) {
+        const table = document.createElement('table');
+        table.className = 'tool-args-table';
+        const tbody = document.createElement('tbody');
+        const keys = includeKeys || Object.keys(args);
+        for (const key of keys) {
+            if (!(key in args)) continue;
+            const tr = document.createElement('tr');
+            const th = document.createElement('th');
+            th.textContent = key;
+            const td = document.createElement('td');
+            const val = args[key];
+            if (typeof val === 'string') {
+                td.textContent = val;
+            } else {
+                const code = document.createElement('code');
+                code.textContent = JSON.stringify(val);
+                td.appendChild(code);
+            }
+            tr.appendChild(th);
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+        }
+        table.appendChild(tbody);
+        return table;
+    }
+
+    function appendSpan(parent, className, text) {
+        const span = document.createElement('span');
+        span.className = className;
+        span.textContent = text;
+        parent.appendChild(span);
+    }
+
+    function renderReadArgs(args) {
+        const container = document.createElement('div');
+        container.className = 'tool-args-render';
+        const header = document.createElement('div');
+        header.className = 'file-header';
+        appendSpan(header, 'file-icon', '📄');
+        appendSpan(header, 'file-path', args.path || '');
+        container.appendChild(header);
+        if (args.limit != null || args.offset != null) {
+            const meta = document.createElement('div');
+            meta.className = 'file-meta';
+            const offset = args.offset || 0;
+            meta.textContent = args.limit != null
+                ? 'Lines ' + (offset + 1) + '–' + (offset + args.limit)
+                : 'From line ' + (offset + 1);
+            container.appendChild(meta);
+        }
+        return container;
+    }
+
+    function renderBashArgs(args) {
+        const container = document.createElement('div');
+        container.className = 'tool-args-render';
+        const term = document.createElement('div');
+        term.className = 'bash-command';
+        appendSpan(term, 'bash-prompt', '$');
+        const code = document.createElement('code');
+        code.textContent = args.command || '';
+        term.appendChild(code);
+        container.appendChild(term);
+        if (args.description) {
+            const desc = document.createElement('div');
+            desc.className = 'bash-description';
+            desc.textContent = args.description;
+            container.appendChild(desc);
+        }
+        if (args.cwd) {
+            const cwd = document.createElement('div');
+            cwd.className = 'bash-cwd';
+            appendSpan(cwd, 'cwd-label', 'cwd:');
+            appendSpan(cwd, 'cwd-path', args.cwd);
+            container.appendChild(cwd);
+        }
+        return container;
+    }
+
+    toolRenderers.set('read', renderReadArgs);
+    toolRenderers.set('bash', renderBashArgs);
+    toolRenderers.set('grep', (args) => renderGenericTable(args, ['path', 'pattern']));
+    toolRenderers.set('finish_task', (args) => renderGenericTable(args, ['commit_message']));
+    toolRenderers.set(EDIT_TOOL_NAME, (args) => renderGenericTable(args, ['path']));
+
+    function renderToolArgs(name, argsJson) {
+        const args = parseData(argsJson);
+        if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+        const renderer = toolRenderers.get(name);
+        return renderer ? renderer(args) : renderGenericTable(args);
+    }
+
+    function wrapRenderedArgs(rendered, argsJson) {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'tool-args-wrapper';
+        wrapper.appendChild(rendered);
+
+        const rawDiv = document.createElement('div');
+        rawDiv.className = 'tool-args-raw';
+        rawDiv.hidden = true;
+        const pre = document.createElement('pre');
+        pre.textContent = argsJson || '';
+        rawDiv.appendChild(pre);
+        wrapper.appendChild(rawDiv);
+        return wrapper;
+    }
+
+    function setRenderedArgs(argsEl, name, argsJson) {
+        if (!argsEl) return;
+        const raw = argsJson || '';
+        const rendered = renderToolArgs(name, raw);
+        argsEl.textContent = '';
+        if (rendered) {
+            argsEl.appendChild(wrapRenderedArgs(rendered, raw));
+        } else {
+            argsEl.textContent = raw;
+        }
+    }
+
+    function addRawToggle(head, argsEl) {
+        if (head.querySelector('.tool-args-raw-toggle')) return;
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'tool-args-raw-toggle';
+        toggle.setAttribute('aria-label', 'Toggle raw JSON');
+        toggle.setAttribute('aria-pressed', 'false');
+        toggle.textContent = '{ }';
+        toggle.addEventListener('click', function () {
+            const rawDiv = argsEl.querySelector('.tool-args-raw');
+            if (!rawDiv) return;
+            const showRaw = rawDiv.hidden;
+            rawDiv.hidden = !showRaw;
+            toggle.classList.toggle('is-active', showRaw);
+            toggle.setAttribute('aria-pressed', String(showRaw));
+        });
+        head.appendChild(toggle);
+    }
+
+    function installToolArgs(head, argsEl, name, argsJson) {
+        setRenderedArgs(argsEl, name, argsJson);
+        addRawToggle(head, argsEl);
+    }
+
     function appendFinalizedToolCard(callId, name, isError, argsJson, resultText, detailsJson) {
         const el = document.createElement('div');
         el.className = 'tool-card' + (isError ? ' is-error' : '');
@@ -496,6 +642,11 @@ function highlightCodeBlocks(container) {
         head.querySelector('.tool-name').textContent = name;
         head.querySelector('.tool-status').textContent = isError ? 'error' : 'done';
         el.appendChild(head);
+
+        const args = document.createElement('div');
+        args.className = 'tool-args';
+        el.appendChild(args);
+        installToolArgs(head, args, name, argsJson);
 
         if (name === SUBAGENT_TOOL_NAME) {
             attachSubagentPanel(el, callId);
@@ -961,6 +1112,9 @@ function highlightCodeBlocks(container) {
             if (nameEl) nameEl.textContent = name;
             const status = card.el.querySelector('.tool-status');
             if (status) status.textContent = 'running…';
+            const argsEl = card.el.querySelector('.tool-args');
+            const headEl = card.el.querySelector('.tool-head');
+            if (headEl && argsEl) installToolArgs(headEl, argsEl, name, argsJson);
             if (name === SUBAGENT_TOOL_NAME) {
                 attachSubagentPanel(card.el, callId);
                 createSubagentSection(callId, argsJson || '');
@@ -989,6 +1143,7 @@ function highlightCodeBlocks(container) {
         args.className = 'tool-args';
         el.appendChild(head);
         el.appendChild(args);
+        installToolArgs(head, args, name, argsJson);
 
         if (name === SUBAGENT_TOOL_NAME) {
             attachSubagentPanel(el, callId);
