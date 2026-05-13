@@ -166,6 +166,7 @@ pub fn build(b: *std.Build) void {
         "test/kitchen_sink_test.zig",
         "test/replay_test.zig",
         "test/mode_test.zig",
+        "test/public_api_hash_test.zig",
     };
     for (integration_files) |path| {
         const mod = b.createModule(.{

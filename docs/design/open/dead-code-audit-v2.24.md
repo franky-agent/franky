@@ -30,19 +30,36 @@ franky.sdk.*      → the curated SDK facade (src/sdk.zig)
 
 **How to mark external-API items going forward** (no native syntax exists, so conventions):
 
-1. **Doc-comment annotation** — the best native tool:
-   ```zig
-   /// ════════════════════════════════════════════════
-   /// PUBLIC API — consumed by franky-go and other
-   /// external dependents. Do not remove without a
-   /// semver-major bump and downstream coordination.
-   /// ════════════════════════════════════════════════
-   pub fn interrupt(self: *Agent) void { … }
-   ```
+✓ decided: **Option 1 — self-documenting one-liner doc comment.** Every `pub` symbol that is part of the SDK contract gets a single-line annotation that encodes both the classification AND the constraint. The emoji makes it visually scannable; the prose makes it unambiguous even when a model sees only a diff.
 
-2. **SDK facade** (`src/sdk.zig`) — anything **not** re-exported through `sdk.zig` is more clearly internal. Items that ARE re-exported there are explicitly part of the stable API.
+```zig
+/// 🔒 PUBLIC API — do not remove, do not change signature (semver-major break)
+pub fn interrupt(self: *Agent) void { … }
 
-3. **API manifest** — an explicit `docs/api-surface.md` listing every symbol that downstream consumers are expected to rely on (proposed below).
+/// 🏠 INTERNAL — safe to refactor or remove
+pub fn drainSteerQueue(self: *Agent) void { … }
+```
+
+For symbols that are used across sibling files but are not SDK-contract, use `pub(sibling)` or `pub(module)` visibility instead of the annotation where possible.
+
+Additionally:
+- **SDK facade** (`src/sdk.zig`) — anything **not** re-exported through `sdk.zig` is more clearly internal.
+- **API manifest** (`docs/api-surface.md`) — to be created after all decisions in this document are settled, listing every symbol downstream consumers rely on.
+
+### Signature verification — comptime hash test ✅ IMPLEMENTED
+
+To catch accidental signature drift, a comptime signature hash test lives at `test/public_api_hash_test.zig`. Each `🔒 PUBLIC API` function gets its own `test "hash: …"` block. The test hashes the function's type name (`@typeName(@TypeOf(fn_ref))`) with Wyhash at compile time; changing a signature causes a compile-time `@compileError` with the old and new hashes.
+
+Implemented as 29 individual test blocks — one per function/type. Functions with identical signatures share the same hash (e.g. `abort`, `reset`, `interrupt` are all `fn(*Agent) void` → `0x904ab417dfd5353a`). This is intentional: changing the signature of any of them also changes the hash for the others sharing that signature, and the test catches all of them.
+
+**Update workflow:**
+1. Change the function signature.
+2. `zig build test` → `@compileError` prints `expected 0xOLD got 0xNEW`.
+3. Copy `0xNEW` into the `check(…)` call.
+4. `zig build test` passes again.
+5. Bump semver-major.
+
+**Covered (29 items):** 15 Agent methods, 3 transform fns, 3 log fns, 1 errors fn, 1 retry fn, 4 object_store fns, 1 session fn, 1 type (`ErrorSource`).
 
 ---
 
@@ -100,6 +117,8 @@ These `pub fn` on `Agent` are **never called from internal production code** (te
 
 **Likely cause:** The `Agent` struct was written with a rich public API for programmatic embedding, but the internal consumer (`subagent.zig`) only uses `init`, `deinit`, `unsubscribe`, `prompt`, and `waitForIdle`. The steer/follow-up/subscribe surface was never integrated into any mode driver.
 
+✓ decided: **Keep all 15 methods.** These are the intended programmatic embedding API — the doc comment on `Agent.zig` line 6 explicitly lists "Command methods: `prompt`, `continueRun`, `steer`, `followUp`, `abort`, `reset`, `waitForIdle`." The fact that internal mode drivers don't call them is expected: they exist for external consumers like `franky-go`. Each method must be annotated with `/// 🔒 PUBLIC API — do not remove, do not change signature (semver-major break)`.
+
 ---
 
 ## 2. Backward-Compatibility Aliases — `src/coding/mod.zig` lines 37–51 — ✅ DONE
@@ -137,6 +156,8 @@ pub const ErrorDetails = ai.errors.ErrorDetails;
 | `enabled` | 187 | Only called from own test block. | ⚠️ YES — `sdk.log.enabled` reachable. |
 | `resetScopeOverrides` | 126 | Only called internally from `init`/`deinit`. | ⚠️ YES — `sdk.log.resetScopeOverrides` reachable. |
 
+✓ decided: **Keep all three.** These are runtime log-configuration knobs for SDK consumers who embed franky. Annotate each with `/// 🔒 PUBLIC API — do not remove, do not change signature (semver-major break)`.
+
 ### `src/ai/error_map.zig` — ✅ DONE (made private)
 
 | Function | Line | Notes | SDK contract? |
@@ -157,6 +178,11 @@ pub const ErrorDetails = ai.errors.ErrorDetails;
 | `ErrorSource` (enum) | 81 | Only used as field in `ErrorDetails`. | Reachable as `sdk.ErrorDetails.ErrorSource` if the type is constructed by consumers. |
 | `AgentError` (error set) | 92 | Not referenced by any external file. | Reachable as `sdk.errors.AgentError`. |
 
+✓ decided:
+- **Keep `fromToolResult`** — useful utility for consumers processing tool results. Annotate `🔒 PUBLIC API`.
+- **Keep `ErrorSource`** — it's part of the `ErrorDetails` struct's public type. Making it private would break anyone constructing `ErrorDetails`. Annotate `🔒 PUBLIC API`.
+- **Make `AgentError` private** — not referenced by any external file and not a return type of any public function.
+
 ### `src/ai/transform.zig`
 
 All three public functions are **test-only dead** internally — but the whole module is re-exported:
@@ -169,13 +195,17 @@ All three public functions are **test-only dead** internally — but the whole m
 
 **Decision needed:** If cross-provider message adaptation is still on the roadmap, these should stay. If not, removal requires semver-major.
 
+✓ decided: **Keep all three.** Cross-provider message transformation is load-bearing for the SDK's value proposition (§3.6 of the spec). The fact that internal mode drivers don't call them is expected — they exist for external consumers who span providers mid-session. Annotate each with `/// 🔒 PUBLIC API — do not remove, do not change signature (semver-major break)`.
+
 ### `src/ai/retry.zig`
 
 | Function | Line | Notes | SDK contract? |
 |----------|------|-------|---------------|
 | `nextDelay` | 256 | Only called internally from `run`. | ⚠️ YES — `sdk.retry.nextDelay` reachable. |
-| `SleepFn` (fn type) | 98 | Internal parameter type. | Reachable as `sdk.retry.SleepFn`. |
-| `RunResult` (struct) | 100 | Internal return type. | Reachable as `sdk.retry.RunResult`. |
+| `SleepFn` (fn type) | 98 | Parameter type of `RetryStrategy.run()`. | ⚠️ YES — part of a public fn signature. |
+| `RunResult` (struct) | 100 | Return type of `RetryStrategy.run()`. | ⚠️ YES — part of a public fn signature. |
+
+✓ decided: **Keep all three.** `SleepFn` and `RunResult` are part of `RetryStrategy.run()`'s public signature — making them private would break any consumer calling `run()`. `nextDelay` is a useful utility for consumers implementing custom retry logic. Annotate all with `/// 🔒 PUBLIC API — do not remove, do not change signature (semver-major break)`.
 
 ### `src/ai/sse.zig` — ✅ DONE (made private)
 
@@ -213,6 +243,12 @@ Not re-exported through `sdk.zig`. Internal to the `ai`/`coding` modules.
 | `SessionMigrationError` (type) | — | Error set of dead fn. | Reachable. |
 | `MigratedSession` (type) | — | Return type of dead fn. | Reachable. |
 
+✓ decided:
+- **Make `appendContentBlockJson`, `atomicWrite`, `readWholeFile` private** — these are internal IO helpers that happen to be `pub`. They are not in `session.mod.zig`'s re-export list.
+- **Keep `migrateSessionIfNeeded`** — session migration is a supported feature pathway for consumers who upgrade. Annotate `🔒 PUBLIC API`.
+- **Make `assertRefsInKeep` private** — debug/test helper, not a consumer API.
+- **Keep `SessionMigrationError` and `MigratedSession` public** — they appear in `migrateSessionIfNeeded`'s return type and must be accessible to callers. Annotate `🔒 PUBLIC API`.
+
 ### `src/coding/session/object_store.zig`
 
 > `object_store` is re-exported via `sdk.zig:99` (`pub const object_store = coding.object_store`). All pub functions here are part of the public API.
@@ -223,6 +259,8 @@ Not re-exported through `sdk.zig`. Internal to the `ai`/`coding` modules.
 | `resolve` | 55 | Only called from own tests. | ⚠️ YES — `sdk.object_store.resolve`. |
 | `sweep` | 70 | Only called from own tests. | ⚠️ YES — `sdk.object_store.sweep`. |
 | `writeObject` | 122 | Called from persistence. | ⚠️ YES — `sdk.object_store.writeObject`. |
+
+✓ decided: **Keep all four.** These are explicitly re-exported through `sdk.zig:99` as `sdk.object_store.*`. They exist for external consumers even though internal code only uses them in tests. Annotate each with `/// 🔒 PUBLIC API — do not remove, do not change signature (semver-major break)`.
 
 ---
 
@@ -240,6 +278,11 @@ Not re-exported through `sdk.zig`. Internal to the `ai`/`coding` modules.
 | `tool/bash.zig` | `resolveDefaultTimeoutMs` | 137 | Only called from `execute` variants in same file. |
 | `tool/web_search.zig` | `envKeyName` | 38 | Never called from outside `web_search.zig`. |
 
+✓ decided:
+- **Remove `tool()` (no-ctx factory)** — unused stub that only returns an error at runtime. No mode driver references it.
+- **Remove `toolWithWorkspace`** — unused variant; all callers use `toolWithCtx`.
+- **Make `readFile`, `readFileWithCap`, `writeFile`, `applyEdits`, `findMatches`, `parseTrailer`, `resolveDefaultTimeoutMs`, `envKeyName` private** — these are file-internal implementation details that happen to be `pub`. They are only called from `execute`/`executeWithCtx` in their own files. Changing to file-private has zero risk.
+
 ---
 
 ## 6. Dead TUI Surface — `src/tui/`
@@ -251,11 +294,15 @@ Not re-exported through `sdk.zig`. Internal to the `ai`/`coding` modules.
 | `keybindings.zig:198` | `vi_insert` table | Only consulted when `editor.preset == .vi`. Interactive mode uses `.emacs` (default) and never reads the `keybindings` setting. |
 | `keybindings.zig:204` | `vi_normal` table | Same — dead code path. |
 
+✓ decided: **Keep both vi tables.** These are configuration tables, not dead logic. The fact that interactive mode hardcodes `.emacs` is a limitation in the mode driver, not a reason to delete vi support. A future mode driver that respects the `keybindings` setting will need them. Annotate with `/// 🏠 INTERNAL — safe to refactor or remove` since they are not individually SDK-contract (they're consumed by the TUI engine when configured).
+
 ### `region.zig`
 
 | Function | Line | Notes |
 |----------|------|-------|
 | `Region.fill()` | 76 | Only called from its own test block. The `fill()` calls in `interactive.zig` go through `Buffer.fill()` (the Buffer method), not `Region.fill()`. |
+
+✓ decided: **Make `Region.fill()` private** — only called from its own test; all production callers use `Buffer.fill()`.
 
 ---
 
@@ -273,6 +320,8 @@ Not re-exported through `sdk.zig`. Internal to the `ai`/`coding` modules.
 | `keepalive_default_interval_ms` | 2299 | Only used as default parameter in same file. |
 | `renderTranscriptForUi` | 2443 | Only called internally. |
 
+✓ decided: **Make all items private.** These are file-internal symbols in a specific mode file that external consumers would not import directly. `RunError` must remain accessible as the return type of `run()` which is called by the mode dispatch system — but since the dispatch is internal to `src/coding/modes/`, making it `pub(sibling)` or file-private works. **Check:** if `run()` is called from `mod.zig` or a mode registry, `RunError` must remain `pub`. If the caller is in the same parent module, `pub(module)` suffices.
+
 ### `src/coding/modes/print.zig`
 
 | Item | Line | Notes |
@@ -285,6 +334,8 @@ Not re-exported through `sdk.zig`. Internal to the `ai`/`coding` modules.
 | `buildPerSessionLogPath` | 617 | Only called at line 648 within `print.zig`. |
 | `authJsonPathFrom` | 1132 | Only called within `print.zig`. (`config.zig` has its own.) |
 
+✓ decided: **Make all items file-private** — they are only called from within `print.zig` itself. Zero risk.
+
 ---
 
 ## 8. Agent Guardrails
@@ -295,11 +346,15 @@ Not re-exported through `sdk.zig`. Internal to the `ai`/`coding` modules.
 |------|------|-------|
 | `OwnedWorkflow.deinit` | 37 | Only called from `CompilationGuard.deinit` in same file. |
 
+✓ decided: **Make `OwnedWorkflow.deinit` private** — internal cleanup method only called from its owning struct's `deinit`. No external callers.
+
 ### `src/agent/proxy.zig`
 
 | Item | Line | Notes |
 |------|------|-------|
 | `writeEvent` | 34 | Only called from own test. |
+
+✓ decided: **Make `writeEvent` private** — only called from its own test block.
 
 ---
 
@@ -311,51 +366,66 @@ These are `pub` items that are only used within their own module sub-tree but ar
 - `AgentEvent.isTerminal` in `src/agent/types.zig` — never called externally.
 - `tools/common.zig` helper functions — all only called from within tool implementations, but that's expected; they're the shared tool library.
 
+✓ decided: **Leave as-is.** The cost of changing visibility across ~25 items exceeds the benefit. These are genuinely used within their module sub-tree and are not dead. If/when Zig's `pub(module)` becomes more ergonomic or a future audit identifies specific candidates, revisit.
+
 ---
 
-## Recommendations
+## Recommendations — All Resolved
 
-### 0. Establish an API surface convention first
+All open questions in this document have been decided. The recommendations below serve as the consolidated action plan.
 
-Before removing anything, decide how to distinguish "pub because it's SDK" from "pub because siblings need it" from "pub by accident." Options:
+### 0. API surface convention — ✓ DECIDED
 
-**Option A: Doc-comment annotations (recommended — no tooling needed)**
+**Self-documenting one-liner doc comments:**
 ```zig
-/// ─── PUBLIC API: consumed by franky-go et al. ───
+/// 🔒 PUBLIC API — do not remove, do not change signature (semver-major break)
 pub fn interrupt(self: *Agent) void { … }
 
-/// ─── INTERNAL: sibling-module access only. ───
+/// 🏠 INTERNAL — safe to refactor or remove
 pub fn drainSteerQueue(self: *Agent) void { … }
 ```
 
-**Option B: API manifest**
-Maintain `docs/api-surface.md` listing every symbol that external consumers are expected to rely on. Generated via `zig build` or manually curated.
+**Verification:** a comptime signature hash test (`test "PUBLIC API signatures unchanged"`) catches accidental signature drift. Every `🔒 PUBLIC API` function gets a hash entry; changing a signature fails the test until the hash is intentionally updated.
 
-**Option C: Narrow `sdk.zig` to re-export only stable, wanted types**
-Currently `sdk.zig` re-exports whole modules (`pub const errors = ai.errors`). This exposes every `pub fn` in those modules. Narrowing to specific types/fns would clarify the contract — but is a breaking change itself.
+Additionally:
+- Create `docs/api-surface.md` listing every SDK-contract symbol after this audit's changes land.
+- Audit `sdk.zig` for whole-module re-exports in a separate design document (not decided here).
 
 ### Immediate — ✅ DONE
 
 1. ✅ **Removed** `path_safety` and `env_denylist` backward-compat aliases from `src/coding/mod.zig` (lines 43–44).
-   - Still reachable via `coding.security.path_safety`/`.env_denylist`.
 2. ✅ **Made private** `sse.zig` constants: `max_event_bytes`, `max_line_bytes`, `Error`.
 3. ✅ **Made private** `partial_json.zig` items: `max_depth`, `PartialResult`, `Error`.
-4. ✅ **Made private** `error_map.zig` items that were `pub` but are internal: `extract`, `classify`, `Provider`, `Extracted`, `Classified`.
+4. ✅ **Made private** `error_map.zig` items: `extract`, `classify`, `Provider`, `Extracted`, `Classified`.
 
-### Requires SDK Contract Audit (do NOT remove without checking franky-go)
+### Keep + annotate 🔒 PUBLIC API
 
-5. **Agent API surface** — `Agent.interrupt`, `Agent.steer`, `Agent.followUp`, `Agent.subscribe` etc. These are `pub` methods on a type re-exported through `sdk.zig`. If `franky-go` uses any, removing them breaks compilation.
-6. **`ai/transform.zig`** — whole module re-exported via `sdk.transform`. If cross-provider adaptation is dead, it needs a deprecation cycle.
-7. **`ai/log.zig` `setLevel`/`enabled`/`resetScopeOverrides`** — whole module re-exported via `sdk.log`.
-8. **`ai/errors.zig` `fromToolResult`/`ErrorSource`/`AgentError`** — whole module re-exported via `sdk.errors`.
-9. **`ai/retry.zig` internal types** (`SleepFn`, `RunResult`, `nextDelay`) — whole module re-exported via `sdk.retry`.
-10. **Session persistence** — `object_store.store`/`resolve`/`sweep` are re-exported via `sdk.object_store`.
+5. **Agent** — all 15 methods (`interrupt`, `steer`, `followUp`, `subscribe`, `setModel`, `setTools`, `setSystemPrompt`, `setThinking`, `reset`, `continueRun`, `abort`, `drainSteerQueue`, `drainFollowUpQueue`, `pendingSteerCount`, `pendingFollowUpCount`).
+6. **`ai/transform.zig`** — `apiAcceptsThinkingOnInput`, `transformForApi`, `freeTransformed`.
+7. **`ai/log.zig`** — `setLevel`, `enabled`, `resetScopeOverrides`.
+8. **`ai/errors.zig`** — `fromToolResult`, `ErrorSource`. (Make `AgentError` private.)
+9. **`ai/retry.zig`** — `nextDelay`, `SleepFn`, `RunResult`.
+10. **`object_store`** — `store`, `resolve`, `sweep`, `writeObject`.
+11. **Session persistence** — `migrateSessionIfNeeded`, `SessionMigrationError`, `MigratedSession`.
 
-### Defer / Keep (regardless of SDK)
+### Make private
 
-- **Keep** `Agent.interrupt` if a stop-button UX is on the roadmap (even if no internal consumer yet).
-- **Keep** steer/follow-up if sub-agent orchestration is planned.
-- **Keep** internal-only `pub` items in modes (`PaintConfig`, `SearchState`, etc.) — changing visibility would cause churn for negligible gain.
+12. **Session persistence** — `appendContentBlockJson`, `atomicWrite`, `readWholeFile`, `assertRefsInKeep`.
+13. **`ai/errors.zig`** — `AgentError` error set.
+14. **TUI `region.zig`** — `Region.fill()`.
+15. **Guardrails** — `OwnedWorkflow.deinit`, `writeEvent`.
+16. **Modes** — `proxy.zig` (`default_port`, `default_host`, `RunError`, `SlashSideEffect`, `ProxySlashCtx`, `keepalive_default_interval_ms`, `renderTranscriptForUi`) and `print.zig` (`resolveAnthropicAlias`, `applyScopeOverrides`, `resolveLogLevel`, `isLoopbackBaseUrl`, `resolveLogPerSessionFromMap`, `buildPerSessionLogPath`, `authJsonPathFrom`).
+17. **Tools** — `readFile`, `readFileWithCap`, `writeFile`, `applyEdits`, `findMatches`, `parseTrailer`, `resolveDefaultTimeoutMs`, `envKeyName`.
+
+### Remove
+
+18. **`tool/subagent.zig`** — `tool()` (no-ctx factory).
+19. **`tool/read.zig`** — `toolWithWorkspace`.
+
+### Defer / Keep
+
+- **Vi keybindings** (`vi_insert`, `vi_normal` tables) — keep; they are configuration tables for a future mode driver.
+- **Internal-only `pub` items (§9)** — leave as-is; refactoring ~25 items to `pub(sibling)` is not worth the churn.
 
 ---
 

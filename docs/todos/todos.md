@@ -1,29 +1,3 @@
-# On the unrecoverable disconnect (Under human investigation)                                                            
-Your symptom — disconnects without reload, can't recover even by reloading the page until you restart the process — is consistent with a subscriber slot leak.      
-Hypothesis:
-
-In runSseStream at proxy.zig:1772-1782, the connection-handler thread blocks on readVec to detect client disconnect:                                                
-while (!sub.closed.load(.acquire)) {
-    var vecs: [1][]u8 = .{&sink};
-    const n = r.interface.readVec(&vecs) catch break;
-    if (n == 0) break;          
-}
-                      
-Meanwhile fanOutLocked at proxy.zig:378 writes events; on write failure it sets sub.closed = true but does not unblock the reader. If the client disconnect doesn't trigger an immediate FIN/RST that wakes readVec (browser background tab, OS-level half-close, network blip), the reader thread stays blocked, the slot stays occupied, and the defer removeSub never runs.                    
-Each browser reconnect adds a fresh subscriber. After ~32 cycles (max_subs = 32), subscriber.refused fires for every new connection and you can't recover until the process restarts and frees the leaked slots.
-If this is the cause, the fix is to make fanOutLocked shut down the read side of the socket when it flags sub.closed = true. That forces readVec to return immediately and removeSub to fire.      
-Two questions to confirm:                                       
-1. When you next see the stuck state, can you curl http://localhost:8787/events? If you get a "too many subscribers" error frame back, that confirms the leak hypothesis.    
-2. Or just check the logs around the disconnect: a leak would show repeated subscriber.added without matching subscriber.removed, ending in subscriber.refused.
-
-
-# SubAgent final text empty (Done | Verify over time)
-
-The transcript contains a lot of context but the final text (aka suganet summary) was empty.
-```
-{"ok":true,"final_text":"","turn_count":4,"tool_call_count":3,"duration_ms":160330,"session_id":"call_omeabw3t","transcript_path":"/home/agent/.franky/sessions/01KQP7P21RJAS2XK8VKBV745GT/subagents/call_omeabw3t/transcript.json"}
-```
-
 # Find tools return wrong not found files (Done | Need Verification)
 
 Here is the real folder structure:
@@ -128,14 +102,6 @@ git stash pop
 ```
 May also define other commands as well
 
-# Lets increase max_turn (Done)
-
-Increase max_turn = 100 by default and also check i think its defined in to many places.
-Also check if we can set it in the settings.json and as cli arg.
-
-
-# Compile Guard has to run after finish_task (Done)
-
 # Add retry the base_delay_ms to the settings.json profiles.models (Done)
 
 Lets set it for mistral models to 40 seconds.
@@ -155,18 +121,12 @@ Lets have a brainstorimg session about how add lsp (language server protocol) su
 
 Do a detail web research spawn sub agent to speed up the research.
 
-# Check the Intent Integrity Chain Approach (Done)
-
-Use web search if need. https://github.com/intent-integrity-chain/kit
-The headline is never trust a monkey how to verify code without reading it.
-
-How we can add the core idea as guardrail implementation to franky agent.
-
-Then save an open design doc in docs/design/open/
-
 # List subagents/preset based on the available API KEYS.
 
 Also if a subagent was started with profile gemini but gemini api key is not there return hint with please use one of the following or change the subagent model without telling the parent agent.
+
+The list_preset tool should return the presets and also all the available profiles so
+that the model can pick one.
 
 
 # Deepseek multiple tool calls
@@ -219,11 +179,8 @@ It could check if the worked on document was updated recently before the finish 
 
 Some models (gpt) need constant nudging like `go on` or `Continue` how can the agent loop decide when to send this nugdes to keep the model working. 
 
-# Bench Terminal
 
-Analzye the failing jobs/2026-05-10__20-11-18/overfull-hbox__QZ7oJYr job
-
-# For failing http request that fail after all retries add error message
+# For failing http request that fail after all retries add error message (Done)
 
 When a http provider request fails add the error message to log not just the error code like transient. When the retries are exhausted also throw the error back to the user with the status and the error message if possible. This will help a lot in debugging and also in understanding what went wrong instead of just knowing that it was a transient error.
 
@@ -233,8 +190,34 @@ Here is an example from the log
 {"error":"model 'deepseek-v4-flash' is temporarily overloaded, please retry shortly or try a different model (ref: d65cad69-0c45-4e58-83bf-7c388293faa4)"}
 ```
 
-# Lets add the file icon to all path args in tool calls
+# Lets add the file icon to all path args in tool calls (failed)
 
 ```
 <span class="file-icon">📄</span>
+```
+
+Here is a failed example. The path value was deleted not the path field name the `<th>path</th>` is still there but the value is gone. We need to make sure to keep the value and just add the icon instead of the th print text.
+```
+<div class="tool-card"><div class="tool-head">tool: <span class="tool-name">ls</span> <span class="tool-status">done</span><button type="button" class="tool-args-raw-toggle" aria-label="Toggle raw JSON" aria-pressed="false">{ }</button><button type="button" class="tool-result-toggle" aria-expanded="false">▶</button></div><div class="tool-args"><div class="tool-args-wrapper"><table class="tool-args-table"><tbody><tr><th>path</th><td><span class="file-icon">📄</span></td></tr><tr><th>maxDepth</th><td><code>2</code></td></tr></tbody></table><div class="tool-args-raw" hidden=""><pre>{"path":"/Users/frank.ittermann@goflink.com/private/github/franky","maxDepth":2}</pre></div></div></div><div class="tool-result-log" hidden="">/Users/frank.ittermann@goflink.com/private/github/franky
+.soteria/
+</div></div>
+```
+
+# Web-UI Disconnect
+
+For long session without activity the web-ui disconnects and the user needs to refresh the page to reconnect.
+We need to add a reconnect logic to the web-ui to handle this case and also show a message to the user that the connection was lost and we are trying to reconnect.
+
+# Write Tool Content parameter should be in the collapsable log
+
+```
+<div class="tool-card is-error"><div class="tool-head">tool: <span class="tool-name">write</span> <span class="tool-status">error</span><button type="button" class="tool-args-raw-toggle" aria-label="Toggle raw JSON" aria-pressed="false">{ }</button><button type="button" class="tool-result-toggle" aria-expanded="false">▶</button></div><div class="tool-args"><div class="tool-args-wrapper"><table class="tool-args-table"><tbody><tr><th>path</th><td><span class="file-icon">📄</span>docs/design/v3.1-franky-orchestrator.md</td></tr><tr><th>content</th><td># franky orch....
+</td></tr></tbody></table><div class="tool-args-raw" hidden=""><pre>{"path":"docs/design/v3.1-franky-orchestrator.md","content":"# franky orchestrator ... registrations?\n"}</pre></div></div></div><div class="tool-result-log" hidden="">[write_exists] file already exists; set overwrite=true to replace</div></div>
+```
+
+# Sub Agent open button spacing
+
+The sa-card-open button icon is to close to the tool-result-toggle button and it can easily be miss clicked. Then just create a little space between them.
+```
+<div class="tool-card tool-card-subagent is-error"><div class="tool-head">tool: <span class="tool-name">subagent</span> <span class="tool-status">error</span><button type="button" class="tool-args-raw-toggle" aria-label="Toggle raw JSON" aria-pressed="false">{ }</button><button type="button" class="tool-result-toggle" aria-expanded="false">▶</button><button type="button" class="sa-card-open" title="Open full sub-agent conversation">↗</button></div><div class="tool-args"><div class="tool-args-wrapper"><table class="tool-args-table"><tbody><tr><th>preset</th><td>code</td></tr></tbody></table><div class="tool-args-raw" hidden="">
 ```

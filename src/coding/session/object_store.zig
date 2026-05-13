@@ -73,7 +73,7 @@ pub fn sweep(
     store_dir: []const u8,
     keep: []const []const u8,
 ) !usize {
-    const root_path = try std.fs.path.join(allocator, &.{ store_dir });
+    const root_path = try std.fs.path.join(allocator, &.{store_dir});
     defer allocator.free(root_path);
 
     var root = std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true }) catch |e| switch (e) {

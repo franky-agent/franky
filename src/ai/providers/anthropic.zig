@@ -28,8 +28,8 @@ const utils = @import("../utils.zig");
 const Channel = channel_mod
     .Channel(stream_mod.StreamEvent);
 
-// pub const default_endpoint: []const u8 = "https://api.anthropic.com/v1/messages";
-pub const default_endpoint: []const u8 = "http://localhost:11434/v1/messages";
+pub const default_endpoint: []const u8 = "https://api.anthropic.com/v1/messages";
+// pub const default_endpoint: []const u8 = "http://localhost:11434/v1/messages";
 pub const default_version_header: []const u8 = "2023-06-01";
 /// Beta header stack required when authenticating with an OAuth/JWT
 /// bearer token (the Claude Pro/Max path). The combination of
@@ -647,7 +647,8 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         .payload = body,
         .extra_headers = http_headers,
     }, &bw, cancel, ctx.options.retry_policy orelse .{}, ctx.options.timeouts, http_mod.hooksFromOptionsWithRetry(ctx), &phase_info) catch |e| {
-        try http_mod.reportTransportErrorWithPhase(ctx.out, ctx.io, ctx.allocator, e, phase_info.timed_out_phase, ctx.options.timeouts);
+        try http_mod.reportTransportErrorWithPhase(ctx.out, ctx.io, ctx.allocator, e, phase_info.timed_out_phase, ctx.options.timeouts, phase_info.last_error_message);
+        if (phase_info.last_error_message) |m| ctx.allocator.free(m);
         return;
     };
 

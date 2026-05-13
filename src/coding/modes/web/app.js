@@ -501,7 +501,19 @@ function highlightCodeBlocks(container) {
             const td = document.createElement('td');
             const val = args[key];
             if (typeof val === 'string') {
-                td.textContent = val;
+                if (key === 'path' || key === 'cwd') {
+                    const icon = document.createElement('span');
+                    icon.className = 'file-icon';
+                    icon.textContent = '📄';
+                    td.appendChild(icon);
+                } else if (key === 'pattern') {
+                    const icon = document.createElement('span');
+                    icon.className = 'search-icon';
+                    icon.textContent = '🔍';
+                    td.appendChild(icon);
+                } else {
+                    td.textContent = val;
+                }
             } else {
                 const code = document.createElement('code');
                 code.textContent = JSON.stringify(val);
@@ -528,7 +540,6 @@ function highlightCodeBlocks(container) {
         const header = document.createElement('div');
         header.className = 'file-header';
         appendSpan(header, 'file-icon', '📄');
-        appendSpan(header, 'file-path', args.path || '');
         container.appendChild(header);
         if (args.limit != null || args.offset != null) {
             const meta = document.createElement('div');
@@ -562,7 +573,7 @@ function highlightCodeBlocks(container) {
             const cwd = document.createElement('div');
             cwd.className = 'bash-cwd';
             appendSpan(cwd, 'cwd-label', 'cwd:');
-            appendSpan(cwd, 'cwd-path', args.cwd);
+            appendSpan(cwd, 'file-icon', '📄');
             container.appendChild(cwd);
         }
         return container;
@@ -573,6 +584,7 @@ function highlightCodeBlocks(container) {
     toolRenderers.set('grep', (args) => renderGenericTable(args, ['path', 'pattern']));
     toolRenderers.set('finish_task', (args) => renderGenericTable(args, ['commit_message']));
     toolRenderers.set(EDIT_TOOL_NAME, (args) => renderGenericTable(args, ['path']));
+    toolRenderers.set(SUBAGENT_TOOL_NAME, (args) => renderGenericTable(args, ['preset', 'profile']));
 
     function renderToolArgs(name, argsJson) {
         const args = parseData(argsJson);
@@ -649,7 +661,7 @@ function highlightCodeBlocks(container) {
         installToolArgs(head, args, name, argsJson);
 
         if (name === SUBAGENT_TOOL_NAME) {
-            attachSubagentPanel(el, callId);
+            attachSubagentPanel(el, callId, argsJson);
             const state = createSubagentSection(callId, argsJson || '');
             if (state) {
                 state.done = true;
@@ -1116,7 +1128,7 @@ function highlightCodeBlocks(container) {
             const headEl = card.el.querySelector('.tool-head');
             if (headEl && argsEl) installToolArgs(headEl, argsEl, name, argsJson);
             if (name === SUBAGENT_TOOL_NAME) {
-                attachSubagentPanel(card.el, callId);
+                attachSubagentPanel(card.el, callId, argsJson);
                 createSubagentSection(callId, argsJson || '');
                 openSubagentPanel();
             } else {
@@ -1146,7 +1158,7 @@ function highlightCodeBlocks(container) {
         installToolArgs(head, args, name, argsJson);
 
         if (name === SUBAGENT_TOOL_NAME) {
-            attachSubagentPanel(el, callId);
+            attachSubagentPanel(el, callId, argsJson);
             createSubagentSection(callId, argsJson || '');
             openSubagentPanel();
         } else {
@@ -1519,7 +1531,7 @@ function highlightCodeBlocks(container) {
     /// Called from startToolCall for both fresh cards and claimed
     /// pending cards (streaming providers open a pending card before
     /// tool_execution_start fires, so both paths must call this).
-    function attachSubagentPanel(el, callId) {
+    function attachSubagentPanel(el, callId, argsJson) {
         el.classList.add('tool-card-subagent');
 
         // ↗ overlay-open button in the card corner
@@ -1540,6 +1552,26 @@ function highlightCodeBlocks(container) {
         log.className = 'subagent-log';
         log.setAttribute('hidden', '');
         el.appendChild(log);
+
+        // Prompt field shown at the top of the expandable log
+        if (argsJson) {
+            try {
+                const parsed = JSON.parse(argsJson);
+                if (parsed && parsed.prompt) {
+                    const promptRow = document.createElement('div');
+                    promptRow.className = 'subagent-prompt';
+                    const label = document.createElement('span');
+                    label.className = 'subagent-prompt-label';
+                    label.textContent = 'prompt: ';
+                    const text = document.createElement('span');
+                    text.className = 'subagent-prompt-text';
+                    text.textContent = parsed.prompt;
+                    promptRow.appendChild(label);
+                    promptRow.appendChild(text);
+                    log.appendChild(promptRow);
+                }
+            } catch (_) {}
+        }
 
         const toggle = document.createElement('button');
         toggle.type = 'button';

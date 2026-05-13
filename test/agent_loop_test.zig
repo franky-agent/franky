@@ -765,3 +765,288 @@ test "agent loop: max_turns_summarize=false preserves legacy behavior" {
         };
     };
 }
+
+// ─── v2.27 nudge-on-stall tests ────────────────────────────────────
+
+test "v2.27 nudge-on-stall: stop_reason=length injects a nudge" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = franky.global_allocator.gpa;
+
+    // turn 1: assistant emits a short text then hits token limit.
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "partial output here", .chunk_size = 8 } },
+        .{ .done = .{ .stop_reason = .length } },
+    } });
+    // turn 2: model continues after nudge with a substantial response.
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "Continuing the response here with a much longer elaboration that exceeds the minimum threshold for nudging.", .chunk_size = 16 } },
+        .{ .done = .{ .stop_reason = .stop } },
+    } });
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel = ai.stream.Cancel{};
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var ch = try newAgentChannel(gpa);
+    defer ch.deinit();
+
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &.{},
+        .registry = &reg,
+        .cancel = &cancel,
+        .nudge_on_stall = true,
+    }, &ch);
+
+    // Drain events.
+    while (ch.next(io)) |ev| ev.deinit(gpa);
+
+    // Transcript: assistant1 (partial), user-nudge, assistant2 (continued).
+    try testing.expectEqual(@as(usize, 3), transcript.messages.items.len);
+    try testing.expectEqual(ai.types.Role.assistant, transcript.messages.items[0].role);
+    try testing.expectEqual(ai.types.Role.user, transcript.messages.items[1].role);
+    try testing.expectEqual(ai.types.Role.assistant, transcript.messages.items[2].role);
+
+    // Verify the nudge text.
+    const nudge_msg = transcript.messages.items[1];
+    const nudge_text = nudge_msg.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, nudge_text, "cut off") != null);
+}
+
+test "v2.27 nudge-on-stall: stop_reason=stop with near-empty content injects a nudge" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = franky.global_allocator.gpa;
+
+    // turn 1: assistant emits almost nothing, then stops.
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "OK", .chunk_size = 2 } },
+        .{ .done = .{ .stop_reason = .stop } },
+    } });
+    // turn 2: model continues after nudge with a substantial response.
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "Here is a more elaborated reply that covers the topic in greater depth and detail.", .chunk_size = 16 } },
+        .{ .done = .{ .stop_reason = .stop } },
+    } });
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel = ai.stream.Cancel{};
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var ch = try newAgentChannel(gpa);
+    defer ch.deinit();
+
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &.{},
+        .registry = &reg,
+        .cancel = &cancel,
+        .nudge_on_stall = true,
+    }, &ch);
+
+    while (ch.next(io)) |ev| ev.deinit(gpa);
+
+    // Transcript: assistant1 (near-empty), user-nudge, assistant2.
+    try testing.expectEqual(@as(usize, 3), transcript.messages.items.len);
+    try testing.expectEqual(ai.types.Role.user, transcript.messages.items[1].role);
+
+    const nudge_text = transcript.messages.items[1].content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, nudge_text, "brief") != null);
+}
+
+test "v2.27 nudge-on-stall: cap at 2 nudges per episode" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = franky.global_allocator.gpa;
+
+    // Three turns all cut off by length. Loop should nudge twice,
+    // then let the third turn end naturally.
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "first partial", .chunk_size = 8 } },
+        .{ .done = .{ .stop_reason = .length } },
+    } });
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "second partial", .chunk_size = 8 } },
+        .{ .done = .{ .stop_reason = .length } },
+    } });
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "third partial", .chunk_size = 8 } },
+        .{ .done = .{ .stop_reason = .length } },
+    } });
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel = ai.stream.Cancel{};
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var ch = try newAgentChannel(gpa);
+    defer ch.deinit();
+
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &.{},
+        .registry = &reg,
+        .cancel = &cancel,
+        .nudge_on_stall = true,
+    }, &ch);
+
+    while (ch.next(io)) |ev| ev.deinit(gpa);
+
+    // Expect: assistant1 + nudge1 + assistant2 + nudge2 + assistant3 = 5 messages.
+    // The third assistant turn is NOT nudged (cap hit), so it's the last.
+    try testing.expectEqual(@as(usize, 5), transcript.messages.items.len);
+
+    // Count user (nudge) messages.
+    var user_count: usize = 0;
+    for (transcript.messages.items) |m| {
+        if (m.role == .user) user_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), user_count);
+}
+
+test "v2.27 nudge-on-stall: false by default — no nudge for stop_reason=length" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = franky.global_allocator.gpa;
+
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "partial", .chunk_size = 4 } },
+        .{ .done = .{ .stop_reason = .length } },
+    } });
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel = ai.stream.Cancel{};
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var ch = try newAgentChannel(gpa);
+    defer ch.deinit();
+
+    // Default config — nudge_on_stall is false.
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &.{},
+        .registry = &reg,
+        .cancel = &cancel,
+    }, &ch);
+
+    while (ch.next(io)) |ev| ev.deinit(gpa);
+
+    // Only one assistant message, no nudge.
+    try testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
+    try testing.expectEqual(ai.types.Role.assistant, transcript.messages.items[0].role);
+}
+
+test "v2.27 nudge-on-stall: tool call skips nudge" {
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = franky.global_allocator.gpa;
+
+    // turn 1: assistant makes a tool call.
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+    try faux.push(.{ .events = &.{
+        .{ .tool_call = .{ .id = "c1", .name = "echo", .args_json = "{}" } },
+        .{ .done = .{ .stop_reason = .tool_use } },
+    } });
+    // turn 2: stops with substantial text after getting the result.
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "The operation completed successfully with the expected result.", .chunk_size = 16 } },
+        .{ .done = .{ .stop_reason = .stop } },
+    } });
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel = ai.stream.Cancel{};
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var ch = try newAgentChannel(gpa);
+    defer ch.deinit();
+
+    const echo_tool = at.AgentTool{
+        .name = "echo",
+        .description = "echo tool",
+        .parameters_json = "{}",
+        .execute = echoTool,
+    };
+
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &[_]at.AgentTool{echo_tool},
+        .registry = &reg,
+        .cancel = &cancel,
+        .nudge_on_stall = true,
+    }, &ch);
+
+    while (ch.next(io)) |ev| ev.deinit(gpa);
+
+    // Transcript: assistant1 (with tool_call), toolResult, assistant2 (done).
+    // No nudge user messages.
+    try testing.expectEqual(@as(usize, 3), transcript.messages.items.len);
+    var user_count: usize = 0;
+    for (transcript.messages.items) |m| {
+        if (m.role == .user) user_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), user_count);
+}

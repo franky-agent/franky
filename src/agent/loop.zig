@@ -288,6 +288,12 @@ pub const Config = struct {
     /// reset per agent-loop run.
     reducer_dump_dir: ?[]const u8 = null,
     guardrails: ?*guardrails_mod.GuardrailState = null,
+    /// v2.27 — when true, the loop detects stalled models (stop_reason
+    /// .length, near-empty .stop, degenerate) and injects a synthetic
+    /// "please continue" user message into the transcript before calling
+    /// the LLM again. Caps at 2 nudges per stall episode to prevent
+    /// infinite loops. Default false — no behavioural change.
+    nudge_on_stall: bool = false,
 };
 
 pub const Transcript = at.Transcript;
@@ -321,6 +327,7 @@ pub fn agentLoop(
 
     var turn_count: u32 = 0;
     var current_cap: u32 = config.max_turns;
+    var nudge_count: u32 = 0; // v2.27 — nudges injected this episode
     cap_loop: while (true) {
         while (turn_count < current_cap) : (turn_count += 1) {
             if (config.cancel.isFired()) {
@@ -348,6 +355,29 @@ pub fn agentLoop(
                 if (gr_wants_turn) continue;
             }
             if (!keep_going) {
+                // v2.27 — nudge-on-stall: detect models that stopped
+                // prematurely (token limit, degenerate, near-empty) and
+                // inject a "please continue" user message into the
+                // transcript before calling the LLM again. Capped at 2
+                // nudges per stall episode; reset when a turn ends
+                // naturally (no nudge) so a later stall episode gets
+                // fresh nudge credits.
+                if (config.nudge_on_stall) {
+                    if (nudge_count < 2) {
+                        const nudged = maybeNudge(allocator, transcript) catch |e| blk: {
+                            ai.log.log(.warn, "nudge", "inject_failed", "err={s}", .{@errorName(e)});
+                            break :blk false;
+                        };
+                        if (nudged) {
+                            nudge_count += 1;
+                            ai.log.log(.info, "nudge", "injected", "count={d}", .{nudge_count});
+                            continue;
+                        }
+                    }
+                    // Turn ended naturally — reset the episode counter
+                    // so future stall episodes get fresh nudge credits.
+                    nudge_count = 0;
+                }
                 // Natural turn_end — check the between-turns hook
                 // (§4.3 followUp drain) before closing. When the
                 // hook returns `true`, the transcript has new
@@ -444,6 +474,69 @@ fn runForcedSummary(
     _ = runTurn(allocator, io, transcript, no_tools_cfg, out, http_client) catch |err| {
         ai.log.log(.warn, "loop", "forced_summary_turn_failed", "err={s}", .{@errorName(err)});
     };
+}
+
+/// v2.27 — inspect the last assistant message in the transcript and
+/// inject a "please continue" user-role nudge if the model appears to
+/// have stalled. Returns true when a nudge was appended, false otherwise.
+fn maybeNudge(
+    allocator: std.mem.Allocator,
+    transcript: *Transcript,
+) !bool {
+    const msgs = transcript.messages.items;
+    if (msgs.len == 0) return false;
+
+    const last = msgs[msgs.len - 1];
+    if (last.role != .assistant) return false;
+
+    const stop = last.stop_reason orelse return false;
+
+    // Skip: model is productively calling tools or explicitly stopped.
+    if (stop == .tool_use or stop == .refusal or stop == .err or stop == .aborted) return false;
+
+    // Count text content length and check for tool calls.
+    var total_text_len: usize = 0;
+    var has_tool_call = false;
+    for (last.content) |cb| {
+        switch (cb) {
+            .text => |t| total_text_len += t.text.len,
+            .tool_call => has_tool_call = true,
+            else => {},
+        }
+    }
+
+    // If the message has tool calls, the model was productive — no nudge.
+    if (has_tool_call) return false;
+
+    // Decide whether to nudge based on stop_reason and content.
+    const should_nudge = switch (stop) {
+        // Token-limit: strongest signal — the model was writing and got cut off.
+        .length => true,
+        // Clean stop with very little content: model "gave up".
+        .stop => total_text_len < 50,
+        else => false,
+    };
+    if (!should_nudge) return false;
+
+    const nudge_text = if (stop == .length)
+        "You were cut off mid-response (token limit reached). Continue from where you left off."
+    else
+        "Your response was very brief. Please continue or elaborate.";
+
+    const text_dup = try allocator.dupe(u8, nudge_text);
+    errdefer allocator.free(text_dup);
+
+    const content = try allocator.alloc(ai.types.ContentBlock, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .text = .{ .text = text_dup } };
+
+    try transcript.append(.{
+        .role = .user,
+        .content = content,
+        .timestamp = ai.stream.nowMillis(),
+    });
+    // Ownership of text_dup and content is now the transcript's.
+    return true;
 }
 
 /// Run one turn. Returns true if the caller should loop again, false to stop.

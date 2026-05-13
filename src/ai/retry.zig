@@ -91,6 +91,12 @@ pub const AttemptResult = struct {
     /// §6.13 — error code that produced the `.retryable` outcome.
     /// Fired through `on_retry` before the backoff sleep.
     reason: errors_mod.Code = .transient,
+    /// Optional human-readable error message from the provider
+    /// (e.g. the `error.message` JSON field). Dupe'd from the
+    /// callers allocator; the retry loop logs it and the caller
+    /// may surface it on exhaustion. Null when no body is
+    /// available (transport errors, empty responses).
+    message: ?[]const u8 = null,
 };
 
 pub const AttemptFn = *const fn (userdata: ?*anyopaque, attempt: u32) AttemptResult;
@@ -142,9 +148,10 @@ pub fn run(
                 return .{ .outcome = .success, .attempts = attempts, .total_delay_ms = total_delay_ms };
             },
             .terminal => {
-                log.log(.debug, "retry", "terminal", "attempt={d} terminal reason={s}", .{
+                log.log(.debug, "retry", "terminal", "attempt={d} terminal reason={s} msg={?s}", .{
                     attempts,
                     @tagName(result.reason),
+                    result.message,
                 });
                 return .{
                     .outcome = .terminal,
@@ -154,20 +161,22 @@ pub fn run(
                 };
             },
             .retryable => {
-                log.log(.debug, "retry", "retryable", "attempt={d} reason={s} retry_after_ms={?}", .{
+                log.log(.debug, "retry", "retryable", "attempt={d} reason={s} retry_after_ms={?} msg={?s}", .{
                     attempts,
                     @tagName(result.reason),
                     result.retry_after_ms,
+                    result.message,
                 });
             },
         }
 
         // Out of retries?
         if (attempts > policy.max_retries) {
-            log.log(.warn, "retry", "exhausted", "attempt={d}/{d} giving up after {d}ms total delay", .{
+            log.log(.warn, "retry", "exhausted", "attempt={d}/{d} giving up after {d}ms total delay msg={?s}", .{
                 attempts,
                 policy.max_retries + 1,
                 total_delay_ms,
+                result.message,
             });
             return .{
                 .outcome = .terminal,

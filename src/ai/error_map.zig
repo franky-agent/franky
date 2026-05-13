@@ -26,7 +26,7 @@ const Provider = enum {
     openai_gateway,
 };
 
-const Extracted = struct {
+pub const Extracted = struct {
     /// Provider-advertised "kind" string: Anthropic's `error.type`,
     /// OpenAI's `error.type`.
     kind: ?[]const u8,
@@ -40,7 +40,11 @@ const Extracted = struct {
 /// Decode `body` into (kind, message, retry_after). Never fails —
 /// unparseable bodies yield all-null. The caller uses the HTTP status
 /// as the fallback signal.
-fn extract(allocator: std.mem.Allocator, provider: Provider, body: []const u8) Extracted {
+///
+/// The returned `kind` and `message` strings are owned by
+/// (allocator-duped from) `allocator`; the caller is responsible
+/// for freeing them.
+pub fn extract(allocator: std.mem.Allocator, provider: Provider, body: []const u8) Extracted {
     _ = provider; // both providers share `error.{type,message}` shape
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

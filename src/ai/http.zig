@@ -47,6 +47,7 @@ const stream_mod = @import("stream.zig");
 const errors_mod = @import("errors.zig");
 const registry_mod = @import("registry.zig");
 const log = @import("log.zig");
+const err_map = @import("error_map.zig");
 
 pub const Timeouts = registry_mod.Timeouts;
 
@@ -144,6 +145,12 @@ pub const PhaseTag = enum {
 /// happens; only the diagnostic tag is dropped on the floor.
 pub const PhaseInfo = struct {
     timed_out_phase: PhaseTag = .none,
+    /// Provider error message from the last retryable HTTP response
+    /// (5xx/429 body's `error.message`). Dupe'd from the client
+    /// allocator; the caller must free it. Populated by
+    /// `fetchAttemptPhased`; useful when a later transport error
+    /// exhausts retries so the upstream error can be surfaced.
+    last_error_message: ?[]const u8 = null,
 };
 
 /// Shared state between the request thread and its watchdog. Owned
@@ -425,6 +432,15 @@ pub const FetchRetryCtx = struct {
     /// `error.Timeout`. `fetchAttemptPhased` writes this; the legacy
     /// `fetchAttempt` leaves it as-is.
     phase_info: ?*PhaseInfo = null,
+    /// Allocator for duplicating the provider error message across
+    /// retry attempts. Owned by the caller; freed by
+    /// `fetchWithRetryAndTimeoutsAndHooksAndPhases` on exit.
+    allocator: std.mem.Allocator,
+    /// Preserved error message from the last HTTP 5xx/429 attempt,
+    /// so transport-error exhaustion can surface the upstream cause
+    /// rather than just "ConnectionResetByPeer". Dupe'd from
+    /// `allocator`; freed below on termination or overwrite.
+    last_error_message: ?[]const u8 = null,
 };
 
 /// Shared attempt callback used by `fetchWithRetry`. Classifies
@@ -570,7 +586,14 @@ pub fn fetchAttemptPhased(userdata: ?*anyopaque, attempt: u32) retry_mod.Attempt
         return .{ .outcome = .success };
     }
     if (status_code >= 500 or status_code == 429) {
-        return .{ .outcome = .retryable };
+        // Extract the provider error message from the response body
+        // so retry logging can surface what actually went wrong
+        // (e.g. "model overloaded") rather than just the code.
+        // Free the previous attempt's message before overwriting.
+        if (ctx.last_error_message) |prev| ctx.allocator.free(prev);
+        ctx.last_error_message = extractErrorMessage(ctx.allocator, ctx.body_writer.written());
+        log.log(.debug, "http", "retryable", "status={d} msg={?s}", .{ status_code, ctx.last_error_message });
+        return .{ .outcome = .retryable, .message = ctx.last_error_message };
     }
     return .{ .outcome = .terminal };
 }
@@ -845,12 +868,11 @@ pub fn reportTransportError(
     allocator: std.mem.Allocator,
     err: anyerror,
 ) !void {
-    return reportTransportErrorWithPhase(out, io, allocator, err, null, null);
+    return reportTransportErrorWithPhase(out, io, allocator, err, null, null, null);
 }
 
-/// Variant that surfaces phase + budget. Pass `null` for either
-/// parameter you don't have access to — callers from the legacy
-/// (non-phased) fetch path hit the wrapper above.
+/// Variant that surfaces phase + budget + optional provider error
+/// message. Pass `null` for any parameter you don't have access to.
 pub fn reportTransportErrorWithPhase(
     out: *stream_mod.Channel,
     io: std.Io,
@@ -858,6 +880,9 @@ pub fn reportTransportErrorWithPhase(
     err: anyerror,
     phase: ?PhaseTag,
     timeouts: ?Timeouts,
+    /// Optional upstream error message (e.g. "model overloaded" from
+    /// a prior 5xx attempt). Included in the error when available.
+    provider_message: ?[]const u8,
 ) !void {
     try out.push(io, .start);
     const Code = @import("errors.zig").Code;
@@ -866,9 +891,13 @@ pub fn reportTransportErrorWithPhase(
         out.closeWithFinal(io, .{ .error_ev = .{ .code = Code.timeout, .message = message } });
         return;
     }
+    const msg = if (provider_message) |pm|
+        try std.fmt.allocPrint(allocator, "http error: {s} ({s})", .{ @errorName(err), pm })
+    else
+        try std.fmt.allocPrint(allocator, "http error: {s}", .{@errorName(err)});
     out.closeWithFinal(io, .{ .error_ev = .{
         .code = Code.transport,
-        .message = try std.fmt.allocPrint(allocator, "http error: {s}", .{@errorName(err)}),
+        .message = msg,
     } });
 }
 
@@ -907,6 +936,21 @@ fn formatTimeoutMessage(
         "{s} timeout: provider didn't respond in time; raise {s} (or set FRANKY_FIRST_BYTE_TIMEOUT_MS) for slow models",
         .{ phase_name, flag_name },
     );
+}
+
+/// Extract the human-readable error message from a provider response
+/// body. Returns the dupe'd `error.message` field (owned by
+/// `allocator`), or null when the body is empty or unparseable.
+///
+/// The caller is responsible for freeing the returned string.
+fn extractErrorMessage(allocator: std.mem.Allocator, body: []const u8) ?[]const u8 {
+    if (body.len == 0) return null;
+    // We're in the retry loop — don't know the provider, but all
+    // providers we support share the `{"error":{"message":"..."}}` shape.
+    const ext = err_map.extract(allocator, .openai, body);
+    // extract dups both `kind` and `message`; we only need message.
+    if (ext.kind) |k| allocator.free(k);
+    return ext.message;
 }
 
 pub fn fetchWithRetryAndTimeoutsAndHooks(
@@ -964,6 +1008,7 @@ pub fn fetchWithRetryAndTimeoutsAndHooksAndPhases(
         .on_response = hooks.on_response,
         .timeouts = timeouts,
         .phase_info = phase_info,
+        .allocator = client.allocator,
     };
 
     defer if (hooks.owned_retry_ctx) |rc| rc.allocator.destroy(rc);
@@ -984,12 +1029,35 @@ pub fn fetchWithRetryAndTimeoutsAndHooksAndPhases(
     );
 
     switch (result.outcome) {
-        .success => return .{ .status = ctx.last_status },
-        .terminal => {
-            if (ctx.last_err) |e| return e;
+        .success => {
+            if (ctx.last_error_message) |m| ctx.allocator.free(m);
             return .{ .status = ctx.last_status };
         },
-        .retryable => unreachable, // `retry.run` never returns .retryable
+        .terminal => {
+            if (ctx.last_err != null) {
+                // Transport error — transfer the preserved error message
+                // to phase_info so the provider catch block can format
+                // and free it. Use ctx.last_error_message directly (not
+                // result.last_message) because retry.run's cancel path
+                // leaves result.last_message null.
+                if (phase_info) |pi| {
+                    pi.last_error_message = ctx.last_error_message;
+                    ctx.last_error_message = null;
+                } else {
+                    // No phase_info to hand ownership to; free here.
+                    if (ctx.last_error_message) |m| ctx.allocator.free(m);
+                    ctx.last_error_message = null;
+                }
+                return ctx.last_err.?;
+            }
+            // HTTP-status exhaustion — provider uses mapError on the
+            // final body instead. Free the preserved message.
+            if (ctx.last_error_message) |m| ctx.allocator.free(m);
+            ctx.last_error_message = null;
+            if (phase_info) |pi| pi.last_error_message = null;
+            return .{ .status = ctx.last_status };
+        },
+        .retryable => unreachable,
     }
 }
 
@@ -1241,6 +1309,7 @@ test "reportTransportErrorWithPhase: error.Timeout produces code=.timeout" {
         error.Timeout,
         .first_byte,
         .{ .first_byte_ms = 42_000 },
+        null,
     );
 
     var saw_timeout = false;
@@ -1267,7 +1336,7 @@ test "reportTransportErrorWithPhase: non-timeout keeps legacy transport code" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    try reportTransportErrorWithPhase(&ch, io, gpa, error.ConnectionRefused, null, null);
+    try reportTransportErrorWithPhase(&ch, io, gpa, error.ConnectionRefused, null, null, null);
 
     var saw_transport = false;
     while (ch.next(io)) |ev| {
