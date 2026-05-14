@@ -27,6 +27,18 @@ RUN wget https://github.com/fr12k/soteria-guard/releases/latest/download/soteria
     mv soteria-guard_${TARGETOS}_${TARGETARCH} /usr/local/bin/soteria-guard && \
     chmod +x /usr/local/bin/soteria-guard
 
+    # Non-interactive aliases via scripts in /usr/bin so they work when franky
+# invokes bash non-interactively (docker exec, the `bash` tool, etc.).
+# See https://www.baeldung.com/ops/dockerfile-set-bash-aliases#setting-aliases-for-the-non-interactive-mode
+RUN printf '#!/bin/bash\nclaude --allow-dangerously-skip-permissions --dangerously-skip-permissions "$@"\n' > /usr/bin/claude && \
+    chmod +x /usr/bin/claude && \
+    printf '#!/bin/bash\nclaude --allow-dangerously-skip-permissions --dangerously-skip-permissions --resume "$@"\n' > /usr/bin/clauder && \
+    chmod +x /usr/bin/clauder && \
+    printf '#!/bin/bash\nexec ./zig-out/bin/franky --profile ollama-deepseek-flash --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-deepseek && \
+    chmod +x /usr/bin/franky-deepseek && \
+    printf '#!/bin/bash\nexec ./zig-out/bin/franky --profile ollama-deepseek-kimi-k --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-kimik && \
+    chmod +x /usr/bin/franky-kimik
+
 USER agent
 RUN go install golang.org/x/vuln/cmd/govulncheck@latest
 RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
@@ -36,6 +48,3 @@ RUN cargo install inferno
 ENV ZIG_LOCAL_CACHE_DIR=/tmp/zig-cache
 ENV ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
 ENV PATH="/home/agent/.cargo/bin:/home/agent/go/bin:${PATH}"
-RUN echo 'alias claude="claude --allow-dangerously-skip-permissions --dangerously-skip-permissions"' >> ~/.bashrc && \
-    echo 'alias clauder="claude --allow-dangerously-skip-permissions --dangerously-skip-permissions --resume"' >> ~/.bashrc && \
-    echo 'alias franky-deepseek="./zig-out/bin/franky --profile ollama-deepseek-flash --mode proxy" >> ~/.bashrc'

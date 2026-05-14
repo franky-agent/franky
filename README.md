@@ -47,6 +47,65 @@ With no flags and no API key in the environment, franky defaults to the
 **faux provider** — a scripted fake LLM — so the binary runs end-to-end
 without network access.
 
+## Getting Started with `sbx` sandbox
+
+Franky ships with a [`Dockerfile.sandbox`](Dockerfile.sandbox) that
+builds a container with Zig 0.17-dev, Go, Rust/Cargo, and the latest
+franky binary pre-installed, along with a pre-configured
+[`settings.json`](settings.json) that includes ready-to-use profiles
+for non-local models. Use the `sbx` CLI to create and manage sandboxed
+environments from this template.
+
+```sh
+# Create a sandbox from the containifyci claude-code template
+sbx create --name franky --template containifyci/claude-code shell <workspace>
+
+# Set API keys (example: Ollama — repeat for other providers)
+sbx secret set-custom -g --host ollama.com --env OLLAMA_API_KEY --value <your-key>
+
+# Publish ports so the proxy web UI is reachable from the host
+sbx ports franky --publish 8787:8787
+
+# Run the sandbox
+sbx run franky
+
+# Run sbx dashboard in another terminal to see the active sandboxes
+sbx
+```
+
+Inside the sandbox the `settings.json` is already copied to
+`~/.franky/settings.json`, so you can start franky using any of the
+pre-defined profiles:
+
+| Profile | Provider | Model |
+|---|---|---|
+| `cerebras` | Cerebras Gateway | qwen-3-235b-a22b-instruct-2507 |
+| `cloudflare-gemma` | Cloudflare Workers AI | @cf/moonshotai/kimi-k2.6 |
+| `cloudflare-nemotron3` | Cloudflare Workers AI | @cf/nvidia/nemotron-3-120b-a12b |
+| `mistral-codestral` | Mistral API | codestral-2508 |
+| `mistral-devstral` | Mistral API | devstral-2512 |
+| `mistral-labs-leanstral` | Mistral API | labs-leanstral-2603 |
+| `mistral-medium-3-5` | Mistral API | mistral-medium-3-5 |
+| `ollama-deepseek-flash` | Ollama Cloud | deepseek-v4-flash:cloud |
+| `ollama-deepseek-pro` | Ollama Cloud | deepseek-v4-pro:cloud |
+| `ollama-kimi-k` | Ollama Cloud | kimi-k2.6:cloud |
+| `ollama-glm-5` | Ollama Cloud | glm-5.1:cloud |
+| `ollama-gemma4-cloud` | Ollama Cloud | gemma4:cloud |
+
+For example, to start the proxy web UI with the Ollama DeepSeek Flash
+profile:
+
+```sh
+cd /workspace/franky
+./zig-out/bin/franky --mode proxy --profile ollama-deepseek-flash
+```
+
+Then open `http://localhost:8787/` on the host.
+
+See [`SANDBOX.md`](SANDBOX.md) for the full list of provider secret
+recipes (Cerebras, Cloudflare, Mistral, OpenRouter, Gemini, OpenAI)
+and the `sbx secret set-custom` commands that go with each.
+
 ## Requirements
 
 - **Zig master / 0.17.0-dev** — uses `std.Io`, `std.Io.Dir` /

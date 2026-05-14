@@ -27,7 +27,12 @@ pub const test_helpers = @import("test_helpers.zig");
 /// Change `src/global_allocator.zig` to swap the allocator project-wide.
 pub const global_allocator = @import("global_allocator.zig");
 
-pub const version = "2.3.0";
+/// Version info injected by goreleaser via -Dversion / -Dcommit / -Ddate.
+/// Falls back to "dev"/"unknown" when building with plain `zig build`.
+const build_options = @import("build_options");
+pub const version: []const u8 = build_options.version;
+pub const commit: []const u8 = build_options.commit;
+pub const build_date: []const u8 = build_options.date;
 
 test {
     _ = ai;

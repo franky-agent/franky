@@ -13,6 +13,9 @@ builds:
       - aarch64-macos
     flags:
       - -Doptimize=ReleaseSafe
+      - -Dversion={{ .Version }}
+      - -Dcommit={{ .ShortCommit }}
+      - -Ddate={{ .CommitDate }}
 archives:
   - formats: [binary]
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ if eq .Arch \"x86\" }}386{{ else }}{{ .Arch }}{{ end }}"

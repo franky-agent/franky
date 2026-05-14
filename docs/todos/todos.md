@@ -236,3 +236,11 @@ The read tool is missing the path value in the arguments div.
 ```
 renderReadArgs
 ```
+
+# Add missing todo tool
+
+Model try to call non existing tool `todo` because i gave it a list of tasks to work on.
+```
+tool: todo error
+todos	[{"content":"Timeline: Add extra tool args display with truncation for large fields","status":"pending"},{"content":"Timeline: Make events clickable to jump to agent view","status":"pending"},{"content":"Timeline: Fix event content disappearing after short time","status":"pending"},{"content":"Dashboard: Fix 'undefined' in agent stats (msgs, turns)","status":"pending"},{"content":"Dashboard: Finished agents should appear as idle not offline","status":"pending"}]
+```

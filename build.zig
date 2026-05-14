@@ -19,6 +19,21 @@ pub fn build(b: *std.Build) void {
     const franky_options = b.addOptions();
     franky_options.addOption([]const u8, "embedded_settings_json", embedded_settings_json);
 
+    // Version info — injected by goreleaser via -Dversion / -Dcommit / -Ddate.
+    // Falls back to defaults when building with plain `zig build`.
+    franky_options.addOption(
+        []const u8, "version",
+        b.option([]const u8, "version", "Version string (set by goreleaser)") orelse "dev",
+    );
+    franky_options.addOption(
+        []const u8, "commit",
+        b.option([]const u8, "commit", "Git commit SHA (set by goreleaser)") orelse "unknown",
+    );
+    franky_options.addOption(
+        []const u8, "date",
+        b.option([]const u8, "date", "Build date in RFC3339 (set by goreleaser)") orelse "unknown",
+    );
+
     // Public module — exposed to dependents via `b.dependency("franky").module("franky")`.
     // The internal binary still imports through the same `franky_module`
     // so there's only one definition. This is what makes franky-do (and
@@ -95,6 +110,9 @@ pub fn build(b: *std.Build) void {
 
     const test_options = b.addOptions();
     test_options.addOption([]const u8, "embedded_settings_json", "{}");
+    test_options.addOption([]const u8, "version", "test");
+    test_options.addOption([]const u8, "commit", "test");
+    test_options.addOption([]const u8, "date", "test");
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
