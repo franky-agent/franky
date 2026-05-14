@@ -36,6 +36,9 @@ export ANTHROPIC_API_KEY=sk-ant-…
 # Web UI (HTTP/SSE listener on http://127.0.0.1:8787/)
 ./zig-out/bin/franky --mode proxy
 
+# Proxy mode with orchestrator registration
+./zig-out/bin/franky --mode proxy --register http://localhost:9000
+
 # Run tests
 zig build test
 ```
@@ -70,6 +73,7 @@ without network access.
 | **Logging** | warnings + errors → stderr | `--log-level info\|debug\|trace` or `FRANKY_LOG=…` or `FRANKY_DEBUG=1`; route to a file with `--log-file PATH` (or `FRANKY_LOG_FILE`); interactive mode auto-diverts above `warn` to `$FRANKY_HOME/logs/franky-<ts>.log` so the TUI stays usable | `--log-level error` |
 | **Tool subset** | every built-in tool | `--tools read,grep,…` (registry filter) | n/a — pair with `--role` for capability-tier scoping instead |
 | **Skills / templates** | n/a | `--skills <path>`, `--prompts-dir <dir>` (template root, was `--prompts` before v1.11.0) | omit |
+| **Orchestrator registration** | off | `--register <url>` (or `FRANKY_ORCHESTRATOR_URL`); proxy calls `POST /register` / `POST /unregister` with exponential backoff | omit `--register` |
 | **Extensions (Tier-1)** | none loaded | `--extensions <csv>` of built-in module names | omit |
 
 ## Using the CLI
@@ -125,6 +129,17 @@ franky --mode proxy
 # GET /role     — active role + permitted tools + sandbox status
 # POST /abort   — fire the cancel flag
 # GET /transcript, GET /sessions, POST /session/new, …
+
+# Proxy with orchestrator registration:
+# `--register` tells franky to POST to the orchestrator after binding
+# its listen socket (POST /register) and POST /unregister on shutdown.
+# Registration is best-effort — the proxy continues standalone if the
+# orchestrator is unreachable. Retries with exponential backoff (1s→30s).
+# Env override: FRANKY_ORCHESTRATOR_URL
+franky --mode proxy --register http://localhost:9000
+# The registration payload advertises apiUrl as http://127.0.0.1:PORT
+# (reachable from the host via Docker port mapping when running in a
+# container), session id, model, role, workspace, and host PID.
 ```
 
 ### Capability roles (§5.10)
@@ -275,6 +290,7 @@ Full list: `franky --help`. Highlights:
 | `--thinking LEVEL` | `off` / `minimal` / `low` / `medium` / `high` / `xhigh` |
 | `--mode MODE` | `print` / `interactive` / `rpc` / `proxy` |
 | `--proxy-port N` | TCP port for `--mode proxy` (default 8787) |
+| `--register URL` | Orchestrator base URL; proxy calls `POST /register` after binding and `POST /unregister` on shutdown. Env: `FRANKY_ORCHESTRATOR_URL` |
 | `--role NAME` | `read` / `plan` / `code` / `full` (default `plan`) |
 | `--prompts` / `--yes` / `--allow-tools` / `--deny-tools` / `--ask-tools` / `--remember-permissions` | Permission overlay (§5.11) |
 | `--connect-timeout-ms N` etc. | Per-phase HTTP watchdogs (§G.4) |
@@ -304,6 +320,7 @@ Full list: `franky --help`. Highlights:
 | `FRANKY_LOG` | Log level: `error` / `warn` / `info` / `debug` / `trace` |
 | `FRANKY_LOG_FILE` | Override `--log-file` |
 | `FRANKY_DEBUG` | `1` or `true` → debug level |
+| `FRANKY_ORCHESTRATOR_URL` | Override `--register`; orchestrator base URL for agent registration |
 | `FRANKY_CONNECT_TIMEOUT_MS` / `FRANKY_UPLOAD_TIMEOUT_MS` / `FRANKY_FIRST_BYTE_TIMEOUT_MS` / `FRANKY_EVENT_GAP_TIMEOUT_MS` | Override the matching `--*-timeout-ms` flag |
 | `ZEROBOX_ACTIVE` | Set externally to silence the sandbox warning |
 

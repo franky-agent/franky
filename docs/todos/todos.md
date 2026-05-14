@@ -175,7 +175,7 @@ Lets add the used preset to the subagent overlay view in the header.
 
 It could check if the worked on document was updated recently before the finish task was called and also take hash of it before the work and compare it after finish task to check changes as well. Or just send a final hint to the model please update the document you were working on if not already happended.
 
-# Nudging Modeles
+# Nudging Modeles (Done)
 
 Some models (gpt) need constant nudging like `go on` or `Continue` how can the agent loop decide when to send this nugdes to keep the model working. 
 
@@ -192,10 +192,6 @@ Here is an example from the log
 
 # Lets add the file icon to all path args in tool calls (failed)
 
-```
-<span class="file-icon">📄</span>
-```
-
 Here is a failed example. The path value was deleted not the path field name the `<th>path</th>` is still there but the value is gone. We need to make sure to keep the value and just add the icon instead of the th print text.
 ```
 <div class="tool-card"><div class="tool-head">tool: <span class="tool-name">ls</span> <span class="tool-status">done</span><button type="button" class="tool-args-raw-toggle" aria-label="Toggle raw JSON" aria-pressed="false">{ }</button><button type="button" class="tool-result-toggle" aria-expanded="false">▶</button></div><div class="tool-args"><div class="tool-args-wrapper"><table class="tool-args-table"><tbody><tr><th>path</th><td><span class="file-icon">📄</span></td></tr><tr><th>maxDepth</th><td><code>2</code></td></tr></tbody></table><div class="tool-args-raw" hidden=""><pre>{"path":"/Users/frank.ittermann@goflink.com/private/github/franky","maxDepth":2}</pre></div></div></div><div class="tool-result-log" hidden="">/Users/frank.ittermann@goflink.com/private/github/franky
@@ -208,7 +204,7 @@ Here is a failed example. The path value was deleted not the path field name the
 For long session without activity the web-ui disconnects and the user needs to refresh the page to reconnect.
 We need to add a reconnect logic to the web-ui to handle this case and also show a message to the user that the connection was lost and we are trying to reconnect.
 
-# Write Tool Content parameter should be in the collapsable log
+# Write Tool Content parameter should be in the collapsable log (Done | Need Verification)
 
 ```
 <div class="tool-card is-error"><div class="tool-head">tool: <span class="tool-name">write</span> <span class="tool-status">error</span><button type="button" class="tool-args-raw-toggle" aria-label="Toggle raw JSON" aria-pressed="false">{ }</button><button type="button" class="tool-result-toggle" aria-expanded="false">▶</button></div><div class="tool-args"><div class="tool-args-wrapper"><table class="tool-args-table"><tbody><tr><th>path</th><td><span class="file-icon">📄</span>docs/design/v3.1-franky-orchestrator.md</td></tr><tr><th>content</th><td># franky orch....
@@ -220,4 +216,23 @@ We need to add a reconnect logic to the web-ui to handle this case and also show
 The sa-card-open button icon is to close to the tool-result-toggle button and it can easily be miss clicked. Then just create a little space between them.
 ```
 <div class="tool-card tool-card-subagent is-error"><div class="tool-head">tool: <span class="tool-name">subagent</span> <span class="tool-status">error</span><button type="button" class="tool-args-raw-toggle" aria-label="Toggle raw JSON" aria-pressed="false">{ }</button><button type="button" class="tool-result-toggle" aria-expanded="false">▶</button><button type="button" class="sa-card-open" title="Open full sub-agent conversation">↗</button></div><div class="tool-args"><div class="tool-args-wrapper"><table class="tool-args-table"><tbody><tr><th>preset</th><td>code</td></tr></tbody></table><div class="tool-args-raw" hidden="">
+```
+
+# Franky Self Update Failure (Done)
+
+When running the franky self update command with the --force flag the following error is shown.
+```
+franky update --force
+franky update: failed to reach GitHub releases API
+```
+
+# Abort Sub Agent
+
+Add the ability to abort a sub agent execution from the web-ui. This is useful in case the sub agent is going in a wrong direction or taking too long and we want to stop it and try a different approach.
+
+# Add Path value to Read Tool
+
+The read tool is missing the path value in the arguments div.
+```
+renderReadArgs
 ```

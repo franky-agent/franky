@@ -153,6 +153,13 @@ pub const Config = struct {
     /// streamProxy listener). Defaults to 8787 when omitted.
     proxy_port: ?u16 = null,
 
+    // ── v3.2 orchestrator registration ────────────────────────────
+    /// `--register URL` — orchestrator base URL for agent registration
+    /// (e.g. http://localhost:9000). When set, the proxy calls
+    /// POST /register after binding its listen socket and
+    /// POST /unregister on shutdown. Env: FRANKY_ORCHESTRATOR_URL.
+    register_url: ?[]const u8 = null,
+
     // ── §G.4 phase-timeout overrides ──────────────────────────────
     /// `--connect-timeout-ms N` — TCP/TLS connect deadline. 0 disables.
     /// Env fallback: `FRANKY_CONNECT_TIMEOUT_MS`. Default 10_000.
@@ -447,6 +454,8 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
     } else if (std.mem.eql(u8, name, "--proxy-port")) {
         const v = try takeValue(argv, i, inline_value);
         cfg.proxy_port = std.fmt.parseInt(u16, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--register")) {
+        cfg.register_url = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--connect-timeout-ms")) {
         const v = try takeValue(argv, i, inline_value);
         cfg.connect_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;

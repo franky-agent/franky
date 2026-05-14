@@ -132,6 +132,50 @@ pub fn run(
     sw.interface.writeAll(banner) catch {};
     sw.interface.flush() catch {};
 
+    // v3.2 — orchestrator registration.
+    const orchestrator_url: ?[]const u8 = cfg.register_url orelse
+        if (environ_map.get("FRANKY_ORCHESTRATOR_URL")) |v|
+            if (v.len > 0) v else null
+        else
+            null;
+    // Register AFTER the listen socket is bound so the orchestrator
+    // can immediately reach us. Best-effort; we continue standalone
+    // if the orchestrator is unreachable.
+    if (orchestrator_url) |ourl| {
+        franky.coding.orchestrator.register(
+            allocator,
+            io,
+            ourl,
+            session.session_id,
+            port,
+            session.provider.model_id,
+            @tagName(session.role_gate.role),
+            environ_map,
+        );
+    }
+
+    // Track orchestrator URL for unregister on shutdown.
+    // The defer below handles both the unregister call AND the free,
+    // so we don't need a separate errdefer here.
+    var orchestrator_owned: ?[]u8 = null;
+    if (orchestrator_url) |ourl| {
+        orchestrator_owned = try allocator.dupe(u8, ourl);
+    }
+
+    // v3.2 — unregister on graceful exit (not restart — the child will
+    // re-register). The defer runs on normal return (Ctrl-C, SIGTERM,
+    // failed spawn after restart).
+    defer {
+        if (orchestrator_owned) |ourl| {
+            if (!session.restart_requested.load(.acquire)) {
+                franky.coding.orchestrator.unregister(
+                    allocator, io, ourl, session.session_id, environ_map,
+                );
+            }
+            allocator.free(ourl);
+        }
+    }
+
     while (true) {
         // v2.17 — poll restart flag. If set, the main thread breaks
         // out of the accept loop, closes the listen socket, spawns a

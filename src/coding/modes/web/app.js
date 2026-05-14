@@ -279,6 +279,7 @@ function highlightCodeBlocks(container) {
     const saOverlayBody     = document.getElementById('sa-overlay-body');
     const saOverlayBadge    = saOverlayEl.querySelector('.sa-overlay-badge');
     const saOverlayTitle    = saOverlayEl.querySelector('.sa-overlay-title');
+    const saOverlayProfile   = saOverlayEl.querySelector('.sa-overlay-profile');
 
     /**
      * State for the in-progress assistant message.
@@ -502,15 +503,11 @@ function highlightCodeBlocks(container) {
             const val = args[key];
             if (typeof val === 'string') {
                 if (key === 'path' || key === 'cwd') {
-                    const icon = document.createElement('span');
-                    icon.className = 'file-icon';
-                    icon.textContent = '📄';
-                    td.appendChild(icon);
+                    th.textContent = '📄';
+                    td.appendChild(document.createTextNode(' ' + val));
                 } else if (key === 'pattern') {
-                    const icon = document.createElement('span');
-                    icon.className = 'search-icon';
-                    icon.textContent = '🔍';
-                    td.appendChild(icon);
+                    th.textContent = '🔍';
+                    td.appendChild(document.createTextNode(' ' + val));
                 } else {
                     td.textContent = val;
                 }
@@ -583,6 +580,55 @@ function highlightCodeBlocks(container) {
     toolRenderers.set('bash', renderBashArgs);
     toolRenderers.set('grep', (args) => renderGenericTable(args, ['path', 'pattern']));
     toolRenderers.set('finish_task', (args) => renderGenericTable(args, ['commit_message']));
+    function renderWriteArgs(args) {
+        const container = document.createElement('div');
+        const table = document.createElement('table');
+        table.className = 'tool-args-table';
+        const tbody = document.createElement('tbody');
+
+        function addRow(key, val) {
+            if (!(key in args)) return;
+            const tr = document.createElement('tr');
+            const th = document.createElement('th');
+            th.textContent = key;
+            const td = document.createElement('td');
+            if (key === 'path' || key === 'cwd') {
+                th.textContent = '📄';
+                td.appendChild(document.createTextNode(' ' + val));
+            } else if (typeof val === 'string') {
+                td.textContent = val;
+            } else {
+                const code = document.createElement('code');
+                code.textContent = JSON.stringify(val);
+                td.appendChild(code);
+            }
+            tr.appendChild(th);
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+        }
+
+        addRow('path', args.path);
+        addRow('overwrite', args.overwrite);
+        table.appendChild(tbody);
+        container.appendChild(table);
+
+        if (args.content !== undefined) {
+            const details = document.createElement('details');
+            details.className = 'tool-args-content';
+            const summary = document.createElement('summary');
+            const len = typeof args.content === 'string' ? args.content.length : 0;
+            summary.textContent = 'content (' + len + ' chars)';
+            details.appendChild(summary);
+            const pre = document.createElement('pre');
+            pre.textContent = args.content;
+            details.appendChild(pre);
+            container.appendChild(details);
+        }
+
+        return container;
+    }
+
+    toolRenderers.set('write', renderWriteArgs);
     toolRenderers.set(EDIT_TOOL_NAME, (args) => renderGenericTable(args, ['path']));
     toolRenderers.set(SUBAGENT_TOOL_NAME, (args) => renderGenericTable(args, ['preset', 'profile']));
 
@@ -1681,6 +1727,9 @@ function highlightCodeBlocks(container) {
 
         setBadge(saOverlayBadge, state.done ? (state.isError ? 'error' : 'done') : 'running', 'sa-overlay-badge');
         saOverlayTitle.textContent = state.preset;
+        if (saOverlayProfile) {
+            saOverlayProfile.textContent = state.profile || '';
+        }
 
         saOverlayBody.innerHTML = '';
         // Clear live-update overlay refs before re-rendering
@@ -1794,9 +1843,11 @@ function highlightCodeBlocks(container) {
         if (!subagentPanelEl) return null;
 
         let preset = 'subagent';
+        let profile = '';
         try {
             const args = JSON.parse(argsJson || '{}');
             if (args.preset) preset = args.preset;
+            if (args.profile) profile = args.profile;
         } catch (_) {}
 
         const rowEl = document.createElement('div');
@@ -1820,6 +1871,7 @@ function highlightCodeBlocks(container) {
 
         const state = {
             preset,
+            profile,
             rowEl, badgeEl,
             textBlocks: new Map(),
             thinkingBlocks: new Map(),

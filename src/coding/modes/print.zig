@@ -498,6 +498,20 @@ pub fn resolveLogLevel(cfg: *const cli_mod.Config, environ: std.process.Environ)
     return .warn;
 }
 
+/// Resolve log level from environ_map only (no cfg available).
+/// Used by `runUpdate` which dispatches before CLI parse.
+/// Precedence: FRANKY_LOG → FRANKY_DEBUG → warn (default).
+pub fn resolveLogLevelMap(environ_map: *const std.process.Environ.Map) ai.log.Level {
+    if (environ_map.get("FRANKY_LOG")) |s| {
+        if (extractGlobalLevel(s)) |l| return l;
+        if (ai.log.Level.fromString(s)) |l| return l;
+    }
+    if (environ_map.get("FRANKY_DEBUG")) |v| {
+        if (v.len > 0 and v[0] != '0') return .debug;
+    }
+    return .warn;
+}
+
 /// Resolve `ai.registry.Timeouts` for this run.
 ///
 /// Precedence per field: CLI flag → env var → autodetected default.
@@ -1653,6 +1667,16 @@ fn runUpdate(
     environ_map: *std.process.Environ.Map,
     args: []const []const u8,
 ) !void {
+    // v1.19.0 — init logging early so the update subcommand's
+    // log.log(...) calls reach the user (the main dispatch path
+    // initialises logging after parsing, but the update subcommand
+    // is dispatched before that).
+    {
+        const log_level = resolveLogLevelMap(environ_map);
+        ai.log.init(io, log_level);
+    }
+    defer ai.log.deinit();
+
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1688,10 +1712,21 @@ fn runUpdate(
         opts.base_url = env_base;
     }
 
-    const outcome = franky.coding.update.run(arena, io, franky.version, opts) catch |err| {
+    const outcome = franky.coding.update.run(arena, io, franky.version, .{
+        .force = opts.force,
+        .dry_run = opts.dry_run,
+        .repo_owner = opts.repo_owner,
+        .repo_name = opts.repo_name,
+        .repo_explicit = opts.repo_explicit,
+        .base_url = opts.base_url,
+        .environ_map = environ_map,
+    }) catch |err| {
         const reason: []const u8 = switch (err) {
             error.UnsupportedPlatform => "unsupported platform — releases ship only macOS/Linux on amd64/arm64 (+ linux/386)",
             error.HttpFailure => "failed to reach GitHub releases API",
+            error.ReleaseApiFailed => "failed to reach GitHub releases API",
+            error.ChecksumDownloadFailed => "failed to download checksums.txt from GitHub releases",
+            error.BinaryDownloadFailed => "failed to download binary asset from GitHub releases",
             error.ReleaseParseFailed => "could not parse the GitHub releases response",
             error.AssetNotFound => "no matching binary asset in the latest release",
             error.ChecksumMissing => "no checksums.txt asset (or our entry was missing)",

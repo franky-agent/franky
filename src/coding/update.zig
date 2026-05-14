@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 
 const franky = @import("../root.zig");
 const http_mod = franky.ai.http;
+const log = franky.ai.log;
 
 pub const default_repo_owner = "fr12k";
 pub const default_repo_name = "franky";
@@ -37,6 +38,9 @@ pub const Error = error{
     ChecksumMissing,
     ChecksumMismatch,
     ReplaceFailed,
+    ReleaseApiFailed,
+    ChecksumDownloadFailed,
+    BinaryDownloadFailed,
 } || std.mem.Allocator.Error;
 
 pub const Outcome = union(enum) {
@@ -56,6 +60,10 @@ pub const Options = struct {
     force: bool = false,
     /// Skip the actual binary swap — used by `--check`.
     dry_run: bool = false,
+    /// Environment map for proxy configuration (HTTP_PROXY, HTTPS_PROXY,
+    /// NO_PROXY). Passed to `http.setupClientFromEnv`. When null, no
+    /// proxy configuration is applied (direct connections only).
+    environ_map: ?*const std.process.Environ.Map = null,
 };
 
 pub const TargetInfo = struct {
@@ -191,9 +199,21 @@ fn httpGetBytes(
         .method = .GET,
         .response_writer = &body_writer.writer,
         .extra_headers = extra_headers,
-    }) catch return Error.HttpFailure;
+    }) catch |err| {
+        log.log(.warn, "update", "fetch_failed", "url={s} err={}", .{ url, err });
+        return Error.HttpFailure;
+    };
 
-    if (@intFromEnum(result.status) != 200) return Error.HttpFailure;
+    if (@intFromEnum(result.status) != 200) {
+        const buf = body_writer.writer.buffered();
+        log.log(.warn, "update", "bad_status", "url={s} status={d} body_bytes={d} body_preview={s}", .{
+            url,
+            @intFromEnum(result.status),
+            buf.len,
+            if (buf.len > 200) buf[0..200] else buf,
+        });
+        return Error.HttpFailure;
+    }
     return try body_writer.toOwnedSlice();
 }
 
@@ -214,7 +234,15 @@ pub fn run(
     // api.github.com socket alive for the JSON + checksums.txt fetches
     // (the binary download follows a 302 to a CDN host).
     var client = http_mod.Client{ .allocator = arena, .io = io };
-    defer client.deinit();
+    var proxy_arena: ?std.heap.ArenaAllocator = null;
+    defer {
+        client.deinit();
+        if (proxy_arena) |*pa| pa.deinit();
+    }
+
+    if (opts.environ_map) |em| {
+        proxy_arena = http_mod.setupClientFromEnv(&client, arena, em) catch null;
+    }
 
     const release_url = try std.fmt.allocPrint(
         arena,
@@ -225,7 +253,12 @@ pub fn run(
         .{ .name = "Accept", .value = "application/vnd.github+json" },
         .{ .name = "User-Agent", .value = "franky-update/" ++ franky.version },
     };
-    const release_body = try httpGetBytes(arena, &client, release_url, &release_headers);
+    const release_body = httpGetBytes(arena, &client, release_url, &release_headers) catch |e| {
+        return switch (e) {
+            error.HttpFailure => Error.ReleaseApiFailed,
+            else => |other| other,
+        };
+    };
 
     var parsed = std.json.parseFromSlice(std.json.Value, arena, release_body, .{}) catch
         return Error.ReleaseParseFailed;
@@ -245,11 +278,27 @@ pub fn run(
     const ua_only = [_]std.http.Header{
         .{ .name = "User-Agent", .value = "franky-update/" ++ franky.version },
     };
-    const checksums_text = try httpGetBytes(arena, &client, checksums_asset.url, &ua_only);
+
+    log.log(.info, "update", "downloading_checksums", "url={s}", .{checksums_asset.url});
+    const checksums_text = httpGetBytes(arena, &client, checksums_asset.url, &ua_only) catch |e| {
+        return switch (e) {
+            error.HttpFailure => Error.ChecksumDownloadFailed,
+            else => |other| other,
+        };
+    };
     const expected_sha = findChecksumLine(checksums_text, asset_name) orelse return Error.ChecksumMissing;
 
-    const binary_bytes = try httpGetBytes(arena, &client, binary_asset.url, &ua_only);
+    log.log(.info, "update", "downloading_binary", "name={s} url={s}", .{ asset_name, binary_asset.url });
+    const binary_bytes = httpGetBytes(arena, &client, binary_asset.url, &ua_only) catch |e| {
+        return switch (e) {
+            error.HttpFailure => Error.BinaryDownloadFailed,
+            else => |other| other,
+        };
+    };
     const got = sha256Hex(binary_bytes);
+    log.log(.debug, "update", "checksum_debug", "got={s} expected={s} asset_name={s} binary_bytes={d}", .{
+        &got, expected_sha, asset_name, binary_bytes.len,
+    });
     if (!std.ascii.eqlIgnoreCase(&got, expected_sha)) return Error.ChecksumMismatch;
 
     if (opts.dry_run) {

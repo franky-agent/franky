@@ -357,8 +357,8 @@ fn selectTools(
 
 const research_tool_names = [_][]const u8{ "read", "ls", "find", "grep", "web_search", "web_fetch" };
 const diff_review_tool_names = [_][]const u8{};
-const file_ops_tool_names = [_][]const u8{ "read", "write", "edit", "ls" };
-const bash_runner_tool_names = [_][]const u8{ "bash", "ls" };
+const file_ops_tool_names = [_][]const u8{ "read", "write", "edit", "ls", "find", "grep" };
+const bash_runner_tool_names = [_][]const u8{ "bash", "ls", "find", "grep" };
 
 fn buildResearchTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
     return selectTools(alloc, parent, &research_tool_names);
