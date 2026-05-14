@@ -903,6 +903,12 @@ main#conversation {
     border-radius: 3px;
     font-size: 11px;
 }
+.tool-args-table td .content-preview {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    word-break: break-all;
+}
 .tool-args-table tr:last-child th,
 .tool-args-table tr:last-child td {
     border-bottom: none;

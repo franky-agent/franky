@@ -204,26 +204,24 @@ Here is a failed example. The path value was deleted not the path field name the
 For long session without activity the web-ui disconnects and the user needs to refresh the page to reconnect.
 We need to add a reconnect logic to the web-ui to handle this case and also show a message to the user that the connection was lost and we are trying to reconnect.
 
-# Write Tool Content parameter should be in the collapsable log (Done | Need Verification)
+# Write Tool Content parameter should be in the collapsable log (ReWork)
+
+
+THe summary content hould be not needed it should be just triggered by the tool-result-toggle or
+tool-args-toggle check how the other tools are rednered
 
 ```
-<div class="tool-card is-error"><div class="tool-head">tool: <span class="tool-name">write</span> <span class="tool-status">error</span><button type="button" class="tool-args-raw-toggle" aria-label="Toggle raw JSON" aria-pressed="false">{ }</button><button type="button" class="tool-result-toggle" aria-expanded="false">▶</button></div><div class="tool-args"><div class="tool-args-wrapper"><table class="tool-args-table"><tbody><tr><th>path</th><td><span class="file-icon">📄</span>docs/design/v3.1-franky-orchestrator.md</td></tr><tr><th>content</th><td># franky orch....
-</td></tr></tbody></table><div class="tool-args-raw" hidden=""><pre>{"path":"docs/design/v3.1-franky-orchestrator.md","content":"# franky orchestrator ... registrations?\n"}</pre></div></div></div><div class="tool-result-log" hidden="">[write_exists] file already exists; set overwrite=true to replace</div></div>
+<div class="tool-card"><div class="tool-head">tool: <span class="tool-name">write</span> <span class="tool-status">done</span><button type="button" class="tool-args-raw-toggle" aria-label="Toggle raw JSON" aria-pressed="false">{ }</button><button type="button" class="tool-result-toggle" aria-expanded="false">▶</button></div><div class="tool-args"><div class="tool-args-wrapper"><div><table class="tool-args-table"><tbody><tr><th>📄</th><td> test.file</td></tr></tbody></table><details class="tool-args-content" open=""><summary>content (14 chars)</summary><pre>Hello, World!
+</pre></details></div><div class="tool-args-raw" hidden=""><pre>{"path":"test.file","content":"Hello, World!\n"}</pre></div></div></div><div class="tool-result-log" hidden="">wrote 14 bytes to test.file</div></div>
 ```
 
-# Sub Agent open button spacing
+
+
+# Sub Agent open button spacing (Done | Need Verification)
 
 The sa-card-open button icon is to close to the tool-result-toggle button and it can easily be miss clicked. Then just create a little space between them.
 ```
 <div class="tool-card tool-card-subagent is-error"><div class="tool-head">tool: <span class="tool-name">subagent</span> <span class="tool-status">error</span><button type="button" class="tool-args-raw-toggle" aria-label="Toggle raw JSON" aria-pressed="false">{ }</button><button type="button" class="tool-result-toggle" aria-expanded="false">▶</button><button type="button" class="sa-card-open" title="Open full sub-agent conversation">↗</button></div><div class="tool-args"><div class="tool-args-wrapper"><table class="tool-args-table"><tbody><tr><th>preset</th><td>code</td></tr></tbody></table><div class="tool-args-raw" hidden="">
-```
-
-# Franky Self Update Failure (Done)
-
-When running the franky self update command with the --force flag the following error is shown.
-```
-franky update --force
-franky update: failed to reach GitHub releases API
 ```
 
 # Abort Sub Agent

@@ -609,21 +609,22 @@ function highlightCodeBlocks(container) {
 
         addRow('path', args.path);
         addRow('overwrite', args.overwrite);
+        if ('content' in args && typeof args.content === 'string') {
+            const tr = document.createElement('tr');
+            const th = document.createElement('th');
+            th.textContent = 'content';
+            const td = document.createElement('td');
+            const span = document.createElement('span');
+            span.className = 'content-preview';
+            const v = args.content;
+            span.textContent = v.length > 200 ? v.substring(0, 200) + '…' : v;
+            td.appendChild(span);
+            tr.appendChild(th);
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+        }
         table.appendChild(tbody);
         container.appendChild(table);
-
-        if (args.content !== undefined) {
-            const details = document.createElement('details');
-            details.className = 'tool-args-content';
-            const summary = document.createElement('summary');
-            const len = typeof args.content === 'string' ? args.content.length : 0;
-            summary.textContent = 'content (' + len + ' chars)';
-            details.appendChild(summary);
-            const pre = document.createElement('pre');
-            pre.textContent = args.content;
-            details.appendChild(pre);
-            container.appendChild(details);
-        }
 
         return container;
     }
