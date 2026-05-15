@@ -294,6 +294,13 @@ pub const Config = struct {
     /// the LLM again. Caps at 2 nudges per stall episode to prevent
     /// infinite loops. Default false — no behavioural change.
     nudge_on_stall: bool = false,
+    /// v2.28 — when true, after a natural text-only stop (substantial
+    /// content, stop_reason == .stop, no tool calls), the loop waits 1 s,
+    /// then injects a synthetic user message asking the model to call
+    /// finish_task if it is done. Caps at 2 nudges per session to prevent
+    /// infinite loops. Designed for print mode where there is no user to
+    /// say "done". Default false — no behavioural change.
+    nudge_on_finish_task: bool = false,
 };
 
 pub const Transcript = at.Transcript;
@@ -328,6 +335,7 @@ pub fn agentLoop(
     var turn_count: u32 = 0;
     var current_cap: u32 = config.max_turns;
     var nudge_count: u32 = 0; // v2.27 — nudges injected this episode
+    var finish_nudge_count: u32 = 0; // v2.28 — finish-task nudges injected
     cap_loop: while (true) {
         while (turn_count < current_cap) : (turn_count += 1) {
             if (config.cancel.isFired()) {
@@ -377,6 +385,24 @@ pub fn agentLoop(
                     // Turn ended naturally — reset the episode counter
                     // so future stall episodes get fresh nudge credits.
                     nudge_count = 0;
+                }
+                // v2.28 — nudge-on-finish-task: after a natural text-only stop
+                // that produced substantive content (model looks done), wait 1 s
+                // then inject a "Are you done? Please call finish_task" message.
+                // Caps at 2 nudges per session. Designed for print mode where
+                // there is no user to say "done".
+                if (config.nudge_on_finish_task) {
+                    if (finish_nudge_count < 2) {
+                        const nudged = maybeNudgeToFinishTask(allocator, io, transcript) catch |e| blk: {
+                            ai.log.log(.warn, "finish_nudge", "inject_failed", "err={s}", .{@errorName(e)});
+                            break :blk false;
+                        };
+                        if (nudged) {
+                            finish_nudge_count += 1;
+                            ai.log.log(.info, "finish_nudge", "injected", "count={d}", .{finish_nudge_count});
+                            continue;
+                        }
+                    }
                 }
                 // Natural turn_end — check the between-turns hook
                 // (§4.3 followUp drain) before closing. When the
@@ -536,6 +562,67 @@ fn maybeNudge(
         .timestamp = ai.stream.nowMillis(),
     });
     // Ownership of text_dup and content is now the transcript's.
+    return true;
+}
+
+/// v2.28 — inspect the last assistant message and inject a "please call
+/// finish_task" user-role nudge if the model appears to be done with its
+/// work (natural .stop, substantive content, no tool calls). Waits 1 s
+/// before injecting to avoid racing past the model's own next turn.
+/// Returns true when a nudge was appended, false otherwise.
+fn maybeNudgeToFinishTask(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    transcript: *Transcript,
+) !bool {
+    const msgs = transcript.messages.items;
+    if (msgs.len == 0) return false;
+
+    const last = msgs[msgs.len - 1];
+    if (last.role != .assistant) return false;
+
+    const stop = last.stop_reason orelse return false;
+
+    // Only nudge on clean .stop (not length, tool_use, refusal, etc.).
+    if (stop != .stop) return false;
+
+    // Count text content and check for tool calls.
+    var total_text_len: usize = 0;
+    var has_tool_call = false;
+    for (last.content) |cb| {
+        switch (cb) {
+            .text => |t| total_text_len += t.text.len,
+            .tool_call => has_tool_call = true,
+            else => {},
+        }
+    }
+
+    // If the message already has tool calls, the model is productive — no nudge.
+    if (has_tool_call) return false;
+
+    // Only nudge when there is substantive content (model looks done).
+    // Models that barely produce anything don't get the finish-task prompt.
+    if (total_text_len < 50) return false;
+
+    // Wait 1 s before injecting. This gives the model a moment in case
+    // the loop is racing past a tool-call response the reducer didn't
+    // parse. Best-effort: if the sleep fails we continue anyway.
+    io.sleep(.fromMilliseconds(1000), .awake) catch {};
+
+    const nudge_text = "Are you done? If so, please call finish_task to signal completion.";
+
+    const text_dup = try allocator.dupe(u8, nudge_text);
+    errdefer allocator.free(text_dup);
+
+    const content = try allocator.alloc(ai.types.ContentBlock, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .text = .{ .text = text_dup } };
+
+    try transcript.append(.{
+        .role = .user,
+        .content = content,
+        .timestamp = ai.stream.nowMillis(),
+    });
     return true;
 }
 

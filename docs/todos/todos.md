@@ -1,56 +1,4 @@
-# Find tools return wrong not found files (Done | Need Verification)
-
-Here is the real folder structure:
-```
-AGENTS.md
-README.md
-build.zig.zon
-settings.json
-src
-zig-out
-Dockerfile.sandbox
-build.zig
-docs
-skills
-test
-```
-
-```
-tool: find error
-{"pattern":"**/test.zig","cwd":"src/coding/tools/bash"}
-[file_not_found] src/coding/tools/bash
-tool: find error
-{"pattern":"**/*.zig","cwd":"src/coding/regex"}
-[file_not_found] src/coding/regex
-tool: find error
-{"pattern":"**/test.zig","cwd":"src/ai/http"}
-[file_not_found] src/ai/http
-```
-
-```
-tool: bash done
-{"command":"grep -n \"pub fn exec\\|pub fn matches\\|step_budget\\|stepBudget\\|StepBudget\\|budget\" src/coding/regex.zig | head -30","description":"Find regex exec and budget functions"}
-[exit] code=0
-[stderr]
-grep: src/coding/regex.zig: No such file or directory
-tool: bash error
-{"command":"wc -l src/coding/regex.zig","description":"Line count of regex.zig"}
-[exit] code=1
-[stderr]
-wc: src/coding/regex.zig: No such file or directory
-```
-
-But read tool found the same path
-```
-tool: read done
-{"path":"src/coding/tools/bash.zig","offset":1030,"limit":80}
-tool: read done
-{"path":"src/coding/regex.zig","offset":880,"limit":50}
-tool: read done
-{"path":"src/ai/http.zig","offset":1275,"limit":100}
-```
-
-# Hide .git folders in find tool results
+# Hide .git folders in find tool results (Check if its already done)
 
 ```
 ool: bash done
@@ -101,10 +49,6 @@ Prevent destructive bash commands like
 git stash pop
 ```
 May also define other commands as well
-
-# Add retry the base_delay_ms to the settings.json profiles.models (Done)
-
-Lets set it for mistral models to 40 seconds.
 
 
 # Model Provider Feature Batch
@@ -160,7 +104,7 @@ This example is from the edit fallback view
 applied 1 edit(s) to /Users/frankittermann/github/franky/src/coding/modes/print.zig
 ```
 
-# Sub Agent Header View improvement
+# Sub Agent Header View improvement (Done)
 
 Lets add the used preset to the subagent overlay view in the header. 
 ```
@@ -171,24 +115,9 @@ Lets add the used preset to the subagent overlay view in the header.
 </div>
 ```
 
-# Finish Task
+# Finish Task (Check for regression after nudging was implemented)
 
 It could check if the worked on document was updated recently before the finish task was called and also take hash of it before the work and compare it after finish task to check changes as well. Or just send a final hint to the model please update the document you were working on if not already happended.
-
-# Nudging Modeles (Done)
-
-Some models (gpt) need constant nudging like `go on` or `Continue` how can the agent loop decide when to send this nugdes to keep the model working. 
-
-
-# For failing http request that fail after all retries add error message (Done)
-
-When a http provider request fails add the error message to log not just the error code like transient. When the retries are exhausted also throw the error back to the user with the status and the error message if possible. This will help a lot in debugging and also in understanding what went wrong instead of just knowing that it was a transient error.
-
-Here is an example from the log
-```
---- response body ---
-{"error":"model 'deepseek-v4-flash' is temporarily overloaded, please retry shortly or try a different model (ref: d65cad69-0c45-4e58-83bf-7c388293faa4)"}
-```
 
 # Lets add the file icon to all path args in tool calls (failed)
 
@@ -204,41 +133,14 @@ Here is a failed example. The path value was deleted not the path field name the
 For long session without activity the web-ui disconnects and the user needs to refresh the page to reconnect.
 We need to add a reconnect logic to the web-ui to handle this case and also show a message to the user that the connection was lost and we are trying to reconnect.
 
-# Write Tool Content parameter should be in the collapsable log (ReWork)
-
-
-THe summary content hould be not needed it should be just triggered by the tool-result-toggle or
-tool-args-toggle check how the other tools are rednered
-
-```
-<div class="tool-card"><div class="tool-head">tool: <span class="tool-name">write</span> <span class="tool-status">done</span><button type="button" class="tool-args-raw-toggle" aria-label="Toggle raw JSON" aria-pressed="false">{ }</button><button type="button" class="tool-result-toggle" aria-expanded="false">▶</button></div><div class="tool-args"><div class="tool-args-wrapper"><div><table class="tool-args-table"><tbody><tr><th>📄</th><td> test.file</td></tr></tbody></table><details class="tool-args-content" open=""><summary>content (14 chars)</summary><pre>Hello, World!
-</pre></details></div><div class="tool-args-raw" hidden=""><pre>{"path":"test.file","content":"Hello, World!\n"}</pre></div></div></div><div class="tool-result-log" hidden="">wrote 14 bytes to test.file</div></div>
-```
-
-
-
-# Sub Agent open button spacing (Done | Need Verification)
-
-The sa-card-open button icon is to close to the tool-result-toggle button and it can easily be miss clicked. Then just create a little space between them.
-```
-<div class="tool-card tool-card-subagent is-error"><div class="tool-head">tool: <span class="tool-name">subagent</span> <span class="tool-status">error</span><button type="button" class="tool-args-raw-toggle" aria-label="Toggle raw JSON" aria-pressed="false">{ }</button><button type="button" class="tool-result-toggle" aria-expanded="false">▶</button><button type="button" class="sa-card-open" title="Open full sub-agent conversation">↗</button></div><div class="tool-args"><div class="tool-args-wrapper"><table class="tool-args-table"><tbody><tr><th>preset</th><td>code</td></tr></tbody></table><div class="tool-args-raw" hidden="">
-```
-
 # Abort Sub Agent
 
 Add the ability to abort a sub agent execution from the web-ui. This is useful in case the sub agent is going in a wrong direction or taking too long and we want to stop it and try a different approach.
 
-# Add Path value to Read Tool
+# New Stack Mesage Feature
 
-The read tool is missing the path value in the arguments div.
-```
-renderReadArgs
-```
+Make it possible to stack multiple tasks/messages that will send when the current session has called finished_task (successfully including non failing guardrails).
 
-# Add missing todo tool
+# When the model forget to call finish_task (Done)
 
-Model try to call non existing tool `todo` because i gave it a list of tasks to work on.
-```
-tool: todo error
-todos	[{"content":"Timeline: Add extra tool args display with truncation for large fields","status":"pending"},{"content":"Timeline: Make events clickable to jump to agent view","status":"pending"},{"content":"Timeline: Fix event content disappearing after short time","status":"pending"},{"content":"Dashboard: Fix 'undefined' in agent stats (msgs, turns)","status":"pending"},{"content":"Dashboard: Finished agents should appear as idle not offline","status":"pending"}]
-```
+When the model finished it work and waits for new instructions lets call a hint are your finish then call finish_task tool.

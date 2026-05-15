@@ -1,6 +1,6 @@
 //! read tool — §C.1 of the spec.
 //!
-//! Schema: `{path, offset?, limit?}`.
+//! Schema: `{path, offset?, limit?}` where `path` is a string or an array of up to 10 strings (batch read).
 //! Output: text prefixed with line numbers in the format `{N:>6}\t{line}`.
 //! Files > 256 KB without explicit `limit` return a truncation error.
 //! Binary files (NUL byte in first 8 KB) return `read_binary`.
@@ -14,12 +14,18 @@ const common = @import("common.zig");
 const truncate_mod = @import("truncate.zig");
 const ls_mod = @import("ls.zig");
 
+pub const max_paths: usize = 10;
 pub const parameters_json: []const u8 =
     \\{
     \\  "type": "object",
     \\  "required": ["path"],
     \\  "properties": {
-    \\    "path": {"type": "string"},
+    \\    "path": {
+    \\      "oneOf": [
+    \\        {"type": "string"},
+    \\        {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 10}
+    \\      ]
+    \\    },
     \\    "offset": {"type": "integer", "minimum": 1},
     \\    "limit": {"type": "integer", "minimum": 1}
     \\  },
@@ -48,7 +54,7 @@ pub const ReadCtx = struct {
 pub fn tool() at.AgentTool {
     return .{
         .name = "read",
-        .description = "Read a file from the workspace. Files >256 KB without `limit` are refused — paginate with `offset`+`limit` (default limit emits up to 2000 lines and a continuation hint).",
+        .description = "Read file(s) from the workspace. `path` can be a string or an array of up to 10 strings. Files >256 KB without `limit` are refused — paginate with `offset`+`limit` (default limit emits up to 2000 lines and a continuation hint).",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .execute = execute,
@@ -61,7 +67,7 @@ pub fn tool() at.AgentTool {
 pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
     return .{
         .name = "read",
-        .description = "Read a file from the workspace (path-safety enforced). Files >256 KB without `limit` are refused — paginate with `offset`+`limit` (default limit emits up to 2000 lines and a continuation hint).",
+        .description = "Read file(s) from the workspace (path-safety enforced). `path` can be a string or an array of up to 10 strings. Files >256 KB without `limit` are refused — paginate with `offset`+`limit` (default limit emits up to 2000 lines and a continuation hint).",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .ctx = @constCast(@ptrCast(ws)),
@@ -75,12 +81,36 @@ pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
 pub fn toolWithCtx(ctx: *const ReadCtx) at.AgentTool {
     return .{
         .name = "read",
-        .description = "Read a file from the workspace (path-safety + max-bytes overlay). Files over the cap without `limit` are refused — paginate with `offset`+`limit`.",
+        .description = "Read file(s) from the workspace (path-safety + max-bytes overlay). `path` can be a string or an array of up to 10 strings. Files over the cap without `limit` are refused — paginate with `offset`+`limit`.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .ctx = @constCast(@ptrCast(ctx)),
         .execute = executeWithCtx,
     };
+}
+
+/// Resolve `path` from JSON: either a single string or an array
+/// of up to `max_paths` strings. Returns owned slice (arena).
+fn resolvePaths(allocator: std.mem.Allocator, val: std.json.Value) ![]const []const u8 {
+    switch (val) {
+        .string => |s| {
+            const arr = try allocator.alloc([]const u8, 1);
+            arr[0] = s;
+            return arr;
+        },
+        .array => |arr| {
+            if (arr.items.len > max_paths)
+                return error.ToolError;
+            const result = try allocator.alloc([]const u8, arr.items.len);
+            for (arr.items, 0..) |item, i| {
+                if (item != .string) return error.ToolError;
+                result[i] = item.string;
+            }
+            return result;
+        },
+        else => {},
+    }
+    return allocator.alloc([]const u8, 0);
 }
 
 fn execute(
@@ -103,8 +133,8 @@ fn execute(
     const root = parsed.value;
     const path_val = root.object.get("path") orelse
         return common.toolError(allocator, "invalid_args", "missing path");
-    if (path_val != .string) return common.toolError(allocator, "invalid_args", "path must be a string");
-    const user_path = path_val.string;
+    const paths = try resolvePaths(arena.allocator(), path_val);
+    if (paths.len == 0) return common.toolError(allocator, "invalid_args", "path must be a string or non-empty array");
 
     const offset: usize = if (root.object.get("offset")) |v| blk: {
         if (v == .integer and v.integer >= 1) break :blk @intCast(v.integer);
@@ -115,24 +145,96 @@ fn execute(
         break :blk null;
     } else null;
 
-    // Apply §R workspace scope check when a Workspace ctx is
-    // attached.  Canonicalized path is freed after `readFile`.
-    var canon_path: ?[]u8 = null;
-    defer if (canon_path) |p| allocator.free(p);
-    const effective_path: []const u8 = if (self.ctx) |raw| blk: {
-        const ws: *const workspace_mod.Workspace = @ptrCast(@alignCast(raw));
-        const r = try workspace_mod.canonicalizeOrError(allocator, ws, user_path);
-        switch (r) {
-            .ok => |c| {
-                canon_path = c.abs;
-                if (try common.contextIgnoreError(allocator, io, ws, c.abs)) |err| return err;
-                break :blk c.abs;
-            },
-            .err => |e| return common.toolError(allocator, e.code, e.message),
-        }
-    } else user_path;
+    return try readFiles(allocator, io, self.ctx, null, paths, offset, limit, max_bytes_without_limit);
+}
 
-    return try readFileWithCap(allocator, io, effective_path, offset, limit, max_bytes_without_limit);
+/// Batch-read multiple paths. Single-path returns raw output; multi-path
+/// prepends a `==== path ====` banner before each file.
+fn readFiles(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ctx: ?*anyopaque,
+    read_ctx: ?*const ReadCtx,
+    paths: []const []const u8,
+    offset: usize,
+    limit: ?usize,
+    default_max_bytes: usize,
+) !at.ToolResult {
+    const max_bytes: usize = if (read_ctx) |r| r.effectiveMaxBytes() else default_max_bytes;
+
+    if (paths.len == 1) {
+        const user_path = paths[0];
+        var canon_path: ?[]u8 = null;
+        defer if (canon_path) |p| allocator.free(p);
+        const effective_path: []const u8 = if (ctx) |raw| blk: {
+            const ws: *const workspace_mod.Workspace = @ptrCast(@alignCast(raw));
+            const r = try workspace_mod.canonicalizeOrError(allocator, ws, user_path);
+            switch (r) {
+                .ok => |c| {
+                    canon_path = c.abs;
+                    if (try common.contextIgnoreError(allocator, io, ws, c.abs)) |err| return err;
+                    break :blk c.abs;
+                },
+                .err => |e| return common.toolError(allocator, e.code, e.message),
+            }
+        } else user_path;
+        return try readFileWithCap(allocator, io, effective_path, offset, limit, max_bytes);
+    }
+
+    // Multi-path: try each file, collecting results with headers.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    for (paths) |user_path| {
+        const header = try std.fmt.allocPrint(allocator, "==== {s} ====\n", .{user_path});
+        defer allocator.free(header);
+        try out.appendSlice(allocator, header);
+
+        var canon_path: ?[]u8 = null;
+        defer if (canon_path) |p| allocator.free(p);
+
+        const effective_path: []const u8 = if (ctx) |raw| blk: {
+            const ws: *const workspace_mod.Workspace = @ptrCast(@alignCast(raw));
+            const r = try workspace_mod.canonicalizeOrError(allocator, ws, user_path);
+            switch (r) {
+                .ok => |c| {
+                    canon_path = c.abs;
+                    if (try common.contextIgnoreError(allocator, io, ws, c.abs)) |_| {
+                        const err_line = try std.fmt.allocPrint(allocator, "\n", .{});
+                        defer allocator.free(err_line);
+                        try out.appendSlice(allocator, err_line);
+                        continue;
+                    }
+                    break :blk c.abs;
+                },
+                .err => |e| {
+                    const err_line = try std.fmt.allocPrint(allocator, "error: {s}\n\n", .{e.message});
+                    defer allocator.free(err_line);
+                    try out.appendSlice(allocator, err_line);
+                    continue;
+                },
+            }
+        } else user_path;
+
+        var result = readFileWithCap(allocator, io, effective_path, offset, limit, max_bytes) catch |err| {
+            const err_line = try std.fmt.allocPrint(allocator, "error: {s}\n\n", .{@errorName(err)});
+            defer allocator.free(err_line);
+            try out.appendSlice(allocator, err_line);
+            continue;
+        };
+        defer result.deinit(allocator);
+        for (result.content) |cb| {
+            if (cb == .text) {
+                try out.appendSlice(allocator, cb.text.text);
+            }
+        }
+        try out.appendSlice(allocator, "\n");
+    }
+
+    const owned_text = try allocator.dupe(u8, out.items);
+    const arr = try allocator.alloc(ai.types.ContentBlock, 1);
+    arr[0] = .{ .text = .{ .text = owned_text } };
+    return .{ .content = arr };
 }
 
 fn executeWithCtx(
@@ -155,8 +257,8 @@ fn executeWithCtx(
     const root = parsed.value;
     const path_val = root.object.get("path") orelse
         return common.toolError(allocator, "invalid_args", "missing path");
-    if (path_val != .string) return common.toolError(allocator, "invalid_args", "path must be a string");
-    const user_path = path_val.string;
+    const paths = try resolvePaths(arena.allocator(), path_val);
+    if (paths.len == 0) return common.toolError(allocator, "invalid_args", "path must be a string or non-empty array");
 
     const offset: usize = if (root.object.get("offset")) |v| blk: {
         if (v == .integer and v.integer >= 1) break :blk @intCast(v.integer);
@@ -168,22 +270,7 @@ fn executeWithCtx(
     } else null;
 
     const ctx: *const ReadCtx = @ptrCast(@alignCast(self.ctx.?));
-
-    var canon_path: ?[]u8 = null;
-    defer if (canon_path) |p| allocator.free(p);
-    const effective_path: []const u8 = if (ctx.workspace) |ws| blk: {
-        const r = try workspace_mod.canonicalizeOrError(allocator, ws, user_path);
-        switch (r) {
-            .ok => |c| {
-                canon_path = c.abs;
-                if (try common.contextIgnoreError(allocator, io, ws, c.abs)) |err| return err;
-                break :blk c.abs;
-            },
-            .err => |e| return common.toolError(allocator, e.code, e.message),
-        }
-    } else user_path;
-
-    return try readFileWithCap(allocator, io, effective_path, offset, limit, ctx.effectiveMaxBytes());
+    return try readFiles(allocator, io, @constCast(@ptrCast(ctx.workspace)), ctx, paths, offset, limit, max_bytes_without_limit);
 }
 
 pub fn readFile(

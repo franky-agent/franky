@@ -70,6 +70,7 @@ const skills_mod = franky.coding.skills;
 const restart_mod = franky.coding.restart;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
+const sse_mod = @import("../sse.zig");
 
 pub const default_port: u16 = 8787;
 // pub const default_host: []const u8 = "127.0.0.1";
@@ -1752,7 +1753,7 @@ fn subagentProgressForward(
         .call_id = owned_call_id,
         .update_json = owned_update,
     } };
-    const frame = renderFrame(allocator, ev) catch {
+    const frame = sse_mod.renderFrame(allocator, ev) catch {
         ev.deinit(allocator);
         return;
     };
@@ -1779,18 +1780,18 @@ fn handleConnection(arg: ConnArg) void {
     // doesn't accept large bodies; `/prompt` payloads beyond
     // 64 KiB get truncated by the body reader below).
     var hdr_buf: [16 * 1024]u8 = undefined;
-    const hdr_len = readHeaders(&stream, arg.io, &hdr_buf) catch {
-        respondStatus(&stream, arg.io, 400, "Bad Request");
+    const hdr_len = sse_mod.readHeaders(&stream, arg.io, &hdr_buf) catch {
+        sse_mod.respondStatus(&stream, arg.io, 400, "Bad Request");
         return;
     };
     const headers = hdr_buf[0..hdr_len.consumed];
-    const req = parseRequest(headers) orelse {
-        respondStatus(&stream, arg.io, 400, "Bad Request");
+    const req = sse_mod.parseRequest(headers) orelse {
+        sse_mod.respondStatus(&stream, arg.io, 400, "Bad Request");
         return;
     };
 
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/health")) {
-        respondJson(&stream, arg.io, 200, "{\"ok\":true}");
+        sse_mod.respondJson(&stream, arg.io, 200, "{\"ok\":true}");
         return;
     }
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/transcript")) {
@@ -1821,7 +1822,7 @@ fn handleConnection(arg: ConnArg) void {
         // 200 still returns. Cheaper than gating on `is_streaming`
         // which would race with the worker thread anyway.
         arg.session.cancel.fire();
-        respondJson(&stream, arg.io, 200, "{\"ok\":true,\"aborted\":true}");
+        sse_mod.respondJson(&stream, arg.io, 200, "{\"ok\":true,\"aborted\":true}");
         return;
     }
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/interrupt")) {
@@ -1830,7 +1831,7 @@ fn handleConnection(arg: ConnArg) void {
         // Unlike /abort, this preserves the current turn's output.
         ai.log.log(.info, "proxy", "interrupt", "graceful stop requested via POST /interrupt", .{});
         arg.session.stop_requested.store(true, .release);
-        respondJson(&stream, arg.io, 200, "{\"ok\":true,\"interrupted\":true}");
+        sse_mod.respondJson(&stream, arg.io, 200, "{\"ok\":true,\"interrupted\":true}");
         return;
     }
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/restart")) {
@@ -1838,7 +1839,7 @@ fn handleConnection(arg: ConnArg) void {
         // on the main thread, closes the listen socket, spawns a
         // fresh binary, and calls exit(0).
         arg.session.restart_requested.store(true, .release);
-        respondJson(&stream, arg.io, 200, "{\"ok\":true,\"restarting\":true}");
+        sse_mod.respondJson(&stream, arg.io, 200, "{\"ok\":true,\"restarting\":true}");
         return;
     }
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/permission/resolve")) {
@@ -1914,68 +1915,7 @@ fn handleConnection(arg: ConnArg) void {
             return;
         }
     }
-    respondStatus(&stream, arg.io, 404, "Not Found");
-}
-
-const HeaderRead = struct { consumed: usize, total: usize };
-
-fn readHeaders(stream: *std.Io.net.Stream, io: std.Io, buf: []u8) !HeaderRead {
-    var total: usize = 0;
-    var r = stream.reader(io, &.{});
-    while (total < buf.len) {
-        var vecs: [1][]u8 = .{buf[total..]};
-        const n = r.interface.readVec(&vecs) catch |err| switch (err) {
-            error.EndOfStream => return HeaderRead{ .consumed = total, .total = total },
-            error.ReadFailed => return error.ReadFailed,
-        };
-        if (n == 0) return HeaderRead{ .consumed = total, .total = total };
-        total += n;
-        // Look for the end-of-headers marker.
-        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |idx| {
-            return HeaderRead{ .consumed = idx + 4, .total = total };
-        }
-    }
-    return HeaderRead{ .consumed = total, .total = total };
-}
-
-const Request = struct {
-    method: []const u8,
-    path: []const u8,
-    content_length: ?usize = null,
-    /// v1.16.0 — `Last-Event-ID: <n>` header for SSE replay on
-    /// `/events`. Null when absent (first connection, or non-
-    /// SSE request). 0 means "before any event" — equivalent to
-    /// no header for replay purposes.
-    last_event_id: ?u64 = null,
-};
-
-fn parseRequest(headers: []const u8) ?Request {
-    const line_end = std.mem.indexOf(u8, headers, "\r\n") orelse return null;
-    const line = headers[0..line_end];
-    const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
-    const method = line[0..sp1];
-    const rest = line[sp1 + 1 ..];
-    const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
-    const path = rest[0..sp2];
-
-    var req: Request = .{ .method = method, .path = path };
-
-    // Walk the remaining header lines for headers we care about.
-    var cursor: usize = line_end + 2;
-    while (cursor < headers.len) {
-        const next_eol = std.mem.indexOfPos(u8, headers, cursor, "\r\n") orelse break;
-        if (next_eol == cursor) break; // empty line — end of headers
-        const header_line = headers[cursor..next_eol];
-        if (std.ascii.startsWithIgnoreCase(header_line, "content-length:")) {
-            const value = std.mem.trim(u8, header_line[15..], " \t");
-            req.content_length = std.fmt.parseInt(usize, value, 10) catch null;
-        } else if (std.ascii.startsWithIgnoreCase(header_line, "last-event-id:")) {
-            const value = std.mem.trim(u8, header_line[14..], " \t");
-            req.last_event_id = std.fmt.parseInt(u64, value, 10) catch null;
-        }
-        cursor = next_eol + 2;
-    }
-    return req;
+    sse_mod.respondStatus(&stream, arg.io, 404, "Not Found");
 }
 
 // ─── /events ─────────────────────────────────────────────────────
@@ -2013,7 +1953,15 @@ fn runSseStream(
         session.events_mutex.lockUncancelable(io);
         defer session.events_mutex.unlock(io);
 
-        if (last_event_id > 0 and last_event_id + 1 < session.next_event_id) {
+        // Replay if the client has missed events OR it's a first-time
+        // connection (last_event_id == 0) and events are available.
+        // The latter covers the orchestrated-print-mode race: the
+        // agent loop finishes before the orchestrator subscribes, so
+        // the fresh client must see buffered events via replay.
+        const has_events = session.next_event_id > 1;
+        const needs_replay = (last_event_id == 0 and has_events) or
+            (last_event_id > 0 and last_event_id + 1 < session.next_event_id);
+        if (needs_replay) {
             const oldest: u64 = if (session.next_event_id > replay_ring_capacity)
                 session.next_event_id - replay_ring_capacity
             else
@@ -2110,7 +2058,7 @@ fn runPrompt(
     stream: *std.Io.net.Stream,
     io: std.Io,
     allocator: std.mem.Allocator,
-    req: Request,
+    req: sse_mod.Request,
     carry: []const u8,
 ) void {
     // Read the body up to Content-Length (or 64 KiB cap).
@@ -2120,7 +2068,7 @@ fn runPrompt(
     var body_buf: std.ArrayList(u8) = .empty;
     defer body_buf.deinit(allocator);
     body_buf.appendSlice(allocator, carry[0..@min(carry.len, want)]) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
 
@@ -2136,7 +2084,7 @@ fn runPrompt(
             };
             if (n == 0) break;
             body_buf.appendSlice(allocator, chunk[0..n]) catch {
-                respondStatus(stream, io, 500, "Internal Server Error");
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
                 return;
             };
         }
@@ -2144,7 +2092,7 @@ fn runPrompt(
 
     const text = std.mem.trim(u8, body_buf.items, " \t\r\n");
     if (text.len == 0) {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     }
 
@@ -2155,7 +2103,7 @@ fn runPrompt(
     // Acknowledge before kicking off the loop so the client can
     // immediately start consuming `/events`. (`/prompt` returns
     // a result, not the stream — events fan out via subscribers.)
-    respondJson(stream, io, 200, "{\"ok\":true}");
+    sse_mod.respondJson(stream, io, 200, "{\"ok\":true}");
 
     runOneTurn(session, allocator, io, text);
 }
@@ -2317,7 +2265,7 @@ fn runOneTurnInternal(
                 }
             } else |_| {}
         }
-        const frame = renderFrame(allocator, ev) catch {
+        const frame = sse_mod.renderFrame(allocator, ev) catch {
             ev.deinit(allocator);
             continue;
         };
@@ -2399,44 +2347,7 @@ fn proxyStopRequestedFn(userdata: ?*anyopaque) bool {
     return session.stop_requested.load(.acquire);
 }
 
-/// Render one `AgentEvent` as a complete SSE frame. Uses
-/// `agent.proxy.encodeEventJson` for the payload — same wire
-/// format the in-process loop emits. Owned by the caller.
-fn renderFrame(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
-    const json = try agent.proxy.encodeEventJson(allocator, ev);
-    defer allocator.free(json);
-    const kind = @tagName(ev);
-    return std.fmt.allocPrint(allocator, "event: {s}\ndata: {s}\n\n", .{ kind, json });
-}
-
 // ─── HTTP response helpers ──────────────────────────────────────
-
-fn respondStatus(stream: *std.Io.net.Stream, io: std.Io, status: u16, reason: []const u8) void {
-    var buf: [512]u8 = undefined;
-    const text = std.fmt.bufPrint(
-        &buf,
-        "HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        .{ status, reason },
-    ) catch return;
-    var wbuf: [256]u8 = undefined;
-    var w = stream.writer(io, &wbuf);
-    w.interface.writeAll(text) catch {};
-    w.interface.flush() catch {};
-}
-
-fn respondJson(stream: *std.Io.net.Stream, io: std.Io, status: u16, body: []const u8) void {
-    var hdr: [256]u8 = undefined;
-    const text = std.fmt.bufPrint(
-        &hdr,
-        "HTTP/1.1 {d} OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-        .{ status, body.len },
-    ) catch return;
-    var wbuf: [256]u8 = undefined;
-    var w = stream.writer(io, &wbuf);
-    w.interface.writeAll(text) catch return;
-    w.interface.writeAll(body) catch return;
-    w.interface.flush() catch {};
-}
 
 /// `GET /transcript` (v1.6.1) — render the active session's
 /// transcript as UI-friendly JSON. Holds `events_mutex` (the same
@@ -2453,12 +2364,12 @@ fn respondTranscript(
     session.events_mutex.lockUncancelable(session.io);
     const body = renderTranscriptForUi(allocator, &session.transcript) catch {
         session.events_mutex.unlock(session.io);
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     session.events_mutex.unlock(session.io);
     defer allocator.free(body);
-    respondJson(stream, io, 200, body);
+    sse_mod.respondJson(stream, io, 200, body);
 }
 
 /// Render the transcript as a UI-friendly JSON projection. Owned
@@ -2610,7 +2521,7 @@ fn respondActiveSession(
     const count = session.transcript.messages.items.len;
     const id_copy = allocator.dupe(u8, session.session_id) catch {
         session.events_mutex.unlock(session.io);
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     session.events_mutex.unlock(session.io);
@@ -2620,11 +2531,11 @@ fn respondActiveSession(
         "{{\"id\":\"{s}\",\"messageCount\":{d},\"persisted\":{}}}",
         .{ id_copy, count, session.parent_dir != null },
     ) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     defer allocator.free(body);
-    respondJson(stream, io, 200, body);
+    sse_mod.respondJson(stream, io, 200, body);
 }
 
 /// `GET /role` — expose the active capability role + the
@@ -2656,11 +2567,11 @@ fn respondRole(
         session.provider.model_id,
         ext_tool_names.items,
     ) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     defer allocator.free(body);
-    respondJson(stream, io, 200, body);
+    sse_mod.respondJson(stream, io, 200, body);
 }
 
 /// `GET /usage` — per-tool call counters and guardrail firings.
@@ -2676,29 +2587,29 @@ fn respondUsage(
     // with bufPrint for the numeric values, matching proxy.zig patterns.
     var body = std.ArrayList(u8).empty;
     defer body.deinit(allocator);
-    body.appendSlice(allocator, "{\"guardrails\":") catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    body.appendSlice(allocator, "{\"guardrails\":") catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
     {
         var num: [32]u8 = undefined;
-        body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{gcount}) catch unreachable) catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{gcount}) catch unreachable) catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
     }
-    body.appendSlice(allocator, ",\"tools\":{") catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    body.appendSlice(allocator, ",\"tools\":{") catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
     var first = true;
     var it = session.tool_usage.iterator();
     while (it.next()) |entry| {
-        if (!first) body.append(allocator, ',') catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        if (!first) body.append(allocator, ',') catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
         first = false;
-        body.append(allocator, '"') catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
-        body.appendSlice(allocator, entry.key_ptr.*) catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
-        body.appendSlice(allocator, "\":") catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        body.append(allocator, '"') catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        body.appendSlice(allocator, entry.key_ptr.*) catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        body.appendSlice(allocator, "\":") catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
         {
             var num: [32]u8 = undefined;
-            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{entry.value_ptr.*}) catch unreachable) catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{entry.value_ptr.*}) catch unreachable) catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
         }
     }
-    body.append(allocator, '}') catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
-    body.append(allocator, '}') catch { respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    body.append(allocator, '}') catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    body.append(allocator, '}') catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
     const json = body.items;
-    respondJson(stream, io, 200, json);
+    sse_mod.respondJson(stream, io, 200, json);
 }
 
 /// `GET /design-docs` — scan `docs/design/` relative to the
@@ -2714,11 +2625,11 @@ fn respondDesignDocs(
     allocator: std.mem.Allocator,
 ) void {
     const body = renderDesignDocsJson(allocator, io) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     defer allocator.free(body);
-    respondJson(stream, io, 200, body);
+    sse_mod.respondJson(stream, io, 200, body);
 }
 
 /// `POST /design-docs/archive` — move a design doc to docs/archive/design/.
@@ -2728,17 +2639,17 @@ fn respondArchiveDesignDoc(
     stream: *std.Io.net.Stream,
     io: std.Io,
     allocator: std.mem.Allocator,
-    req: Request,
+    req: sse_mod.Request,
     carry: []const u8,
 ) void {
     const body_bytes = readBody(allocator, stream, io, req, carry, 1024) catch {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     };
     defer allocator.free(body_bytes);
 
     const src = extractJsonStringField(body_bytes, "path") orelse {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     };
 
@@ -2746,13 +2657,13 @@ fn respondArchiveDesignDoc(
         !std.mem.endsWith(u8, src, ".md") or
         std.mem.indexOf(u8, src, "..") != null)
     {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     }
 
     const basename = std.fs.path.basename(src);
     const dest = std.fmt.allocPrint(allocator, "docs/archive/design/{s}", .{basename}) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     defer allocator.free(dest);
@@ -2761,21 +2672,21 @@ fn respondArchiveDesignDoc(
     cwd.createDirPath(io, "docs/archive/design") catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
-            respondStatus(stream, io, 500, "Internal Server Error");
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
             return;
         },
     };
     cwd.rename(src, cwd, dest, io) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
 
     const resp = std.fmt.allocPrint(allocator, "{{\"ok\":true,\"archived\":\"{s}\"}}", .{dest}) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     defer allocator.free(resp);
-    respondJson(stream, io, 200, resp);
+    sse_mod.respondJson(stream, io, 200, resp);
 }
 
 /// Read the first 512 bytes of `path` and parse the `**Status:**` marker.
@@ -2901,15 +2812,15 @@ fn respondSessionList(
     allocator: std.mem.Allocator,
 ) void {
     const parent = session.parent_dir orelse {
-        respondJson(stream, io, 200, "{\"sessions\":[],\"persisted\":false}");
+        sse_mod.respondJson(stream, io, 200, "{\"sessions\":[],\"persisted\":false}");
         return;
     };
     const body = renderSessionListJson(allocator, io, parent, session.session_id) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     defer allocator.free(body);
-    respondJson(stream, io, 200, body);
+    sse_mod.respondJson(stream, io, 200, body);
 }
 
 const SessionEntry = struct {
@@ -3052,24 +2963,24 @@ fn respondSessionTranscript(
     id: []const u8,
 ) void {
     const parent = session.parent_dir orelse {
-        respondStatus(stream, io, 404, "Not Found");
+        sse_mod.respondStatus(stream, io, 404, "Not Found");
         return;
     };
     if (!isUlidLike(id)) {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     }
     var loaded = session_mod.load(allocator, io, parent, id) catch {
-        respondStatus(stream, io, 404, "Not Found");
+        sse_mod.respondStatus(stream, io, 404, "Not Found");
         return;
     };
     defer loaded.deinit(allocator);
     const body = renderTranscriptForUi(allocator, &loaded.transcript) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     defer allocator.free(body);
-    respondJson(stream, io, 200, body);
+    sse_mod.respondJson(stream, io, 200, body);
 }
 
 /// Cheap ULID-shape guard so a malicious request can't traverse
@@ -3101,7 +3012,7 @@ fn respondNewSession(
 
     persistSession(session); // last save before swap
     swapToFreshSession(session) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     broadcastSessionSwitched(session, allocator);
@@ -3111,11 +3022,11 @@ fn respondNewSession(
         "{{\"id\":\"{s}\",\"created\":true}}",
         .{session.session_id},
     ) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     defer allocator.free(body);
-    respondJson(stream, io, 200, body);
+    sse_mod.respondJson(stream, io, 200, body);
 }
 
 /// `POST /command` (v1.7.3) — accept a plain-text slash command
@@ -3141,18 +3052,18 @@ fn respondSlashCommand(
     stream: *std.Io.net.Stream,
     io: std.Io,
     allocator: std.mem.Allocator,
-    req: Request,
+    req: sse_mod.Request,
     carry: []const u8,
 ) void {
     const body_bytes = readBody(allocator, stream, io, req, carry, 16 * 1024) catch {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     };
     defer allocator.free(body_bytes);
 
     const line = std.mem.trim(u8, body_bytes, " \t\r\n");
     if (line.len == 0 or line[0] != '/') {
-        respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"not a slash command\",\"errorCode\":\"rejected\"}");
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"not a slash command\",\"errorCode\":\"rejected\"}");
         return;
     }
 
@@ -3163,7 +3074,7 @@ fn respondSlashCommand(
     defer session.run_mutex.unlock(io);
 
     var reg = buildProxySlashRegistry(allocator) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     defer reg.deinit();
@@ -3192,11 +3103,11 @@ fn respondSlashCommand(
             "{{\"ok\":false,\"error\":\"{s}\",\"errorCode\":\"{s}\"}}",
             .{ @errorName(err), code },
         ) catch {
-            respondStatus(stream, io, 500, "Internal Server Error");
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
             return;
         };
         defer allocator.free(body);
-        respondJson(stream, io, 200, body);
+        sse_mod.respondJson(stream, io, 200, body);
         return;
     };
 
@@ -3222,11 +3133,11 @@ fn respondSlashCommand(
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(allocator);
     resp.appendSlice(allocator, "{\"ok\":true,\"output\":") catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     appendUiJsonStr(&resp, allocator, output.items) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     resp.appendSlice(allocator, ",\"sideEffect\":") catch {};
@@ -3237,7 +3148,7 @@ fn respondSlashCommand(
     }
     resp.append(allocator, '}') catch {};
 
-    respondJson(stream, io, 200, resp.items);
+    sse_mod.respondJson(stream, io, 200, resp.items);
 }
 
 /// `POST /session/activate` — switch to a different persisted
@@ -3248,21 +3159,21 @@ fn respondActivateSession(
     stream: *std.Io.net.Stream,
     io: std.Io,
     allocator: std.mem.Allocator,
-    req: Request,
+    req: sse_mod.Request,
     carry: []const u8,
 ) void {
     const body_bytes = readBody(allocator, stream, io, req, carry, 4096) catch {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     };
     defer allocator.free(body_bytes);
 
     const id = extractJsonStringField(body_bytes, "id") orelse {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     };
     if (!isUlidLike(id)) {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     }
 
@@ -3270,11 +3181,11 @@ fn respondActivateSession(
     defer session.run_mutex.unlock(io);
 
     const parent = session.parent_dir orelse {
-        respondStatus(stream, io, 404, "Not Found");
+        sse_mod.respondStatus(stream, io, 404, "Not Found");
         return;
     };
     var loaded = session_mod.load(allocator, io, parent, id) catch {
-        respondStatus(stream, io, 404, "Not Found");
+        sse_mod.respondStatus(stream, io, 404, "Not Found");
         return;
     };
 
@@ -3284,7 +3195,7 @@ fn respondActivateSession(
     // Swap session state in place.
     swapToLoadedSession(session, &loaded, id) catch {
         loaded.deinit(allocator);
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
 
@@ -3295,11 +3206,11 @@ fn respondActivateSession(
         "{{\"id\":\"{s}\",\"activated\":true}}",
         .{session.session_id},
     ) catch {
-        respondStatus(stream, io, 500, "Internal Server Error");
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
     defer allocator.free(resp);
-    respondJson(stream, io, 200, resp);
+    sse_mod.respondJson(stream, io, 200, resp);
 }
 
 /// `POST /permission/resolve` (v1.11.4) — body is JSON
@@ -3313,25 +3224,25 @@ fn respondPermissionResolve(
     stream: *std.Io.net.Stream,
     io: std.Io,
     allocator: std.mem.Allocator,
-    req: Request,
+    req: sse_mod.Request,
     carry: []const u8,
 ) void {
     const body_bytes = readBody(allocator, stream, io, req, carry, 4096) catch {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     };
     defer allocator.free(body_bytes);
 
     const call_id = extractJsonStringField(body_bytes, "call_id") orelse {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     };
     const resolution_str = extractJsonStringField(body_bytes, "resolution") orelse {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     };
     const resolution = permissions_mod.Resolution.fromString(resolution_str) orelse {
-        respondStatus(stream, io, 400, "Bad Request");
+        sse_mod.respondStatus(stream, io, 400, "Bad Request");
         return;
     };
 
@@ -3339,14 +3250,14 @@ fn respondPermissionResolve(
     defer session.resolve_mutex.unlock(io);
 
     const prompter = session.current_prompter orelse {
-        respondStatus(stream, io, 409, "Conflict");
+        sse_mod.respondStatus(stream, io, 409, "Conflict");
         return;
     };
     prompter.resolve(call_id, resolution) catch {
-        respondStatus(stream, io, 404, "Not Found");
+        sse_mod.respondStatus(stream, io, 404, "Not Found");
         return;
     };
-    respondJson(stream, io, 200, "{\"ok\":true}");
+    sse_mod.respondJson(stream, io, 200, "{\"ok\":true}");
 }
 
 /// In-place mutate `session` to point at a fresh ULID with an
@@ -3403,7 +3314,7 @@ fn readBody(
     allocator: std.mem.Allocator,
     stream: *std.Io.net.Stream,
     io: std.Io,
-    req: Request,
+    req: sse_mod.Request,
     carry: []const u8,
     cap: usize,
 ) ![]u8 {
@@ -3570,7 +3481,7 @@ const test_h = @import("../../test_helpers.zig");
 
 test "parseRequest: GET /events" {
     const headers = "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-    const r = parseRequest(headers).?;
+    const r = sse_mod.parseRequest(headers).?;
     try testing.expectEqualStrings("GET", r.method);
     try testing.expectEqualStrings("/events", r.path);
     try testing.expect(r.content_length == null);
@@ -3582,15 +3493,15 @@ test "parseRequest: POST with content-length" {
         "Host: 127.0.0.1\r\n" ++
         "Content-Length: 42\r\n" ++
         "\r\n";
-    const r = parseRequest(headers).?;
+    const r = sse_mod.parseRequest(headers).?;
     try testing.expectEqualStrings("POST", r.method);
     try testing.expectEqualStrings("/prompt", r.path);
     try testing.expectEqual(@as(usize, 42), r.content_length.?);
 }
 
 test "parseRequest: malformed line returns null" {
-    try testing.expect(parseRequest("INVALID\r\n\r\n") == null);
-    try testing.expect(parseRequest("") == null);
+    try testing.expect(sse_mod.parseRequest("INVALID\r\n\r\n") == null);
+    try testing.expect(sse_mod.parseRequest("") == null);
 }
 
 test "parseRequest: case-insensitive Content-Length header" {
@@ -3598,12 +3509,12 @@ test "parseRequest: case-insensitive Content-Length header" {
         "POST /prompt HTTP/1.1\r\n" ++
         "content-length: 7\r\n" ++
         "\r\n";
-    try testing.expectEqual(@as(usize, 7), parseRequest(headers).?.content_length.?);
+    try testing.expectEqual(@as(usize, 7), sse_mod.parseRequest(headers).?.content_length.?);
 }
 
 test "renderFrame: SSE framing matches encodeEventJson" {
     const gpa = testing.allocator;
-    const frame = try renderFrame(gpa, .turn_start);
+    const frame = try sse_mod.renderFrame(gpa, .turn_start);
     defer gpa.free(frame);
     try testing.expectEqualStrings("event: turn_start\ndata: {\"kind\":\"turn_start\"}\n\n", frame);
 }
@@ -5174,7 +5085,7 @@ test "parseRequest: Last-Event-ID header" {
         "Host: 127.0.0.1\r\n" ++
         "Last-Event-ID: 42\r\n" ++
         "\r\n";
-    const r = parseRequest(headers).?;
+    const r = sse_mod.parseRequest(headers).?;
     try testing.expectEqual(@as(u64, 42), r.last_event_id.?);
 }
 
@@ -5183,12 +5094,12 @@ test "parseRequest: case-insensitive Last-Event-ID header" {
         "GET /events HTTP/1.1\r\n" ++
         "last-event-id: 7\r\n" ++
         "\r\n";
-    try testing.expectEqual(@as(u64, 7), parseRequest(headers).?.last_event_id.?);
+    try testing.expectEqual(@as(u64, 7), sse_mod.parseRequest(headers).?.last_event_id.?);
 }
 
 test "parseRequest: missing Last-Event-ID is null" {
     const headers = "GET /events HTTP/1.1\r\n\r\n";
-    try testing.expect(parseRequest(headers).?.last_event_id == null);
+    try testing.expect(sse_mod.parseRequest(headers).?.last_event_id == null);
 }
 
 test "broadcastEvent: stamps frame with monotonic id and stores in ring" {

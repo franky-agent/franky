@@ -332,6 +332,20 @@ pub const PresetRegistry = struct {
     pub fn get(self: *const PresetRegistry, name: []const u8) ?Preset {
         return self.presets.get(name);
     }
+
+    /// Returns a deep copy of the registry. Every parallel subagent
+    /// call clones its own copy so concurrent hash-map reads don't
+    /// race (v1.28.1 race fix — same pattern as cloneEnvironMap).
+    /// The clone owns its allocated memory; caller must deinit.
+    pub fn clone(self: *const PresetRegistry, allocator: std.mem.Allocator) !PresetRegistry {
+        var out = PresetRegistry.init(allocator);
+        errdefer out.deinit();
+        var it = self.presets.iterator();
+        while (it.next()) |entry| {
+            try out.register(entry.value_ptr.*);
+        }
+        return out;
+    }
 };
 
 // ─── preset builders ───────────────────────────────────────────────
@@ -496,7 +510,7 @@ const list_presets_params_json: []const u8 =
 pub fn listPresetsToolWithCtx(registry: *const PresetRegistry) at.AgentTool {
     return .{
         .name = list_presets_tool_name,
-        .description = "List available sub-agent presets with their purpose, default profile, and default role.",
+        .description = "List available sub-agent presets (with their purpose, default profile, and default role) plus all available profile names you can use with the `profile` parameter.",
         .parameters_json = list_presets_params_json,
         .execution_mode = .sequential,
         .ctx = @ptrCast(@constCast(registry)),
@@ -513,7 +527,6 @@ fn executeListPresets(
     cancel: *ai.stream.Cancel,
     on_update: at.OnUpdate,
 ) anyerror!at.ToolResult {
-    _ = io;
     _ = call_id;
     _ = args_json;
     _ = cancel;
@@ -521,10 +534,18 @@ fn executeListPresets(
 
     const registry: *const PresetRegistry = @ptrCast(@alignCast(self.ctx.?));
 
+    // Compute available profiles — same approach as buildSubagentHint.
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const profiles_csv = profiles_mod.listProfileNamesCSV(allocator, io, &env_map) catch "";
+    defer if (profiles_csv.len > 0) allocator.free(profiles_csv);
+
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try buf.append(allocator, '[');
+    try buf.append(allocator, '{');
 
+    // ── presets array ──
+    try buf.appendSlice(allocator, "\"presets\":[");
     var it = registry.presets.iterator();
     var first = true;
     while (it.next()) |entry| {
@@ -544,6 +565,12 @@ fn executeListPresets(
         try buf.append(allocator, '}');
     }
     try buf.append(allocator, ']');
+
+    // ── available_profiles (comma-separated) ──
+    try buf.appendSlice(allocator, ",\"available_profiles\":");
+    try ai.utils.appendJsonStr(&buf, allocator, profiles_csv);
+
+    try buf.append(allocator, '}');
 
     const text = try buf.toOwnedSlice(allocator);
     var content = try allocator.alloc(ai.types.ContentBlock, 1);
@@ -822,8 +849,20 @@ fn runSubagent(
     };
     defer parsed.deinit(allocator);
 
+    // v1.28.1 — clone the preset registry per-call. The
+    // PresetRegistry (a StringArrayHashMapUnmanaged) is NOT
+    // thread-safe. With N parallel `subagent` tool calls all
+    // reading the SAME map concurrently, the hash table
+    // metadata corrupts → SIGABRT (same class of bug as
+    // the environ_map clone in v1.24.2).
+    // The clone gives each sub-agent isolated read state;
+    // parent's registry stays untouched. Freed when this
+    // stack frame exits.
+    var local_presets = try ctx.presets.clone(allocator);
+    defer local_presets.deinit();
+
     // Resolve preset.
-    const preset = ctx.presets.get(parsed.preset) orelse {
+    const preset = local_presets.get(parsed.preset) orelse {
         const msg = std.fmt.allocPrint(
             allocator,
             "preset '{s}' is not registered; call list_subagent_presets to see available presets",
@@ -888,7 +927,21 @@ fn runSubagent(
 
     // Resolve the provider — same path print mode runs at startup.
     const provider_info = print_mod.resolveProviderIo(allocator, io, ctx.environ, &sub_cfg) catch |e| {
-        const msg = std.fmt.allocPrint(allocator, "provider resolve failed: {s}", .{@errorName(e)}) catch unreachable;
+        // Detect missing API key — give a hint with available profiles
+        // rather than a raw error name the parent model can't act on.
+        if (e == error.MissingApiKey) {
+            var env_map = std.process.Environ.Map.init(allocator);
+            defer env_map.deinit();
+            const list = profiles_mod.listProfileNamesCSV(allocator, io, &env_map) catch "";
+            defer if (list.len > 0) allocator.free(list);
+            const hint = if (list.len > 0)
+                try std.fmt.allocPrint(allocator, "profile '{s}' uses a provider whose API key is not set; retry with one of the available profiles: {s}", .{effective_profile, list})
+            else
+                try allocator.dupe(u8, "profile uses a provider whose API key is not set; set the required environment variable or choose a different profile");
+            defer allocator.free(hint);
+            return errorResult(allocator, .agent_error, hint, .{});
+        }
+        const msg = try std.fmt.allocPrint(allocator, "provider resolve failed: {s}", .{@errorName(e)});
         defer allocator.free(msg);
         return errorResult(allocator, .agent_error, msg, .{});
     };

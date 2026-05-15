@@ -115,6 +115,45 @@ button#new-session:hover {
     border-color: var(--accent);
 }
 
+/* ─── Event anchors ──────────────────────────────────────────── */
+
+.anchor-btn {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 1px 4px;
+    margin-left: 6px;
+    opacity: 0.25;
+    transition: opacity 0.15s, transform 0.15s;
+    vertical-align: middle;
+    line-height: 1;
+    color: var(--muted);
+    flex-shrink: 0;
+}
+.anchor-btn:hover {
+    opacity: 0.8;
+    transform: scale(1.15);
+}
+.anchor-copied {
+    color: var(--accent);
+    opacity: 1 !important;
+}
+
+/* Highlight flash when navigating via URL hash */
+.anchor-highlight {
+    animation: anchor-flash 2s ease-out;
+}
+
+@keyframes anchor-flash {
+    0%   { background-color: var(--accent); opacity: 0.3; }
+    100% { background-color: transparent; opacity: 1; }
+}
+
+/* Ensure elements with anchor-btn have position:relative for button placement */
+.message, .tool-card, .error-banner {
+    position: relative;
+}
 button#sidebar-toggle {
     background: transparent;
     color: var(--muted);
@@ -455,6 +494,45 @@ button#help-toggle:hover {
     border-color: var(--accent);
 }
 
+/* ─── Event anchors ──────────────────────────────────────────── */
+
+.anchor-btn {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 1px 4px;
+    margin-left: 6px;
+    opacity: 0.25;
+    transition: opacity 0.15s, transform 0.15s;
+    vertical-align: middle;
+    line-height: 1;
+    color: var(--muted);
+    flex-shrink: 0;
+}
+.anchor-btn:hover {
+    opacity: 0.8;
+    transform: scale(1.15);
+}
+.anchor-copied {
+    color: var(--accent);
+    opacity: 1 !important;
+}
+
+/* Highlight flash when navigating via URL hash */
+.anchor-highlight {
+    animation: anchor-flash 2s ease-out;
+}
+
+@keyframes anchor-flash {
+    0%   { background-color: var(--accent); opacity: 0.3; }
+    100% { background-color: transparent; opacity: 1; }
+}
+
+/* Ensure elements with anchor-btn have position:relative for button placement */
+.message, .tool-card, .error-banner {
+    position: relative;
+}
 .help-overlay {
     position: fixed;
     inset: 0;
@@ -1453,7 +1531,46 @@ button#design-panel-btn.is-active {
 .permission-btn:hover:not(:disabled) {
     border-color: var(--accent);
 }
-.permission-btn:disabled {
+
+/* ─── Event anchors ──────────────────────────────────────────── */
+
+.anchor-btn {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 1px 4px;
+    margin-left: 6px;
+    opacity: 0.25;
+    transition: opacity 0.15s, transform 0.15s;
+    vertical-align: middle;
+    line-height: 1;
+    color: var(--muted);
+    flex-shrink: 0;
+}
+.anchor-btn:hover {
+    opacity: 0.8;
+    transform: scale(1.15);
+}
+.anchor-copied {
+    color: var(--accent);
+    opacity: 1 !important;
+}
+
+/* Highlight flash when navigating via URL hash */
+.anchor-highlight {
+    animation: anchor-flash 2s ease-out;
+}
+
+@keyframes anchor-flash {
+    0%   { background-color: var(--accent); opacity: 0.3; }
+    100% { background-color: transparent; opacity: 1; }
+}
+
+/* Ensure elements with anchor-btn have position:relative for button placement */
+.message, .tool-card, .error-banner {
+    position: relative;
+}.permission-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
 }
@@ -1871,4 +1988,44 @@ button#send:hover:not(:disabled) {
 .diff-view-toggle:hover {
     color: var(--accent);
     border-color: var(--accent);
+}
+
+/* ─── Event anchors ──────────────────────────────────────────── */
+
+.anchor-btn {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 1px 4px;
+    margin-left: 6px;
+    opacity: 0.25;
+    transition: opacity 0.15s, transform 0.15s;
+    vertical-align: middle;
+    line-height: 1;
+    color: var(--muted);
+    flex-shrink: 0;
+}
+.anchor-btn:hover {
+    opacity: 0.8;
+    transform: scale(1.15);
+}
+.anchor-copied {
+    color: var(--accent);
+    opacity: 1 !important;
+}
+
+/* Highlight flash when navigating via URL hash */
+.anchor-highlight {
+    animation: anchor-flash 2s ease-out;
+}
+
+@keyframes anchor-flash {
+    0%   { background-color: var(--accent); opacity: 0.3; }
+    100% { background-color: transparent; opacity: 1; }
+}
+
+/* Ensure elements with anchor-btn have position:relative for button placement */
+.message, .tool-card, .error-banner {
+    position: relative;
 }

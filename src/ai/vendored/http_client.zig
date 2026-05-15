@@ -40,6 +40,11 @@ const HostName = std.Io.net.HostName;
 
 pub const disable_tls = std.options.http_disable_tls;
 
+/// v1.28.1 — compile-time flag to skip TLS certificate verification.
+/// Set via `zig build -Dtls-insecure=true`. Keeps TLS encryption but
+/// skips CA bundle loading and certificate/hostname verification.
+pub const tls_insecure: bool = @import("build_options").tls_insecure;
+
 /// Used for all client allocations. Must be thread-safe.
 allocator: Allocator,
 /// Used for opening TCP connections.
@@ -358,23 +363,7 @@ pub const Connection = struct {
                 .client = std.crypto.tls.Client.init(
                     &tls.connection.stream_reader.interface,
                     &tls.connection.stream_writer.interface,
-                    .{
-                        .host = .{ .explicit = remote_host.bytes },
-                        .ca = .{ .bundle = .{
-                            .gpa = client.allocator,
-                            .io = client.io,
-                            .lock = &client.ca_bundle_lock,
-                            .bundle = &client.ca_bundle,
-                        } },
-                        .ssl_key_log = client.ssl_key_log,
-                        .read_buffer = tls_read_buffer,
-                        .write_buffer = socket_write_buffer,
-                        .entropy = &random_buffer,
-                        .realtime_now = client.now.?,
-                        // This is appropriate for HTTPS because the HTTP headers contain
-                        // the content length which is used to detect truncation attacks.
-                        .allow_truncation_attacks = true,
-                    },
+                    tlsOptions(client, remote_host, tls_read_buffer, socket_write_buffer, &random_buffer),
                 ) catch |err| switch (err) {
                     error.WriteFailed => return tls.connection.stream_writer.err.?,
                     error.ReadFailed => return tls.connection.stream_reader.err.?,
@@ -1721,9 +1710,61 @@ pub fn connectProxied(
     };
 }
 
+/// Builds `tls.Client.Options`. When `tls_insecure` is true (set at
+/// compile time via `-Dtls-insecure=true`), both certificate chain
+/// and hostname verification are skipped (`.ca = .no_verification`,
+/// `.host = .no_verification`) and no CA bundle is required. When
+/// false (the default), the standard CA bundle verification is used.
+fn tlsOptions(
+    client: *Client,
+    remote_host: HostName,
+    read_buffer: []u8,
+    write_buffer: []u8,
+    entropy: *const [std.crypto.tls.Client.Options.entropy_len]u8,
+) std.crypto.tls.Client.Options {
+    if (comptime tls_insecure) {
+        return .{
+            .host = .no_verification,
+            .ca = .no_verification,
+            .ssl_key_log = client.ssl_key_log,
+            .read_buffer = read_buffer,
+            .write_buffer = write_buffer,
+            .entropy = entropy,
+            .realtime_now = client.now.?,
+            .allow_truncation_attacks = true,
+        };
+    }
+    return .{
+        .host = .{ .explicit = remote_host.bytes },
+        .ca = .{ .bundle = .{
+            .gpa = client.allocator,
+            .io = client.io,
+            .lock = &client.ca_bundle_lock,
+            .bundle = &client.ca_bundle,
+        } },
+        .ssl_key_log = client.ssl_key_log,
+        .read_buffer = read_buffer,
+        .write_buffer = write_buffer,
+        .entropy = entropy,
+        .realtime_now = client.now.?,
+        .allow_truncation_attacks = true,
+    };
+}
+
 fn ensureCaBundle(client: *Client) (Io.Cancelable || error{CertificateBundleLoadFailure})!void {
     if (disable_tls) unreachable;
     const io = client.io;
+
+    // v1.28.1 — when tls_insecure is true (compile-time flag), just
+    // record the current timestamp so `tls.Client.init()` has a
+    // non-null `realtime_now`, but skip CA bundle loading entirely
+    // (no filesystem access).
+    if (comptime tls_insecure) {
+        if (client.now == null) {
+            client.now = Io.Clock.real.now(io);
+        }
+        return;
+    }
 
     {
         try client.ca_bundle_lock.lockShared(io);

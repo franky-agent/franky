@@ -323,6 +323,43 @@ function highlightCodeBlocks(container) {
      */
     const pendingToolCards = [];
 
+    // vN — event anchors: monotonic counter for generating unique
+    // anchor IDs for messages, errors, system messages, etc. Tool
+    // calls use their caller-supplied callId directly.
+    let nextAnchorId = 1;
+
+    /**
+     * Generate a unique anchor ID for a given element type.
+     * Messages and system events get `msg-N`, tool calls get
+     * `tool-call_{callId}`, errors get `error-N`.
+     */
+    function anchorIdFor(type, callId) {
+        if (type === "tool-call" && callId) return "tool_" + callId;
+        const n = nextAnchorId++;
+        return type + "-" + n;
+    }
+
+    /**
+     * vN — on page load and after every session switch, check if
+     * the URL hash references an anchor in the conversation. If so,
+     * scroll to it and flash a highlight.
+     */
+    function scrollToAnchor() {
+        const hash = window.location.hash;
+        if (!hash || hash.length < 2) return;
+        const id = hash.slice(1);
+        const target = document.getElementById(id);
+        if (!target) return;
+        requestAnimationFrame(() => {
+            target.scrollIntoView({ behavior: "smooth", block: "center" });
+            target.classList.add("anchor-highlight");
+            setTimeout(() => target.classList.remove("anchor-highlight"), 2000);
+        });
+    }
+
+    // Listen for hash changes (user navigates back/forward).
+    window.addEventListener("hashchange", scrollToAnchor);
+
     /** Single "assistant is thinking..." indicator between turn_start and message_start. */
     let turnIndicator = null;
 
@@ -444,6 +481,7 @@ function highlightCodeBlocks(container) {
         content.textContent = text;
         el.appendChild(role);
         el.appendChild(content);
+        el.id = anchorIdFor("msg");
         conversation.appendChild(el);
         // User just sent a message — force scroll so they see their
         // own bubble even if they were reading scrollback.
@@ -484,6 +522,7 @@ function highlightCodeBlocks(container) {
             highlightCodeBlocks(c);
             el.appendChild(c);
         }
+        el.id = anchorIdFor("msg");
         conversation.appendChild(el);
     }
 
@@ -537,6 +576,7 @@ function highlightCodeBlocks(container) {
         const header = document.createElement('div');
         header.className = 'file-header';
         appendSpan(header, 'file-icon', '📄');
+        appendSpan(header, 'file-path', args.path || '(unknown)');
         container.appendChild(header);
         if (args.limit != null || args.offset != null) {
             const meta = document.createElement('div');
@@ -609,20 +649,6 @@ function highlightCodeBlocks(container) {
 
         addRow('path', args.path);
         addRow('overwrite', args.overwrite);
-        if ('content' in args && typeof args.content === 'string') {
-            const tr = document.createElement('tr');
-            const th = document.createElement('th');
-            th.textContent = 'content';
-            const td = document.createElement('td');
-            const span = document.createElement('span');
-            span.className = 'content-preview';
-            const v = args.content;
-            span.textContent = v.length > 200 ? v.substring(0, 200) + '…' : v;
-            td.appendChild(span);
-            tr.appendChild(th);
-            tr.appendChild(td);
-            tbody.appendChild(tr);
-        }
         table.appendChild(tbody);
         container.appendChild(table);
 
@@ -697,7 +723,7 @@ function highlightCodeBlocks(container) {
         const head = document.createElement('div');
         head.className = 'tool-head';
         head.innerHTML =
-            'tool: <span class="tool-name"></span> <span class="tool-status"></span>';
+            '<span class="tool-name"></span> <span class="tool-status"></span>';
         head.querySelector('.tool-name').textContent = name;
         head.querySelector('.tool-status').textContent = isError ? 'error' : 'done';
         el.appendChild(head);
@@ -740,7 +766,7 @@ function highlightCodeBlocks(container) {
             const renderedDiff = !isError && tryRenderDiffPanel(el, panel, toggle, detailsJson);
             if (!renderedDiff && resultText) panel.textContent = resultText;
         }
-
+        el.id = anchorIdFor("tool-call", callId)
         conversation.appendChild(el);
     }
 
@@ -775,6 +801,7 @@ function highlightCodeBlocks(container) {
         const el = document.createElement('div');
         el.className = 'error-banner';
         el.textContent = message;
+        el.id = anchorIdFor("error")
         conversation.appendChild(el);
         // Errors are worth showing — force scroll so the user sees
         // them even if they were reading earlier content.
@@ -1015,6 +1042,7 @@ function highlightCodeBlocks(container) {
         content.className = 'content';
         el.appendChild(roleEl);
         el.appendChild(content);
+        el.id = anchorIdFor("msg");
         conversation.appendChild(el);
         active = {
             el,
@@ -1136,7 +1164,7 @@ function highlightCodeBlocks(container) {
             const head = document.createElement('div');
             head.className = 'tool-head';
             head.innerHTML =
-                'tool: <span class="tool-name">…</span> <span class="tool-status">streaming args…</span>';
+                '<span class="tool-name">…</span> <span class="tool-status">streaming args…</span>';
             const argsEl = document.createElement('div');
             argsEl.className = 'tool-args';
             el.appendChild(head);
@@ -1182,6 +1210,7 @@ function highlightCodeBlocks(container) {
                 attachResultPanel(card.el);
             }
             if (name === EDIT_TOOL_NAME) card.el.classList.add('is-edit');
+            card.el.id = anchorIdFor("tool-call", callId)
             toolCards.set(callId, card.el);
             scrollToBottom();
             return;
@@ -1196,7 +1225,7 @@ function highlightCodeBlocks(container) {
         const head = document.createElement('div');
         head.className = 'tool-head';
         head.innerHTML =
-            'tool: <span class="tool-name"></span> <span class="tool-status">running…</span>';
+            '<span class="tool-name"></span> <span class="tool-status">running…</span>';
         head.querySelector('.tool-name').textContent = name;
         const args = document.createElement('div');
         args.className = 'tool-args';
@@ -1211,7 +1240,7 @@ function highlightCodeBlocks(container) {
         } else {
             attachResultPanel(el);
         }
-
+        el.id = anchorIdFor("tool-call", callId)
         conversation.appendChild(el);
         toolCards.set(callId, el);
         scrollToBottom();
@@ -2281,7 +2310,7 @@ function highlightCodeBlocks(container) {
         content.innerHTML = Markdown.render(outputMd || '');
         highlightCodeBlocks(content);
         el.appendChild(content);
-
+        el.id = anchorIdFor("msg")
         conversation.appendChild(el);
         scrollToBottom(true);
     }
@@ -3035,6 +3064,8 @@ function highlightCodeBlocks(container) {
         // Page just loaded / session just switched — land at the
         // bottom (newest message) regardless of saved scroll state.
         scrollToBottom(true);
+        // vN — after rehydrating from saved transcript, check for URL anchor.
+        scrollToAnchor();
     }
 
     // v1.7.7 — load prompt history before connecting; it's

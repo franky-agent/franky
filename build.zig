@@ -22,16 +22,30 @@ pub fn build(b: *std.Build) void {
     // Version info — injected by goreleaser via -Dversion / -Dcommit / -Ddate.
     // Falls back to defaults when building with plain `zig build`.
     franky_options.addOption(
-        []const u8, "version",
+        []const u8,
+        "version",
         b.option([]const u8, "version", "Version string (set by goreleaser)") orelse "dev",
     );
     franky_options.addOption(
-        []const u8, "commit",
+        []const u8,
+        "commit",
         b.option([]const u8, "commit", "Git commit SHA (set by goreleaser)") orelse "unknown",
     );
     franky_options.addOption(
-        []const u8, "date",
+        []const u8,
+        "date",
         b.option([]const u8, "date", "Build date in RFC3339 (set by goreleaser)") orelse "unknown",
+    );
+
+    // v1.28.1 — compile-time TLS verification skip. When true, TLS
+    // encryption is still active but certificate chain and hostname
+    // verification are skipped (no CA bundle needed). Set via:
+    //   zig build -Dtls-insecure=true
+    // Useful in container environments that lack CA certificates.
+    franky_options.addOption(
+        bool,
+        "tls_insecure",
+        b.option(bool, "tls-insecure", "Skip TLS certificate verification (keep encryption, skip CA bundle)") orelse false,
     );
 
     // Public module — exposed to dependents via `b.dependency("franky").module("franky")`.
@@ -113,6 +127,7 @@ pub fn build(b: *std.Build) void {
     test_options.addOption([]const u8, "version", "test");
     test_options.addOption([]const u8, "commit", "test");
     test_options.addOption([]const u8, "date", "test");
+    test_options.addOption(bool, "tls_insecure", false);
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -232,6 +247,7 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = false,
         .link_libc = true,
     });
+    profile_test_module.addOptions("build_options", franky_options);
     const profile_unit_tests = b.addTest(.{
         .name = "franky-test",
         .root_module = profile_test_module,

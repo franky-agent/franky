@@ -280,13 +280,22 @@ pub fn run(
     };
 
     log.log(.info, "update", "downloading_checksums", "url={s}", .{checksums_asset.url});
-    const checksums_text = httpGetBytes(arena, &client, checksums_asset.url, &ua_only) catch |e| {
-        return switch (e) {
-            error.HttpFailure => Error.ChecksumDownloadFailed,
-            else => |other| other,
-        };
+    const checksums_text = httpGetBytes(arena, &client, checksums_asset.url, &ua_only) catch |err| {
+        if (opts.force) {
+            log.log(.warn, "update", "checksums_download_failed_force", "url={s} err={}", .{ checksums_asset.url, err });
+            // --force: skip verification, download binary directly.
+            return forceDownloadBinary(arena, io, &client, binary_asset.url, current_version, tag, opts);
+        }
+        return Error.ChecksumDownloadFailed;
     };
-    const expected_sha = findChecksumLine(checksums_text, asset_name) orelse return Error.ChecksumMissing;
+
+    const expected_sha = findChecksumLine(checksums_text, asset_name) orelse {
+        if (opts.force) {
+            log.log(.warn, "update", "checksums_line_missing_force", "asset={s}", .{asset_name});
+            return forceDownloadBinary(arena, io, &client, binary_asset.url, current_version, tag, opts);
+        }
+        return Error.ChecksumMissing;
+    };
 
     log.log(.info, "update", "downloading_binary", "name={s} url={s}", .{ asset_name, binary_asset.url });
     const binary_bytes = httpGetBytes(arena, &client, binary_asset.url, &ua_only) catch |e| {
@@ -299,7 +308,14 @@ pub fn run(
     log.log(.debug, "update", "checksum_debug", "got={s} expected={s} asset_name={s} binary_bytes={d}", .{
         &got, expected_sha, asset_name, binary_bytes.len,
     });
-    if (!std.ascii.eqlIgnoreCase(&got, expected_sha)) return Error.ChecksumMismatch;
+    if (!std.ascii.eqlIgnoreCase(&got, expected_sha)) {
+        if (opts.force) {
+            log.log(.warn, "update", "checksum_mismatch_force", "got={s} expected={s}", .{ &got, expected_sha });
+            // Force overrides checksum mismatch — proceed to replace.
+        } else {
+            return Error.ChecksumMismatch;
+        }
+    }
 
     if (opts.dry_run) {
         return .{ .updated = .{
@@ -309,6 +325,34 @@ pub fn run(
     }
 
     // 5. Replace running binary.
+    replaceExecutable(arena, io, binary_bytes) catch return Error.ReplaceFailed;
+    return .{ .updated = .{
+        .from = try arena.dupe(u8, current_version),
+        .to = try arena.dupe(u8, tag),
+    } };
+}
+
+/// Download and replace the binary without checksum verification.
+/// Only called when --force is set and checksum data is unavailable.
+fn forceDownloadBinary(arena: std.mem.Allocator, io: std.Io, client: *http_mod.Client, binary_url: []const u8, current_version: []const u8, tag: []const u8, opts: Options) Error!Outcome {
+    const ua_only = [_]std.http.Header{
+        .{ .name = "User-Agent", .value = "franky-update/" ++ franky.version },
+    };
+    log.log(.info, "update", "downloading_binary_force", "url={s}", .{binary_url});
+    const binary_bytes = httpGetBytes(arena, client, binary_url, &ua_only) catch |e| {
+        return switch (e) {
+            error.HttpFailure => Error.BinaryDownloadFailed,
+            else => |other| other,
+        };
+    };
+
+    if (opts.dry_run) {
+        return .{ .updated = .{
+            .from = try arena.dupe(u8, current_version),
+            .to = try arena.dupe(u8, tag),
+        } };
+    }
+
     replaceExecutable(arena, io, binary_bytes) catch return Error.ReplaceFailed;
     return .{ .updated = .{
         .from = try arena.dupe(u8, current_version),

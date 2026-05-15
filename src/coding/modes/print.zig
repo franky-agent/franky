@@ -36,6 +36,8 @@ const slash_mod = franky.coding.slash;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
 const config_mod = franky.coding.config.resolver;
+const sse_mod = @import("../sse.zig");
+const orchestrator = franky.coding.orchestrator;
 
 /// Default model when the user didn't pass `--model`. Sonnet 4.6 is
 /// the current cost/latency sweet spot; Opus 4.6 is reachable via
@@ -50,6 +52,7 @@ pub const default_context_window: u32 = 1_000_000;
 /// Opus 4.6 / Sonnet 4.6 cap at 64k–128k; users can override via
 /// `--model` + a future `--max-output` flag when they need the full cap.
 pub const default_max_output: u32 = 8192;
+pub const default_sse_host: []const u8 = "0.0.0.0";
 
 pub const RunError = error{
     MissingApiKey,
@@ -321,6 +324,7 @@ fn runPrint(
         .registry = &resolved.registry,
         .cancel = &cancel,
         .guardrails = resolved.guardrail_state,
+        .nudge_on_finish_task = true,
         .hook_userdata = @ptrCast(resolved.session_gates),
         .role_denied = permissions_mod.SessionGates.roleDenied,
         .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
@@ -348,6 +352,116 @@ fn runPrint(
     const worker = try std.Thread.spawn(.{}, workerMain, .{worker_args});
     defer worker.join();
 
+    // ── Optional orchestrator registration ──────────────────────────
+    //
+    // When `--register <url>` (or FRANKY_ORCHESTRATOR_URL) is set,
+    // we register the agent with a remote orchestrator after the SSE
+    // listener is up.
+    const orchestrator_url: ?[]const u8 = blk: {
+        if (cfg.register_url) |u| if (u.len > 0) break :blk u;
+        if (environ_map.get("FRANKY_ORCHESTRATOR_URL")) |v| if (v.len > 0) break :blk v;
+        break :blk null;
+    };
+
+    // ── Optional SSE listener ────────────────────────────────────
+    //
+    // Only bind an SSE HTTP server when an orchestrator URL is
+    // configured via `--register <url>` or FRANKY_ORCHESTRATOR_URL.
+    // Print mode is purely a stdout pipeline — no server needed.
+    var sse_server: ?*sse_mod.SseBroadcaster = null;
+    var sse_server_storage: sse_mod.SseBroadcaster = undefined;
+    var sse_accept_thread: ?std.Thread = null;
+    const sse_port: u16 = cfg.proxy_port orelse @as(u16, 8787);
+    var orchestrator_owned: ?[]u8 = null;
+
+    if (orchestrator_url != null) {
+        var addr = std.Io.net.IpAddress.parseIp4(default_sse_host, sse_port) catch {
+            ai.log.log(.err, "sse", "listen", "failed to parse address", .{});
+            return;
+        };
+        var listener = std.Io.net.IpAddress.listen(&addr, io, .{
+            .kernel_backlog = 8,
+            .reuse_address = true,
+        }) catch {
+            ai.log.log(.err, "sse", "listen", "failed to bind SSE listener on port {d}", .{sse_port});
+            return;
+        };
+        defer {
+            if (sse_accept_thread == null) listener.deinit(io);
+        }
+        sse_server_storage = sse_mod.SseBroadcaster.init(allocator, io);
+        sse_server = &sse_server_storage;
+
+        // Spawn the accept loop on a background thread.
+        const ctx = allocator.create(SseAcceptCtx) catch {
+            listener.deinit(io);
+            return;
+        };
+        ctx.* = .{ .allocator = allocator, .listener = listener, .broadcaster = sse_server.?, .io = io };
+        const accept_args = SseAcceptArgs{ .ctx = ctx };
+        sse_accept_thread = std.Thread.spawn(.{}, sseAcceptLoop, .{accept_args}) catch blk: {
+            allocator.destroy(ctx);
+            listener.deinit(io);
+            sse_server = null;
+            break :blk null;
+        };
+
+        // Register with orchestrator (best-effort) when configured.
+        if (orchestrator_url) |ourl| {
+            orchestrator.register(
+                allocator,
+                io,
+                ourl,
+                session_state.id(),
+                sse_port,
+                resolved.model_id,
+                resolved.active_role.toString(),
+                environ_map,
+            );
+            orchestrator_owned = try allocator.dupe(u8, ourl);
+        }
+    }
+
+    // Stderr notice.
+    {
+        var stderr_buf: [512]u8 = undefined;
+        var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
+        if (sse_server != null) {
+            if (orchestrator_url != null) {
+                stderr.interface.print(
+                    "franky · SSE listener on http://127.0.0.1:{d}/ · registered with orchestrator\n",
+                    .{sse_port},
+                ) catch {};
+            } else {
+                stderr.interface.print(
+                    "franky · SSE listener on http://127.0.0.1:{d}/events\n",
+                    .{sse_port},
+                ) catch {};
+            }
+        }
+        stderr.interface.flush() catch {};
+    }
+
+    defer {
+        if (sse_accept_thread) |t| {
+            // Signal the accept loop to stop by closing all subscribers.
+            // The listener will cause accept() to error on next iteration.
+            sse_server.?.events_mutex.lockUncancelable(io);
+            for (sse_server.?.subs[0..]) |maybe| {
+                if (maybe) |sub| sub.close();
+            }
+            sse_server.?.events_mutex.unlock(io);
+            t.join();
+        }
+        if (sse_server) |srv| srv.deinit();
+        if (orchestrator_owned) |ourl| {
+            if (!cfg.no_session) {
+                orchestrator.unregister(allocator, io, ourl, session_state.id(), environ_map);
+            }
+            allocator.free(ourl);
+        }
+    }
+
     var saw_error = false;
     while (ch.next(io)) |ev| {
         switch (ev) {
@@ -370,6 +484,13 @@ fn runPrint(
                 stdout.interface.flush() catch {};
             },
             else => {},
+        }
+        // Broadcast to SSE subscribers when active.
+        if (sse_server) |srv| {
+            if (sse_mod.renderFrame(allocator, ev)) |frame| {
+                srv.broadcastEvent(frame);
+                allocator.free(frame);
+            } else |_| {}
         }
         ev.deinit(allocator);
     }
@@ -405,6 +526,69 @@ const WorkerArgs = struct {
     config: agent.loop.Config,
     ch: *agent.loop.AgentChannel,
 };
+
+const SseAcceptArgs = struct {
+    ctx: *SseAcceptCtx,
+};
+
+const SseAcceptCtx = struct {
+    allocator: std.mem.Allocator,
+    listener: std.Io.net.Server,
+    broadcaster: *sse_mod.SseBroadcaster,
+    io: std.Io,
+};
+
+fn sseAcceptLoop(args: SseAcceptArgs) void {
+    const ctx = args.ctx;
+    defer {
+        ctx.listener.deinit(ctx.io);
+        ctx.allocator.destroy(ctx);
+    }
+    while (true) {
+        var stream = ctx.listener.accept(ctx.io) catch |err| switch (err) {
+            error.Canceled => continue,
+            else => return,
+        };
+        const hargs = HandleConnArgs{ .broadcaster = ctx.broadcaster, .stream = stream, .io = ctx.io };
+        const t = std.Thread.spawn(.{}, handleSseConn, .{hargs}) catch {
+            stream.close(ctx.io);
+            continue;
+        };
+        t.detach();
+    }
+}
+
+const HandleConnArgs = struct {
+    broadcaster: *sse_mod.SseBroadcaster,
+    stream: std.Io.net.Stream,
+    io: std.Io,
+};
+
+fn handleSseConn(args: HandleConnArgs) void {
+    var stream = args.stream;
+    defer stream.close(args.io);
+
+    var hdr_buf: [4096]u8 = undefined;
+    const hdr_len = sse_mod.readHeaders(&stream, args.io, &hdr_buf) catch {
+        sse_mod.respondStatus(&stream, args.io, 400, "Bad Request");
+        return;
+    };
+    const headers = hdr_buf[0..hdr_len.consumed];
+    const req = sse_mod.parseRequest(headers) orelse {
+        sse_mod.respondStatus(&stream, args.io, 400, "Bad Request");
+        return;
+    };
+
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/health")) {
+        sse_mod.respondJson(&stream, args.io, 200, "{\"ok\":true}");
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/events")) {
+        sse_mod.handleSseRequest(args.broadcaster, &stream, args.io, req.last_event_id orelse 0);
+        return;
+    }
+    sse_mod.respondStatus(&stream, args.io, 404, "Not Found");
+}
 
 fn workerMain(args: WorkerArgs) void {
     agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
