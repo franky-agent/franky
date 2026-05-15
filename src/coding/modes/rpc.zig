@@ -643,7 +643,7 @@ fn runPrompt(
     }
 
     // Run the loop; stream events as notifications.
-    var ch = try agent.loop.AgentChannel.initWithDrop(allocator, 65536, at.AgentEvent.deinit, allocator);
+    var ch = try agent.loop.AgentChannel.initWithDrop(allocator, 16384, at.AgentEvent.deinit, allocator);
     defer ch.deinit();
 
     // v1.11.3 — per-turn prompter so the worker can suspend on

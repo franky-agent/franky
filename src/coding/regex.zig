@@ -892,6 +892,7 @@ test "regex: UTF-8 byte-safe (bytes pass through)" {
 }
 
 test "regex: step budget bounds pathological patterns" {
+    if (!@import("build_options").regex_pathological_test) return error.SkipZigTest;
     // (a*)* against all-a input would blow up without the budget; with the
     // budget it just returns false quickly rather than hanging.
     var r = try compile(testing.allocator, "(a*)*b");

@@ -311,7 +311,7 @@ fn runPrint(
     var cancel = ai.stream.Cancel{};
     var ch = try agent.loop.AgentChannel.initWithDrop(
         allocator,
-        65536,
+        16384,
         at.AgentEvent.deinit,
         allocator,
     );

@@ -1196,7 +1196,9 @@ test "bash tool: background: true returns pid + outputFile, command runs detache
     while (ai.stream.nowMillis() < deadline) {
         var f = std.Io.Dir.cwd().openFile(io, "/tmp/franky_bg_test_sentinel", .{}) catch |e| switch (e) {
             error.FileNotFound => {
-                std.Thread.yield() catch {};
+                // Sleep 50ms instead of busy-polling to avoid burning CPU.
+                const ts = std.c.timespec{ .sec = 0, .nsec = 50_000_000 };
+                _ = std.c.nanosleep(&ts, null);
                 continue;
             },
             else => break,

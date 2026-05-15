@@ -1093,7 +1093,7 @@ fn runOneTurn(
     var stop_requested: std.atomic.Value(bool) = .init(false);
     var ch = try agent.loop.AgentChannel.initWithDrop(
         allocator,
-        4096,
+        16384,
         at.AgentEvent.deinit,
         allocator,
     );

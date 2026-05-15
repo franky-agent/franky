@@ -1416,18 +1416,10 @@ test "driveSseFromBytesWithTimeouts fires Timeout when handler stalls past event
             const self: *@This() = @ptrCast(@alignCast(ud.?));
             self.calls += 1;
             if (self.calls == 1) {
-                // Sleep primitive stand-in: `std.Thread.sleep` and
-                // `std.posix.nanosleep` are gone in Zig 0.17-dev;
-                // `Condition.timedWait` with no signaler blocks the
-                // current thread until the timeout elapses.
-                var m: std.Io.Mutex = .init;
-                var c: std.Io.Condition = .init;
-                // Use a busy clock loop instead — std.Io.Mutex wants an io
-                // handle, and we don't have one in this test callback.
-                _ = &m;
-                _ = &c;
-                const start = stream_mod.nowMillis();
-                while (stream_mod.nowMillis() - start < 80) {}
+                // Stall for 80 ms to trigger the event_gap_ms=20 timeout.
+                // `nanoSleepMs` uses `std.c.nanosleep` (the test binary
+                // links libc), so no busy-polling against the wall clock.
+                nanoSleepMs(80);
             }
         }
     };

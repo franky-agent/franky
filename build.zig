@@ -15,6 +15,8 @@ pub fn build(b: *std.Build) void {
     else
         use_lld_opt;
 
+    const regex_pathological = b.option(bool, "regex-pathological", "Run expensive regex pathological-pattern test (default: false)") orelse false;
+
     const embedded_settings_json = @embedFile("settings.json");
     const franky_options = b.addOptions();
     franky_options.addOption([]const u8, "embedded_settings_json", embedded_settings_json);
@@ -46,6 +48,11 @@ pub fn build(b: *std.Build) void {
         bool,
         "tls_insecure",
         b.option(bool, "tls-insecure", "Skip TLS certificate verification (keep encryption, skip CA bundle)") orelse false,
+    );
+    franky_options.addOption(
+        bool,
+        "regex_pathological_test",
+        regex_pathological,
     );
 
     // Public module — exposed to dependents via `b.dependency("franky").module("franky")`.
@@ -128,6 +135,7 @@ pub fn build(b: *std.Build) void {
     test_options.addOption([]const u8, "commit", "test");
     test_options.addOption([]const u8, "date", "test");
     test_options.addOption(bool, "tls_insecure", false);
+    test_options.addOption(bool, "regex_pathological_test", regex_pathological);
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,

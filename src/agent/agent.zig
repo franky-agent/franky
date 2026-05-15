@@ -458,12 +458,13 @@ pub const Agent = struct {
         //   + start / done / diagnostic + misc overhead
         //   ≈ 5 300 events total
         //
-        // 65 536 gives a 12× safety margin over that observed peak and
-        // comfortably covers models producing up to ~60 K output tokens.
-        // Memory cost is transient (per-turn arena): ~3.5 MB at 54 B/slot.
+        // 16 384 gives a 3× safety margin over that observed peak.
+        // Interactive mode uses 4 096 without blocking, confirming
+        // the consumer side is fast enough; 16 384 is conservative.
+        // Memory cost is ~5.5 MB at 352 B/slot vs 22 MB at 65 536.
         var ch = loop_mod.AgentChannel.initWithDrop(
             self.allocator,
-            65536,
+            16384,
             at.AgentEvent.deinit,
             self.allocator,
         ) catch return;

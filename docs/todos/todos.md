@@ -144,3 +144,45 @@ Make it possible to stack multiple tasks/messages that will send when the curren
 # When the model forget to call finish_task (Done)
 
 When the model finished it work and waits for new instructions lets call a hint are your finish then call finish_task tool.
+
+# Check for LLM Agent Standards
+
+How PI and Hermes for example:
+* handle AGENTS.md files ?
+* what are the folders they check like .agents?
+* how they load skills ? From .skills or .agent/skills ? How they check when to apply what skill ?
+* how they handle tools and MCP ? Can tools be added ? WHen yes how ?
+
+Create a design doc on how we can support the LLM standard.
+
+# The session id should be a path parameter
+
+This make it possible to jump between session but consider there is only one active session but still how we can support at least jumping between sessions and view them while still keep the active session
+MAke a design doc
+
+# the tool call ids aren't unique (Done)
+
+To be able to link dediacted messages like tool calls we need a unique id.
+
+# Review --mulitmodel;
+
+Here is an conversation snippet lets fix it the `/review --multimodel` command should work out of the box may we dont even need a skill the command just contain the prompt already or ? 
+```
+assistant
+The multimodel review skill isn't found. Let me check the skills directory and the AGENTS.md to see what skills are loaded.
+ls done
+📄	 /Users/frankittermann/github/franky/skills
+grep done
+📄	 /Users/frankittermann/github/franky
+🔍	 multimodel-review|multimodel_review
+assistant
+The multimodel-review design doc doesn't exist anymore, but the code references it. The `review_config_block` in the system prompt tells the model about the review profiles. The model uses the `subagent` tool with the `code-audit` and `diff-review` presets to run the review. Let me look at the system prompt to understand how it's wired in.
+
+Let me now understand the full picture. The user's question is about fixing the tool_call_id suffix duplication in `renderTranscriptForUi`. We've already fixed it. Now they want me to run a multi-model code review with `--multimodel`. But actually, the `--multimodel` is not a CLI arg, it's triggered via the `/review` slash command which requires `--skill multimodel-review`.
+
+Wait, the user said "Run a multi-model code review on: --multimodel". Let me re-read. They want a multi-model code review using the multimodel-review skill, specifically on the recent changes we made to proxy.zig.
+
+Let me search for the skill file.
+
+Since I'm not in interactive mode with the /review slash command available, I'll run the code review directly using sub-agents per the configured review profiles. Let me review the changes I just made to proxy.zig.
+```

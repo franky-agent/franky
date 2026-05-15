@@ -2170,7 +2170,7 @@ fn runOneTurnInternal(
     // we can fan events out to subscribers.
     var ch = agent.loop.AgentChannel.initWithDrop(
         allocator,
-        65536,
+        16384,
         at.AgentEvent.deinit,
         allocator,
     ) catch return;
@@ -2395,6 +2395,9 @@ fn respondTranscript(
 /// Image and thinking-signature fields are omitted — the v1.6.1
 /// UI doesn't render either. Add when the UI grows artifact
 /// support.
+///
+/// Tool-call ids are suffixed with a session-unique sequence number
+/// (_0, _1, …) so the front-end can use them as stable HTML anchors.
 pub fn renderTranscriptForUi(
     allocator: std.mem.Allocator,
     transcript: *const agent.loop.Transcript,
@@ -2403,9 +2406,11 @@ pub fn renderTranscriptForUi(
     defer buf.deinit(allocator);
 
     try buf.appendSlice(allocator, "{\"messages\":[");
+    var tool_call_seq: usize = 0;
+    var tool_result_seq: usize = 0;
     for (transcript.messages.items, 0..) |m, i| {
         if (i > 0) try buf.append(allocator, ',');
-        try writeMessageForUi(&buf, allocator, m);
+        try writeMessageForUi(&buf, allocator, m, &tool_call_seq, &tool_result_seq);
     }
     try buf.appendSlice(allocator, "]}");
     return try buf.toOwnedSlice(allocator);
@@ -2415,13 +2420,21 @@ fn writeMessageForUi(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     m: ai.types.Message,
+    tool_call_seq: *usize,
+    tool_result_seq: *usize,
 ) !void {
     try buf.append(allocator, '{');
     try buf.appendSlice(allocator, "\"role\":");
     try appendUiJsonStr(buf, allocator, m.role.toString());
     if (m.tool_call_id) |tcid| {
         try buf.appendSlice(allocator, ",\"toolCallId\":");
-        try appendUiJsonStr(buf, allocator, tcid);
+        // tool_results appear in the same order as their matching
+        // tool_calls, so both counters stay in lockstep.
+        const seq = tool_result_seq.*;
+        tool_result_seq.* += 1;
+        const suffix = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ tcid, seq });
+        defer allocator.free(suffix);
+        try appendUiJsonStr(buf, allocator, suffix);
     }
     if (m.is_error) {
         try buf.appendSlice(allocator, ",\"isError\":true");
@@ -2466,7 +2479,11 @@ fn writeMessageForUi(
                 if (!first) try buf.append(allocator, ',');
                 first = false;
                 try buf.appendSlice(allocator, "{\"kind\":\"tool_call\",\"id\":");
-                try appendUiJsonStr(buf, allocator, tc.id);
+                const seq = tool_call_seq.*;
+                tool_call_seq.* += 1;
+                const suffix = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ tc.id, seq });
+                defer allocator.free(suffix);
+                try appendUiJsonStr(buf, allocator, suffix);
                 try buf.appendSlice(allocator, ",\"name\":");
                 try appendUiJsonStr(buf, allocator, tc.name);
                 try buf.appendSlice(allocator, ",\"args\":");
@@ -3926,10 +3943,11 @@ test "renderTranscriptForUi: user + assistant + tool_result round-trip" {
     try testing.expect(std.mem.indexOf(u8, json, "\"role\":\"user\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"role\":\"assistant\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"role\":\"toolResult\"") != null);
-    try testing.expect(std.mem.indexOf(u8, json, "\"toolCallId\":\"c1\"") != null);
+    // c1 is the only tool call → gets seq 0
+    try testing.expect(std.mem.indexOf(u8, json, "\"toolCallId\":\"c1_0\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"text\",\"text\":\"hi\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"text\",\"text\":\"hello\"") != null);
-    try testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"tool_call\",\"id\":\"c1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"tool_call\",\"id\":\"c1_0\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"name\":\"read\"") != null);
 }
 
