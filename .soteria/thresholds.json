@@ -1,0 +1,20 @@
+{
+  "p60_hotspot": 17.5000,
+  "p85_hotspot": 61.6043,
+  "p95_hotspot": 112.9749,
+  "p60_complexity": 5.7792,
+  "p85_complexity": 7.0353,
+  "p95_complexity": 8.5385,
+  "p60_revisions": 3.0000,
+  "p85_revisions": 10.0000,
+  "p95_revisions": 18.0000,
+  "p60_authors": 2.0000,
+  "p85_authors": 2.0000,
+  "p95_authors": 2.0000,
+  "p60_congestion": 0.6667,
+  "p85_congestion": 1.0000,
+  "p95_congestion": 1.0000,
+  "p60_risk": 1.3819,
+  "p85_risk": 2.5269,
+  "p95_risk": 3.4690
+}

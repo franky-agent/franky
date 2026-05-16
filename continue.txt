@@ -1,0 +1,61 @@
+# Continue analysis — subagent panel tool calls not showing
+
+## Problem
+The subagent panel (right-side panel in web UI) doesn't show subagent tool calls anymore. Entries like `tool_start`, `tool_end`, `text_delta`, `thinking_delta` don't appear.
+
+## Architecture (event flow)
+
+1. Sub-agent worker emits `AgentEvent` (tool_execution_start, tool_execution_end, message_update, etc.)
+2. `subagentProgressHandler` (subagent.zig:167) subscribes to sub-agent events, converts them to JSON blobs, calls `ctx.progress_fn` (set to `subagentProgressForward` in proxy mode)
+3. `subagentProgressForward` (proxy.zig:1829) wraps the JSON as a `tool_execution_update` `AgentEvent`, renders SSE frame via `sse_mod.renderFrame`, broadcasts via `session.broadcastEvent`
+4. Browser SSE `tool_execution_update` handler (app.js:2115) looks up tool card by `data.callId`, checks `toolCards.get()`, then calls `appendSubagentEntry` and `appendSubagentPanelEvent`
+
+## Status after code review
+
+### What's working correctly:
+
+1. **Proxy mode setup** (proxy.zig:816-855) — subagent_ctx has `.progress_fn = subagentProgressForward` and `.verbose_progress = true`
+2. **subagentProgressHandler** (subagent.zig:167-279) — correctly forwards tool_start, tool_end, message_update (text_delta, thinking_delta), agent_error
+3. **subagentProgressForward** (proxy.zig:1829-1855) — builds `tool_execution_update` event, renders SSE frame, broadcasts
+4. **SSE encoding** (agent/proxy.zig:100-105) — `encodeEventJson` correctly encodes `tool_execution_update` with update_json appended raw (already valid JSON)
+5. **Browser handler** (app.js:2115-2130) — parses data, looks up tool card, renders entries
+
+### The most likely root cause — **timing race between `tool_execution_start` and `tool_execution_update`**:
+
+In `runToolsParallel` (agent/loop.zig), `pushToolStart` pushes events to the parent's event channel, THEN workers are spawned. But the parent's drain loop runs on the main thread while the sub-agent worker runs on a separate thread. The sub-agent can generate `tool_execution_update` events BEFORE the parent's `tool_execution_start` event is drained and broadcast.
+
+When the `tool_execution_update` arrives at the browser first, `toolCards.get(data.callId)` returns null (no card exists yet), so the update is silently dropped.
+
+This race existed before the subagent panel was added but was masked because:
+- Initially, the sub-agent runs were fast enough that the start event usually arrived first
+- Now with slower/smarter models, the sub-agent can generate progress events before the start event propagates
+
+### Secondary concern — **rehydration ID mismatch**:
+
+Commit `4b4ca80` added suffixing of tool call IDs (`_0`, `_1`, etc.) in `renderTranscriptForUi`. The rehydration path (`appendFinalizedToolCard`) creates subagent sections with suffixed IDs. But this is for past tool calls during rehydration — live events still use original IDs, so it shouldn't affect live subagent tool calls.
+
+## Files involved:
+- `src/coding/modes/proxy.zig` — `subagentProgressForward` (line 1829), session init (line 816-855), `broadcastEvent` (line 517)
+- `src/coding/tools/subagent.zig` — `subagentProgressHandler` (line 167), `ForwardState` (line 83)
+- `src/coding/modes/web/app.js` — event handlers (line 2092-2130), `startToolCall` (line 1185), `appendSubagentEntry` (line 1675), `appendSubagentPanelEvent` (line 1921)
+- `src/agent/proxy.zig` — `encodeEventJson` (line 50), tool_execution_update encoding (line 100)
+- `src/coding/sse.zig` — `renderFrame` (line 345)
+- `src/agent/loop.zig` — `runToolsParallel` (tool_start push before worker spawn)
+
+## Fix — pending buffer for orphaned tool_execution_update events
+
+Implemented in `src/coding/modes/web/app.js`:
+
+1. **New `pendingSubagentUpdates` map** (line 316) — buffers `tool_execution_update` events that arrive before the parent's `tool_execution_start` (async race between server event channel threading).
+
+2. **`tool_execution_update` handler** (line 2135) — if `toolCards.get(data.callId)` returns null, buffers the parsed update object into `pendingSubagentUpdates` instead of dropping it.
+
+3. **`tool_execution_start` handler** (line 2096) — after calling `startToolCall`, checks if there are buffered updates for this call ID. If so, replays them in order — creates the subagent entries and panel events just as if they had arrived after the card was created.
+
+4. **`clearConversation`** (line 2982) — clears `pendingSubagentUpdates` alongside `subagentSections` to prevent stale buffers when the conversation is wiped.
+
+This is low-risk because:
+- The pending buffer only accumulates events that would otherwise be silently dropped
+- It's bounded by the number of concurrent sub-agent calls (typically 1-4)
+- The buffer is cleared on conversation reset
+- The fix involves zero server-side changes

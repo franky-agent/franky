@@ -396,9 +396,9 @@ fn runCpuPipeline(
         defer gpa.free(a);
         const b = try shellQuoteAlloc(gpa, cpu_folded);
         defer gpa.free(b);
-        const cmd = try std.fmt.allocPrint(gpa, "perf script --input {s} | inferno-collapse-perf > {s}", .{ a, b });
+        const cmd = try std.fmt.allocPrint(gpa, "perf script --input {s} | sed 's/→/->/g' | inferno-collapse-perf > {s}", .{ a, b });
         defer gpa.free(cmd);
-        try writeOut(io, "$ perf script | inferno-collapse-perf > cpu.folded\n");
+        try writeOut(io, "$ perf script | sed 's/→/->/g' | inferno-collapse-perf > cpu.folded\n");
         try runShell(io, env, cmd, "collapse perf");
     }
     {
