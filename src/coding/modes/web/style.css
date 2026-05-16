@@ -987,6 +987,20 @@ main#conversation {
     color: var(--text-dim);
     word-break: break-all;
 }
+.tool-args-table td .content-expand {
+    display: block;
+    margin-top: 4px;
+    background: none;
+    border: 1px solid var(--tool-border);
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-size: 10px;
+    color: var(--accent);
+    cursor: pointer;
+}
+.tool-args-table td .content-expand:hover {
+    background: var(--hover-bg);
+}
 .tool-args-table tr:last-child th,
 .tool-args-table tr:last-child td {
     border-bottom: none;

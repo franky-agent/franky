@@ -70,6 +70,7 @@ const skills_mod = franky.coding.skills;
 const restart_mod = franky.coding.restart;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
+const review_mod = @import("../review.zig");
 const sse_mod = @import("../sse.zig");
 
 pub const default_port: u16 = 8787;
@@ -1527,10 +1528,22 @@ fn reviewHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!
     const px = proxySlashCtx(ctx);
     const session = px.session;
 
-    // Build the user prompt: "Run a multi-model code review on:" plus args.
+    // Build a self-contained multi-model review prompt.
+    // Instructions are embedded here so /review works without
+    // requiring the multimodel-review skill to be active.
     var pb: std.ArrayList(u8) = .empty;
     defer pb.deinit(ctx.allocator);
-    try pb.appendSlice(ctx.allocator, "Run a multi-model code review on:");
+
+    const review_prompt = try review_mod.buildReviewPrompt(ctx.allocator);
+    defer ctx.allocator.free(review_prompt);
+    try pb.appendSlice(ctx.allocator, review_prompt);
+
+    if (session.cfg.review_config_block) |block| {
+        try pb.appendSlice(ctx.allocator, "\n\n");
+        try pb.appendSlice(ctx.allocator, block);
+        try pb.appendSlice(ctx.allocator, "\n");
+    }
+    try pb.appendSlice(ctx.allocator, "\n\nFiles/revision to review:");
     for (args) |a| {
         try pb.appendSlice(ctx.allocator, " ");
         try pb.appendSlice(ctx.allocator, a);

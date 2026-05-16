@@ -51,7 +51,9 @@ const edit_description =
     "Apply one or more find/replace edits to a file atomically. " ++
     "If `old` is not found, do NOT widen it with more surrounding " ++
     "context — re-read the file with the `read` tool and copy-paste " ++
-    "the exact bytes into `old`.";
+    "the exact bytes into `old`. " ++
+    "Pre-condition: you MUST have called `read` on the same path " ++
+    "within the last 2 turns before calling edit.";
 
 const edit_description_workspace = edit_description ++ " (path-safety enforced)";
 
@@ -387,15 +389,71 @@ fn buildNoMatchMsg(
     // backslashes in the edit `old`, causing a mismatch.  Try collapsing
     // every `\\` pair to `\` and see if that matches.
     const deescaped = try collapseBackslashPairs(allocator, old);
-    defer allocator.free(deescaped);
     if (deescaped.len < old.len and std.mem.indexOf(u8, file_content, deescaped) != null) {
+        defer allocator.free(deescaped);
         return std.fmt.allocPrint(
             allocator,
-            "edit {d}: `old` not found — backslash over-escaping detected (match found after collapsing double-backslash pairs); re-read the file with the `read` tool and copy-paste exact bytes",
+            "edit {d}: `old` not found — backslash over-escaping detected. " ++
+                "STOP. Do not retry with widened `old` — read the file with `read` and copy-paste exact bytes",
             .{idx},
         );
     }
-    return std.fmt.allocPrint(allocator, "edit {d}: `old` not found", .{idx});
+    defer allocator.free(deescaped);
+
+    // Check for a partial match — if most of `old` appears at one position,
+    // show the model the actual bytes around the near-miss.
+    var partial: ?PartialMatch = null;
+    if (old.len > 4) {
+        partial = findPartialMatch(old, file_content);
+    }
+
+    if (partial) |pm| {
+        const ctx_start = if (pm.offset >= 15) pm.offset - 15 else 0;
+        const ctx_end = @min(pm.offset + pm.match_len + 15, file_content.len);
+        var context = file_content[ctx_start..ctx_end];
+        // Cap the context display at 100 chars to avoid giant error messages.
+        if (context.len > 100) context = context[0..100];
+        return std.fmt.allocPrint(
+            allocator,
+            "edit {d}: `old` not found — closest match at byte offset {d} ({d} of {d} bytes matched). " ++
+                "STOP. Do not retry with widened `old`. Read the file with `read` and copy-paste the exact bytes. " ++
+                "Bytes around offset {d}: `{s}`",
+            .{ idx, pm.offset, pm.match_len, old.len, pm.offset, context },
+        );
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "edit {d}: `old` not found. " ++
+            "STOP. Do not retry with widened `old` — read the file with `read` and copy-paste exact bytes",
+        .{idx},
+    );
+}
+
+const PartialMatch = struct {
+    offset: usize,
+    match_len: usize,
+};
+
+/// Find the longest contiguous prefix of `old` that appears in `content`.
+/// Returns the offset and length of the best match (longest prefix).
+/// Only checks the full old prefix — if the model appended/inserted
+/// extra characters mid-way, this detects where the split happened.
+fn findPartialMatch(old: []const u8, content: []const u8) ?PartialMatch {
+    // Try the full prefix, then shrink by one byte at a time.
+    var best: ?PartialMatch = null;
+    var probe_len = old.len - 1;
+    while (probe_len >= old.len / 2) : (probe_len -= 1) {
+        const probe = old[0..probe_len];
+        if (std.mem.indexOf(u8, content, probe)) |offset| {
+            if (best == null or probe_len > best.?.match_len) {
+                best = .{ .offset = offset, .match_len = probe_len };
+            }
+            // Longest possible for this probe_len — shrink further.
+            // But a longer prefix is better, so continue.
+        }
+    }
+    return best;
 }
 
 fn collapseBackslashPairs(allocator: std.mem.Allocator, s: []const u8) ![]u8 {

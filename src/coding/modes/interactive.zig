@@ -50,6 +50,7 @@ const models_mod = franky.coding.models;
 const restart_mod = franky.coding.restart;
 const term_mod = @import("../terminal.zig");
 const print_mode = @import("print.zig");
+const review_mod = @import("../review.zig");
 
 const RunError = error{InteractiveNotSupported} || std.mem.Allocator.Error;
 
@@ -2202,10 +2203,22 @@ fn interactiveTemplateHandler(ctx: *slash_mod.Ctx, args: []const []const u8) sla
 fn interactiveReviewHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!void {
     const bridge = bridgeFromCtx(ctx);
 
-    // Build the user prompt: "Run a multi-model code review on:" plus args.
+    // Build a self-contained multi-model review prompt.
+    // Instructions are embedded here so /review works without
+    // requiring the multimodel-review skill to be active.
     var pb: std.ArrayList(u8) = .empty;
     errdefer pb.deinit(bridge.allocator);
-    try pb.appendSlice(bridge.allocator, "Run a multi-model code review on:");
+
+    const review_prompt = try review_mod.buildReviewPrompt(bridge.allocator);
+    defer bridge.allocator.free(review_prompt);
+    try pb.appendSlice(bridge.allocator, review_prompt);
+
+    if (bridge.session.cfg.review_config_block) |block| {
+        try pb.appendSlice(bridge.allocator, "\n\n");
+        try pb.appendSlice(bridge.allocator, block);
+        try pb.appendSlice(bridge.allocator, "\n");
+    }
+    try pb.appendSlice(bridge.allocator, "\n\nFiles/revision to review:");
     for (args) |a| {
         try pb.appendSlice(bridge.allocator, " ");
         try pb.appendSlice(bridge.allocator, a);

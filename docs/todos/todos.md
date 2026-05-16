@@ -186,3 +186,22 @@ Let me search for the skill file.
 
 Since I'm not in interactive mode with the /review slash command available, I'll run the code review directly using sub-agents per the configured review profiles. Let me review the changes I just made to proxy.zig.
 ```
+
+# Improve Edit tool Error Handling
+
+With some changes we can save some turns and tokens when we handle error cases with better response.
+Auto-read on first edit_no_match
+
+Server-side: when edit_no_match occurs, instead of just returning an error, return the actual file content in the error message so the model can retry immediately without an extra read call:
+
+return common.toolError(allocator, "edit_no_match",
+    "old not found. Here are the actual file contents:\n---\n{s}\n---\n" ++
+    "Copy-paste the exact bytes you want to replace from above.",
+    .{original}
+);
+
+This eliminates the "waste a turn re-reading" excuse — the model gets the correct bytes in the error and can immediately retry with matching old.
+
+Validate old against file before attempting edits
+
+Run a pre-check: if old appears nowhere in the file (not even partially), short-circuit to the auto-read error immediately without going through the full edit pipeline. Saves the allocation/atomic-write setup cost on what is guaranteed to fail.

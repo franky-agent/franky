@@ -310,6 +310,10 @@ function highlightCodeBlocks(container) {
     // v2.7 — per-subagent-call section state. callId → state object.
     // Survives across turns; cleared by clearConversation().
     const subagentSections = new Map();
+    // v2.31 — buffer tool_execution_update events that arrive before
+    // the parent's tool_execution_start (async race). Replayed once
+    // the tool card is registered in toolCards.
+    const pendingSubagentUpdates = new Map();
     let currentOverlayCallId = null; // null = overlay closed
 
     /**
@@ -649,6 +653,41 @@ function highlightCodeBlocks(container) {
 
         addRow('path', args.path);
         addRow('overwrite', args.overwrite);
+        if ('content' in args && typeof args.content === 'string') {
+            const tr = document.createElement('tr');
+            const th = document.createElement('th');
+            th.textContent = 'content';
+            const td = document.createElement('td');
+            const preview = document.createElement('span');
+            preview.className = 'content-preview';
+            const v = args.content;
+            const isLong = v.length > 200;
+            const short = isLong ? v.substring(0, 200) + '…' : v;
+            preview.textContent = short;
+            td.appendChild(preview);
+            if (isLong) {
+                const toggle = document.createElement('button');
+                toggle.type = 'button';
+                toggle.className = 'content-expand';
+                toggle.textContent = '(' + v.length + ' chars)';
+                toggle.addEventListener('click', function () {
+                    const expanded = preview.getAttribute('data-expanded') === 'true';
+                    if (expanded) {
+                        preview.textContent = short;
+                        toggle.textContent = '(' + v.length + ' chars)';
+                        preview.setAttribute('data-expanded', 'false');
+                    } else {
+                        preview.textContent = v;
+                        toggle.textContent = 'collapse';
+                        preview.setAttribute('data-expanded', 'true');
+                    }
+                });
+                td.appendChild(toggle);
+            }
+            tr.appendChild(th);
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+        }
         table.appendChild(tbody);
         container.appendChild(table);
 
@@ -2094,6 +2133,22 @@ function highlightCodeBlocks(container) {
             const data = parseData(e.data);
             if (!data) return;
             startToolCall(data.callId, data.name || 'tool', data.argsJson || '');
+            // v2.31 — replay any sub-agent progress events that arrived
+            // before the tool card was created (timing race).
+            if (data.name === SUBAGENT_TOOL_NAME) {
+                const pending = pendingSubagentUpdates.get(data.callId);
+                if (pending) {
+                    pendingSubagentUpdates.delete(data.callId);
+                    for (const upd of pending) {
+                        const card = toolCards.get(data.callId);
+                        if (!card || !card.classList.contains('tool-card-subagent')) continue;
+                        const log = card.querySelector('.subagent-log');
+                        if (!log) continue;
+                        appendSubagentEntry(card, log, upd);
+                        appendSubagentPanelEvent(data.callId, upd);
+                    }
+                }
+            }
             setActivity('running: ' + (data.name || 'tool'));
         });
 
@@ -2116,15 +2171,27 @@ function highlightCodeBlocks(container) {
             noteEvent();
             const data = parseData(e.data);
             if (!data || !data.callId) return;
-            const card = toolCards.get(data.callId);
-            if (!card || !card.classList.contains('tool-card-subagent')) return;
-            const log = card.querySelector('.subagent-log');
-            if (!log) return;
             let upd;
             try {
                 upd = typeof data.update === 'string' ? JSON.parse(data.update) : data.update;
             } catch (_) { return; }
             if (!upd) return;
+
+            const card = toolCards.get(data.callId);
+            if (!card || !card.classList.contains('tool-card-subagent')) {
+                // v2.31 — tool_execution_start hasn't arrived yet (async
+                // race with sub-agent worker). Buffer the update and
+                // replay it when the start event creates the tool card.
+                let buf = pendingSubagentUpdates.get(data.callId);
+                if (!buf) {
+                    buf = [];
+                    pendingSubagentUpdates.set(data.callId, buf);
+                }
+                buf.push(upd);
+                return;
+            }
+            const log = card.querySelector('.subagent-log');
+            if (!log) return;
             appendSubagentEntry(card, log, upd);
             appendSubagentPanelEvent(data.callId, upd);
         });
@@ -2947,6 +3014,7 @@ function highlightCodeBlocks(container) {
         pendingToolCards.length = 0;
         closeSubagentOverlay();
         subagentSections.clear();
+        pendingSubagentUpdates.clear();
         if (subagentPanelBody) subagentPanelBody.innerHTML = '';
         if (subagentPanelEl) subagentPanelEl.setAttribute('hidden', '');
         if (subagentPanelBtn) subagentPanelBtn.setAttribute('hidden', '');
