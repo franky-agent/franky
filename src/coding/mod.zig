@@ -76,6 +76,7 @@ pub const improvement = @import("improvement.zig");
 pub const update = @import("update.zig");
 pub const orchestrator = @import("orchestrator.zig");
 pub const skills = @import("skills.zig");
+pub const instructions = @import("instructions.zig");
 pub const restart = @import("restart.zig");
 pub const templates = @import("templates.zig");
 pub const extensions = @import("extensions.zig");

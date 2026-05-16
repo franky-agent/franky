@@ -31,6 +31,7 @@ const settings_mod = franky.coding.settings;
 const models_mod = franky.coding.models;
 const branching_mod = franky.coding.branching;
 const skills_mod = franky.coding.skills;
+const instructions_mod = franky.coding.instructions;
 const diagnostics_mod = franky.coding.diagnostics;
 const slash_mod = franky.coding.slash;
 const extensions_mod = franky.coding.extensions;
@@ -1631,12 +1632,31 @@ pub fn buildSystemPromptIo(
     }
     defer if (hint_owned) allocator.free(with_hint);
 
+
+    // AGENTS.md / CLAUDE.md instructions block (v2.30 design doc).
+    // Scanned from workspace at startup; injected after subagent hint,
+    // before skills. Skipped when --no-standards suppresses the scan.
+    var with_instructions: []u8 = with_hint;
+    var instructions_owned = false;
+    if (io) |ioref| instructions_block: {
+        const pwd = environ.getPosix("PWD");
+        const pp = pwd orelse break :instructions_block;
+        if (cfg.no_standards) break :instructions_block;
+        var state = instructions_mod.InstructionsState.scan(allocator, ioref, pp) catch break :instructions_block;
+        defer state.deinit(allocator);
+        const block = state.rendered orelse break :instructions_block;
+        const trimmed = std.mem.trimEnd(u8, with_hint, &std.ascii.whitespace);
+        with_instructions = std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed, block }) catch break :instructions_block;
+        instructions_owned = true;
+    }
+    defer if (instructions_owned) allocator.free(with_instructions);
+
     // Skills layer (§6.1). Each active skill's body is appended
     // verbatim under `## Active skills`. Activation is deterministic:
     // explicit `--skill NAME` and/or `auto_apply` glob match against
     // the workspace tree. Skipped silently when no `io` (pure-logic
     // path used by tests).
-    var with_skills: []u8 = with_hint;
+    var with_skills: []u8 = with_instructions;
     var skills_owned = false;
     if (io) |ioref| skills_block: {
         const pwd = environ.getPosix("PWD");

@@ -137,6 +137,13 @@ pub const Config = struct {
     /// regardless of its `auto_apply` glob. Stored as a CSV string
     /// for simplicity; the loader splits on `,`.
     skills_select_csv: ?[]const u8 = null,
+    /// `--agents <dir>` — explicit override for `.agents/` directory.
+    /// Defaults to `<workspace>/.agents/` when not set.
+    agents_path: ?[]const u8 = null,
+    /// `--no-standards` — suppress all standard-file scanning
+    /// (AGENTS.md, CLAUDE.md, .agents/, .claude/, .cursor/).
+    /// Franky-native paths are unaffected.
+    no_standards: bool = false,
     /// `--prompts-dir <dir>` — root for `/template <name>` lookups.
     /// Was `--prompts <dir>` until v1.11.0; renamed to free up
     /// `--prompts` for the per-tool permission gate.
@@ -381,6 +388,10 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
         cfg.offline = true;
         return true;
     }
+    if (std.mem.eql(u8, name, "--no-standards")) {
+        cfg.no_standards = true;
+        return true;
+    }
     return false;
 }
 
@@ -438,6 +449,8 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
         cfg.tools_filter = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--skills")) {
         cfg.skills_path = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--agents")) {
+        cfg.agents_path = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--skill")) {
         const v = try takeValue(argv, i, inline_value);
         if (cfg.skills_select_csv) |existing| {

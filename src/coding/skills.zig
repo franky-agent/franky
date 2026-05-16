@@ -46,11 +46,17 @@ pub const max_body_bytes: usize = 200_000;
 pub const Frontmatter = struct {
     /// Required.
     name: []const u8,
+    /// Optional. `.agents/skills/*/skill.md` uses `id:` when `name:` is absent.
+    /// When both are present, `name` wins and `id` is stored as an alias.
+    id: ?[]const u8 = null,
     /// Required. May be multi-line via YAML `description: |`.
     description: []const u8,
     /// Optional. Empty slice when absent. Glob syntax matches
     /// `find.globMatch` (`*`, `**`, `?`, `[abc]`).
     auto_apply: []const []const u8,
+    /// Optional. When false, the skill is excluded from the active set
+    /// regardless of auto_apply or explicit selection. Default true.
+    enabled: bool = true,
 };
 
 pub const Skill = struct {
@@ -62,6 +68,7 @@ pub const Skill = struct {
 
     pub fn deinit(self: *Skill, allocator: std.mem.Allocator) void {
         allocator.free(self.meta.name);
+        if (self.meta.id) |id| allocator.free(id);
         allocator.free(self.meta.description);
         for (self.meta.auto_apply) |g| allocator.free(g);
         allocator.free(self.meta.auto_apply);
@@ -120,10 +127,13 @@ pub fn parseSkill(
     const raw_body = if (close_after < after_open.len) after_open[close_after..] else "";
 
     var name_owned: ?[]u8 = null;
+    var id_owned: ?[]u8 = null;
     var description_owned: ?[]u8 = null;
     var auto_apply_list: std.ArrayList([]const u8) = .empty;
+    var enabled: bool = true;
     errdefer {
         if (name_owned) |n| allocator.free(n);
+        if (id_owned) |id| allocator.free(id);
         if (description_owned) |d| allocator.free(d);
         for (auto_apply_list.items) |g| allocator.free(g);
         auto_apply_list.deinit(allocator);
@@ -144,6 +154,9 @@ pub fn parseSkill(
         if (std.mem.eql(u8, key, "name")) {
             if (name_owned) |old| allocator.free(old);
             name_owned = try allocator.dupe(u8, rest);
+        } else if (std.mem.eql(u8, key, "id")) {
+            if (id_owned) |old| allocator.free(old);
+            id_owned = try allocator.dupe(u8, rest);
         } else if (std.mem.eql(u8, key, "description")) {
             if (description_owned) |old| allocator.free(old);
             if (std.mem.eql(u8, rest, "|") or std.mem.eql(u8, rest, "|-")) {
@@ -153,11 +166,13 @@ pub fn parseSkill(
             }
         } else if (std.mem.eql(u8, key, "auto_apply")) {
             try parseStringArray(allocator, rest, &auto_apply_list);
+        } else if (std.mem.eql(u8, key, "enabled")) {
+            enabled = std.mem.eql(u8, rest, "true");
         }
         // Unknown keys silently ignored (forward-compat).
     }
 
-    const name = name_owned orelse return ParseError.MissingName;
+    const name = name_owned orelse id_owned orelse return ParseError.MissingName;
     const description = description_owned orelse return ParseError.MissingDescription;
 
     // Take ownership of the glob list. After this point, errdefer
@@ -172,11 +187,18 @@ pub fn parseSkill(
     const body_owned = try allocator.dupe(u8, raw_body);
     errdefer allocator.free(body_owned);
     const path_owned = try allocator.dupe(u8, source_path);
+
+    // If `name` was taken from `id` (no `name:` key), the id field
+    // becomes null (already consumed). Otherwise keep it as alias.
+    const id_final: ?[]u8 = if (name_owned != null) id_owned else null;
+
     return .{
         .meta = .{
             .name = name,
+            .id = id_final,
             .description = description,
             .auto_apply = auto_apply_owned,
+            .enabled = enabled,
         },
         .body = body_owned,
         .source_path = path_owned,
@@ -259,6 +281,8 @@ pub const Roots = struct {
     workspace_root: ?[]u8 = null,
     /// `$FRANKY_HOME/skills/` or `$HOME/.franky/skills/` — owned.
     user_root: ?[]u8 = null,
+    /// NEW — directories from standard locations (read-only).
+    standard_roots: []const []const u8 = &.{},
     /// Bare PWD, used for `auto_apply` glob walks (separate from
     /// `workspace_root` because the glob is scanned over the
     /// project root, not the skills dir). Borrowed.
@@ -267,8 +291,31 @@ pub const Roots = struct {
     pub fn deinit(self: *Roots, allocator: std.mem.Allocator) void {
         if (self.workspace_root) |b| allocator.free(b);
         if (self.user_root) |b| allocator.free(b);
+        for (self.standard_roots) |r| allocator.free(r);
+        allocator.free(self.standard_roots);
         self.workspace_root = null;
         self.user_root = null;
+        self.standard_roots = &.{};
+    }
+
+    /// Resolve paths for standard skill roots (.agents/skills/,
+    /// .claude/skills/, .cursor/rules/) at workspace and home levels.
+    pub fn resolveStandard(allocator: std.mem.Allocator, workspace: ?[]const u8, home: ?[]const u8) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (out.items) |p| allocator.free(p);
+            out.deinit(allocator);
+        }
+        if (workspace) |p| {
+            try out.append(allocator, try std.fs.path.join(allocator, &.{ p, ".agents", "skills" }));
+            try out.append(allocator, try std.fs.path.join(allocator, &.{ p, ".claude", "skills" }));
+            try out.append(allocator, try std.fs.path.join(allocator, &.{ p, ".cursor", "rules" }));
+        }
+        if (home) |h| {
+            try out.append(allocator, try std.fs.path.join(allocator, &.{ h, ".agents", "skills" }));
+            try out.append(allocator, try std.fs.path.join(allocator, &.{ h, ".claude", "skills" }));
+        }
+        return try out.toOwnedSlice(allocator);
     }
 };
 
@@ -289,8 +336,13 @@ pub fn resolveRootsFromMap(
     } else if (environ_map.get("HOME")) |h| {
         if (h.len > 0) r.user_root = try std.fs.path.join(allocator, &.{ h, ".franky", "skills" });
     }
+    // Resolve standard roots.
+    const pwd = if (environ_map.get("PWD")) |p| if (p.len > 0) p else null else null;
+    const home = if (environ_map.get("FRANKY_HOME")) |h| if (h.len > 0) h else null else if (environ_map.get("HOME")) |h| if (h.len > 0) h else null else null;
+    r.standard_roots = try Roots.resolveStandard(allocator, pwd, home);
     return r;
 }
+
 
 /// Render a human-readable listing of every loaded skill, marking
 /// each one ACTIVE / idle along with the reason. Used by the
@@ -405,6 +457,9 @@ pub const LoadOptions = struct {
     workspace_root: ?[]const u8 = null,
     /// `$FRANKY_HOME/skills/` or `$HOME/.franky/skills/`. May be null.
     user_root: ?[]const u8 = null,
+    /// NEW — standard roots from `.agents/skills/`, `.claude/skills/`, `.cursor/rules/`.
+    /// Lower precedence than user_root, higher than builtins.
+    standard_roots: []const []const u8 = &.{},
 };
 
 /// Walk every configured root, parse each `*.md` (skipping
@@ -430,6 +485,14 @@ pub fn loadAll(
     const roots = [_]?[]const u8{ opts.explicit_root, opts.workspace_root, opts.user_root };
     for (roots) |maybe_root| {
         const root = maybe_root orelse continue;
+        loadFromRoot(allocator, io, root, &out, &seen) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => continue,
+            else => return e,
+        };
+    }
+
+    // NEW — iterate standard roots after user root, before builtins.
+    for (opts.standard_roots) |root| {
         loadFromRoot(allocator, io, root, &out, &seen) catch |e| switch (e) {
             error.FileNotFound, error.NotDir => continue,
             else => return e,
