@@ -205,3 +205,13 @@ This eliminates the "waste a turn re-reading" excuse — the model gets the corr
 Validate old against file before attempting edits
 
 Run a pre-check: if old appears nowhere in the file (not even partially), short-circuit to the auto-read error immediately without going through the full edit pipeline. Saves the allocation/atomic-write setup cost on what is guaranteed to fail.
+
+# Add ast-grep
+
+The grep is good for text search but its missing programming language syntax there is tool 
+https://github.com/ast-grep/ast-grep that does. How could we intgrate it so that the Model use ast-grep instread of grep or we offer normal grep and run ast-grep in the background or
+merge the result from grep and ast-grep in the tool result what would be the prefred way ?
+
+# Agent2Agent Protocol (A2A)
+
+Collect information about https://github.com/a2aproject/A2A protocol. WHat has to be implemented to support A2A.

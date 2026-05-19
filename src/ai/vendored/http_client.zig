@@ -1691,7 +1691,11 @@ pub fn connectProxied(
                 writer_iface.buffer.len,
             });
             errdefer tls.connection.destroy(io);
-            tls.connection.proxied = true;
+            // CONNECT tunnel: the TLS connection reaches the origin directly.
+            // Keep proxied=false (default from Tls.create) so sendHead emits
+            // origin-form requests (GET /path HTTP/1.1). Setting proxied=true
+            // would emit absolute-form (GET https://host/path HTTP/1.1) which
+            // the origin server rejects with 400 Bad Request.
             client.connection_pool.addUsed(io, &tls.connection) catch |err| {
                 tunnel_log.log(.warn, "http", "tunnel.tls_pool_add_failed", "err={s}", .{@errorName(err)});
                 return err;

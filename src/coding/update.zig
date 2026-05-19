@@ -189,8 +189,17 @@ fn httpGetBytes(
     allocator: std.mem.Allocator,
     client: *http_mod.Client,
     url: []const u8,
+    headers: http_mod.Client.Request.Headers,
     extra_headers: []const std.http.Header,
 ) ![]u8 {
+    log.log(.trace, "update", "http_get_start", "url={s} headers={d}", .{
+        url,
+        extra_headers.len,
+    });
+    for (extra_headers) |h| {
+        log.log(.trace, "update", "http_get_header", "name={s} value={s}", .{ h.name, h.value });
+    }
+
     var body_writer = std.Io.Writer.Allocating.init(allocator);
     errdefer body_writer.deinit();
 
@@ -198,20 +207,34 @@ fn httpGetBytes(
         .location = .{ .url = url },
         .method = .GET,
         .response_writer = &body_writer.writer,
+        .headers = headers,
         .extra_headers = extra_headers,
     }) catch |err| {
-        log.log(.warn, "update", "fetch_failed", "url={s} err={}", .{ url, err });
+        log.log(.warn, "update", "fetch_failed", "url={s} err={} err_name={s}", .{ url, err, @errorName(err) });
         return Error.HttpFailure;
     };
 
-    if (@intFromEnum(result.status) != 200) {
+    const status = result.status;
+    log.log(.trace, "update", "http_get_response", "url={s} status={d}", .{ url, @intFromEnum(status) });
+
+    if (@intFromEnum(status) != 200) {
         const buf = body_writer.writer.buffered();
+        const preview = if (buf.len > 2048) buf[0..2048] else buf;
         log.log(.warn, "update", "bad_status", "url={s} status={d} body_bytes={d} body_preview={s}", .{
             url,
-            @intFromEnum(result.status),
+            @intFromEnum(status),
             buf.len,
-            if (buf.len > 200) buf[0..200] else buf,
+            preview,
         });
+        // Log the full body up to 32KB at .trace level for diagnostics
+        if (buf.len > 2048) {
+            const full_head = if (buf.len > 32768) buf[0..32768] else buf;
+            log.log(.trace, "update", "bad_status_full_body", "url={s} body_bytes={d} body={s}", .{
+                url,
+                buf.len,
+                full_head,
+            });
+        }
         return Error.HttpFailure;
     }
     return try body_writer.toOwnedSlice();
@@ -229,6 +252,10 @@ pub fn run(
     opts: Options,
 ) Error!Outcome {
     const target = currentTarget() orelse return Error.UnsupportedPlatform;
+
+    log.log(.trace, "update", "run_start", "version={s} force={} dry_run={} base_url={s} repo={s}/{s} os={s} arch={s}", .{
+        current_version, opts.force, opts.dry_run, opts.base_url, opts.repo_owner, opts.repo_name, target.os, target.arch,
+    });
 
     // One client across the three GETs — the connection pool keeps the
     // api.github.com socket alive for the JSON + checksums.txt fetches
@@ -249,11 +276,14 @@ pub fn run(
         "{s}/repos/{s}/{s}/releases/latest",
         .{ opts.base_url, opts.repo_owner, opts.repo_name },
     );
-    const release_headers = [_]std.http.Header{
-        .{ .name = "Accept", .value = "application/vnd.github+json" },
-        .{ .name = "User-Agent", .value = "franky-update/" ++ franky.version },
+    log.log(.trace, "update", "release_url", "url={s}", .{release_url});
+    const release_headers: http_mod.Client.Request.Headers = .{
+        .user_agent = .{ .override = "franky-update/" ++ franky.version },
     };
-    const release_body = httpGetBytes(arena, &client, release_url, &release_headers) catch |e| {
+    const release_extra = [_]std.http.Header{
+        .{ .name = "Accept", .value = "application/vnd.github+json" },
+    };
+    const release_body = httpGetBytes(arena, &client, release_url, release_headers, &release_extra) catch |e| {
         return switch (e) {
             error.HttpFailure => Error.ReleaseApiFailed,
             else => |other| other,
@@ -271,16 +301,18 @@ pub fn run(
     }
 
     const asset_name = try std.fmt.allocPrint(arena, "franky_{s}_{s}", .{ target.os, target.arch });
+    log.log(.trace, "update", "asset_lookup", "want={s}", .{asset_name});
     const binary_asset = findAssetByName(parsed.value, asset_name) orelse return Error.AssetNotFound;
     const checksums_asset = findAssetByName(parsed.value, "checksums.txt") orelse
         return Error.ChecksumMissing;
+    log.log(.trace, "update", "asset_found", "binary_url={s} checksums_url={s}", .{ binary_asset.url, checksums_asset.url });
 
-    const ua_only = [_]std.http.Header{
-        .{ .name = "User-Agent", .value = "franky-update/" ++ franky.version },
+    const dl_headers: http_mod.Client.Request.Headers = .{
+        .user_agent = .{ .override = "franky-update/" ++ franky.version },
     };
 
     log.log(.info, "update", "downloading_checksums", "url={s}", .{checksums_asset.url});
-    const checksums_text = httpGetBytes(arena, &client, checksums_asset.url, &ua_only) catch |err| {
+    const checksums_text = httpGetBytes(arena, &client, checksums_asset.url, dl_headers, &.{}) catch |err| {
         if (opts.force) {
             log.log(.warn, "update", "checksums_download_failed_force", "url={s} err={}", .{ checksums_asset.url, err });
             // --force: skip verification, download binary directly.
@@ -298,7 +330,7 @@ pub fn run(
     };
 
     log.log(.info, "update", "downloading_binary", "name={s} url={s}", .{ asset_name, binary_asset.url });
-    const binary_bytes = httpGetBytes(arena, &client, binary_asset.url, &ua_only) catch |e| {
+    const binary_bytes = httpGetBytes(arena, &client, binary_asset.url, dl_headers, &.{}) catch |e| {
         return switch (e) {
             error.HttpFailure => Error.BinaryDownloadFailed,
             else => |other| other,
@@ -335,11 +367,11 @@ pub fn run(
 /// Download and replace the binary without checksum verification.
 /// Only called when --force is set and checksum data is unavailable.
 fn forceDownloadBinary(arena: std.mem.Allocator, io: std.Io, client: *http_mod.Client, binary_url: []const u8, current_version: []const u8, tag: []const u8, opts: Options) Error!Outcome {
-    const ua_only = [_]std.http.Header{
-        .{ .name = "User-Agent", .value = "franky-update/" ++ franky.version },
+    const dl_headers: http_mod.Client.Request.Headers = .{
+        .user_agent = .{ .override = "franky-update/" ++ franky.version },
     };
     log.log(.info, "update", "downloading_binary_force", "url={s}", .{binary_url});
-    const binary_bytes = httpGetBytes(arena, client, binary_url, &ua_only) catch |e| {
+    const binary_bytes = httpGetBytes(arena, client, binary_url, dl_headers, &.{}) catch |e| {
         return switch (e) {
             error.HttpFailure => Error.BinaryDownloadFailed,
             else => |other| other,
