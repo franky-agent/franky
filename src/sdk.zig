@@ -31,7 +31,12 @@
 
 const std = @import("std");
 
-// ─── ai layer (wire format, streaming, types) ────────────────────
+// §3.2 — session factory + system prompt builder for programmatic callers.
+const cli = @import("coding/config/cli.zig");
+const config_resolver = @import("coding/config.zig");
+const session_create = @import("coding/session/create.zig");
+const build_sysprompt = @import("coding/modes/print.zig").buildSystemPromptIo;
+
 const ai = @import("ai/mod.zig");
 pub const types = ai.types;
 pub const errors = ai.errors;
@@ -103,7 +108,74 @@ pub const settings = coding.settings;
 pub const auth = coding.auth;
 pub const templates = coding.templates;
 pub const extensions = coding.extensions;
-pub const ext_catalog = coding.extensions_builtin.catalog;
+
+pub const SessionState = session_create.SessionState;
+pub const SessionHandle = struct {
+    /// Resolved configuration bundle (providers, tools, permissions, etc.).
+    resolved: config_resolver.ResolvedConfig,
+    /// Session identity + transcript.
+    session_state: SessionState,
+    /// Built system prompt (heap-allocated, freed on deinit).
+    system_prompt: []u8,
+    /// Provider metadata for persistence headers.
+    provider_info: session_create.ProviderInfo,
+
+    pub fn deinit(self: *SessionHandle, allocator: std.mem.Allocator) void {
+        self.session_state.deinit(allocator);
+        allocator.free(self.system_prompt);
+        self.resolved.deinit();
+    }
+
+    pub fn sessionId(self: *const SessionHandle) []const u8 {
+        return self.session_state.id();
+    }
+};
+
+/// One-shot session factory: resolves config, creates session
+/// identity, builds system prompt. Returns a `SessionHandle`
+/// ready to wire into an agent loop.
+///
+/// This is the main entry point for SDK consumers (external
+/// orchestrators, A2A server, test harnesses).
+pub fn createSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    environ_map: *std.process.Environ.Map,
+    cfg: *cli.Config,
+    argv: []const []u8,
+) !SessionHandle {
+    // Step 1: Resolve config (providers, tools, permissions, etc.).
+    var resolved = try config_resolver.resolve(allocator, io, cfg, environ, environ_map, argv);
+    errdefer resolved.deinit();
+
+    // Step 2: Session identity + transcript.
+    var session_state = try SessionState.init(allocator, io, environ, cfg);
+    errdefer session_state.deinit(allocator);
+
+    // Step 3: Build system prompt.
+    const system_prompt = try build_sysprompt(allocator, io, environ, cfg);
+    errdefer allocator.free(system_prompt);
+
+    const provider_info: session_create.ProviderInfo = .{
+        .provider_name = resolved.provider_name,
+        .api_tag = resolved.api_tag,
+        .model_id = resolved.model_id,
+        .api_key = resolved.api_key,
+        .auth_token = resolved.auth_token,
+        .base_url = resolved.base_url,
+        .context_window = resolved.context_window,
+        .max_output = resolved.max_output,
+        .capabilities = resolved.capabilities,
+    };
+
+    return SessionHandle{
+        .resolved = resolved,
+        .session_state = session_state,
+        .system_prompt = system_prompt,
+        .provider_info = provider_info,
+    };
+}
 
 // ─── version surface ─────────────────────────────────────────────
 pub const version = @import("root.zig").version;

@@ -37,6 +37,11 @@ pub const MigratedSession = p.MigratedSession;
 pub const migrateSessionIfNeeded = p.migrateSessionIfNeeded;
 pub const assertRefsInKeep = p.assertRefsInKeep;
 
+// ─── Session factory (§3.2) ────────────────────────────────────────
+pub const create = @import("create.zig");
+pub const SessionState = create.SessionState;
+pub const ProviderInfo = create.ProviderInfo;
+
 /// Convenience: top-level save/load.
 
 pub const Session = struct {

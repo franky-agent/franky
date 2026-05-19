@@ -63,6 +63,7 @@ const tools_mod = franky.coding.tools;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
 const session_mod = franky.coding.session;
+const session_create = franky.coding.session.create;
 const slash_mod = franky.coding.slash;
 const diagnostics_mod = franky.coding.diagnostics;
 const improvement_mod = franky.coding.improvement;
@@ -570,44 +571,37 @@ fn initSession(
     restart_mod.init(original_argv, io, allocator) catch {
         ai.log.log(.warn, "proxy", "restart.init", "failed to cache argv — restart will not be available", .{});
     };
-    // Resolve where (or whether) sessions live on disk. Mirrors
-    // print mode's SessionState.init policy: explicit `--session-dir`
-    // > `$FRANKY_HOME/sessions` > `~/.franky/sessions` > `./.franky-sessions`.
-    // `--no-session` disables persistence (parent_dir = null).
-    const parent_dir: ?[]u8 = if (cfg.no_session) null else blk: {
-        if (cfg.session_dir) |d| break :blk try allocator.dupe(u8, d);
-        if (environ.getPosix("FRANKY_HOME")) |h| {
-            break :blk try std.fs.path.join(allocator, &.{ h, "sessions" });
-        }
-        if (environ.getPosix("HOME")) |h| {
-            break :blk try std.fs.path.join(allocator, &.{ h, ".franky", "sessions" });
-        }
-        break :blk try allocator.dupe(u8, "./.franky-sessions");
-    };
-    errdefer if (parent_dir) |p| allocator.free(p);
 
-    // v1.7.0 — load existing transcript when `--resume <id>` is
-    // set; otherwise mint a fresh ULID (or use `--session <id>`
-    // verbatim, matching print mode).
-    var resume_loaded: ?session_mod.Session = null;
+    // Use the shared SessionState.init() for session identity
+    // (parent_dir resolution, id minting/resume, transcript loading).
+    // Scope is bounded so SessionState cleanup happens before the
+    // rest of session init (no stale errdefer risk).
     var session_id: []u8 = undefined;
-    var created_at_ms: i64 = ai.stream.nowMillis();
+    var parent_dir: ?[]u8 = undefined;
+    var created_at_ms: i64 = undefined;
+    var transcript: agent.loop.Transcript = undefined;
+    {
+        var ss = try session_create.SessionState.init(allocator, io, environ, cfg);
+        defer ss.deinit(allocator);
 
-    if (cfg.resume_id) |sid| {
-        if (parent_dir == null) return error.ResumeFailed;
-        const loaded = session_mod.load(allocator, io, parent_dir.?, sid) catch |e| {
-            if (parent_dir) |p| allocator.free(p);
-            return e;
-        };
-        resume_loaded = loaded;
-        session_id = try allocator.dupe(u8, sid);
-        created_at_ms = loaded.header.created_at_ms;
-    } else if (cfg.session_id) |sid| {
-        session_id = try allocator.dupe(u8, sid);
-    } else {
-        session_id = try mintUlid(allocator);
+        // Move transcript ownership out of SessionState (replace
+        // with empty so defer deinit won't double-free).
+        const tr = ss.transcript;
+        ss.transcript = agent.loop.Transcript.init(allocator);
+
+        session_id = try allocator.dupe(u8, ss.session_id);
+        parent_dir = if (ss.parent_dir) |pd| blk: {
+            const owned = try allocator.dupe(u8, pd);
+            break :blk owned;
+        } else null;
+        created_at_ms = ss.created_at_ms;
+        transcript = tr;
     }
-    errdefer allocator.free(session_id);
+    errdefer {
+        allocator.free(session_id);
+        if (parent_dir) |p| allocator.free(p);
+        // transcript deinited by Session.deinit()
+    }
 
     const active_role = if (cfg.role) |s|
         role_mod.Role.fromString(s) catch |err| switch (err) {
@@ -695,7 +689,7 @@ fn initSession(
         .role_gate = role_gate,
         .permission_store = permission_store,
         .system_prompt = undefined,
-        .transcript = if (resume_loaded) |loaded| loaded.transcript else agent.loop.Transcript.init(allocator),
+        .transcript = transcript,
         .cfg = cfg,
         .environ_map = environ_map,
         .session_id = session_id,
@@ -749,11 +743,8 @@ fn initSession(
         };
         session.tools = try role_mod.filterTools(session.role_arena.allocator(), &all_tools_with_state, session.role_gate.set);
     }
-    if (resume_loaded) |loaded| {
-        // Header strings are arena-owned by the loader; free them
-        // since we kept only the transcript.
-        session_mod.freeSessionHeader(allocator, loaded.header);
-    }
+    // No resume_loaded cleanup — SessionState.init() handled
+    // the loaded header internally, transferring transcript ownership.
     errdefer session.registry.deinit();
     errdefer session.faux.deinit();
 

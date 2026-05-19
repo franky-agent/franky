@@ -33,8 +33,6 @@ const permissions_mod = franky.coding.permissions;
 const skills_mod = franky.coding.skills;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
-const session_mod = franky.coding.session;
-const branching_mod = franky.coding.branching;
 
 /// Error set for config resolution.
 pub const ResolveError = error{
@@ -118,9 +116,6 @@ pub const ResolvedConfig = struct {
     http_trace_dir: ?[]const u8,
     log_per_session: bool,
 
-    // ── Session ──────────────────────────────────────────────────
-    session_state: ?SessionState,
-
     // ── Role gate ────────────────────────────────────────────────
     role_gate: *role_mod.RoleGate,
     active_role: role_mod.Role,
@@ -158,13 +153,6 @@ pub const ResolvedConfig = struct {
         self.faux_provider.deinit();
         a.destroy(self.faux_provider);
         self.registry.deinit();
-        // Session state if any.
-        if (self.session_state) |*s| {
-            s.transcript.deinit();
-            s.tree.deinit();
-            // session arena is separate from resolver arena
-            s.arena.deinit();
-        }
         // Skills state.
         if (self.skills.owned) {
             for (self.skills.skills.items) |*s| s.deinit(a);
@@ -181,16 +169,6 @@ pub const SkillsState = struct {
     owned: bool,
     skills: std.ArrayList(skills_mod.Skill),
     active: std.ArrayList(usize),
-};
-
-/// Session state mirroring the private struct in print.zig.
-pub const SessionState = struct {
-    arena: std.heap.ArenaAllocator,
-    session_id: []const u8,
-    parent_dir: ?[]const u8,
-    transcript: agent.loop.Transcript,
-    created_at_ms: i64,
-    tree: branching_mod.Tree,
 };
 
 // ─── Env-var resolution table ───────────────────────────────────
@@ -1139,12 +1117,6 @@ pub fn resolve(
         .active = .empty,
     };
 
-    // ── Step 18: Session state ────────────────────────────────────
-    // Session init is mode-specific (print/proxy persist to disk,
-    // interactive/rpc don't). We do the common parts here.
-    // The mode calls session_state.init() separately.
-    const session_state: ?SessionState = null;
-
     return ResolvedConfig{
         .provider_name = provider.provider_name,
         .model_id = provider.model_id,
@@ -1183,7 +1155,6 @@ pub fn resolve(
         .log_file = log_file,
         .http_trace_dir = http_trace_dir,
         .log_per_session = log_per_session,
-        .session_state = session_state,
         .role_gate = role_gate,
         .active_role = active_role,
         .review_config_block = review_block,

@@ -145,6 +145,29 @@ test "hash: session.migrateSessionIfNeeded" {
     check("session.migrateSessionIfNeeded", franky.coding.session.migrateSessionIfNeeded, 0x8042677888491156);
 }
 
+// ── session (factory) — §3.2, added in v3.3 ──
+test "hash: SessionState.init" {
+    check("SessionState.init", sdk.SessionState.init, 0x7fded742a2806b8a);
+}
+test "hash: SessionState.deinit" {
+    check("SessionState.deinit", sdk.SessionState.deinit, 0x4628f64c24aea49c);
+}
+test "hash: SessionState.id" {
+    check("SessionState.id", sdk.SessionState.id, 0xdfaeef31f4c4c4e5);
+}
+test "hash: SessionState.persist" {
+    check("SessionState.persist", sdk.SessionState.persist, 0xbe12d82565c2270e);
+}
+test "hash: SessionHandle.deinit" {
+    check("SessionHandle.deinit", sdk.SessionHandle.deinit, 0xabbf6cbd29447ec);
+}
+test "hash: SessionHandle.sessionId" {
+    check("SessionHandle.sessionId", sdk.SessionHandle.sessionId, 0x325f033c5f286cf5);
+}
+test "hash: createSession" {
+    check("createSession", sdk.createSession, 0xe0d2753ed09846d0);
+}
+
 // ── types ──
 test "hash: errors.ErrorSource" {
     checkT("errors.ErrorSource", sdk.errors.ErrorSource, 0x40fefdc831bac7da);
