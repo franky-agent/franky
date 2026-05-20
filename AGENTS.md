@@ -15,7 +15,7 @@ Version: 2.3.0 (library root), built on Zig 0.17-dev (master), zero external dep
 | Lines of code | ~50k+ across 100+ files |
 | Tests | 881 (unit + integration) |
 | Providers | 6 (Anthropic, OpenAI Chat, OpenAI Responses, OpenAI Gateway, Google Gemini, Google Vertex, + Faux for testing) |
-| Built-in tools | 12 (read/write/edit/bash/ls/find/grep/subagent/web_search/web_fetch/truncate/workspace) |
+| Built-in tools | 13 (read/write/edit/bash/ls/find/grep/ast_grep/subagent/web_search/web_fetch/truncate/workspace) |
 | Run modes | 4 (print/interactive/rpc/proxy) |
 | Capability roles | 4 (read/plan/code/full) |
 | Guardrails | 3 (stuck detector, compilation guard, finish_task) |

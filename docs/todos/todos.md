@@ -211,7 +211,3 @@ Run a pre-check: if old appears nowhere in the file (not even partially), short-
 The grep is good for text search but its missing programming language syntax there is tool 
 https://github.com/ast-grep/ast-grep that does. How could we intgrate it so that the Model use ast-grep instread of grep or we offer normal grep and run ast-grep in the background or
 merge the result from grep and ast-grep in the tool result what would be the prefred way ?
-
-# Agent2Agent Protocol (A2A)
-
-Collect information about https://github.com/a2aproject/A2A protocol. WHat has to be implemented to support A2A.
