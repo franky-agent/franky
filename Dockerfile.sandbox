@@ -11,9 +11,9 @@ RUN sudo apt-get update && \
     sudo apt-get clean && \
     sudo rm -rf /var/lib/apt/lists/*
 
-RUN wget https://ziglang.org/builds/zig-aarch64-linux-0.17.0-dev.304+9787df942.tar.xz && \
-    tar -xf zig-aarch64-linux-0.17.0-dev.304+9787df942.tar.xz -C /usr/local/bin --strip-components=1 && \
-    rm zig-aarch64-linux-0.17.0-dev.304+9787df942.tar.xz
+RUN wget https://ziglang.org/builds/zig-aarch64-linux-0.17.0-dev.420+8086ae176.tar.xz && \
+    tar -xf zig-aarch64-linux-0.17.0-dev.420+8086ae176.tar.xz -C /usr/local/bin --strip-components=1 && \
+    rm zig-aarch64-linux-0.17.0-dev.420+8086ae176.tar.xz
 # this enable memory allocatioin tracking for tests with heaptrack that is donme in the profile build step of franky
 # Not needed anymore solved by src/global_allocator.zig 
 # RUN sudo sed -i 's|^pub const allocator = allocator_instance.allocator();$|pub const allocator = std.heap.c_allocator;|' /usr/local/bin/lib/std/testing.zig
@@ -34,10 +34,16 @@ RUN printf '#!/bin/bash\nclaude --allow-dangerously-skip-permissions --dangerous
     chmod +x /usr/bin/claude && \
     printf '#!/bin/bash\nclaude --allow-dangerously-skip-permissions --dangerously-skip-permissions --resume "$@"\n' > /usr/bin/clauder && \
     chmod +x /usr/bin/clauder && \
-    printf '#!/bin/bash\nexec ./zig-out/bin/franky --profile ollama-deepseek-flash --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-deepseek && \
-    chmod +x /usr/bin/franky-deepseek && \
-    printf '#!/bin/bash\nexec ./zig-out/bin/franky --profile ollama-deepseek-kimi-k --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-kimik && \
-    chmod +x /usr/bin/franky-kimik
+    printf '#!/bin/bash\nexec franky --profile ollama-deepseek-flash --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-deepseek-flash && \
+    chmod +x /usr/bin/franky-deepseek-flash && \
+    printf '#!/bin/bash\nexec franky --profile ollama-deepseek-kimi-k --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-kimik && \
+    chmod +x /usr/bin/franky-kimik && \
+    printf '#!/bin/bash\nexec franky --profile ollama-deepseek-pro --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-deepseek-pro && \
+    chmod +x /usr/bin/franky-deepseek-pro && \
+    printf '#!/bin/bash\nexec franky --profile ollama-glm-5 --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-glm5 && \
+    chmod +x /usr/bin/franky-glm5 && \
+    printf '#!/bin/bash\nexec franky --profile ollama-gemma4-cloud --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-gemma4 && \
+    chmod +x /usr/bin/franky-gemma4
 
 USER agent
 RUN go install golang.org/x/vuln/cmd/govulncheck@latest
@@ -48,3 +54,5 @@ RUN cargo install inferno
 ENV ZIG_LOCAL_CACHE_DIR=/tmp/zig-cache
 ENV ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
 ENV PATH="/home/agent/.cargo/bin:/home/agent/go/bin:${PATH}"
+
+CMD ["/usr/bin/franky-deepseek"]

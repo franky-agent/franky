@@ -301,6 +301,22 @@ pub const Config = struct {
     /// infinite loops. Designed for print mode where there is no user to
     /// say "done". Default false — no behavioural change.
     nudge_on_finish_task: bool = false,
+
+    /// v3.0 — opt-in tool-result offloading. When > 0, only the `N` most
+    /// recent tool-result messages are sent to the LLM with full content.
+    /// Older tool results are replaced with a compact placeholder
+    /// ("[tool result: <call_id> — <size> (offloaded) — see <path>]") so the
+    /// model still sees the shape of the conversation without paying token
+    /// cost for stale output, and the agent can `read` the file to recover
+    /// the full content. 0 disables offloading (default — send everything).
+    max_full_tool_results: u32 = 0,
+    /// v3.0 — when `max_full_tool_results > 0`, the directory to write
+    /// offloaded tool-result snapshots. Files are named
+    /// `tool-<call_id>.json`. When null, offloaded content is discarded
+    /// (old behaviour — the placeholder is still emitted but points to
+    /// nowhere). Mode drivers populate this with
+    /// `<session_dir>/offloaded-tool-results` or similar.
+    offload_dir: ?[]const u8 = null,
 };
 
 pub const Transcript = at.Transcript;
@@ -639,10 +655,18 @@ fn runTurn(
     ai.log.log(.debug, "turn", "start", "messages_in_transcript={d}", .{transcript.messages.items.len});
 
     // Build context from messages.
-    const llm_messages = try config.convert_to_llm(allocator, transcript.messages.items);
+    var llm_messages = try config.convert_to_llm(allocator, transcript.messages.items);
     errdefer {
         for (llm_messages) |*m| m.deinit(allocator);
         allocator.free(llm_messages);
+    }
+    // v3.0 — optional tool-result offloading before sending to the LLM.
+    if (config.max_full_tool_results > 0) {
+        const offloaded = try offloadToolResults(allocator, io, llm_messages, config.max_full_tool_results, config.offload_dir);
+        for (llm_messages) |*m| m.deinit(allocator);
+        allocator.free(llm_messages);
+        llm_messages = offloaded;
+        // errdefer already captures the new slice.
     }
     if (ai.log.enabledForScope(.trace, "message")) {
         for (llm_messages, 0..) |m, i| {
@@ -1242,6 +1266,139 @@ fn makeErrorResult(allocator: std.mem.Allocator, text: []const u8) !at.ToolResul
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = cb;
     return .{ .content = arr, .is_error = true };
+}
+
+/// v3.0 — offload early tool-result messages to compact placeholders.
+/// Keeps only the `keep` most recent tool-result messages with full
+/// content. Older ones are replaced with a single text block:
+/// "[tool result: <tool-call-id> — <size> (offloaded)]".
+/// Non-tool-result messages pass through unchanged.
+fn offloadToolResults(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    messages: []const ai.types.Message,
+    keep: u32,
+    offload_dir: ?[]const u8,
+) ![]ai.types.Message {
+    // First pass: count tool-result messages so we know which are old.
+    var tr_count: u32 = 0;
+    for (messages) |m| {
+        if (m.role == .tool_result) tr_count += 1;
+    }
+    if (tr_count <= keep) {
+        // Nothing to offload — dupe the whole slice.
+        var out = try allocator.alloc(ai.types.Message, messages.len);
+        errdefer {
+            for (out[0..messages.len]) |*m| m.deinit(allocator);
+            allocator.free(out);
+        }
+        for (messages, 0..) |m, i| out[i] = try dupeMessage(allocator, m);
+        return out;
+    }
+
+    // Second pass: mark which tool results to offload.
+    var to_offload = try allocator.alloc(bool, messages.len);
+    defer allocator.free(to_offload);
+    @memset(to_offload, false);
+    {
+        var seen: u32 = 0;
+        var i = messages.len;
+        while (i > 0) {
+            i -= 1;
+            if (messages[i].role == .tool_result) {
+                if (seen >= keep) {
+                    to_offload[i] = true;
+                }
+                seen += 1;
+            }
+        }
+    }
+
+    // Ensure the offload directory exists.
+    if (offload_dir) |dir| {
+        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
+            ai.log.log(.warn, "loop", "offload_mkdir",
+                "failed to create offload dir '{s}': {s}",
+                .{ dir, @errorName(err) },
+            );
+        };
+    }
+
+    // Third pass: allocate and fill.
+    var out = try allocator.alloc(ai.types.Message, messages.len);
+    errdefer {
+        for (out[0..messages.len]) |*m| m.deinit(allocator);
+        allocator.free(out);
+    }
+    for (messages, 0..) |m, i| {
+        if (to_offload[i]) {
+            // Compute original size across all text content blocks.
+            var total_size: usize = 0;
+            for (m.content) |cb| switch (cb) {
+                .text => |t| total_size += t.text.len,
+                else => {},
+            };
+            const call_id = m.tool_call_id orelse "?";
+            const size_str = try truncate.formatSize(allocator, total_size);
+            defer allocator.free(size_str);
+
+            // Write full content to offload file if a directory is configured.
+            var file_path: ?[]const u8 = null;
+            if (offload_dir) |dir| {
+                const seq = synth_tool_id_seq.fetchAdd(1, .monotonic);
+                const filename = try std.fmt.allocPrint(allocator, "tool-{s}-s{x:0>8}.txt", .{ call_id, seq });
+                defer allocator.free(filename);
+                const full_path = try std.fs.path.join(allocator, &.{ dir, filename });
+                defer allocator.free(full_path);
+                // Concatenate all text content blocks into a single blob.
+                var text_parts: std.ArrayList(u8) = .empty;
+                defer text_parts.deinit(allocator);
+                for (m.content) |cb| switch (cb) {
+                    .text => |t| try text_parts.appendSlice(allocator, t.text),
+                    else => {},
+                };
+                if (std.Io.Dir.cwd().writeFile(io, .{
+                    .sub_path = full_path,
+                    .data = text_parts.items,
+                })) {
+                    file_path = try allocator.dupe(u8, full_path);
+                } else |err| {
+                    ai.log.log(.warn, "loop", "offload_write",
+                        "failed to write offload file '{s}': {s}",
+                        .{ full_path, @errorName(err) },
+                    );
+                }
+            }
+
+            const placeholder = if (file_path) |fp|
+                try std.fmt.allocPrint(
+                    allocator,
+                    "[tool result: {s} — {s} (offloaded) — see {s}]",
+                    .{ call_id, size_str, fp },
+                )
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "[tool result: {s} — {s} (offloaded)]",
+                    .{ call_id, size_str },
+                );
+            errdefer allocator.free(placeholder);
+
+            var content = try allocator.alloc(ai.types.ContentBlock, 1);
+            errdefer allocator.free(content);
+            content[0] = .{ .text = .{ .text = placeholder } };
+            out[i] = .{
+                .role = .tool_result,
+                .content = content,
+                .timestamp = m.timestamp,
+                .tool_call_id = try allocator.dupe(u8, call_id),
+                .is_error = false,
+            };
+        } else {
+            out[i] = try dupeMessage(allocator, m);
+        }
+    }
+    return out;
 }
 
 /// v1.16.3 — render a model-facing message for an exception that
@@ -2312,4 +2469,63 @@ test "makeToolResultMessage: text blocks under 8KB pass through unchanged" {
     defer msg.deinit(gpa);
 
     try testing.expectEqualStrings("hello tool result", msg.content[0].text.text);
+}
+
+test "offloadToolResults: nothing offloaded when under keep limit" {
+    const gpa = testing.allocator;
+    var tr_content = [_]ai.types.ContentBlock{.{ .text = .{ .text = "big output here" } }};
+    var msgs = [_]ai.types.Message{
+        .{ .role = .user, .content = &.{}, .timestamp = 0 },
+        .{ .role = .assistant, .content = &.{}, .timestamp = 0 },
+        .{ .role = .tool_result, .content = &tr_content, .timestamp = 0, .tool_call_id = "call_1" },
+    };
+    const result = try offloadToolResults(gpa, undefined, &msgs, 5, null);
+    defer {
+        for (result) |*m| m.deinit(gpa);
+        gpa.free(result);
+    }
+    try testing.expect(result.len == 3);
+    // tool_result still has full content
+    try testing.expectEqualStrings("big output here", result[2].content[0].text.text);
+}
+
+test "offloadToolResults: old tool results replaced with placeholder" {
+    const gpa = testing.allocator;
+    var old_tr = [_]ai.types.ContentBlock{.{ .text = .{ .text = "old big output here" } }};
+    var new_tr = [_]ai.types.ContentBlock{.{ .text = .{ .text = "fresh result" } }};
+    var msgs = [_]ai.types.Message{
+        .{ .role = .user, .content = &.{}, .timestamp = 0 },
+        .{ .role = .tool_result, .content = &old_tr, .timestamp = 0, .tool_call_id = "call_1" },
+        .{ .role = .assistant, .content = &.{}, .timestamp = 0 },
+        .{ .role = .tool_result, .content = &new_tr, .timestamp = 0, .tool_call_id = "call_2" },
+    };
+    // keep=1 → only the last tool_result survives with full content
+    const result = try offloadToolResults(gpa, undefined, &msgs, 1, null);
+    defer {
+        for (result) |*m| m.deinit(gpa);
+        gpa.free(result);
+    }
+    try testing.expect(result.len == 4);
+    // Index 1 (old tool result) is offloaded
+    try testing.expect(std.mem.indexOf(u8, result[1].content[0].text.text, "(offloaded)") != null);
+    // Index 3 (new tool result) still has full content
+    try testing.expectEqualStrings("fresh result", result[3].content[0].text.text);
+}
+
+test "offloadToolResults: non-tool-result messages pass through unchanged" {
+    const gpa = testing.allocator;
+    var user_content = [_]ai.types.ContentBlock{.{ .text = .{ .text = "hello" } }};
+    var tr_content = [_]ai.types.ContentBlock{.{ .text = .{ .text = "result" } }};
+    var msgs = [_]ai.types.Message{
+        .{ .role = .user, .content = &user_content, .timestamp = 0 },
+        .{ .role = .tool_result, .content = &tr_content, .timestamp = 0, .tool_call_id = "c1" },
+    };
+    const result = try offloadToolResults(gpa, undefined, &msgs, 0, null);
+    defer {
+        for (result) |*m| m.deinit(gpa);
+        gpa.free(result);
+    }
+    try testing.expect(result.len == 2);
+    try testing.expectEqualStrings("hello", result[0].content[0].text.text);
+    try testing.expect(std.mem.indexOf(u8, result[1].content[0].text.text, "(offloaded)") != null);
 }

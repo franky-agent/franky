@@ -327,6 +327,7 @@ fn runPrint(
         .cancel = &cancel,
         .guardrails = resolved.guardrail_state,
         .nudge_on_finish_task = true,
+        .max_full_tool_results = resolved.max_full_tool_results,
         .hook_userdata = @ptrCast(resolved.session_gates),
         .role_denied = permissions_mod.SessionGates.roleDenied,
         .before_tool_call = permissions_mod.SessionGates.beforeToolCall,

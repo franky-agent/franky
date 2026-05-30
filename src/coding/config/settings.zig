@@ -64,6 +64,13 @@ pub const Settings = struct {
     /// without-explicit-limit cap. Per-call `limit` arg still wins.
     read_max_bytes: ?usize = null,
 
+    /// v3.0 — `tools.maxFullToolResults` — settings-layer default for
+    /// the number of most-recent tool results to keep with full content.
+    /// Older tool results are replaced with a compact placeholder
+    /// ("[tool result: <id> — <size> (offloaded)]") before sending to
+    /// the LLM. 0 (default) disables offloading — send everything.
+    max_full_tool_results: ?u32 = null,
+
     /// `permissions.ask_all` — settings-layer default for the
     /// "ask before every tool call" toggle. CLI `--ask-tools all`
     /// still wins.
@@ -256,6 +263,9 @@ fn applyToolsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
             if (read_v.object.get("maxBytes")) |m| if (m == .integer and m.integer >= 1) {
                 settings.read_max_bytes = @intCast(m.integer);
             };
+        };
+        if (tools_v.object.get("maxFullToolResults")) |v| if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+            settings.max_full_tool_results = @intCast(v.integer);
         };
         if (tools_v.object.get("retry")) |retry_v| if (retry_v == .object) {
             if (retry_v.object.get("maxAttempts")) |rv| if (rv == .integer and rv.integer >= 0 and rv.integer <= std.math.maxInt(u32)) {
