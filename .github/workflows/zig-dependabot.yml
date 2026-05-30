@@ -1,0 +1,23 @@
+name: Zig Dependabot
+
+on:
+  schedule:
+    - cron: '0 0 * * *'     # daily at midnight
+  workflow_dispatch:          # manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  update-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: master
+      - uses: muhammad-fiaz/zig-dependabot@v1
+        with:
+          close_old: true

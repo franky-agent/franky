@@ -1,0 +1,20 @@
+version: 1.0.0
+
+_config: merge
+
+approve:
+  include:
+    branches:
+      dependabot_golang:
+        prefix: "dependabot/go_modules"
+      zig_dependabot:
+        prefix: "zig-deps/"
+
+merge:
+  include:
+    branches:
+      dependabot_golang:
+        prefix: "dependabot/go_modules"
+      zig_dependabot:
+        prefix: "zig-deps/"
+  method: squash

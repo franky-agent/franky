@@ -172,7 +172,11 @@ pub fn run(
         if (orchestrator_owned) |ourl| {
             if (!session.restart_requested.load(.acquire)) {
                 franky.coding.orchestrator.unregister(
-                    allocator, io, ourl, session.session_id, environ_map,
+                    allocator,
+                    io,
+                    ourl,
+                    session.session_id,
+                    environ_map,
                 );
             }
             allocator.free(ourl);
@@ -642,7 +646,7 @@ fn initSession(
         prompts_enabled = print_mode.resolvePromptsDefault(cfg, &settings);
         print_mode.applyMaxTurnsSettingsOverlay(cfg, &settings);
         print_mode.applyRetrySettingsOverlay(cfg, &settings);
-        max_full_tool_results = settings.max_full_tool_results orelse 0;        // v2.16 — pre-render the review config block for system-prompt injection.
+        max_full_tool_results = settings.max_full_tool_results orelse 0; // v2.16 — pre-render the review config block for system-prompt injection.
         // Only populate when profiles are configured so the block is non-empty.
         if (settings.review_profiles.len > 0) {
             const ca = cfg.arena.allocator();
@@ -658,10 +662,10 @@ fn initSession(
             cfg.review_config_block = try std.fmt.allocPrint(
                 ca,
                 "## Review configuration\n" ++
-                "profiles: {s}\n" ++
-                "min_models: {d}\n" ++
-                "max_models: {d}\n" ++
-                "timeout_ms: {d}",
+                    "profiles: {s}\n" ++
+                    "min_models: {d}\n" ++
+                    "max_models: {d}\n" ++
+                    "timeout_ms: {d}",
                 .{
                     profiles_csv,
                     settings.review_min_models,
@@ -2615,27 +2619,57 @@ fn respondUsage(
     // with bufPrint for the numeric values, matching proxy.zig patterns.
     var body = std.ArrayList(u8).empty;
     defer body.deinit(allocator);
-    body.appendSlice(allocator, "{\"guardrails\":") catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    body.appendSlice(allocator, "{\"guardrails\":") catch {
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
     {
         var num: [32]u8 = undefined;
-        body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{gcount}) catch unreachable) catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{gcount}) catch unreachable) catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
     }
-    body.appendSlice(allocator, ",\"tools\":{") catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    body.appendSlice(allocator, ",\"tools\":{") catch {
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
     var first = true;
     var it = session.tool_usage.iterator();
     while (it.next()) |entry| {
-        if (!first) body.append(allocator, ',') catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        if (!first) body.append(allocator, ',') catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
         first = false;
-        body.append(allocator, '"') catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
-        body.appendSlice(allocator, entry.key_ptr.*) catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
-        body.appendSlice(allocator, "\":") catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
+        body.append(allocator, '"') catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        body.appendSlice(allocator, entry.key_ptr.*) catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        body.appendSlice(allocator, "\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
         {
             var num: [32]u8 = undefined;
-            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{entry.value_ptr.*}) catch unreachable) catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{entry.value_ptr.*}) catch unreachable) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
         }
     }
-    body.append(allocator, '}') catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
-    body.append(allocator, '}') catch { sse_mod.respondStatus(stream, io, 500, "Internal Server Error"); return; };
+    body.append(allocator, '}') catch {
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
+    body.append(allocator, '}') catch {
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
     const json = body.items;
     sse_mod.respondJson(stream, io, 200, json);
 }
@@ -2737,7 +2771,6 @@ fn readDocStatus(io: std.Io, path: []const u8) []const u8 {
         std.mem.startsWith(u8, after, "ready")) return "decided";
     return "unknown";
 }
-
 
 fn renderDesignDocsJson(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;

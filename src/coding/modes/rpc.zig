@@ -203,10 +203,10 @@ fn initSession(
             cfg.review_config_block = try std.fmt.allocPrint(
                 ca,
                 "## Review configuration\n" ++
-                "profiles: {s}\n" ++
-                "min_models: {d}\n" ++
-                "max_models: {d}\n" ++
-                "timeout_ms: {d}",
+                    "profiles: {s}\n" ++
+                    "min_models: {d}\n" ++
+                    "max_models: {d}\n" ++
+                    "timeout_ms: {d}",
                 .{
                     profiles_csv,
                     settings.review_min_models,
@@ -729,7 +729,8 @@ fn runPrompt(
                     continue;
                 };
                 defer allocator.free(payload);
-                const notif = std.fmt.allocPrint(allocator,
+                const notif = std.fmt.allocPrint(
+                    allocator,
                     "{{\"jsonrpc\":\"2.0\",\"method\":\"event\",\"params\":{s}}}",
                     .{payload},
                 ) catch {
@@ -826,12 +827,8 @@ fn writeResultFrame(
     result_json: []const u8,
 ) !void {
     const body = switch (id orelse rpc.Id{ .string = "" }) {
-        .string => |s| try std.fmt.allocPrint(allocator,
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"{s}\",\"result\":{s}}}",
-            .{ s, result_json }),
-        .number => |n| try std.fmt.allocPrint(allocator,
-            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}",
-            .{ n, result_json }),
+        .string => |s| try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"2.0\",\"id\":\"{s}\",\"result\":{s}}}", .{ s, result_json }),
+        .number => |n| try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}", .{ n, result_json }),
     };
     defer allocator.free(body);
     try writeFrameToStdout(io, stdout, body);
@@ -846,12 +843,8 @@ fn writeErrorFrame(
 ) !void {
     const msg = @errorName(err);
     const body = switch (id orelse rpc.Id{ .string = "" }) {
-        .string => |s| try std.fmt.allocPrint(allocator,
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"{s}\",\"error\":{{\"code\":-32603,\"message\":\"{s}\"}}}}",
-            .{ s, msg }),
-        .number => |n| try std.fmt.allocPrint(allocator,
-            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":-32603,\"message\":\"{s}\"}}}}",
-            .{ n, msg }),
+        .string => |s| try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"2.0\",\"id\":\"{s}\",\"error\":{{\"code\":-32603,\"message\":\"{s}\"}}}}", .{ s, msg }),
+        .number => |n| try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":-32603,\"message\":\"{s}\"}}}}", .{ n, msg }),
     };
     defer allocator.free(body);
     try writeFrameToStdout(io, stdout, body);

@@ -118,6 +118,10 @@ pub const ResolvedConfig = struct {
     http_trace_dir: ?[]const u8,
     log_per_session: bool,
 
+    // ── Startup warnings ─────────────────────────────────────────
+    /// Messages printed to stderr once at startup (tool install hints, etc).
+    startup_warnings: []const []const u8 = &.{},
+
     // ── Role gate ────────────────────────────────────────────────
     role_gate: *role_mod.RoleGate,
     active_role: role_mod.Role,
@@ -325,14 +329,10 @@ pub fn resolveTimeouts(
     var t: ai.registry.Timeouts = .{};
     if (isLoopbackBaseUrl(cfg.base_url)) t.first_byte_ms = 600_000;
 
-    if (cfg.connect_timeout_ms) |v| t.connect_ms = v
-    else if (parseEnvMapU32(map, "FRANKY_CONNECT_TIMEOUT_MS")) |v| t.connect_ms = v;
-    if (cfg.upload_timeout_ms) |v| t.upload_ms = v
-    else if (parseEnvMapU32(map, "FRANKY_UPLOAD_TIMEOUT_MS")) |v| t.upload_ms = v;
-    if (cfg.first_byte_timeout_ms) |v| t.first_byte_ms = v
-    else if (parseEnvMapU32(map, "FRANKY_FIRST_BYTE_TIMEOUT_MS")) |v| t.first_byte_ms = v;
-    if (cfg.event_gap_timeout_ms) |v| t.event_gap_ms = v
-    else if (parseEnvMapU32(map, "FRANKY_EVENT_GAP_TIMEOUT_MS")) |v| t.event_gap_ms = v;
+    if (cfg.connect_timeout_ms) |v| t.connect_ms = v else if (parseEnvMapU32(map, "FRANKY_CONNECT_TIMEOUT_MS")) |v| t.connect_ms = v;
+    if (cfg.upload_timeout_ms) |v| t.upload_ms = v else if (parseEnvMapU32(map, "FRANKY_UPLOAD_TIMEOUT_MS")) |v| t.upload_ms = v;
+    if (cfg.first_byte_timeout_ms) |v| t.first_byte_ms = v else if (parseEnvMapU32(map, "FRANKY_FIRST_BYTE_TIMEOUT_MS")) |v| t.first_byte_ms = v;
+    if (cfg.event_gap_timeout_ms) |v| t.event_gap_ms = v else if (parseEnvMapU32(map, "FRANKY_EVENT_GAP_TIMEOUT_MS")) |v| t.event_gap_ms = v;
     return t;
 }
 
@@ -831,10 +831,10 @@ fn buildReviewConfigBlock(
     return try std.fmt.allocPrint(
         ca,
         "## Review configuration\n" ++
-        "profiles: {s}\n" ++
-        "min_models: {d}\n" ++
-        "max_models: {d}\n" ++
-        "timeout_ms: {d}",
+            "profiles: {s}\n" ++
+            "min_models: {d}\n" ++
+            "max_models: {d}\n" ++
+            "timeout_ms: {d}",
         .{
             profiles_csv,
             settings.review_min_models,
@@ -978,27 +978,53 @@ pub fn resolve(
         .environ_map = environ_map,
     };
 
-    const all_tools = if (workspace_state) |ws| [_]at.AgentTool{
-        tools_mod.read.toolWithCtx(read_ctx),
-        tools_mod.write.toolWithWorkspace(ws),
-        tools_mod.edit.toolWithWorkspace(ws),
-        tools_mod.bash.toolWithStateAndWorkspace(bash_ctx),
-        tools_mod.ls.toolWithWorkspace(ws),
-        tools_mod.find.toolWithWorkspace(ws),
-        tools_mod.grep.toolWithWorkspace(ws),
-        tools_mod.web_search.toolWithCtx(web_search_ctx),
-        tools_mod.web_fetch.toolWithCtx(web_search_ctx),
-    } else [_]at.AgentTool{
-        tools_mod.read.tool(),
-        tools_mod.write.tool(),
-        tools_mod.edit.tool(),
-        tools_mod.bash.toolWithState(bash_state),
-        tools_mod.ls.tool(),
-        tools_mod.find.tool(),
-        tools_mod.grep.tool(),
-        tools_mod.web_search.toolWithCtx(web_search_ctx),
-        tools_mod.web_fetch.toolWithCtx(web_search_ctx),
-    };
+    var startup_warnings: std.ArrayList([]const u8) = .empty;
+    const base_tool_count: usize = 9;
+    var all_tools: [10]at.AgentTool = undefined;
+    {
+        var i: usize = 0;
+        // Common tools (always present)
+        if (workspace_state) |ws| {
+            all_tools[i] = tools_mod.read.toolWithCtx(read_ctx);
+            i += 1;
+            all_tools[i] = tools_mod.write.toolWithWorkspace(ws);
+            i += 1;
+            all_tools[i] = tools_mod.edit.toolWithWorkspace(ws);
+            i += 1;
+            all_tools[i] = tools_mod.bash.toolWithStateAndWorkspace(bash_ctx);
+            i += 1;
+            all_tools[i] = tools_mod.ls.toolWithWorkspace(ws);
+            i += 1;
+            all_tools[i] = tools_mod.find.toolWithWorkspace(ws);
+            i += 1;
+            all_tools[i] = tools_mod.grep.toolWithWorkspace(ws);
+            i += 1;
+            all_tools[i] = tools_mod.web_search.toolWithCtx(web_search_ctx);
+            i += 1;
+            all_tools[i] = tools_mod.web_fetch.toolWithCtx(web_search_ctx);
+            i += 1;
+        } else {
+            all_tools[i] = tools_mod.read.tool();
+            i += 1;
+            all_tools[i] = tools_mod.write.tool();
+            i += 1;
+            all_tools[i] = tools_mod.edit.tool();
+            i += 1;
+            all_tools[i] = tools_mod.bash.toolWithState(bash_state);
+            i += 1;
+            all_tools[i] = tools_mod.ls.tool();
+            i += 1;
+            all_tools[i] = tools_mod.find.tool();
+            i += 1;
+            all_tools[i] = tools_mod.grep.tool();
+            i += 1;
+            all_tools[i] = tools_mod.web_search.toolWithCtx(web_search_ctx);
+            i += 1;
+            all_tools[i] = tools_mod.web_fetch.toolWithCtx(web_search_ctx);
+            i += 1;
+        }
+    }
+    const all_tools_slice = all_tools[0..base_tool_count];
 
     const active_role = if (cfg.role) |s|
         try role_mod.Role.fromString(s)
@@ -1007,7 +1033,7 @@ pub fn resolve(
     const role_gate = try a.create(role_mod.RoleGate);
     errdefer a.destroy(role_gate);
     role_gate.* = role_mod.RoleGate.init(active_role);
-    const role_filtered_tools = try role_mod.filterTools(allocator, &all_tools, role_gate.set);
+    const role_filtered_tools = try role_mod.filterTools(allocator, all_tools_slice, role_gate.set);
     defer allocator.free(role_filtered_tools);
 
     // ── Step 9: Permission store ─────────────────────────────────
@@ -1158,6 +1184,7 @@ pub fn resolve(
         .log_file = log_file,
         .http_trace_dir = http_trace_dir,
         .log_per_session = log_per_session,
+        .startup_warnings = try startup_warnings.toOwnedSlice(a),
         .role_gate = role_gate,
         .active_role = active_role,
         .review_config_block = review_block,

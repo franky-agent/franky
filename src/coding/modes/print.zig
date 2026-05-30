@@ -253,6 +253,16 @@ fn runPrint(
         stderr.interface.flush() catch {};
     }
 
+    // Startup warnings (tool install hints, etc).
+    {
+        var sw_buf: [1024]u8 = undefined;
+        var sw = std.Io.File.stderr().writer(io, &sw_buf);
+        for (resolved.startup_warnings) |w| {
+            sw.interface.print("⚠ {s}\n", .{w}) catch {};
+        }
+        sw.interface.flush() catch {};
+    }
+
     // ── Session / transcript ───────────────────────────────────────
     var session_state = try SessionState.init(allocator, io, environ, cfg);
     defer session_state.deinit(allocator);
