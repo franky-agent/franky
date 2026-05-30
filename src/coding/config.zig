@@ -67,8 +67,10 @@ pub const ResolvedConfig = struct {
     event_gap_timeout_ms: u64,
     /// Text-tool-call-fallback flag (default false)
     text_tool_call_fallback: bool,
-
-    // ── Registry (populated) ──────────────────────────────────────
+    /// v3.0 — when > 0, only the N most recent tool results carry full
+    /// content to the LLM; older ones are replaced with a compact
+    /// placeholder.
+    max_full_tool_results: u32 = 0,
     registry: ai.registry.Registry,
     faux_provider: *ai.providers.faux.FauxProvider,
 
@@ -1133,6 +1135,7 @@ pub fn resolve(
         .first_byte_timeout_ms = resolveTimeouts(cfg, environ_map).first_byte_ms,
         .event_gap_timeout_ms = resolveTimeouts(cfg, environ_map).event_gap_ms,
         .text_tool_call_fallback = cfg.text_tool_call_fallback,
+        .max_full_tool_results = settings.max_full_tool_results orelse 0,
         .registry = reg,
         .faux_provider = faux_ptr,
         .tools = all_final_tools,

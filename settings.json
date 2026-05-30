@@ -3,7 +3,8 @@
         "retry": {
             "maxAttempts": 3,
             "maxTotalMs": 180000
-        }
+        },
+        "maxFullToolResults": 10
     },
     "review": {
         "profiles": ["ollama-deepseek-flash", "ollama-kimi-k", "ollama-deepseek-pro", "ollama-gemma4-cloud"],
@@ -72,10 +73,25 @@
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             }
         },
-        "ollama-home": {
+        "ollama-home-gemma4": {
             "provider": "gateway",
-            "base-url": "http://192.168.1.107:11434/v1/chat/completions",
+            "base-url": "http://192.168.1.109:11434/v1/chat/completions",
             "model": "gemma4:31b",
+            "api-key": "ollama",
+            "ask-tools": "all",
+            "role": "full",
+            "prompts": true,
+            "log-level": "trace",
+            "http-trace-dir": "${HOME}/.franky/log-trace",
+            "thinking": "xhigh",
+            "env": {
+                "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
+            }
+        },
+        "ollama-home-qwen3": {
+            "provider": "gateway",
+            "base-url": "http://192.168.1.109:11434/v1/chat/completions",
+            "model": "qwen3.6:latest",
             "api-key": "ollama",
             "ask-tools": "all",
             "role": "full",

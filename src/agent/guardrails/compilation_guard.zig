@@ -84,6 +84,11 @@ pub const CompilationGuard = struct {
     }
 
     /// Increment the mutation counter if `tool_name` is "edit" or "write".
+    /// Return true if the workflow YAML has `auto_commit: true`.
+    pub fn workflowAutoCommit(self: *const CompilationGuard) bool {
+        return if (self.workflow) |*w| w.wf.auto_commit else false;
+    }
+
     pub fn bumpIfMutation(self: *CompilationGuard, tool_name: []const u8) void {
         if (!std.mem.eql(u8, tool_name, "edit") and !std.mem.eql(u8, tool_name, "write")) return;
         self.mutation_count += 1;

@@ -1,7 +1,7 @@
 # Hide .git folders in find tool results (Check if its already done)
 
 ```
-ool: bash done
+tool: bash done
 {"command":"find . -maxdepth 2 -type f | head -80","description":"List files in workspace to understand structure"}
 [exit] code=0
 [stdout]
@@ -58,13 +58,6 @@ CHeck if this is a unified standard across other providers like opanai, ollama, 
 
 Do a web research.
 
-
-# add lsp (language server protocol) support for zig
-
-Lets have a brainstorimg session about how add lsp (language server protocol) support atleast for ziglang and what it brings in terms of efficientcy compared to a llm that just uses plain text edit.
-
-Do a detail web research spawn sub agent to speed up the research.
-
 # List subagents/preset based on the available API KEYS.
 
 Also if a subagent was started with profile gemini but gemini api key is not there return hint with please use one of the following or change the subagent model without telling the parent agent.
@@ -104,17 +97,6 @@ This example is from the edit fallback view
 applied 1 edit(s) to /Users/frankittermann/github/franky/src/coding/modes/print.zig
 ```
 
-# Sub Agent Header View improvement (Done)
-
-Lets add the used preset to the subagent overlay view in the header. 
-```
-<div class="sa-overlay-head">
-    <span class="sa-badge sa-overlay-badge done">done</span>
-    <span class="sa-overlay-title">go-dev</span>
-    <button class="sa-overlay-close" id="sa-overlay-close" aria-label="Close">×</button>
-</div>
-```
-
 # Finish Task (Check for regression after nudging was implemented)
 
 It could check if the worked on document was updated recently before the finish task was called and also take hash of it before the work and compare it after finish task to check changes as well. Or just send a final hint to the model please update the document you were working on if not already happended.
@@ -141,10 +123,6 @@ Add the ability to abort a sub agent execution from the web-ui. This is useful i
 
 Make it possible to stack multiple tasks/messages that will send when the current session has called finished_task (successfully including non failing guardrails).
 
-# When the model forget to call finish_task (Done)
-
-When the model finished it work and waits for new instructions lets call a hint are your finish then call finish_task tool.
-
 # Check for LLM Agent Standards
 
 How PI and Hermes for example:
@@ -164,7 +142,7 @@ MAke a design doc
 
 To be able to link dediacted messages like tool calls we need a unique id.
 
-# Review --mulitmodel;
+# Review --mulitmodel (Done)
 
 Here is an conversation snippet lets fix it the `/review --multimodel` command should work out of the box may we dont even need a skill the command just contain the prompt already or ? 
 ```
@@ -206,12 +184,40 @@ Validate old against file before attempting edits
 
 Run a pre-check: if old appears nowhere in the file (not even partially), short-circuit to the auto-read error immediately without going through the full edit pipeline. Saves the allocation/atomic-write setup cost on what is guaranteed to fail.
 
-# Add ast-grep
+# Add ast-grep (Removed)
 
 The grep is good for text search but its missing programming language syntax there is tool 
 https://github.com/ast-grep/ast-grep that does. How could we intgrate it so that the Model use ast-grep instread of grep or we offer normal grep and run ast-grep in the background or
 merge the result from grep and ast-grep in the tool result what would be the prefred way ?
 
-# Agent2Agent Protocol (A2A)
+# Auto Continue
 
-Collect information about https://github.com/a2aproject/A2A protocol. WHat has to be implemented to support A2A.
+When --autocontinue is enbale detect model is finished and wait for input but didn't call finished_task yet (in the current turn) then
+send a predefined user message like `Continue until you are done and then call finish task`.
+
+# Fix segafult
+
+Segmentation fault at address 0x13fc13300
+/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/compiler_rt/memcpy.zig:170:17: 0x100f9f92c in copyFixedLength (compiler_rt)
+        d[i] = s[i];
+                ^
+/Users/frankittermann/github/franky/src/coding/modes/proxy.zig:2473:11: 0x100b92e3f in writeMessageForUi (franky)
+    for (m.content) |cb| {
+          ^
+/Users/frankittermann/github/franky/src/coding/modes/proxy.zig:2424:30: 0x100b93c77 in renderTranscriptForUi (franky)
+        try writeMessageForUi(&buf, allocator, m, &tool_call_seq, &tool_result_seq);
+                             ^
+/Users/frankittermann/github/franky/src/coding/modes/proxy.zig:2376:39: 0x100bb6fc3 in respondTranscript (franky)
+    const body = renderTranscriptForUi(allocator, &session.transcript) catch {
+                                      ^
+/Users/frankittermann/github/franky/src/coding/modes/proxy.zig:1808:26: 0x100b76e3b in handleConnection (franky)
+        respondTranscript(arg.session, &stream, arg.io, arg.allocator);
+                         ^
+/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std/Thread.zig:422:13: 0x100b76373 in callFn__anon_70414 (franky)
+            @call(.auto, f, args);
+            ^
+/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std/Thread.zig:752:30: 0x100b761eb in entryFn (franky)
+                return callFn(f, args_ptr.*);
+                             ^
+???:?:?: 0x186f7bc57 in __pthread_cond_wait (/usr/lib/system/libsystem_pthread.dylib)
+???:?:?: 0x186f76c1b in _pthread_cond_broadcast (/usr/lib/system/libsystem_pthread.dylib)

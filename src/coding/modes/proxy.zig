@@ -327,6 +327,11 @@ const Session = struct {
     /// wins; otherwise honors settings.json `prompts: bool`.
     prompts_enabled: bool = false,
 
+    /// v3.0 — when > 0, only the N most recent tool results carry
+    /// full content to the LLM. Wired from settings.json at session
+    /// init; 0 disables offloading.
+    max_full_tool_results: u32 = 0,
+
     // ── v1.7.0 — session persistence on disk ──────────────────
     //
     // When `parent_dir` is non-null we mirror what print mode's
@@ -628,6 +633,7 @@ fn initSession(
     var permission_store = permissions_mod.Store.init(allocator);
     errdefer permission_store.deinit();
     var prompts_enabled: bool = cfg.prompts;
+    var max_full_tool_results: u32 = 0;
     // v1.19.0 — settings-layer overlay first; CLI overlay below.
     {
         var settings = try print_mode.loadSettingsForOverlay(allocator, io, environ);
@@ -636,8 +642,7 @@ fn initSession(
         prompts_enabled = print_mode.resolvePromptsDefault(cfg, &settings);
         print_mode.applyMaxTurnsSettingsOverlay(cfg, &settings);
         print_mode.applyRetrySettingsOverlay(cfg, &settings);
-
-        // v2.16 — pre-render the review config block for system-prompt injection.
+        max_full_tool_results = settings.max_full_tool_results orelse 0;        // v2.16 — pre-render the review config block for system-prompt injection.
         // Only populate when profiles are configured so the block is non-empty.
         if (settings.review_profiles.len > 0) {
             const ca = cfg.arena.allocator();
@@ -697,6 +702,7 @@ fn initSession(
         .created_at_ms = created_at_ms,
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
         .prompts_enabled = prompts_enabled,
+        .max_full_tool_results = max_full_tool_results,
         .tool_usage = std.StringHashMap(u32).init(allocator),
     };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
@@ -2225,6 +2231,7 @@ fn runOneTurnInternal(
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
+            .max_full_tool_results = session.max_full_tool_results,
             .stop_requested_fn = proxyStopRequestedFn,
             .max_turns = print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map) orelse @as(u32, 100),
             .stream_options = .{
