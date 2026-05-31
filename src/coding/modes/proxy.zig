@@ -2235,6 +2235,7 @@ fn runOneTurnInternal(
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
+            .nudge_on_autocontinue = session.cfg.autocontinue,
             .max_full_tool_results = session.max_full_tool_results,
             .stop_requested_fn = proxyStopRequestedFn,
             .max_turns = print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map) orelse @as(u32, 100),

@@ -241,6 +241,12 @@ pub const Config = struct {
     /// runs. Off by default — every session is fresh-state.
     remember_permissions: bool = false,
 
+    /// `--autocontinue` — when the model stops (after tool calls or a
+    /// text-only turn) without calling `finish_task`, inject a user
+    /// message asking it to continue and call finish_task. Caps at 2
+    /// nudges per session. Useful for running with no user in the loop.
+    autocontinue: bool = false,
+
     /// Concatenated positional args — the user's prompt.
     prompt: []const u8 = "",
 
@@ -390,6 +396,10 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
     }
     if (std.mem.eql(u8, name, "--no-standards")) {
         cfg.no_standards = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--autocontinue")) {
+        cfg.autocontinue = true;
         return true;
     }
     return false;
