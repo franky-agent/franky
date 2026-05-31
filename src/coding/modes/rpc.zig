@@ -692,6 +692,7 @@ fn runPrompt(
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
+            .nudge_on_autocontinue = session.cfg.autocontinue,
             .max_turns = print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map) orelse @as(u32, 100),
             .stream_options = .{
                 .api_key = session.provider.api_key,

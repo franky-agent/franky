@@ -281,6 +281,8 @@ fn runPrint(
     defer if (session_dir_path) |p| allocator.free(p);
     var events_dir_path: ?[]u8 = null;
     defer if (events_dir_path) |p| allocator.free(p);
+    var offload_dir_path: ?[]u8 = null;
+    defer if (offload_dir_path) |p| allocator.free(p);
     if (session_state.parent_dir) |parent| {
         session_dir_path = std.fs.path.join(allocator, &.{ parent, session_state.id() }) catch null;
         if (session_dir_path) |sd| {
@@ -289,6 +291,10 @@ fn runPrint(
             // v1.29.0 — `<session>/events` for reducer-state dumps
             // when a turn ends degenerate (clean STOP, zero content).
             events_dir_path = std.fs.path.join(allocator, &.{ sd, "events" }) catch null;
+            // v3.0 — `<session>/offloaded-tool-results` for tool-result
+            // offloading. The model can `read` these files to recover
+            // full tool output after offloading replaced it with a placeholder.
+            offload_dir_path = std.fs.path.join(allocator, &.{ sd, "offloaded-tool-results" }) catch null;
         }
     }
 
@@ -337,7 +343,9 @@ fn runPrint(
         .cancel = &cancel,
         .guardrails = resolved.guardrail_state,
         .nudge_on_finish_task = true,
+        .nudge_on_autocontinue = cfg.autocontinue,
         .max_full_tool_results = resolved.max_full_tool_results,
+        .offload_dir = offload_dir_path,
         .hook_userdata = @ptrCast(resolved.session_gates),
         .role_denied = permissions_mod.SessionGates.roleDenied,
         .before_tool_call = permissions_mod.SessionGates.beforeToolCall,

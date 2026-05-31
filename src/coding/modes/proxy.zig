@@ -2210,6 +2210,17 @@ fn runOneTurnInternal(
         session.resolve_mutex.unlock(io);
     }
 
+    // v3.0 — compute offload dir for tool-result snapshots so the
+    // model can `read` them back after they're replaced with placeholders.
+    var offload_dir: ?[]u8 = null;
+    defer if (offload_dir) |d| allocator.free(d);
+    if (session.max_full_tool_results > 0) {
+        if (session.parent_dir) |parent| {
+            const sd = std.fs.path.join(allocator, &.{ parent, session.session_id, "offloaded-tool-results" }) catch null;
+            offload_dir = sd;
+        }
+    }
+
     session.cancel = .{};
     // vN — reset stop-requested flag for this new turn.
     session.stop_requested.store(false, .release);
@@ -2235,7 +2246,9 @@ fn runOneTurnInternal(
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
+            .nudge_on_autocontinue = session.cfg.autocontinue,
             .max_full_tool_results = session.max_full_tool_results,
+            .offload_dir = offload_dir,
             .stop_requested_fn = proxyStopRequestedFn,
             .max_turns = print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map) orelse @as(u32, 100),
             .stream_options = .{

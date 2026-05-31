@@ -301,6 +301,13 @@ pub const Config = struct {
     /// infinite loops. Designed for print mode where there is no user to
     /// say "done". Default false — no behavioural change.
     nudge_on_finish_task: bool = false,
+    /// v2.29 — when true, after any stop where the model produced text or
+    /// tool calls but did NOT call `finish_task`, inject a synthetic user
+    /// message asking it to "Continue until you are done and then call
+    /// finish task". Caps at 2 nudges per session. Broader than
+    /// `nudge_on_finish_task` — fires even after tool-call turns.
+    /// Set via CLI flag `--autocontinue`. Default false.
+    nudge_on_autocontinue: bool = false,
 
     /// v3.0 — opt-in tool-result offloading. When > 0, only the `N` most
     /// recent tool-result messages are sent to the LLM with full content.
@@ -352,6 +359,7 @@ pub fn agentLoop(
     var current_cap: u32 = config.max_turns;
     var nudge_count: u32 = 0; // v2.27 — nudges injected this episode
     var finish_nudge_count: u32 = 0; // v2.28 — finish-task nudges injected
+    var autocontinue_nudge_count: u32 = 0; // v2.29 — autocontinue nudges injected
     cap_loop: while (true) {
         while (turn_count < current_cap) : (turn_count += 1) {
             if (config.cancel.isFired()) {
@@ -416,6 +424,23 @@ pub fn agentLoop(
                         if (nudged) {
                             finish_nudge_count += 1;
                             ai.log.log(.info, "finish_nudge", "injected", "count={d}", .{finish_nudge_count});
+                            continue;
+                        }
+                    }
+                }
+                // v2.29 — autocontinue: broader nudge that fires after
+                // tool-call turns too (not only clean .stop). Injects
+                // "Continue until you are done and then call finish task"
+                // when the model stopped without calling finish_task.
+                if (config.nudge_on_autocontinue) {
+                    if (autocontinue_nudge_count < 2) {
+                        const nudged = maybeNudgeAutoContinue(allocator, transcript) catch |e| blk: {
+                            ai.log.log(.warn, "autocontinue", "inject_failed", "err={s}", .{@errorName(e)});
+                            break :blk false;
+                        };
+                        if (nudged) {
+                            autocontinue_nudge_count += 1;
+                            ai.log.log(.info, "autocontinue", "injected", "count={d}", .{autocontinue_nudge_count});
                             continue;
                         }
                     }
@@ -639,6 +664,63 @@ fn maybeNudgeToFinishTask(
         .content = content,
         .timestamp = ai.stream.nowMillis(),
     });
+    return true;
+}
+
+/// v2.29 — inspect the last assistant message and inject a "Continue
+/// until you are done and then call finish task" user-role nudge if the
+/// model appears to be done (any stop_reason except err/aborted/refusal)
+/// but did NOT call finish_task. Broader than `maybeNudgeToFinishTask` —
+/// also fires after tool-call turns. Caps at 2 per session.
+fn maybeNudgeAutoContinue(
+    allocator: std.mem.Allocator,
+    transcript: *Transcript,
+) !bool {
+    const msgs = transcript.messages.items;
+    if (msgs.len == 0) return false;
+
+    const last = msgs[msgs.len - 1];
+    if (last.role != .assistant) return false;
+
+    const stop = last.stop_reason orelse return false;
+
+    // Don't nudge on explicit error / aborted / refusal.
+    if (stop == .err or stop == .aborted or stop == .refusal) return false;
+
+    // Check whether the last message has any text content.
+    var total_text_len: usize = 0;
+    var has_finish_task = false;
+    for (last.content) |cb| {
+        switch (cb) {
+            .text => |t| total_text_len += t.text.len,
+            .tool_call => |tc| {
+                // If the model already called finish_task, skip.
+                if (std.mem.eql(u8, tc.name, "finish_task")) has_finish_task = true;
+            },
+            else => {},
+        }
+    }
+
+    if (has_finish_task) return false;
+
+    // Only nudge when there is substantive content.
+    if (total_text_len < 30) return false;
+
+    const nudge_text = "Continue until you are done and then call finish task.";
+
+    const text_dup = try allocator.dupe(u8, nudge_text);
+    errdefer allocator.free(text_dup);
+
+    const content = try allocator.alloc(ai.types.ContentBlock, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .text = .{ .text = text_dup } };
+
+    try transcript.append(.{
+        .role = .user,
+        .content = content,
+        .timestamp = ai.stream.nowMillis(),
+    });
+    // Ownership of text_dup and content is now the transcript's.
     return true;
 }
 

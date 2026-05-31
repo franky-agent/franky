@@ -1147,6 +1147,7 @@ fn runOneTurn(
                 },
             };
             if (print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map)) |v| lc.max_turns = v;
+            lc.nudge_on_autocontinue = session.cfg.autocontinue;
             break :blk lc;
         },
         .ch = &ch,

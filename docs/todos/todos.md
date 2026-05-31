@@ -190,10 +190,19 @@ The grep is good for text search but its missing programming language syntax the
 https://github.com/ast-grep/ast-grep that does. How could we intgrate it so that the Model use ast-grep instread of grep or we offer normal grep and run ast-grep in the background or
 merge the result from grep and ast-grep in the tool result what would be the prefred way ?
 
-# Auto Continue
+# Auto Continue (DONE)
 
-When --autocontinue is enbale detect model is finished and wait for input but didn't call finished_task yet (in the current turn) then
-send a predefined user message like `Continue until you are done and then call finish task`.
+When --autocontinue is enabled, after the model stops (any stop_reason except
+error/aborted/refusal) without calling finish_task, inject a user message:
+"Continue until you are done and then call finish task."
+
+Implementation:
+- `--autocontinue` CLI flag → `cfg.autocontinue`
+- `Config.nudge_on_autocontinue` in loop config
+- `maybeNudgeAutoContinue()` — broader than `maybeNudgeToFinishTask()`:
+  fires after tool-call turns too, checks for `finish_task` tool_call
+- Wired in print, interactive, proxy, and rpc modes
+- Caps at 2 nudges per session
 
 # Fix segafult
 
@@ -221,3 +230,28 @@ Segmentation fault at address 0x13fc13300
                              ^
 ???:?:?: 0x186f7bc57 in __pthread_cond_wait (/usr/lib/system/libsystem_pthread.dylib)
 ???:?:?: 0x186f76c1b in _pthread_cond_broadcast (/usr/lib/system/libsystem_pthread.dylib)
+
+# Tool Result offload missing path
+
+The tool offload results missing the path for the model to read the result again that leads to multiple new full reads because context was missing.
+```
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_h9xz6ave",
+          "type": "function",
+          "function": {
+            "name": "bash",
+            "arguments": "{\"command\":\"cd /Users/frankittermann/github/zettler \\u0026\\u0026 zig run src/main.zig -- 2\\u003e\\u00261 | head -5\",\"description\":\"Check how to build and run the project\",\"timeoutMs\":30000}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_h9xz6ave",
+      "content": "[tool result: call_h9xz6ave — 257B (offloaded)]"
+    }
+```

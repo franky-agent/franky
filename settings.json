@@ -4,7 +4,7 @@
             "maxAttempts": 3,
             "maxTotalMs": 180000
         },
-        "maxFullToolResults": 10
+        "maxFullToolResults": 20
     },
     "review": {
         "profiles": ["ollama-deepseek-flash", "ollama-kimi-k", "ollama-deepseek-pro", "ollama-gemma4-cloud"],

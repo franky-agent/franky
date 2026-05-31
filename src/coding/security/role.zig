@@ -93,7 +93,8 @@ pub const ToolSet = struct {
     /// Bit `i` is set iff `tool_table[i].min_role <= role`.
     /// Sized for `tool_table.len` so the compiler will catch
     /// any drift if the table grows.
-    bits: std.StaticBitSet(tool_table.len) = std.StaticBitSet(tool_table.len).initEmpty(),
+    /// Default-initialized to all zeros via `.{}`.
+    bits: std.StaticBitSet(tool_table.len) = .empty,
 
     pub fn forRole(r: Role) ToolSet {
         var ts: ToolSet = .{};
