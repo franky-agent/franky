@@ -55,4 +55,13 @@ ENV ZIG_LOCAL_CACHE_DIR=/tmp/zig-cache
 ENV ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
 ENV PATH="/home/agent/.cargo/bin:/home/agent/go/bin:${PATH}"
 
+# OCI image annotations
+LABEL org.opencontainers.image.title="franky sandbox"
+LABEL org.opencontainers.image.description="Development sandbox with franky AI coding agent, Zig toolchain, and analysis tools"
+LABEL org.opencontainers.image.vendor="containifyci"
+LABEL org.opencontainers.image.version="0.30.0"
+LABEL org.opencontainers.image.url="https://github.com/fr12k/franky"
+LABEL org.opencontainers.image.source="https://github.com/fr12k/franky"
+LABEL org.opencontainers.image.licenses="MIT"
+
 CMD ["/usr/bin/franky-deepseek"]
