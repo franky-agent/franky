@@ -1,4 +1,4 @@
-auto_commit: true
+auto_commit: false
 stages:
   - name: build
     command: "zig build"

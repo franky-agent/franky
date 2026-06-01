@@ -52,6 +52,7 @@ const role_mod = @import("../security/role.zig");
 const permissions_mod = @import("../security/permissions.zig");
 const session_mod = @import("../session/mod.zig");
 const truncate_mod = @import("truncate.zig");
+const common = @import("common.zig");
 
 pub const tool_name: []const u8 = "subagent";
 
@@ -935,9 +936,9 @@ fn runSubagent(
             const list = profiles_mod.listProfileNamesCSV(allocator, io, &env_map) catch "";
             defer if (list.len > 0) allocator.free(list);
             const hint = if (list.len > 0)
-                try std.fmt.allocPrint(allocator, "profile '{s}' uses a provider whose API key is not set; retry with one of the available profiles: {s}", .{effective_profile, list})
+                try std.fmt.allocPrint(allocator, "the requested profile needs an API key that is not configured; please retry with one of these: {s}", .{list})
             else
-                try allocator.dupe(u8, "profile uses a provider whose API key is not set; set the required environment variable or choose a different profile");
+                try allocator.dupe(u8, "the requested profile needs an API key that is not configured; set the required environment variable or retry with a different profile");
             defer allocator.free(hint);
             return errorResult(allocator, .agent_error, hint, .{});
         }
@@ -1247,7 +1248,11 @@ fn parseArgs(allocator: std.mem.Allocator, args_json: []const u8) ParseError!Par
     defer arena.deinit();
     const aalloc = arena.allocator();
 
-    const parsed = std.json.parseFromSlice(std.json.Value, aalloc, args_json, .{}) catch return error.InvalidJson;
+    const json_to_parse: []const u8 = blk: {
+        if (common.repairConcatJson(aalloc, args_json)) |r| break :blk r;
+        break :blk args_json;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, aalloc, json_to_parse, .{}) catch return error.InvalidJson;
     if (parsed.value != .object) return error.InvalidJson;
     const obj = parsed.value.object;
 

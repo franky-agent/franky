@@ -104,7 +104,8 @@ fn executeSearch(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), args_json, .{});
+    const json_to_parse = common.repairConcatJson(arena.allocator(), args_json) orelse args_json;
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json_to_parse, .{});
     const root = parsed.value;
 
     const query_v = root.object.get("query") orelse
