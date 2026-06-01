@@ -32,6 +32,7 @@ pub const AgentMessage = at.AgentMessage;
 
 const guardrails_mod = @import("guardrails/guardrails.zig");
 const truncate = @import("../coding/tools/truncate.zig");
+const tool_common = @import("../coding/tools/common.zig");
 
 pub const ConvertToLlmFn = *const fn (
     allocator: std.mem.Allocator,
@@ -917,6 +918,17 @@ fn runTurn(
     maybeApplyDsmlThinkingFallback(allocator, &assistant_msg, config.tools) catch |e| {
         ai.log.log(.debug, "loop", "dsml_thinking_fallback_failed", "err={s}", .{@errorName(e)});
     };
+
+    // vNEXT — v1.28.2 — repair concatenated-JSON tool-call args in
+    // the assistant message before it enters the transcript. Some
+    // models emit `{"path":"a"}{"path":"b"}` when calling read/ls;
+    // the raw broken JSON is rejected by providers (request_invalid)
+    // on the next turn. Repairing here ensures both the transcript
+    // and the UI see a valid single-object arguments_json.
+    repairToolCallArgsInMessage(allocator, &assistant_msg) catch |e| {
+        ai.log.log(.debug, "loop", "repair_tool_args_failed", "err={s}", .{@errorName(e)});
+    };
+
     // Push a duplicate into the event and keep the original for transcript.
     try out.push(io, .{ .message_end = try dupeMessage(allocator, assistant_msg) });
     if (ai.log.enabledForScope(.trace, "message")) logMessageTrace("recv", 0, assistant_msg);
@@ -1538,6 +1550,33 @@ fn looksLikeJsonError(name: []const u8) bool {
         if (std.mem.eql(u8, name, m)) return true;
     }
     return false;
+}
+
+//  ─── vNEXT — tool-arg repair ─────────────────────────────────────
+
+/// Repair concatenated-JSON tool-call arguments in every tool_call
+/// content block of `msg`. Called before the message enters the
+/// transcript so the provider never sees `{"path":"a"}{"path":"b"}`.
+fn repairToolCallArgsInMessage(
+    allocator: std.mem.Allocator,
+    msg: *AgentMessage,
+) !void {
+    for (msg.content) |*cb| {
+        switch (cb.*) {
+            .tool_call => |*tc| {
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                if (tool_common.repairConcatJson(arena.allocator(), tc.arguments_json)) |fixed| {
+                    ai.log.log(.debug, "loop", "repair_tool_args", "name={s} orig_bytes={d} fixed_bytes={d}", .{
+                        tc.name, tc.arguments_json.len, fixed.len,
+                    });
+                    allocator.free(tc.arguments_json);
+                    tc.arguments_json = try allocator.dupe(u8, fixed);
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 // ─── v1.16.3 — text-tool-call fallback ────────────────────────
