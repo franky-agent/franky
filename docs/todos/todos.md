@@ -138,7 +138,7 @@ Create a design doc on how we can support the LLM standard.
 This make it possible to jump between session but consider there is only one active session but still how we can support at least jumping between sessions and view them while still keep the active session
 MAke a design doc
 
-# the tool call ids aren't unique (Done)
+# the tool call ids aren't unique (Not working)
 
 To be able to link dediacted messages like tool calls we need a unique id.
 
@@ -231,7 +231,7 @@ Segmentation fault at address 0x13fc13300
 ???:?:?: 0x186f7bc57 in __pthread_cond_wait (/usr/lib/system/libsystem_pthread.dylib)
 ???:?:?: 0x186f76c1b in _pthread_cond_broadcast (/usr/lib/system/libsystem_pthread.dylib)
 
-# Tool Result offload missing path
+# Tool Result offload missing path (Done)
 
 The tool offload results missing the path for the model to read the result again that leads to multiple new full reads because context was missing.
 ```
