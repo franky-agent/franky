@@ -39,10 +39,15 @@ pub const parameters_json: []const u8 =
     \\  "type": "object",
     \\  "required": ["pattern"],
     \\  "properties": {
-    \\    "pattern": {"type": "string", "description": "ECMAScript-subset regex by default: . * + ? | [abc] [^abc] [a-z] ^ $ \\w \\d \\s (and \\W \\D \\S). Non-capturing groups with (...). Set regex=false for literal substring match."},
+    \\    "pattern": {
+    \\      "oneOf": [
+    \\        {"type": "string", "description": "ECMAScript-subset regex by default: . * + ? | [abc] [^abc] [a-z] ^ $ \\w \\d \\s (and \\W \\D \\S). Non-capturing groups with (...). Set regex=false for literal substring match."},
+    \\        {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Array of patterns — matches lines matching ANY of the patterns (OR logic)."}
+    \\      ]
+    \\    },
     \\    "path": {"type": "string", "description": "Root path to search. Default '.'."},
     \\    "filesGlob": {"type": "string", "description": "Only search files matching this glob (e.g. '**/*.zig')."},
-    \\    "regex": {"type": "boolean", "description": "Treat pattern as regex. Default true. Set false for `grep -F` literal search."},
+    \\    "regex": {"type": "boolean", "description": "Treat pattern(s) as regex. Default true. Set false for `grep -F` literal search."},
     \\    "caseSensitive": {"type": "boolean", "description": "Default true."},
     \\    "contextBefore": {"type": "integer", "minimum": 0},
     \\    "contextAfter": {"type": "integer", "minimum": 0},
@@ -99,9 +104,27 @@ fn execute(
 
     const pattern_val = root.object.get("pattern") orelse
         return common.toolError(allocator, "invalid_args", "missing pattern");
-    if (pattern_val != .string) return common.toolError(allocator, "invalid_args", "pattern must be a string");
-    const pattern = pattern_val.string;
-    if (pattern.len == 0) return common.toolError(allocator, "invalid_args", "pattern cannot be empty");
+
+    // pattern can be a string or an array of strings (OR logic).
+    const patterns: []const []const u8 = if (pattern_val == .string) blk: {
+        const p = pattern_val.string;
+        if (p.len == 0) return common.toolError(allocator, "invalid_args", "pattern cannot be empty");
+        const arr = try arena.allocator().alloc([]const u8, 1);
+        arr[0] = p;
+        break :blk arr;
+    } else if (pattern_val == .array) blk: {
+        const items = pattern_val.array.items;
+        if (items.len == 0) return common.toolError(allocator, "invalid_args", "pattern array cannot be empty");
+        const arr = try arena.allocator().alloc([]const u8, items.len);
+        for (items, 0..) |item, i| {
+            if (item != .string) return common.toolError(allocator, "invalid_args", "each pattern in array must be a string");
+            if (item.string.len == 0) return common.toolError(allocator, "invalid_args", "pattern in array cannot be empty");
+            arr[i] = item.string;
+        }
+        break :blk arr;
+    } else {
+        return common.toolError(allocator, "invalid_args", "pattern must be a string or array of strings");
+    };
 
     const user_path: []const u8 = if (root.object.get("path")) |v|
         (if (v == .string) v.string else ".")
@@ -149,33 +172,72 @@ fn execute(
     else
         true;
 
-    // Compile the regex up front so a bad pattern surfaces as a clean
+    // Compile the matcher(s) up front so a bad pattern surfaces as a clean
     // `grep_bad_regex` tool error before we touch the filesystem.
     var matcher: Matcher = undefined;
-    if (use_regex) {
-        // v2.18 — strip unsupported ECMAScript assertions (\\b, \\B) that
-        // models reliably emit because every other regex engine supports them.
-        // Lookaround assertions ((?=, (?!, (?<=, (?<!) are also unsupported
-        // and cause a fallback to literal-substring mode.
-        const stripped = stripUnsupportedAssertions(pattern, allocator) catch {
-            // Fall through to literal mode when lookaround is present.
-            matcher = .{ .literal = .{ .pattern = pattern, .case_sensitive = case_sensitive } };
-            defer matcher.deinit();
-            return try grepTree(allocator, io, path, &matcher, files_glob, context_before, context_after, max_matches, respect_gitignore, cancel);
-        };
-        defer allocator.free(stripped);
+    if (patterns.len == 1) {
+        const pattern = patterns[0];
+        if (use_regex) {
+            // v2.18 — strip unsupported ECMAScript assertions (\b, \B) that
+            // models reliably emit because every other regex engine supports them.
+            // Lookaround assertions ((?=, (?!, (?<=, (?<!) are also unsupported
+            // and cause a fallback to literal-substring mode.
+            const stripped = stripUnsupportedAssertions(pattern, allocator) catch {
+                // Fall through to literal mode when lookaround is present.
+                matcher = .{ .literal = .{ .pattern = pattern, .case_sensitive = case_sensitive } };
+                defer matcher.deinit();
+                return try grepTree(allocator, io, path, &matcher, files_glob, context_before, context_after, max_matches, respect_gitignore, cancel);
+            };
+            defer allocator.free(stripped);
 
-        var report: regex_mod.ErrorReport = .{};
-        matcher = .{ .regex = regex_mod.compileOpts(
-            allocator,
-            stripped,
-            .{ .case_insensitive = !case_sensitive },
-            &report,
-        ) catch |e| {
-            return try badRegexError(allocator, pattern, e, report.pos);
-        } };
+            var report: regex_mod.ErrorReport = .{};
+            matcher = .{ .regex = regex_mod.compileOpts(
+                allocator,
+                stripped,
+                .{ .case_insensitive = !case_sensitive },
+                &report,
+            ) catch |e| {
+                return try badRegexError(allocator, pattern, e, report.pos);
+            } };
+        } else {
+            matcher = .{ .literal = .{ .pattern = pattern, .case_sensitive = case_sensitive } };
+        }
     } else {
-        matcher = .{ .literal = .{ .pattern = pattern, .case_sensitive = case_sensitive } };
+        // Multiple patterns — build a multi matcher (OR logic).
+        const sub_matchers = try allocator.alloc(Matcher, patterns.len);
+        var sub_matchers_initialized: usize = 0;
+        errdefer {
+            for (0..sub_matchers_initialized) |j| {
+                sub_matchers[j].deinit();
+            }
+            allocator.free(sub_matchers);
+        }
+
+        for (patterns, sub_matchers) |pattern, *sm| {
+            if (use_regex) {
+                const stripped = stripUnsupportedAssertions(pattern, allocator) catch {
+                    sm.* = .{ .literal = .{ .pattern = pattern, .case_sensitive = case_sensitive } };
+                    sub_matchers_initialized += 1;
+                    continue;
+                };
+                defer allocator.free(stripped);
+
+                var report: regex_mod.ErrorReport = .{};
+                sm.* = .{ .regex = regex_mod.compileOpts(
+                    allocator,
+                    stripped,
+                    .{ .case_insensitive = !case_sensitive },
+                    &report,
+                ) catch |e| {
+                    return try badRegexError(allocator, pattern, e, report.pos);
+                } };
+            } else {
+                sm.* = .{ .literal = .{ .pattern = pattern, .case_sensitive = case_sensitive } };
+            }
+            sub_matchers_initialized += 1;
+        }
+
+        matcher = .{ .multi = .{ .matchers = sub_matchers, .allocator = allocator } };
     }
     defer matcher.deinit();
 
@@ -186,16 +248,35 @@ fn execute(
 pub const Matcher = union(enum) {
     regex: regex_mod.Regex,
     literal: Literal,
+    multi: Multi,
 
     pub const Literal = struct {
         pattern: []const u8,
         case_sensitive: bool,
     };
 
+    pub const Multi = struct {
+        matchers: []Matcher,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *Multi) void {
+            for (self.matchers) |*sm| sm.deinit();
+            self.allocator.free(self.matchers);
+        }
+
+        pub fn matches(self: *const Multi, line: []const u8) bool {
+            for (self.matchers) |*sm| {
+                if (sm.matches(line)) return true;
+            }
+            return false;
+        }
+    };
+
     pub fn deinit(self: *Matcher) void {
         switch (self.*) {
             .regex => |*r| r.deinit(),
             .literal => {},
+            .multi => |*m| m.deinit(),
         }
     }
 
@@ -206,6 +287,7 @@ pub const Matcher = union(enum) {
                 std.mem.indexOf(u8, line, l.pattern) != null
             else
                 indexOfNoCase(line, l.pattern) != null,
+            .multi => |*m| m.matches(line),
         };
     }
 };
@@ -1212,4 +1294,76 @@ test "stripUnsupportedAssertions: lookbehind assertions trigger UnsupportedRegex
     const gpa = testing.allocator;
     try testing.expectError(error.UnsupportedRegexAssertion, stripUnsupportedAssertions("(?<=foo)", gpa));
     try testing.expectError(error.UnsupportedRegexAssertion, stripUnsupportedAssertions("(?<!foo)", gpa));
+}
+
+test "grep tool: multi-pattern array (OR logic) matches any of the patterns" {
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const base = "/tmp/franky_grep_multi";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    var file = try std.Io.Dir.cwd().createFile(io, base ++ "/test.txt", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "hello world\nfoo bar\nbaz qux\napple pie\n");
+
+    // Multi-pattern with literal matchers.
+    var m = Matcher{ .multi = .{
+        .matchers = try gpa.alloc(Matcher, 2),
+        .allocator = gpa,
+    } };
+    m.multi.matchers[0] = literalMatcher("hello", true);
+    m.multi.matchers[1] = literalMatcher("baz", true);
+    defer m.deinit();
+
+    var cancel = ai.stream.Cancel{};
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, false, &cancel);
+    defer res.deinit(gpa);
+
+    try testing.expect(res.content.len == 1);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "hello world") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "baz qux") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "foo bar") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "apple pie") == null);
+}
+
+test "grep tool: multi-pattern with regex matchers" {
+    const gpa = testing.allocator;
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const base = "/tmp/franky_grep_multi_re";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    var file = try std.Io.Dir.cwd().createFile(io, base ++ "/test.txt", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "hello world\nfoo bar\n12345\napple pie\n");
+
+    // Build sub-matchers first to avoid partial-initialization on failure.
+    const sm0 = try regexMatcher("^hello", false);
+    const sm1 = try regexMatcher("\\d+", false);
+    var m = Matcher{ .multi = .{
+        .matchers = try gpa.alloc(Matcher, 2),
+        .allocator = gpa,
+    } };
+    m.multi.matchers[0] = sm0;
+    m.multi.matchers[1] = sm1;
+    defer m.deinit();
+
+    var cancel = ai.stream.Cancel{};
+    var res = try grepTree(gpa, io, base, &m, null, 0, 0, 100, false, &cancel);
+    defer res.deinit(gpa);
+
+    try testing.expect(res.content.len == 1);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "hello world") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "12345") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "foo bar") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "apple pie") == null);
 }
