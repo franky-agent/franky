@@ -26,60 +26,22 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Verify fork head commit is reachable
-        env:
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          status=$(curl -sS -o /tmp/head-commit.json -w "%{http_code}" \
-            -u "x-access-token:${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${HEAD_REPO}/commits/${HEAD_SHA}")
-          if ! [[ "${status}" =~ ^2[0-9][0-9]$ ]]; then
-            if [ "${status}" = "401" ] || [ "${status}" = "403" ]; then
-              echo "::error::GitHub API access to ${HEAD_REPO} failed with status ${status}. Verify token permissions and retry."
-            else
-              echo "::error::Fork head commit ${HEAD_SHA} is no longer reachable in ${HEAD_REPO}."
-              echo "::error::This usually means the fork branch or commit was deleted/rewritten. Push the branch again or update the PR head and re-run CI."
-            fi
-            cat /tmp/head-commit.json
-            exit 1
-          fi
-
       - name: Checkout fork head commit
         uses: actions/checkout@v6
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install engine-ci binary
-        env:
-          ENGINE_CI_VERSION: v0.42.9
-          ENGINE_CI_SHA256: 22ce827b2d95105f0a9572ebe85449c1c72904a7c981c3cd60ba2a7ff89d7809
-        run: |
-          curl --tlsv1.2 -fsSL -o /tmp/engine-ci \
-            "https://github.com/containifyci/engine-ci/releases/download/${ENGINE_CI_VERSION}/engine-ci_linux_x86_64"
-          test -s /tmp/engine-ci || {
-            echo "::error::Downloaded engine-ci binary is empty or missing from release ${ENGINE_CI_VERSION} (engine-ci_linux_x86_64).";
-            exit 1;
-          }
-          curl --tlsv1.2 -fsSL -o /tmp/engine-ci_checksums.txt \
-            "https://github.com/containifyci/engine-ci/releases/download/${ENGINE_CI_VERSION}/engine-ci_${ENGINE_CI_VERSION#v}_checksums.txt" || {
-            echo "::error::Failed to download published checksums for ${ENGINE_CI_VERSION}.";
-            exit 1;
-          }
-          grep -q "^${ENGINE_CI_SHA256}  engine-ci_linux_x86_64$" /tmp/engine-ci_checksums.txt || {
-            echo "::error::Pinned checksum ${ENGINE_CI_SHA256} for engine-ci_linux_x86_64 was not found in published checksums for ${ENGINE_CI_VERSION}.";
-            exit 1;
-          }
-          echo "${ENGINE_CI_SHA256}  /tmp/engine-ci" | sha256sum -c - || {
-            echo "::error::Checksum verification failed for /tmp/engine-ci. Expected ${ENGINE_CI_SHA256}.";
-            exit 1;
-          }
-          mkdir -p "${HOME}/.local/bin"
-          install -m 0755 /tmp/engine-ci "${HOME}/.local/bin/engine-ci"
-          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+      - name: Install Engine CI
+        uses: jaxxstorm/action-install-gh-release@v1
+        with:
+          repo: containifyci/engine-ci
+          # At the moment fetch latest release
+          # version: ${{ inputs.version }}
+          cache: true
+          extension-matching: disable
+          rename-to: engine-ci
+          chmod: 0755
 
       - name: Run fork build with ContainifyCI
         env:
