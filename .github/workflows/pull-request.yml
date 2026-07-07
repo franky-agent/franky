@@ -30,12 +30,16 @@ jobs:
         env:
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          auth_header="Authorization: token ${GH_TOKEN}"
           status=$(curl -sS -o /tmp/head-commit.json -w "%{http_code}" \
+            -H "${auth_header}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${HEAD_REPO}/commits/${HEAD_SHA}")
           if [ "${status}" != "200" ]; then
             echo "::error::Fork head commit ${HEAD_SHA} is no longer reachable in ${HEAD_REPO}."
+            echo "::error::This usually means the fork branch or commit was deleted/rewritten. Push the branch again or update the PR head and re-run CI."
             cat /tmp/head-commit.json
             exit 1
           fi
