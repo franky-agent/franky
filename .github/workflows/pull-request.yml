@@ -31,8 +31,12 @@ jobs:
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if ! git ls-remote "https://github.com/${HEAD_REPO}.git" "${HEAD_SHA}" | grep -q "${HEAD_SHA}"; then
+          status=$(curl -sS -o /tmp/head-commit.json -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${HEAD_REPO}/commits/${HEAD_SHA}")
+          if [ "${status}" != "200" ]; then
             echo "::error::Fork head commit ${HEAD_SHA} is no longer reachable in ${HEAD_REPO}."
+            cat /tmp/head-commit.json
             exit 1
           fi
 
