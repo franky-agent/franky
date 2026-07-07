@@ -84,7 +84,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     b.step("run", "Run the franky CLI").dependOn(&run_cmd.step);
 
     // `zig build gen-models` — regenerate the §H.3 catalog by polling
@@ -105,7 +105,7 @@ pub fn build(b: *std.Build) void {
         .use_lld = use_lld,
     });
     const gen_models_run = b.addRunArtifact(gen_models_exe);
-    if (b.args) |args| gen_models_run.addArgs(args);
+    gen_models_run.addPassthruArgs();
     b.step("gen-models", "Regenerate models.json by polling provider endpoints").dependOn(&gen_models_run.step);
 
     // `zig build doctor` — cross-session self-improvement analyzer.
@@ -126,7 +126,7 @@ pub fn build(b: *std.Build) void {
         .use_lld = use_lld,
     });
     const doctor_run = b.addRunArtifact(doctor_exe);
-    if (b.args) |args| doctor_run.addArgs(args);
+    doctor_run.addPassthruArgs();
     b.step("doctor", "Run cross-session self-improvement analyzer").dependOn(&doctor_run.step);
 
     const test_options = b.addOptions();
@@ -307,6 +307,6 @@ pub fn build(b: *std.Build) void {
     });
     const profile_driver_run = b.addRunArtifact(profile_driver_exe);
     profile_driver_run.step.dependOn(test_profile_step);
-    if (b.args) |args| profile_driver_run.addArgs(args);
+    profile_driver_run.addPassthruArgs();
     b.step("profile", "Capture CPU + memory flamegraphs from the test suite").dependOn(&profile_driver_run.step);
 }
