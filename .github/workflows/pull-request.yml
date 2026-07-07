@@ -12,8 +12,43 @@ permissions:
 jobs:
   build:
     name: Build
+    if: github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: write
       pull-requests: write
     uses: containifyci/.github/.github/workflows/pull-request.yml@v1
     secrets: inherit
+
+  build-fork:
+    name: Build (fork PR)
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout fork head commit
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install Engine CI
+        uses: jaxxstorm/action-install-gh-release@v1
+        with:
+          repo: containifyci/engine-ci
+          # At the moment fetch latest release
+          # version: ${{ inputs.version }}
+          cache: true
+          extension-matching: disable
+          rename-to: engine-ci
+          chmod: 0755
+
+      - name: Run fork build with ContainifyCI
+        env:
+          CONTAINER_RUNTIME: docker
+          DOCKER_USER: containifyci
+          CONTAINIFYCI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONTAINIFYCI_FILE: .containifyci/containifyci.go
+        run: |
+          engine-ci github_actions
+          engine-ci engine
