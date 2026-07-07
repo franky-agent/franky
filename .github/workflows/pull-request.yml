@@ -60,11 +60,14 @@ jobs:
         run: |
           curl -fsSL -o /tmp/engine-ci \
             "https://github.com/containifyci/engine-ci/releases/download/${ENGINE_CI_VERSION}/engine-ci_linux_x86_64"
-          test -s /tmp/engine-ci || { echo "::error::Downloaded engine-ci binary is empty or missing."; exit 1; }
+          test -s /tmp/engine-ci || {
+            echo "::error::Downloaded engine-ci binary is empty or missing from release ${ENGINE_CI_VERSION} (engine-ci_linux_x86_64).";
+            exit 1;
+          }
           curl -fsSL -o /tmp/engine-ci_checksums.txt \
             "https://github.com/containifyci/engine-ci/releases/download/${ENGINE_CI_VERSION}/engine-ci_${ENGINE_CI_VERSION#v}_checksums.txt"
           grep -q "^${ENGINE_CI_SHA256}  engine-ci_linux_x86_64$" /tmp/engine-ci_checksums.txt || {
-            echo "::error::Pinned engine-ci checksum does not match the published checksums file.";
+            echo "::error::Pinned checksum ${ENGINE_CI_SHA256} for engine-ci_linux_x86_64 was not found in published checksums for ${ENGINE_CI_VERSION}.";
             exit 1;
           }
           echo "${ENGINE_CI_SHA256}  /tmp/engine-ci" | sha256sum -c -
