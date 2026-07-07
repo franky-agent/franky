@@ -25,9 +25,29 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      pull-requests: write
     steps:
-      - name: Skip ContainifyCI build on fork PRs
+      - name: Checkout fork head commit
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install engine-ci binary
+        uses: jaxxstorm/action-install-gh-release@v3.0.0
+        with:
+          repo: containifyci/engine-ci
+          cache: true
+          extension-matching: disable
+          rename-to: engine-ci
+          chmod: 0755
+
+      - name: Run fork build with ContainifyCI
+        env:
+          CONTAINER_RUNTIME: docker
+          DOCKER_USER: containifyci
+          CONTAINIFYCI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONTAINIFYCI_FILE: .containifyci/containifyci.go
         run: |
-          echo "ContainifyCI reusable workflow checks out github.head_ref in the base repo."
-          echo "Fork PR head branches live in a different repository, so that checkout fails."
-          echo "This fallback marks the build check as non-failing for fork PRs."
+          engine-ci github_actions
+          engine-ci engine
