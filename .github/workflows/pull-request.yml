@@ -36,7 +36,7 @@ jobs:
             -u "x-access-token:${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${HEAD_REPO}/commits/${HEAD_SHA}")
-          if [ "${status}" != "200" ]; then
+          if ! [[ "${status}" =~ ^2[0-9][0-9]$ ]]; then
             echo "::error::Fork head commit ${HEAD_SHA} is no longer reachable in ${HEAD_REPO}."
             echo "::error::This usually means the fork branch or commit was deleted/rewritten. Push the branch again or update the PR head and re-run CI."
             cat /tmp/head-commit.json
@@ -56,6 +56,7 @@ jobs:
         run: |
           curl -fsSL -o /tmp/engine-ci \
             "https://github.com/containifyci/engine-ci/releases/download/${ENGINE_CI_VERSION}/engine-ci_linux_x86_64"
+          test -s /tmp/engine-ci
           echo "${ENGINE_CI_SHA256}  /tmp/engine-ci" | sha256sum -c -
           mkdir -p "${HOME}/.local/bin"
           install -m 0755 /tmp/engine-ci "${HOME}/.local/bin/engine-ci"
