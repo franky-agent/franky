@@ -58,19 +58,22 @@ jobs:
           ENGINE_CI_VERSION: v0.42.9
           ENGINE_CI_SHA256: 22ce827b2d95105f0a9572ebe85449c1c72904a7c981c3cd60ba2a7ff89d7809
         run: |
-          curl -fsSL -o /tmp/engine-ci \
+          curl --tlsv1.2 -fsSL -o /tmp/engine-ci \
             "https://github.com/containifyci/engine-ci/releases/download/${ENGINE_CI_VERSION}/engine-ci_linux_x86_64"
           test -s /tmp/engine-ci || {
             echo "::error::Downloaded engine-ci binary is empty or missing from release ${ENGINE_CI_VERSION} (engine-ci_linux_x86_64).";
             exit 1;
           }
-          curl -fsSL -o /tmp/engine-ci_checksums.txt \
+          curl --tlsv1.2 -fsSL -o /tmp/engine-ci_checksums.txt \
             "https://github.com/containifyci/engine-ci/releases/download/${ENGINE_CI_VERSION}/engine-ci_${ENGINE_CI_VERSION#v}_checksums.txt"
           grep -q "^${ENGINE_CI_SHA256}  engine-ci_linux_x86_64$" /tmp/engine-ci_checksums.txt || {
             echo "::error::Pinned checksum ${ENGINE_CI_SHA256} for engine-ci_linux_x86_64 was not found in published checksums for ${ENGINE_CI_VERSION}.";
             exit 1;
           }
-          echo "${ENGINE_CI_SHA256}  /tmp/engine-ci" | sha256sum -c -
+          echo "${ENGINE_CI_SHA256}  /tmp/engine-ci" | sha256sum -c - || {
+            echo "::error::Checksum verification failed for /tmp/engine-ci. Expected ${ENGINE_CI_SHA256}.";
+            exit 1;
+          }
           mkdir -p "${HOME}/.local/bin"
           install -m 0755 /tmp/engine-ci "${HOME}/.local/bin/engine-ci"
           echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
