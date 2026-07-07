@@ -32,9 +32,8 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          auth_header="Authorization: token ${GH_TOKEN}"
           status=$(curl -sS -o /tmp/head-commit.json -w "%{http_code}" \
-            -H "${auth_header}" \
+            -u "x-access-token:${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${HEAD_REPO}/commits/${HEAD_SHA}")
           if [ "${status}" != "200" ]; then
@@ -51,13 +50,16 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Install engine-ci binary
-        uses: jaxxstorm/action-install-gh-release@25e24d2d23ae098373794ef1d6faecb48ee52da8 # v3.0.0
-        with:
-          repo: containifyci/engine-ci
-          cache: true
-          extension-matching: disable
-          rename-to: engine-ci
-          chmod: 0755
+        env:
+          ENGINE_CI_VERSION: v0.42.9
+          ENGINE_CI_SHA256: 22ce827b2d95105f0a9572ebe85449c1c72904a7c981c3cd60ba2a7ff89d7809
+        run: |
+          curl -fsSL -o /tmp/engine-ci \
+            "https://github.com/containifyci/engine-ci/releases/download/${ENGINE_CI_VERSION}/engine-ci_linux_x86_64"
+          echo "${ENGINE_CI_SHA256}  /tmp/engine-ci" | sha256sum -c -
+          mkdir -p "${HOME}/.local/bin"
+          install -m 0755 /tmp/engine-ci "${HOME}/.local/bin/engine-ci"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
 
       - name: Run fork build with ContainifyCI
         env:
