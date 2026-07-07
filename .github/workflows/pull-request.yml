@@ -37,8 +37,12 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${HEAD_REPO}/commits/${HEAD_SHA}")
           if ! [[ "${status}" =~ ^2[0-9][0-9]$ ]]; then
-            echo "::error::Fork head commit ${HEAD_SHA} is no longer reachable in ${HEAD_REPO}."
-            echo "::error::This usually means the fork branch or commit was deleted/rewritten. Push the branch again or update the PR head and re-run CI."
+            if [ "${status}" = "401" ] || [ "${status}" = "403" ]; then
+              echo "::error::GitHub API access to ${HEAD_REPO} failed with status ${status}. Verify token permissions and retry."
+            else
+              echo "::error::Fork head commit ${HEAD_SHA} is no longer reachable in ${HEAD_REPO}."
+              echo "::error::This usually means the fork branch or commit was deleted/rewritten. Push the branch again or update the PR head and re-run CI."
+            fi
             cat /tmp/head-commit.json
             exit 1
           fi
@@ -56,7 +60,13 @@ jobs:
         run: |
           curl -fsSL -o /tmp/engine-ci \
             "https://github.com/containifyci/engine-ci/releases/download/${ENGINE_CI_VERSION}/engine-ci_linux_x86_64"
-          test -s /tmp/engine-ci
+          test -s /tmp/engine-ci || { echo "::error::Downloaded engine-ci binary is empty or missing."; exit 1; }
+          curl -fsSL -o /tmp/engine-ci_checksums.txt \
+            "https://github.com/containifyci/engine-ci/releases/download/${ENGINE_CI_VERSION}/engine-ci_${ENGINE_CI_VERSION#v}_checksums.txt"
+          grep -q "^${ENGINE_CI_SHA256}  engine-ci_linux_x86_64$" /tmp/engine-ci_checksums.txt || {
+            echo "::error::Pinned engine-ci checksum does not match the published checksums file.";
+            exit 1;
+          }
           echo "${ENGINE_CI_SHA256}  /tmp/engine-ci" | sha256sum -c -
           mkdir -p "${HOME}/.local/bin"
           install -m 0755 /tmp/engine-ci "${HOME}/.local/bin/engine-ci"
