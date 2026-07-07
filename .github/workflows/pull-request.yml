@@ -12,8 +12,22 @@ permissions:
 jobs:
   build:
     name: Build
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     permissions:
       contents: write
       pull-requests: write
     uses: containifyci/.github/.github/workflows/pull-request.yml@v1
     secrets: inherit
+
+  build-fork:
+    name: Build
+    if: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Skip external reusable workflow on fork PRs
+        run: |
+          echo "ContainifyCI reusable workflow checks out github.head_ref in the base repo."
+          echo "Fork PR head branches live in a different repository, so that checkout fails."
+          echo "Skipping this job for forks to avoid a false-negative CI failure."
