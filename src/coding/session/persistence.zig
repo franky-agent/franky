@@ -139,10 +139,10 @@ pub fn readSessionHeader(
 /// so adding a new owning-string field to `SessionHeader` automatically
 /// frees it without updating this function.
 pub fn freeSessionHeader(allocator: std.mem.Allocator, h: SessionHeader) void {
-    const info = @typeInfo(SessionHeader).@"struct";
-    inline for (info.field_names, info.field_types) |name, ty| {
-        if (ty == []const u8) {
-            allocator.free(@field(h, name));
+    const struct_info = @typeInfo(SessionHeader).@"struct";
+    inline for (struct_info.field_names, struct_info.field_types) |field_name, field_type| {
+        if (field_type == []const u8) {
+            allocator.free(@field(h, field_name));
         }
     }
 }
