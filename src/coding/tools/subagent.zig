@@ -1730,8 +1730,8 @@ test "PresetRegistry: SDK preset overrides built-in with same name" {
 }
 
 test "ErrorKind hints are non-empty for all variants" {
-    const info = @typeInfo(ErrorKind).@"enum";
-    inline for (info.field_names, info.field_values) |name, value| {
+    const enum_info = @typeInfo(ErrorKind).@"enum";
+    inline for (enum_info.field_names, enum_info.field_values) |name, value| {
         _ = name;
         const k: ErrorKind = @enumFromInt(value);
         try testing.expect(k.hint().len > 0);
