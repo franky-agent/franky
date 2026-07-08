@@ -76,6 +76,16 @@ pub const Profile = struct {
     /// pre-existing env** so a profile entry can reference parent
     /// env vars without leaking secrets into the file.
     env: ?std.StringHashMap([]const u8) = null,
+
+    /// v3.1 — `models` array. When present, the profile is a
+    /// *provider template* that auto-expands into synthetic
+    /// sub-profiles named `<parent-name>/<model>` for each entry.
+    /// All other fields (provider, base_url, api_key, …) are
+    /// inherited; only `model` differs per entry.
+    /// Example: `"ollama"` with `models: ["gemma4:31b", "qwen3.6:latest"]`
+    /// creates synthetic profiles `ollama/gemma4:31b` and
+    /// `ollama/qwen3.6:latest`.
+    models: ?[][]const u8 = null,
 };
 
 /// Settings.json paths searched. First match wins; profiles are
@@ -175,6 +185,33 @@ pub fn loadFromSettings(
         return try parseBuiltinBody(arena, environ_map, body);
     }
 
+    // v3.1 — try parent/model expansion against the built-in catalog.
+    // If name is "parent/model", look up "parent" in built-ins, check
+    // if it has a "models" array, and synthesize a profile.
+    if (std.mem.indexOfScalar(u8, name, '/')) |slash| {
+        const parent_name = name[0..slash];
+        const model_name = name[slash + 1 ..];
+        if (model_name.len > 0) {
+            if (getBuiltinBody(parent_name)) |body| {
+                const parsed = std.json.parseFromSlice(std.json.Value, arena, body, .{}) catch
+                    return error.MalformedProfile;
+                if (parsed.value == .object) {
+                    if (parsed.value.object.get("models")) |models_v| if (models_v == .array) {
+                        const found = for (models_v.array.items) |item| {
+                            if (item == .string and std.mem.eql(u8, item.string, model_name)) break true;
+                        } else false;
+                        if (found) {
+                            var profile = try parseProfileObject(arena, environ_map, parsed.value.object);
+                            profile.model = try arena.dupe(u8, model_name);
+                            log.log(.debug, "profile", "loaded", "name={s} source=builtin-expanded", .{name});
+                            return profile;
+                        }
+                    };
+                }
+            }
+        }
+    }
+
     return null;
 }
 
@@ -217,10 +254,40 @@ fn loadProfileFromBytes(
     if (parsed.value != .object) return null;
     const profiles_val = parsed.value.object.get("profiles") orelse return null;
     if (profiles_val != .object) return null;
-    const profile_val = profiles_val.object.get(name) orelse return null;
-    if (profile_val != .object) return error.MalformedProfile;
 
-    return try parseProfileObject(arena, environ_map, profile_val.object);
+    // 1. Try exact match first.
+    if (profiles_val.object.get(name)) |profile_val| {
+        if (profile_val != .object) return error.MalformedProfile;
+        return try parseProfileObject(arena, environ_map, profile_val.object);
+    }
+
+    // 2. v3.1 — try parent/model expansion.
+    //    If name is "parent/model", look up "parent", check its
+    //    "models" array, and synthesize a profile with model set.
+    if (std.mem.indexOfScalar(u8, name, '/')) |slash| {
+        const parent_name = name[0..slash];
+        const model_name = name[slash + 1 ..];
+        if (model_name.len == 0) return null;
+        if (profiles_val.object.get(parent_name)) |parent_val| {
+            if (parent_val != .object) return null;
+            const parent_obj = parent_val.object;
+            const models_val = parent_obj.get("models") orelse return null;
+            if (models_val != .array) return null;
+            // Check that model_name is in the models array.
+            const found = for (models_val.array.items) |item| {
+                if (item == .string and std.mem.eql(u8, item.string, model_name)) break true;
+            } else false;
+            if (!found) return null;
+
+            // Parse the parent profile, then override model.
+            var profile = try parseProfileObject(arena, environ_map, parent_obj);
+            // Free the parent's model (if any) and set to the specific model.
+            profile.model = try arena.dupe(u8, model_name);
+            return profile;
+        }
+    }
+
+    return null;
 }
 
 /// Parse one `{...}` object into a `Profile`. Each string value
@@ -258,6 +325,19 @@ fn parseProfileObject(
     if (optInt(u32, obj, "retry_max_attempts")) |v| p.retry_max_attempts = v;
     if (optInt(u64, obj, "retry_max_total_ms")) |v| p.retry_max_total_ms = v;
     if (optInt(u32, obj, "base_delay_ms")) |v| p.base_delay_ms = v;
+
+    if (obj.get("models")) |models_v| if (models_v == .array) {
+        const arr = models_v.array;
+        var models = try arena.alloc([]const u8, arr.items.len);
+        for (arr.items, 0..) |item, i| {
+            if (item == .string) {
+                models[i] = try interpolate(arena, environ_map, item.string);
+            } else {
+                models[i] = "";
+            }
+        }
+        p.models = models;
+    };
 
     if (obj.get("env")) |env_v| if (env_v == .object) {
         var env_map = std.StringHashMap([]const u8).init(arena);
@@ -749,6 +829,19 @@ fn collectUserProfileNames(
     while (it.next()) |entry| {
         const name_dup = try arena.dupe(u8, entry.key_ptr.*);
         try out.put(name_dup, {});
+
+        // v3.1 — if the profile has a "models" array, also register
+        // each expanded name (parent/model) so they appear in listings.
+        if (entry.value_ptr.* == .object) {
+            if (entry.value_ptr.object.get("models")) |models_v| if (models_v == .array) {
+                for (models_v.array.items) |item| {
+                    if (item == .string and item.string.len > 0) {
+                        const expanded = try std.fmt.allocPrint(arena, "{s}/{s}", .{ entry.key_ptr.*, item.string });
+                        try out.put(expanded, {});
+                    }
+                }
+            };
+        }
     }
 }
 
