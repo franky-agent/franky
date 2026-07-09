@@ -87,6 +87,21 @@ pub const Profile = struct {
     /// When a profile is referenced directly (without `/model` suffix),
     /// the first entry in `models` is used as the effective model.
     models: ?[][]const u8 = null,
+
+    /// Index into `models` for the selected model. When `null`,
+    /// defaults to 0 (first entry). Set during parent/model expansion
+    /// to point at the matched model without mutating the array.
+    selected_model_idx: ?usize = null,
+
+    /// Return the effective model string: `models[selected_model_idx orelse 0]`.
+    /// Returns `null` when `models` is null or empty.
+    pub fn model(self: Profile) ?[]const u8 {
+        const ms = self.models orelse return null;
+        if (ms.len == 0) return null;
+        const idx = self.selected_model_idx orelse 0;
+        if (idx >= ms.len) return null;
+        return ms[idx];
+    }
 };
 
 /// Settings.json paths searched. First match wins; profiles are
@@ -203,10 +218,14 @@ pub fn loadFromSettings(
                         } else false;
                         if (found) {
                             var profile = try parseProfileObject(arena, environ_map, parsed.value.object);
-                            // Replace the parent's models array with a single-element
-                            // array containing the selected model.
-                            profile.models = try arena.alloc([]const u8, 1);
-                            profile.models.?[0] = try arena.dupe(u8, model_name);
+                            // Set the selected model index to point at the matched model
+                            // without mutating the parent's models array.
+                            for (profile.models.?, 0..) |m, i| {
+                                if (std.mem.eql(u8, m, model_name)) {
+                                    profile.selected_model_idx = i;
+                                    break;
+                                }
+                            }
                             log.log(.debug, "profile", "loaded", "name={s} source=builtin-expanded", .{name});
                             return profile;
                         }
@@ -283,11 +302,15 @@ fn loadProfileFromBytes(
             } else false;
             if (!found) return null;
 
-            // Parse the parent profile, then override models to a
-            // single-element array with the selected model.
+            // Parse the parent profile, then set the selected model index
+            // to point at the matched model without mutating the array.
             var profile = try parseProfileObject(arena, environ_map, parent_obj);
-            profile.models = try arena.alloc([]const u8, 1);
-            profile.models.?[0] = try arena.dupe(u8, model_name);
+            for (profile.models.?, 0..) |m, i| {
+                if (std.mem.eql(u8, m, model_name)) {
+                    profile.selected_model_idx = i;
+                    break;
+                }
+            }
             return profile;
         }
     }
@@ -482,8 +505,8 @@ fn applyProfileStringFields(
     if (cfg.provider == null) if (profile.provider) |v| {
         cfg.provider = try arena.dupe(u8, v);
     };
-    if (cfg.model == null) if (profile.models) |models| if (models.len > 0 and models[0].len > 0) {
-        cfg.model = try arena.dupe(u8, models[0]);
+    if (cfg.model == null) if (profile.model()) |v| {
+        cfg.model = try arena.dupe(u8, v);
     };
     if (cfg.api_key == null) {
         if (profile.api_key) |v| {
