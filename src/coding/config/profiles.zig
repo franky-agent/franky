@@ -40,7 +40,6 @@ pub const ProfileError = error{
 /// is owned by the caller's arena (cfg.arena).
 pub const Profile = struct {
     provider: ?[]const u8 = null,
-    model: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     api_key_env: ?[]const u8 = null,
     auth_token: ?[]const u8 = null,
@@ -77,14 +76,16 @@ pub const Profile = struct {
     /// env vars without leaking secrets into the file.
     env: ?std.StringHashMap([]const u8) = null,
 
-    /// v3.1 — `models` array. When present, the profile is a
+    /// `models` array. When present, the profile is a
     /// *provider template* that auto-expands into synthetic
     /// sub-profiles named `<parent-name>/<model>` for each entry.
     /// All other fields (provider, base_url, api_key, …) are
-    /// inherited; only `model` differs per entry.
+    /// inherited; only the model differs per entry.
     /// Example: `"ollama"` with `models: ["gemma4:31b", "qwen3.6:latest"]`
     /// creates synthetic profiles `ollama/gemma4:31b` and
     /// `ollama/qwen3.6:latest`.
+    /// When a profile is referenced directly (without `/model` suffix),
+    /// the first entry in `models` is used as the effective model.
     models: ?[][]const u8 = null,
 };
 
@@ -202,7 +203,10 @@ pub fn loadFromSettings(
                         } else false;
                         if (found) {
                             var profile = try parseProfileObject(arena, environ_map, parsed.value.object);
-                            profile.model = try arena.dupe(u8, model_name);
+                            // Replace the parent's models array with a single-element
+                            // array containing the selected model.
+                            profile.models = try arena.alloc([]const u8, 1);
+                            profile.models.?[0] = try arena.dupe(u8, model_name);
                             log.log(.debug, "profile", "loaded", "name={s} source=builtin-expanded", .{name});
                             return profile;
                         }
@@ -279,10 +283,11 @@ fn loadProfileFromBytes(
             } else false;
             if (!found) return null;
 
-            // Parse the parent profile, then override model.
+            // Parse the parent profile, then override models to a
+            // single-element array with the selected model.
             var profile = try parseProfileObject(arena, environ_map, parent_obj);
-            // Free the parent's model (if any) and set to the specific model.
-            profile.model = try arena.dupe(u8, model_name);
+            profile.models = try arena.alloc([]const u8, 1);
+            profile.models.?[0] = try arena.dupe(u8, model_name);
             return profile;
         }
     }
@@ -301,7 +306,6 @@ fn parseProfileObject(
     var p: Profile = .{};
 
     if (try optString(arena, environ_map, obj, "provider")) |v| p.provider = v;
-    if (try optString(arena, environ_map, obj, "model")) |v| p.model = v;
     if (try optString(arena, environ_map, obj, "api_key")) |v| p.api_key = v;
     if (try optString(arena, environ_map, obj, "api_key_env")) |v| p.api_key_env = v;
     if (try optString(arena, environ_map, obj, "auth_token")) |v| p.auth_token = v;
@@ -337,12 +341,6 @@ fn parseProfileObject(
             }
         }
         p.models = models;
-        // If no singular model was set, default to the first model
-        // in the array. This lets profiles use only `models` even
-        // when referenced directly (without parent/model syntax).
-        if (p.model == null and models.len > 0 and models[0].len > 0) {
-            p.model = models[0];
-        }
     };
 
     if (obj.get("env")) |env_v| if (env_v == .object) {
@@ -484,8 +482,8 @@ fn applyProfileStringFields(
     if (cfg.provider == null) if (profile.provider) |v| {
         cfg.provider = try arena.dupe(u8, v);
     };
-    if (cfg.model == null) if (profile.model) |v| {
-        cfg.model = try arena.dupe(u8, v);
+    if (cfg.model == null) if (profile.models) |models| if (models.len > 0 and models[0].len > 0) {
+        cfg.model = try arena.dupe(u8, models[0]);
     };
     if (cfg.api_key == null) {
         if (profile.api_key) |v| {
