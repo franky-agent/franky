@@ -337,6 +337,12 @@ fn parseProfileObject(
             }
         }
         p.models = models;
+        // If no singular model was set, default to the first model
+        // in the array. This lets profiles use only `models` even
+        // when referenced directly (without parent/model syntax).
+        if (p.model == null and models.len > 0 and models[0].len > 0) {
+            p.model = models[0];
+        }
     };
 
     if (obj.get("env")) |env_v| if (env_v == .object) {
@@ -604,7 +610,7 @@ pub const Builtin = struct {
 const builtin_cloudflare_gemma_body =
     \\{
     \\  "provider": "gateway",
-    \\  "model": "@cf/google/gemma-4-26b-a4b-it",
+    \\  "models": ["@cf/google/gemma-4-26b-a4b-it"],
     \\  "base_url": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions",
     \\  "api_key_env": "CLOUDFLARE_API_TOKEN",
     \\  "ask_tools": "all",
@@ -617,7 +623,7 @@ const builtin_cloudflare_gemma_body =
 const builtin_cloudflare_llama_body =
     \\{
     \\  "provider": "gateway",
-    \\  "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    \\  "models": ["@cf/meta/llama-3.3-70b-instruct-fp8-fast"],
     \\  "base_url": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions",
     \\  "api_key_env": "CLOUDFLARE_API_TOKEN",
     \\  "text_tool_call_fallback": true,
@@ -664,7 +670,7 @@ const builtin_lm_studio_body =
 const builtin_gemini_body =
     \\{
     \\  "provider": "google-gemini",
-    \\  "model": "gemini-2.5-pro",
+    \\  "models": ["gemini-2.5-pro"],
     \\  "api_key_env": "GEMINI_API_KEY"
     \\}
 ;
@@ -744,7 +750,22 @@ pub fn listProfileNamesCSV(
         const path = maybe_path orelse continue;
         try collectUserProfileNames(a, io, path, &names);
     }
-    for (builtin_catalog) |b| try names.put(try a.dupe(u8, b.name), {});
+    for (builtin_catalog) |b| {
+        try names.put(try a.dupe(u8, b.name), {});
+        // v3.1 — also register expanded parent/model names for
+        // built-ins that have a "models" array.
+        const parsed = std.json.parseFromSlice(std.json.Value, a, b.body, .{}) catch continue;
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("models")) |models_v| if (models_v == .array) {
+                for (models_v.array.items) |item| {
+                    if (item == .string and item.string.len > 0) {
+                        const expanded = try std.fmt.allocPrint(a, "{s}/{s}", .{ b.name, item.string });
+                        try names.put(expanded, {});
+                    }
+                }
+            };
+        }
+    }
 
     var sorted: std.ArrayList([]const u8) = .empty;
     var it = names.iterator();
