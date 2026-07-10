@@ -1112,7 +1112,7 @@ test "applyProfile: full cloudflare-style profile from settings.json" {
         \\    "cloudflare": {
         \\      "provider": "gateway",
         \\      "mode": "print",
-        \\      "model": "@cf/google/gemma-4-26b-a4b-it",
+        \\      "models": ["@cf/google/gemma-4-26b-a4b-it"],
         \\      "base_url": "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions",
         \\      "api_key_env": "CF_API_TOKEN",
         \\      "thinking": "high",
@@ -1208,7 +1208,7 @@ test "applyProfile: CLI flags win over profile values" {
     const settings_path = try std.fs.path.join(gpa, &.{ dir_path, "settings.json" });
     defer gpa.free(settings_path);
     const settings_body =
-        \\{"profiles": {"p": {"provider": "gateway", "model": "from-profile"}}}
+        \\{"profiles": {"p": {"provider": "gateway", "models": ["from-profile"]}}}
     ;
     var f = try std.Io.Dir.cwd().createFile(io, settings_path, .{});
     {
@@ -1255,7 +1255,7 @@ test "applyProfile: kebab-case keys work as well as snake_case" {
         \\  "profiles": {
         \\    "cf": {
         \\      "provider": "gateway",
-        \\      "model": "@cf/google/gemma-4-26b-a4b-it",
+        \\      "models": ["@cf/google/gemma-4-26b-a4b-it"],
         \\      "base-url": "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions",
         \\      "api-key-env": "CF_API_TOKEN",
         \\      "ask-tools": "all",

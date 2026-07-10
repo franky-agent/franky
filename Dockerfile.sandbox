@@ -34,15 +34,15 @@ RUN printf '#!/bin/bash\nclaude --allow-dangerously-skip-permissions --dangerous
     chmod +x /usr/bin/claude && \
     printf '#!/bin/bash\nclaude --allow-dangerously-skip-permissions --dangerously-skip-permissions --resume "$@"\n' > /usr/bin/clauder && \
     chmod +x /usr/bin/clauder && \
-    printf '#!/bin/bash\nexec franky --profile ollama-deepseek-flash --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-deepseek-flash && \
+    printf '#!/bin/bash\nexec franky --profile ollama-cloud/deepseek-v4-flash:cloud --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-deepseek-flash && \
     chmod +x /usr/bin/franky-deepseek-flash && \
-    printf '#!/bin/bash\nexec franky --profile ollama-deepseek-kimi-k --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-kimik && \
+    printf '#!/bin/bash\nexec franky --profile ollama-cloud/kimi-k2.6:cloud --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-kimik && \
     chmod +x /usr/bin/franky-kimik && \
-    printf '#!/bin/bash\nexec franky --profile ollama-deepseek-pro --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-deepseek-pro && \
+    printf '#!/bin/bash\nexec franky --profile ollama-cloud/deepseek-v4-pro:cloud --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-deepseek-pro && \
     chmod +x /usr/bin/franky-deepseek-pro && \
-    printf '#!/bin/bash\nexec franky --profile ollama-glm-5 --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-glm5 && \
+    printf '#!/bin/bash\nexec franky --profile ollama-cloud/glm-5.1:cloud --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-glm5 && \
     chmod +x /usr/bin/franky-glm5 && \
-    printf '#!/bin/bash\nexec franky --profile ollama-gemma4-cloud --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-gemma4 && \
+    printf '#!/bin/bash\nexec franky --profile ollama-cloud/gemma4:31b-cloud --role full --yes --mode proxy "$@"\n' > /usr/bin/franky-gemma4 && \
     chmod +x /usr/bin/franky-gemma4
 
 USER agent

@@ -13,8 +13,16 @@ USAGE:
 
 PROFILES:
   openai                 Uses settings.json profile "openai"; requires OPENAI_API_KEY.
-  ollama-deepseek-flash  Uses settings.json profile "ollama-deepseek-flash"; requires OLLAMA_API_KEY.
-  mistral-labs-leanstral Uses settings.json profile "mistral-labs-leanstral"; requires MISTRAL_API_KEY.
+  ollama-cloud/deepseek-v4-flash:cloud  Uses settings.json profile "ollama-cloud/deepseek-v4-flash:cloud"; requires OLLAMA_API_KEY.
+  ollama-cloud/deepseek-v4-pro:cloud    Uses settings.json profile "ollama-cloud/deepseek-v4-pro:cloud"; requires OLLAMA_API_KEY.
+  ollama-cloud/kimi-k2.6:cloud          Uses settings.json profile "ollama-cloud/kimi-k2.6:cloud"; requires OLLAMA_API_KEY.
+  ollama-cloud/gemma4:31b-cloud         Uses settings.json profile "ollama-cloud/gemma4:31b-cloud"; requires OLLAMA_API_KEY.
+  ollama-cloud/minimax-m3:cloud         Uses settings.json profile "ollama-cloud/minimax-m3:cloud"; requires OLLAMA_API_KEY.
+  ollama-cloud/glm-5.1:cloud            Uses settings.json profile "ollama-cloud/glm-5.1:cloud"; requires OLLAMA_API_KEY.
+  mistral/devstral-2512                 Uses settings.json profile "mistral/devstral-2512"; requires MISTRAL_API_KEY.
+  mistral/mistral-medium-3-5            Uses settings.json profile "mistral/mistral-medium-3-5"; requires MISTRAL_API_KEY.
+  mistral/codestral-2508                Uses settings.json profile "mistral/codestral-2508"; requires MISTRAL_API_KEY.
+  mistral/labs-leanstral-2603           Uses settings.json profile "mistral/labs-leanstral-2603"; requires MISTRAL_API_KEY.
 
 OPTIONS:
   --task-id ID           Run one Terminal-Bench task.
@@ -29,9 +37,9 @@ Any args after -- are passed through to `harbor run`.
 EXAMPLES:
   OPENAI_API_KEY=... bench/run-harbor-franky.sh openai --task-id <task-id>
 
-  OLLAMA_API_KEY=... bench/run-harbor-franky.sh ollama-deepseek-flash --task-id <task-id>
+  OLLAMA_API_KEY=... bench/run-harbor-franky.sh ollama-cloud/deepseek-v4-flash:cloud --task-id <task-id>
 
-  MISTRAL_API_KEY=... bench/run-harbor-franky.sh mistral-labs-leanstral --task-id <task-id>
+  MISTRAL_API_KEY=... bench/run-harbor-franky.sh mistral/labs-leanstral-2603 --task-id <task-id>
 EOF
 }
 
@@ -122,15 +130,15 @@ case "$PROFILE" in
     require_env OPENAI_API_KEY
     export FRANKY_BENCH_ARGS="--profile openai"
     ;;
-  ollama-deepseek-flash)
+  ollama-cloud/deepseek-v4-flash:cloud)
     require_env OLLAMA_API_KEY
     append_forward_env OLLAMA_API_KEY
-    export FRANKY_BENCH_ARGS="--profile ollama-deepseek-flash --thinking high"
+    export FRANKY_BENCH_ARGS="--profile ollama-cloud/deepseek-v4-flash:cloud --thinking high"
     ;;
-  mistral-labs-leanstral)
+  mistral/labs-leanstral-2603)
     require_env MISTRAL_API_KEY
     append_forward_env MISTRAL_API_KEY
-    export FRANKY_BENCH_ARGS="--profile mistral-labs-leanstral"
+    export FRANKY_BENCH_ARGS="--profile mistral/labs-leanstral-2603"
     ;;
   *)
     echo "unknown profile: $PROFILE" >&2
