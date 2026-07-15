@@ -80,24 +80,22 @@ pre-defined profiles:
 | Profile | Provider | Model |
 |---|---|---|
 | `cerebras` | Cerebras Gateway | qwen-3-235b-a22b-instruct-2507 |
-| `cloudflare-gemma` | Cloudflare Workers AI | @cf/moonshotai/kimi-k2.6 |
-| `cloudflare-nemotron3` | Cloudflare Workers AI | @cf/nvidia/nemotron-3-120b-a12b |
-| `mistral-codestral` | Mistral API | codestral-2508 |
-| `mistral-devstral` | Mistral API | devstral-2512 |
-| `mistral-labs-leanstral` | Mistral API | labs-leanstral-2603 |
-| `mistral-medium-3-5` | Mistral API | mistral-medium-3-5 |
-| `ollama-deepseek-flash` | Ollama Cloud | deepseek-v4-flash:cloud |
-| `ollama-deepseek-pro` | Ollama Cloud | deepseek-v4-pro:cloud |
-| `ollama-kimi-k` | Ollama Cloud | kimi-k2.6:cloud |
-| `ollama-glm-5` | Ollama Cloud | glm-5.1:cloud |
-| `ollama-gemma4-cloud` | Ollama Cloud | gemma4:cloud |
+| `cloudflare` | Cloudflare Workers AI | @cf/moonshotai/kimi-k2.6, @cf/nvidia/nemotron-3-120b-a12b |
+| `mistral` | Mistral API | devstral-2512, mistral-medium-3-5, codestral-2508, labs-leanstral-2603 |
+| `ollama-cloud` | Ollama Cloud | deepseek-v4-flash:cloud, kimi-k2.6:cloud, deepseek-v4-pro:cloud, gemma4:31b-cloud, minimax-m3:cloud, glm-5.1:cloud |
+| `ollama-home` | Ollama Home (192.168.1.109) | gemma4:31b, qwen3.6:latest |
+| `ollama-local` | Ollama Local (localhost) | gemma4:latest, granite4.1:30b |
+| `openrouter` | OpenRouter | openrouter/owl-alpha |
+| `google` | Google Gemini | gemini-2.5-pro |
+| `gemini` | Google Gemini | gemini-2.5-pro, gemini-3.1-pro-preview |
+| `openai` | OpenAI | gpt-5.4-mini-2026-03-17 |
 
-For example, to start the proxy web UI with the Ollama DeepSeek Flash
+For example, to start the proxy web UI with the Ollama Cloud DeepSeek Flash
 profile:
 
 ```sh
 cd /workspace/franky
-./zig-out/bin/franky --mode proxy --profile ollama-deepseek-flash
+./zig-out/bin/franky --mode proxy --profile ollama-cloud/deepseek-v4-flash:cloud
 ```
 
 Then open `http://localhost:8787/` on the host.
