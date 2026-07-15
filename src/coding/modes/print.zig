@@ -267,6 +267,14 @@ fn runPrint(
     var session_state = try SessionState.init(allocator, io, environ, cfg);
     defer session_state.deinit(allocator);
 
+    // v3.0 — wire the session's CCR store into the ccr_retrieve tool
+    for (resolved.tools, 0..) |t, i| {
+        if (std.mem.eql(u8, t.name, "ccr_retrieve")) {
+            const tools_slice: []at.AgentTool = @constCast(resolved.tools);
+            tools_slice[i].ctx = @ptrCast(&session_state.ccr_store);
+        }
+    }
+
     if (!cfg.no_session) {
         ai.log.log(.info, "session", "init", "id={s} dir={s}", .{
             session_state.id(),
@@ -351,6 +359,8 @@ fn runPrint(
         .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
         .text_tool_call_fallback = cfg.text_tool_call_fallback,
         .reducer_dump_dir = events_dir_path,
+        .compression = if (resolved.compression.enabled) resolved.compression else null,
+        .ccr_store = &session_state.ccr_store,
         .stream_options = .{
             .api_key = resolved.api_key,
             .auth_token = resolved.auth_token,
@@ -1587,10 +1597,33 @@ pub fn buildSystemPromptIo(
     }
     defer if (review_owned) allocator.free(with_review);
 
-    if (cfg.append_system_prompt) |extra| {
+    // v3.0 — compression hint: tell the LLM about CCR markers
+    var with_compression: []u8 = with_review;
+    var compression_owned = false;
+    if (cfg.compress) {
         const trimmed = std.mem.trimEnd(u8, if (review_owned) with_review else with_skills, &std.ascii.whitespace);
+        with_compression = try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n## Compression\n\n" ++
+            "When tool output contains `<<<ccr:<hash> N_rows_offloaded>>>` markers, " ++
+            "the original content was compressed to save context. You can retrieve " ++
+            "the full original content by calling the `ccr_retrieve` tool with the " ++
+            "hash key. Do NOT guess or hallucinate the content behind a marker — " ++
+            "always use the retrieval tool if you need details.\n",
+            .{trimmed},
+        );
+        compression_owned = true;
+    }
+    defer if (compression_owned) allocator.free(with_compression);
+
+    if (cfg.append_system_prompt) |extra| {
+        const trimmed = std.mem.trimEnd(u8, if (compression_owned) with_compression else if (review_owned) with_review else with_skills, &std.ascii.whitespace);
         const out = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed, extra });
         return out;
+    }
+    if (compression_owned) {
+        compression_owned = false;
+        return with_compression;
     }
     if (review_owned) {
         review_owned = false;

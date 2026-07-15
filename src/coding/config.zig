@@ -33,6 +33,7 @@ const permissions_mod = franky.coding.permissions;
 const skills_mod = franky.coding.skills;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
+const compression_mod = franky.coding.compression;
 
 /// Error set for config resolution.
 pub const ResolveError = error{
@@ -128,6 +129,9 @@ pub const ResolvedConfig = struct {
 
     // ── Pre-rendered review config block ─────────────────────────
     review_config_block: ?[]const u8,
+
+    // ── Compression config ────────────────────────────────────────
+    compression: compression_mod.CompressionConfig,
 
     // ── Arena ────────────────────────────────────────────────────
     /// Everything that outlives `resolve()` is allocated on this arena.
@@ -419,6 +423,22 @@ pub fn applyRetrySettingsOverlay(
     if (cfg.retry_max_total_ms == null) {
         cfg.retry_max_total_ms = settings.retry_max_total_ms;
     }
+}
+
+/// v3.0 — apply `tools.compress.*` settings.json overlay onto `cfg`.
+/// Settings fill in when CLI didn't set them (CLI always wins).
+pub fn applyCompressionSettingsOverlay(
+    cfg: *cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) void {
+    if (settings.compress_enabled) |v| cfg.compress = v;
+    if (settings.compress_min_bytes) |v| cfg.compress_min_bytes = v;
+    if (settings.compress_ccr) |v| cfg.compress_ccr = v;
+    if (settings.compress_json) |v| cfg.compress_json = v;
+    if (settings.compress_logs) |v| cfg.compress_logs = v;
+    if (settings.compress_search) |v| cfg.compress_search = v;
+    if (settings.compress_diff) |v| cfg.compress_diff = v;
+    if (settings.compress_code) |v| cfg.compress_code = v;
 }
 
 /// Apply permissions settings overlay onto permission store.
@@ -893,6 +913,7 @@ pub fn resolve(
     // ── Step 4: Apply settings overlays to cfg ──────────────────
     applyMaxTurnsSettingsOverlay(cfg, &settings);
     applyRetrySettingsOverlay(cfg, &settings);
+    applyCompressionSettingsOverlay(cfg, &settings);
 
     // ── Step 5: Resolve provider ──────────────────────────────────
     const provider = try resolveProvider(allocator, io, cfg, environ_map);
@@ -980,7 +1001,7 @@ pub fn resolve(
 
     var startup_warnings: std.ArrayList([]const u8) = .empty;
     const base_tool_count: usize = 9;
-    var all_tools: [10]at.AgentTool = undefined;
+    var all_tools: [11]at.AgentTool = undefined;
     {
         var i: usize = 0;
         // Common tools (always present)
@@ -1116,7 +1137,7 @@ pub fn resolve(
     };
     const all_final_tools = blk: {
         const base_len = role_filtered_tools.len + ext_tools.len;
-        const slice = try a.alloc(at.AgentTool, base_len + 3);
+        const slice = try a.alloc(at.AgentTool, base_len + 4);
         @memcpy(slice[0..role_filtered_tools.len], role_filtered_tools);
         if (ext_tools.len > 0) {
             @memcpy(slice[role_filtered_tools.len..][0..ext_tools.len], ext_tools);
@@ -1124,6 +1145,8 @@ pub fn resolve(
         slice[base_len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
         slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(&preset_registry);
         slice[base_len + 2] = guardrail_state.finishTaskTool();
+        // ccr_retrieve tool — ctx is set by the mode driver after session creation
+        slice[base_len + 3] = tools_mod.ccr_retrieve.toolWithCtx(null);
         break :blk slice;
     };
 
@@ -1188,6 +1211,16 @@ pub fn resolve(
         .role_gate = role_gate,
         .active_role = active_role,
         .review_config_block = review_block,
+        .compression = .{
+            .enabled = cfg.compress,
+            .min_bytes_to_compress = cfg.compress_min_bytes,
+            .smart_crusher_enabled = cfg.compress_json,
+            .log_compressor_enabled = cfg.compress_logs,
+            .search_compressor_enabled = cfg.compress_search,
+            .diff_compressor_enabled = cfg.compress_diff,
+            .code_compressor_enabled = cfg.compress_code,
+            .ccr_enabled = cfg.compress_ccr,
+        },
         .arena = arena,
     };
 }
