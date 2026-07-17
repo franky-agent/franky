@@ -7,6 +7,9 @@
 //!
 //! The store is in-memory for the session lifetime. Persistence across
 //! sessions is a future enhancement.
+//!
+//! Keys are 12 hex characters (48 bits) — a truncated SHA-256.
+//! Collision probability at 1000 entries is ~10⁻⁹, negligible.
 
 const std = @import("std");
 
@@ -16,9 +19,12 @@ pub const default_max_entries: usize = 1000;
 /// Maximum total bytes of stored content before LRU eviction kicks in.
 pub const default_max_bytes: usize = 64 * 1024 * 1024; // 64 MB
 
+/// Length of CCR keys in hex characters (48 bits of SHA-256).
+pub const key_len: usize = 12;
+
 /// Session-scoped CCR store.
 ///
-/// Stores original content blobs keyed by a full SHA-256 hex hash.
+/// Stores original content blobs keyed by a 12-char truncated SHA-256 hex hash.
 /// Old entries are evicted via LRU when the cap is reached.
 pub const CcrSessionStore = struct {
     allocator: std.mem.Allocator,
@@ -55,7 +61,7 @@ pub const CcrSessionStore = struct {
 
     /// Store original content and return a hash key.
     /// The returned key is owned by the store and valid until the entry is evicted.
-    /// Uses full SHA-256 hex (64 characters) for the key.
+    /// Uses 12 hex chars (48 bits of SHA-256) — collision-free at session scale.
     pub fn store(self: *CcrSessionStore, original: []const u8) ![]const u8 {
         const key = try computeKey(self.allocator, original);
         errdefer self.allocator.free(key);
@@ -127,12 +133,9 @@ pub const CcrSessionStore = struct {
 
     /// Format a CCR marker for embedding in compressed output.
     /// Uses a distinctive prefix to avoid collision with tool output.
-    /// The marker uses a 12-char truncated hash for readability;
-    /// the full 64-char hash is used internally for lookups.
+    /// The key is already 12 chars — no truncation needed.
     pub fn formatMarker(key: []const u8, count: usize, allocator: std.mem.Allocator) ![]const u8 {
-        // Use first 12 hex chars of the full SHA-256 for the display marker.
-        const display_key = if (key.len > 12) key[0..12] else key;
-        return std.fmt.allocPrint(allocator, "<<<ccr:{s} {d}_rows_offloaded>>>", .{ display_key, count });
+        return std.fmt.allocPrint(allocator, "<<<ccr:{s} {d}_rows_offloaded>>>", .{ key, count });
     }
 
     /// Parse a CCR marker to extract the hash key and count.
@@ -153,17 +156,18 @@ pub const CcrSessionStore = struct {
     }
 };
 
-/// Compute a full SHA-256 hex key for content.
-/// Returns 64 hex characters (256 bits) — collision-free at session scale.
+/// Compute a 12-char hex key for content (truncated SHA-256).
+/// 12 hex chars = 48 bits. Collision probability at 1000 entries is ~10⁻⁹.
 fn computeKey(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
     var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
     sha256.update(content);
     var digest: [32]u8 = undefined;
     sha256.final(&digest);
 
+    // Take first 6 bytes (48 bits) and hex-encode to 12 chars.
     const hex_chars = "0123456789abcdef";
-    var key_buf: [64]u8 = undefined;
-    for (0..32) |i| {
+    var key_buf: [key_len]u8 = undefined;
+    for (0..key_len / 2) |i| {
         key_buf[i * 2] = hex_chars[digest[i] >> 4];
         key_buf[i * 2 + 1] = hex_chars[digest[i] & 0x0f];
     }
@@ -222,6 +226,12 @@ test "compute key differs for different content" {
     try std.testing.expect(!std.mem.eql(u8, key1, key2));
 }
 
+test "CCR key length is 12" {
+    const key = try computeKey(std.testing.allocator, "test content");
+    defer std.testing.allocator.free(key);
+    try std.testing.expectEqual(@as(usize, key_len), key.len);
+}
+
 test "CCR store LRU eviction" {
     var store = CcrSessionStore.init(std.testing.allocator);
     store.max_entries = 3;
@@ -242,4 +252,19 @@ test "CCR store LRU eviction" {
     try std.testing.expect(store.retrieve(a) == null); // evicted
     try std.testing.expect(store.retrieve(b) != null);
     try std.testing.expect(store.retrieve(c) != null);
+}
+
+test "CCR store retrieve by key from marker" {
+    var store = CcrSessionStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const key = try store.store("some important content");
+    // key is 12 chars (truncated SHA-256)
+    try std.testing.expectEqual(@as(usize, key_len), key.len);
+
+    // Retrieving with the key should work
+    try std.testing.expectEqualStrings("some important content", store.retrieve(key).?);
+
+    // A non-existent key should return null
+    try std.testing.expect(store.retrieve("nonexistent12") == null);
 }
