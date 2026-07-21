@@ -86,7 +86,7 @@
         "ollama-cloud": {
             "provider": "gateway",
             "base-url": "https://ollama.com/v1/chat/completions",
-            "models": ["deepseek-v4-flash:cloud", "kimi-k2.6:cloud", "deepseek-v4-pro:cloud", "gemma4:31b-cloud", "minimax-m3:cloud", "glm-5.1:cloud"],
+            "models": ["deepseek-v4-flash:cloud", "kimi-k2.6:cloud", "deepseek-v4-pro:cloud", "gemma4:31b-cloud", "minimax-m3:cloud", "glm-5.2:cloud"],
             "api-key-env": "OLLAMA_API_KEY",
             "ask-tools": "all",
             "role": "full",
