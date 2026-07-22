@@ -29,6 +29,7 @@ const sse_mod = @import("../sse.zig");
 const http_mod = @import("../http.zig");
 const log = @import("../log.zig");
 const utils = @import("../utils.zig");
+const schema_sanitize = @import("../schema_sanitize.zig");
 
 const Channel = channel_mod.Channel(stream_mod.StreamEvent);
 
@@ -73,7 +74,11 @@ pub fn buildRequestJson(
             try buf.appendSlice(allocator, ",\"description\":");
             try utils.appendJsonStr(&buf, allocator, t.description);
             try buf.appendSlice(allocator, ",\"parameters\":");
-            try buf.appendSlice(allocator, t.parameters_json);
+            // v1.30.0 — sanitize tool schemas before sending. Some
+            // OpenAI-compatible gateways reject JSON Schema keywords
+            // like `additionalProperties` with a 400. Same fix as
+            // openai_chat and google_gemini.
+            try schema_sanitize.appendSanitizedSchema(&buf, allocator, t.parameters_json);
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');
