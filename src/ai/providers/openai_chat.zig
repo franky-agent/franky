@@ -31,6 +31,7 @@ const sse_mod = @import("../sse.zig");
 const http_mod = @import("../http.zig");
 const log = @import("../log.zig");
 const utils = @import("../utils.zig");
+const schema_sanitize = @import("../schema_sanitize.zig");
 
 const Channel = channel_mod.Channel(stream_mod.StreamEvent);
 
@@ -78,7 +79,13 @@ pub fn buildRequestJson(
             try buf.appendSlice(allocator, ",\"description\":");
             try utils.appendJsonStr(&buf, allocator, t.description);
             try buf.appendSlice(allocator, ",\"parameters\":");
-            try buf.appendSlice(allocator, t.parameters_json);
+            // v1.30.0 — sanitize tool schemas before sending. Some
+            // OpenAI-compatible gateways (GLM, Cloudflare Workers AI)
+            // reject JSON Schema keywords like `additionalProperties`,
+            // `$schema`, `$defs`, and `definitions` with a 400
+            // (`request_invalid http_status=400`). Strip them the same
+            // way the Gemini provider does.
+            try schema_sanitize.appendSanitizedSchema(&buf, allocator, t.parameters_json);
             try buf.appendSlice(allocator, "}}");
         }
         try buf.append(allocator, ']');
@@ -710,6 +717,34 @@ test "buildRequestJson: tool schema under function wrapper" {
     try testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"description\":\"look up the weather\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"parameters\":{\"type\":\"object\"") != null);
+}
+
+// v1.30.0 — tool schemas with `additionalProperties` must be stripped
+// for OpenAI-compatible gateways that reject them with a 400.
+test "buildRequestJson: tool schema additionalProperties is stripped" {
+    const gpa = testing.allocator;
+    const tool: types.Tool = .{
+        .name = "read",
+        .description = "read a file",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"additionalProperties\":false}",
+    };
+    var uc = [_]types.ContentBlock{.{ .text = .{ .text = "read foo.zig" } }};
+    var msgs = [_]types.Message{.{ .role = .user, .content = &uc, .timestamp = 0 }};
+    var tools_arr = [_]types.Tool{tool};
+    const ctx: types.Context = .{
+        .system_prompt = "",
+        .messages = &msgs,
+        .tools = &tools_arr,
+    };
+    const model: types.Model = .{ .id = "glm-4", .provider = "gateway", .api = "openai-compatible-gateway" };
+    const body = try buildRequestJson(gpa, model, ctx, .{});
+    defer gpa.free(body);
+
+    // `additionalProperties` must be removed
+    try testing.expect(std.mem.indexOf(u8, body, "additionalProperties") == null);
+    // The other properties should still be present
+    try testing.expect(std.mem.indexOf(u8, body, "\"path\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"type\":\"object\"") != null);
 }
 
 test "buildRequestJson: assistant-with-tool_calls serializes tool_calls array" {
