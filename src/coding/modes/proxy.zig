@@ -742,30 +742,12 @@ fn initSession(
         if (std.fs.path.join(allocator, &.{ parent, session.session_id })) |sd| {
             defer allocator.free(sd);
             session.bash_state.setSessionDir(sd) catch {};
-            // v0.30.0 — expose session metadata to the bash tool's child env.
-            const tfile = std.fs.path.join(allocator, &.{ sd, "transcript.json" }) catch null;
-            defer if (tfile) |p| allocator.free(p);
-            session.bash_state.parent_env = session.environ_map;
-            session.bash_state.setSessionMetadata(
-                session.session_id,
-                tfile,
-                session.provider.provider_name,
-                session.provider.model_id,
-                session.cfg.thinking,
-            ) catch {};
         } else |_| {}
-    } else {
-        // v0.30.0 — ephemeral session: no session file, but still expose
-        // id/provider/model/reasoning.
-        session.bash_state.parent_env = session.environ_map;
-        session.bash_state.setSessionMetadata(
-            session.session_id,
-            null,
-            session.provider.provider_name,
-            session.provider.model_id,
-            session.cfg.thinking,
-        ) catch {};
     }
+    // v0.30.0 — parent_env is set early (no provider dependency); the
+    // session metadata (which needs provider/model) is wired after
+    // resolveProviderIo below.
+    session.bash_state.parent_env = session.environ_map;
 
     // v1.27.3 — rebuild the filtered tool list with `bash.toolWithState`
     // now that `&session.bash_state` is at a stable address. The
@@ -793,6 +775,23 @@ fn initSession(
     errdefer session.faux.deinit();
 
     session.provider = try print_mode.resolveProviderIo(allocator, io, environ, cfg);
+
+    // v0.30.0 — expose session metadata to the bash tool's child env now
+    // that the provider is resolved. The session file is only set for
+    // persistent sessions (parent_dir non-null).
+    {
+        const tfile: ?[]const u8 = if (session.parent_dir) |parent|
+            std.fs.path.join(session.role_arena.allocator(), &.{ parent, session.session_id, "transcript.json" }) catch null
+        else
+            null;
+        session.bash_state.setSessionMetadata(
+            session.session_id,
+            tfile,
+            session.provider.provider_name,
+            session.provider.model_id,
+            session.cfg.thinking,
+        ) catch {};
+    }
 
     try session.registry.register(.{
         .api = "faux",

@@ -318,6 +318,7 @@ fn runBackground(
     io: std.Io,
     command: []const u8,
     cwd: ?[]const u8,
+    state: ?*SessionBashState,
 ) !at.ToolResult {
     const ts: i64 = ai.stream.nowMillis();
     const out_file = try std.fmt.allocPrint(allocator, "/tmp/franky_bg_{d}.out", .{ts});
@@ -325,12 +326,22 @@ fn runBackground(
 
     const wrapper = "nohup sh -c \"$1\" sh > \"$2\" 2>&1 < /dev/null & echo $!";
 
+    // v0.30.0 — build a child env so session metadata is injected into
+    // background commands too (same pattern as execute/executeWithCtx).
+    var child_env: ?std.process.Environ.Map = if (state) |s|
+        if (s.parent_env) |pe| try pe.clone(allocator) else null
+    else
+        null;
+    defer if (child_env) |*m| m.deinit();
+    if (child_env) |*m| injectSessionEnv(m, state);
+
     const argv = [_][]const u8{ "/bin/sh", "-c", wrapper, "__franky_bg", command, out_file };
     const result = std.process.run(allocator, io, .{
         .argv = &argv,
         .cwd = if (cwd) |c| std.process.Child.Cwd{ .path = c } else .inherit,
         .stdout_limit = std.Io.Limit.limited(256),
         .stderr_limit = std.Io.Limit.limited(1024),
+        .environ_map = if (child_env) |*m| m else null,
     }) catch |err| return common.toolError(allocator, "bash_spawn_failed", @errorName(err));
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -516,7 +527,7 @@ fn execute(
         (v == .bool and v.bool)
     else
         false;
-    if (background) return try runBackground(allocator, io, command, cwd_opt);
+    if (background) return try runBackground(allocator, io, command, cwd_opt, state);
 
     const eff_default_ms: u64 = resolveDefaultTimeoutMs(state);
     const timeout_ms: u64 = if (root.object.get("timeoutMs")) |v| blk: {
@@ -546,9 +557,9 @@ fn execute(
     // wired, clone its `parent_env` (if set) into a mutable map, inject,
     // and pass it to the child. When `state` is null (the stateless
     // `tool()` factory, used only in tests), inherit the parent env
-    // verbatim as before — there is no metadata to inject.
+    // verbatim as before — we cannot inject without a parent_env base.
     var child_env: ?std.process.Environ.Map = if (state) |s|
-        if (s.parent_env) |pe| try pe.clone(allocator) else std.process.Environ.Map.init(allocator)
+        if (s.parent_env) |pe| try pe.clone(allocator) else null
     else
         null;
     defer if (child_env) |*m| m.deinit();
@@ -677,7 +688,7 @@ fn executeWithCtx(
         (v == .bool and v.bool)
     else
         false;
-    if (background) return try runBackground(allocator, io, command, cwd_opt);
+    if (background) return try runBackground(allocator, io, command, cwd_opt, state);
 
     const eff_default_ms: u64 = resolveDefaultTimeoutMs(state);
     const timeout_ms: u64 = if (root.object.get("timeoutMs")) |v| blk: {
@@ -692,18 +703,21 @@ fn executeWithCtx(
 
     // §R.5 shell choice + §R.6 env filter.
     const shell = if (workspace) |ws| workspace_mod.chosenShell(ws, ws.host_env) else "/bin/sh";
-    // v0.30.0 — always have a mutable env map so session metadata can be
-    // injected/scrubbed. When a workspace filter applies, start from it;
-    // otherwise clone the session's `parent_env` (if set) so the child
-    // still inherits PATH etc. When neither is available the map is empty
-    // and std.process.run inherits the parent env verbatim.
-    var filtered_env: std.process.Environ.Map = if (workspace) |ws|
+    // v0.30.0 — build a mutable env map so session metadata can be
+    // injected/scrubbed, but only when we have a base to start from.
+    // When a workspace filter applies, start from it; otherwise clone
+    // the session's `parent_env` (if set) so the child still inherits
+    // PATH etc. When neither is available, pass null so std.process.run
+    // inherits the parent env verbatim (legacy behavior) — we cannot
+    // scrub/inject without a base, but that only happens when a mode
+    // driver forgot to set `parent_env`, which all four do.
+    var filtered_env: ?std.process.Environ.Map = if (workspace) |ws|
         (try workspace_mod.filteredEnv(allocator, ws)) orelse std.process.Environ.Map.init(allocator)
-    else if (state) |s| if (s.parent_env) |pe| try pe.clone(allocator) else std.process.Environ.Map.init(allocator)
+    else if (state) |s| if (s.parent_env) |pe| try pe.clone(allocator) else null
     else
-        std.process.Environ.Map.init(allocator);
-    defer filtered_env.deinit();
-    injectSessionEnv(&filtered_env, state);
+        null;
+    defer if (filtered_env) |*m| m.deinit();
+    if (filtered_env) |*m| injectSessionEnv(m, state);
 
     // Wrap the user command so $PWD is captured after the command
     // exits. Grouping + preserving `$?` keeps exit-code semantics
@@ -723,7 +737,7 @@ fn executeWithCtx(
         .stdout_limit = std.Io.Limit.limited(max_output_bytes),
         .stderr_limit = std.Io.Limit.limited(max_output_bytes),
         .timeout = timeout,
-        .environ_map = &filtered_env,
+        .environ_map = if (filtered_env) |*m| m else null,
     }) catch |err| switch (err) {
         error.StreamTooLong => return common.toolError(allocator, "bash_output_too_large", "output exceeded 8 MiB cap; redirect to a file or pipe through head/tail"),
         // v1.28.0 — FileNotFound can mean either the shell binary
