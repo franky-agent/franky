@@ -27,10 +27,14 @@ builds:
       - x86_64-macos
       - aarch64-macos
     flags:
-      - -Doptimize=Debug
+      - -Doptimize=ReleaseSafe
       - -Dversion={{ .Version }}
       - -Dcommit={{ .ShortCommit }}
       - -Ddate={{ .CommitDate }}
+    # NOTE: -Doptimize=Debug hangs under gvisor sandboxes (Zig 0.17-dev
+    # std.Io.Threaded futex backoff bug). ReleaseSafe retains all safety
+    # checks and full source-location stacktraces via the custom panic
+    # handler in src/bin/main.zig, making it suitable for debugging.
 archives:
   - id: release
     ids: [release]
